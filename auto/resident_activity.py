@@ -221,7 +221,26 @@ class ResidentActivityAutomation:
         results[task] = self.run_siege(task)
         return results
 
+    def run_once(self, task: str) -> dict[str, int]:
+        """Run exactly one selected siege sweep for end-to-end verification."""
+        if not connect():
+            raise RuntimeError("ADB连接失败")
+        if not self.open_action_summary():
+            return {task: 0}
+        if not self.driver.click_text("利刃围剿"):
+            return {task: 0}
+        if not self.select_siege_task(task):
+            return {task: 0}
+        completed = self.sweep_current_activity(1)
+        logger.info(f"单次扫荡验证完成：{task} {completed}/1 次")
+        return {task: completed}
+
 
 def run_resident_activity(task: str) -> dict[str, int]:
     """GUI entry point."""
     return ResidentActivityAutomation().run(task)
+
+
+def run_resident_activity_once(task: str) -> dict[str, int]:
+    """GUI entry point for one non-repeating verification sweep."""
+    return ResidentActivityAutomation().run_once(task)

@@ -73,6 +73,16 @@ class ResidentActivityTests(unittest.TestCase):
         driver = SweepDriver([[]])
         self.assertEqual(ResidentActivityAutomation(driver).sweep_current_activity(3), 2)
 
+    def test_single_sweep_has_hard_limit_of_one(self):
+        class SweepDriver(FakeDriver):
+            def click_text(self, text, **_):
+                self.clicked.append(text)
+                return True
+
+        driver = SweepDriver([[]])
+        self.assertEqual(ResidentActivityAutomation(driver).sweep_current_activity(1), 1)
+        self.assertEqual(driver.clicked, ["扫荡"])
+
 
 if __name__ == "__main__":
     unittest.main()

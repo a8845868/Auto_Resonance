@@ -32,7 +32,11 @@ from app.components.link_card import LinkCardView
 from app.components.settings.checkbox_group_card import CheckboxGroup
 from app.utils.constants import ICON_PATH
 from core.control.control import stop
-from auto.resident_activity import SIEGE_TASKS, run_resident_activity
+from auto.resident_activity import (
+    SIEGE_TASKS,
+    run_resident_activity,
+    run_resident_activity_once,
+)
 from app.utils.worker import Worker
 from qfluentwidgets import qconfig
 
@@ -171,6 +175,14 @@ class HomeInterface(ScrollArea):
         )
 
         basicInputView.addSampleCard(
+            icon=FluentIcon.ACCEPT,
+            title="单次扫荡验证",
+            content="仅对所选利刃围剿任务扫荡一次",
+            func=self.startResidentActivityOnce,
+            routekey="LoggerInterface",
+        )
+
+        basicInputView.addSampleCard(
             icon=":/gallery/images/controls/Button.png",
             title="停止",
             content="停止运行",
@@ -186,6 +198,15 @@ class HomeInterface(ScrollArea):
             return
         self.residentActivityWorker = Worker(
             run_resident_activity,
+            task=cfg.residentActivityTask.value,
+        )
+        self.residentActivityWorker.start()
+
+    def startResidentActivityOnce(self):
+        if self.residentActivityWorker and self.residentActivityWorker.isRunning():
+            return
+        self.residentActivityWorker = Worker(
+            run_resident_activity_once,
             task=cfg.residentActivityTask.value,
         )
         self.residentActivityWorker.start()
