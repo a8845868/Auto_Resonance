@@ -18,6 +18,25 @@ class RunningBusinessConfig(QConfig):
     """Config of application"""
 
     BuyCount = ConfigItem("RunBuy", "BuyCount", 0, None)
+    UseSilverBranch = ConfigItem("RunBuy", "UseSilverBranch", False, None)
+    OptimizerCargo = ConfigItem("WeeklyOptimizer", "Cargo", 1121, None)
+    OptimizerBooks = ConfigItem("WeeklyOptimizer", "Books", 10, None)
+    OptimizerFatigue = ConfigItem("WeeklyOptimizer", "Fatigue", 5292, None)
+    OptimizerTradeLevel = ConfigItem("WeeklyOptimizer", "TradeLevel", 20, None)
+    OptimizerBargainTries = ConfigItem("WeeklyOptimizer", "BargainTries", 5, None)
+    OptimizerRaiseTries = ConfigItem("WeeklyOptimizer", "RaiseTries", 5, None)
+    OptimizerBargainCountBonus = ConfigItem("WeeklyRole", "BargainCountBonus", 0, None)
+    OptimizerRaiseCountBonus = ConfigItem("WeeklyRole", "RaiseCountBonus", 0, None)
+    OptimizerBargainRateBonus = ConfigItem("WeeklyRole", "BargainRateBonus", 0, None)
+    OptimizerRaiseRateBonus = ConfigItem("WeeklyRole", "RaiseRateBonus", 0, None)
+    OptimizerBargainSuccessBonus = ConfigItem("WeeklyRole", "BargainSuccessBonus", 0, None)
+    OptimizerRaiseSuccessBonus = ConfigItem("WeeklyRole", "RaiseSuccessBonus", 0, None)
+    OptimizerFirstTrySuccessBonus = ConfigItem("WeeklyRole", "FirstTrySuccessBonus", 0, None)
+    OptimizerAfterFailedSuccessBonus = ConfigItem("WeeklyRole", "AfterFailedSuccessBonus", 0, None)
+    OptimizerFailedFatigueReduction = ConfigItem("WeeklyRole", "FailedFatigueReduction", 0, None)
+    OptimizerTaxCutPercent = ConfigItem("WeeklyRole", "TaxCutPercent", 0, None)
+    OptimizerExtraBuyPercent = ConfigItem("WeeklyRole", "ExtraBuyPercent", 0, None)
+    OptimizerDriveFatigueReduction = ConfigItem("WeeklyRole", "DriveFatigueReduction", 0, None)
 
     for city in CITYS:
         # 特殊适配7号自由港
@@ -26,6 +45,9 @@ class RunningBusinessConfig(QConfig):
         )
         locals()[f"{city}议价次数"] = ConfigItem(
             "CityHaggle", city.replace("七号自由港", "7号自由港"), 0, None
+        )
+        locals()[f"{city}声望等级"] = ConfigItem(
+            "CityPrestige", city.replace("七号自由港", "7号自由港"), 20, None
         )
 
 
