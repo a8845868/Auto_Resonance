@@ -70,8 +70,10 @@ class RewardChoiceCard(QWidget):
     def __init__(self, value, title, subtitle, icon_name, parent=None):
         super().__init__(parent)
         self.value = value
+        self.setObjectName("rewardChoiceCard")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(82)
+        self.setFixedHeight(92)
 
         icon = QLabel(self)
         pixmap = QPixmap(str(REWARD_ICON_DIR / icon_name))
@@ -88,6 +90,9 @@ class RewardChoiceCard(QWidget):
         title_label.setStyleSheet("font-size: 14px; font-weight: 600;")
         subtitle_label = QLabel(subtitle, self)
         subtitle_label.setStyleSheet("font-size: 11px; color: #7a7a7a;")
+        self.selectionLabel = QLabel("✓  当前选择", self)
+        self.selectionLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.selectionLabel.setFixedSize(78, 24)
 
         text_layout = QVBoxLayout()
         text_layout.setSpacing(3)
@@ -97,14 +102,21 @@ class RewardChoiceCard(QWidget):
         layout.setContentsMargins(12, 10, 12, 10)
         layout.addWidget(icon)
         layout.addLayout(text_layout, 1)
+        layout.addWidget(self.selectionLabel, 0, Qt.AlignmentFlag.AlignTop)
         self.setChecked(False)
 
     def setChecked(self, checked):
-        border = "#4f8cff" if checked else "rgba(128,128,128,0.30)"
-        background = "rgba(79,140,255,0.16)" if checked else "rgba(128,128,128,0.06)"
+        border = "#43a5ff" if checked else "rgba(128,128,128,0.24)"
+        background = "rgba(30,120,210,0.28)" if checked else "rgba(128,128,128,0.05)"
         self.setStyleSheet(
-            f"RewardChoiceCard {{ border: 2px solid {border}; "
-            f"border-radius: 10px; background: {background}; }}"
+            f"QWidget#rewardChoiceCard {{ border: 2px solid {border}; "
+            f"border-radius: 10px; background-color: {background}; }}"
+            "QWidget#rewardChoiceCard QLabel { border: none; background: transparent; }"
+        )
+        self.selectionLabel.setVisible(checked)
+        self.selectionLabel.setStyleSheet(
+            "color: white; font-size: 11px; font-weight: 600; "
+            "border-radius: 12px; background-color: #1688e8;"
         )
 
     def mouseReleaseEvent(self, event):
@@ -278,18 +290,46 @@ class HomeInterface(ScrollArea):
         self.dailyRewardSwitch = SwitchButton(autoRewardSelector)
         self.dailyRewardSwitch.setChecked(bool(cfg.autoCollectDailyActivity.value))
         self.dailyRewardSwitch.checkedChanged.connect(
-            lambda value: qconfig.set(cfg.autoCollectDailyActivity, value)
+            lambda value: self.setRewardOption(cfg.autoCollectDailyActivity, value)
         )
         autoRewardLayout.addWidget(self.dailyRewardSwitch)
         autoRewardLayout.addWidget(QLabel("环游手册", autoRewardSelector))
         self.manualRewardSwitch = SwitchButton(autoRewardSelector)
         self.manualRewardSwitch.setChecked(bool(cfg.autoCollectTravelManual.value))
         self.manualRewardSwitch.checkedChanged.connect(
-            lambda value: qconfig.set(cfg.autoCollectTravelManual, value)
+            lambda value: self.setRewardOption(cfg.autoCollectTravelManual, value)
         )
         autoRewardLayout.addWidget(self.manualRewardSwitch)
         autoRewardLayout.addStretch(1)
         basicInputView.vBoxLayout.insertWidget(2, autoRewardSelector)
+
+        self.planPanel = QWidget(self.view)
+        self.planPanel.setObjectName("currentPlanPanel")
+        self.planPanel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.planPanel.setStyleSheet(
+            "QWidget#currentPlanPanel { background-color: rgba(30,120,210,0.14); "
+            "border: 1px solid rgba(67,165,255,0.65); border-radius: 12px; }"
+            "QWidget#currentPlanPanel QLabel { border: none; background: transparent; }"
+        )
+        planLayout = QVBoxLayout(self.planPanel)
+        planLayout.setContentsMargins(18, 14, 18, 14)
+        planHeader = QHBoxLayout()
+        planTitle = QLabel("当前扫荡方案", self.planPanel)
+        planTitle.setStyleSheet("font-size: 17px; font-weight: 700;")
+        self.runStateLabel = QLabel("●  等待开始", self.planPanel)
+        self.runStateLabel.setStyleSheet(
+            "color: #8fd694; font-size: 13px; font-weight: 600;"
+        )
+        planHeader.addWidget(planTitle)
+        planHeader.addStretch(1)
+        planHeader.addWidget(self.runStateLabel)
+        planLayout.addLayout(planHeader)
+        self.planSummaryLabel = QLabel(self.planPanel)
+        self.planSummaryLabel.setWordWrap(True)
+        self.planSummaryLabel.setStyleSheet("font-size: 13px; line-height: 1.5;")
+        planLayout.addWidget(self.planSummaryLabel)
+        basicInputView.vBoxLayout.insertWidget(3, self.planPanel)
+        self.updateCurrentPlan()
         # self.taskCheckboxGroup.addCheckbox("购买桦石", cfg.huashi)
         # self.taskCheckboxGroup.addCheckbox("刷铁安局", cfg.railwaySafetyBureau)
 
@@ -321,7 +361,7 @@ class HomeInterface(ScrollArea):
             icon=":/gallery/images/controls/Button.png",
             title="停止",
             content="停止运行",
-            func=stop,
+            func=self.stopCurrentTask,
             routekey="LoggerInterface",
         )
 
@@ -338,17 +378,22 @@ class HomeInterface(ScrollArea):
             daily_activity=bool(cfg.autoCollectDailyActivity.value),
             travel_manual=bool(cfg.autoCollectTravelManual.value),
         )
+        self.residentActivityWorker.result.connect(self.onActivityFinished)
+        self.residentActivityWorker.error.connect(self.onActivityError)
+        self.setRunState("●  运行中：正在执行全域整备", "#43a5ff")
         self.residentActivityWorker.start()
 
     def selectFullRealmReward(self, reward):
         qconfig.set(cfg.residentActivityFullRealmReward, reward)
         for value, card in self.fullRealmRewardCards.items():
             card.setChecked(value == reward)
+        self.updateCurrentPlan()
 
     def selectSiegeTask(self, task):
         qconfig.set(cfg.residentActivityTask, task)
         for value, card in self.siegeRewardCards.items():
             card.setChecked(value == task)
+        self.updateCurrentPlan()
 
     def startResidentActivityOnce(self):
         if self.residentActivityWorker and self.residentActivityWorker.isRunning():
@@ -357,6 +402,9 @@ class HomeInterface(ScrollArea):
             run_resident_activity_once,
             task=cfg.residentActivityTask.value,
         )
+        self.residentActivityWorker.result.connect(self.onActivityFinished)
+        self.residentActivityWorker.error.connect(self.onActivityError)
+        self.setRunState("●  运行中：单次扫荡验证", "#43a5ff")
         self.residentActivityWorker.start()
 
     def startRewardCollection(self):
@@ -371,4 +419,51 @@ class HomeInterface(ScrollArea):
             daily_activity=daily,
             travel_manual=manual,
         )
+        self.rewardWorker.result.connect(
+            lambda _: self.setRunState("✓  奖励领取完成", "#65c466")
+        )
+        self.rewardWorker.error.connect(self.onActivityError)
+        self.setRunState("●  运行中：正在领取奖励", "#43a5ff")
         self.rewardWorker.start()
+
+    def setRewardOption(self, config_item, value):
+        qconfig.set(config_item, value)
+        self.updateCurrentPlan()
+
+    def updateCurrentPlan(self):
+        if not hasattr(self, "planSummaryLabel"):
+            return
+        reward = cfg.residentActivityFullRealmReward.value
+        stage = FULL_REALM_REWARDS[reward]
+        task = cfg.residentActivityTask.value
+        main_drop = SIEGE_REWARDS[task][0]
+        after_actions = []
+        if bool(cfg.autoCollectDailyActivity.value):
+            after_actions.append("每日活跃奖励")
+        if bool(cfg.autoCollectTravelManual.value):
+            after_actions.append("环游手册奖励")
+        after_text = "、".join(after_actions) if after_actions else "不自动领取奖励"
+        self.planSummaryLabel.setText(
+            "① 私贩追缴：补齐本周剩余奖励次数（每周上限 3 次）\n"
+            f"② 全境特供：刷取【{reward}】— {stage}，补齐今日剩余次数（每天上限 3 次）\n"
+            f"③ 利刃围剿：刷取【{main_drop}】— {task}，持续到澄清度不足\n"
+            f"④ 结束处理：{after_text}"
+        )
+
+    def setRunState(self, text, color):
+        if hasattr(self, "runStateLabel"):
+            self.runStateLabel.setText(text)
+            self.runStateLabel.setStyleSheet(
+                f"color: {color}; font-size: 13px; font-weight: 600;"
+            )
+
+    def onActivityFinished(self, result):
+        details = "，".join(f"{name} {count} 次" for name, count in result.items())
+        self.setRunState(f"✓  已完成：{details}", "#65c466")
+
+    def onActivityError(self, message):
+        self.setRunState(f"✕  执行失败：{message}", "#ff6b6b")
+
+    def stopCurrentTask(self):
+        stop()
+        self.setRunState("■  已请求停止", "#f0a44b")
