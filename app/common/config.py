@@ -94,6 +94,13 @@ class Config(RunningBusinessConfig):
         ),
     )
 
+    autoCollectDailyActivity = ConfigItem(
+        "RewardCollection", "DailyActivity", True, None
+    )
+    autoCollectTravelManual = ConfigItem(
+        "RewardCollection", "TravelManual", True, None
+    )
+
 
 YEAR = 2023
 AUTHOR = "Night-stars-1"
