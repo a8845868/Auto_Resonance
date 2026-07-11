@@ -24,6 +24,26 @@ SIEGE_TASKS = (
     "总体围剿",
 )
 
+# User-facing reward labels.  The game calls these stages by abstract names,
+# while players usually decide what to sweep by the material they need.
+FULL_REALM_REWARDS = {
+    "学会装备箱": "特供·救世",
+    "黑月装备箱": "特供·雅致",
+    "帝国装备箱": "特供·魔力",
+}
+
+SIEGE_REWARDS = {
+    "特殊订单": ("纯金零件 / 火控单元", "gold_part.png"),
+    "利刃行动": ("桦树核仁 / 劫掠锯轮", "birch_core.png"),
+    "挑灯看剑": ("照夜双刃 / 噪音激酶", "night_blades.png"),
+    "武器材质分析": ("骨龙头骨 / 骨龙脊骨", "bone_dragon_skull.png"),
+    "骑士小说": ("暮光坚壳 / 昏聩头壳", "dim_shell.png"),
+    "我思我在": ("笃学灯芯 / 远祖的根系", "learning_wick.png"),
+    "所知所闻": ("对策系统载体 / 笃学灯芯", "countermeasure_core.png"),
+    "大的！": ("尘鸣坚骨 / 裂首骨龙材料", "hard_bone.png"),
+    "总体围剿": ("深眠木 / 游星之眼", "deep_sleep_wood.png"),
+}
+
 
 def _center(item: dict) -> tuple[int, int]:
     position = item["position"]
@@ -150,13 +170,16 @@ class ResidentActivityAutomation:
             completed += 1
         return completed
 
-    def run_limited_activity(self, name: str) -> int:
+    def run_limited_activity(self, name: str, stage: Optional[str] = None) -> int:
         if not self.driver.click_text(name):
             logger.warning(f"未找到活动：{name}")
             return 0
         attempts = self._reward_attempts()
         if attempts == 0:
             logger.info(f"{name}次数已用完")
+            return 0
+        if stage and not self.driver.click_text(stage, attempts=3):
+            logger.warning(f"{name}未找到目标奖励关卡：{stage}")
             return 0
         # The selected limited activity opens its stage list. Enter the visible
         # challenge and then use the sweep button on the detail screen.
@@ -202,7 +225,7 @@ class ResidentActivityAutomation:
         logger.info(f"{task}完成 {completed} 次")
         return completed
 
-    def run(self, task: str) -> dict[str, int]:
+    def run(self, task: str, full_realm_reward: str = "学会装备箱") -> dict[str, int]:
         if not connect():
             raise RuntimeError("ADB连接失败")
         if not self.open_action_summary():
@@ -214,7 +237,8 @@ class ResidentActivityAutomation:
         if not self.open_action_summary():
             results.update({"全境特供": 0, task: 0})
             return results
-        results["全境特供"] = self.run_limited_activity("全境特供")
+        stage = FULL_REALM_REWARDS.get(full_realm_reward)
+        results["全境特供"] = self.run_limited_activity("全境特供", stage=stage)
         if not self.open_action_summary():
             results[task] = 0
             return results
@@ -236,9 +260,11 @@ class ResidentActivityAutomation:
         return {task: completed}
 
 
-def run_resident_activity(task: str) -> dict[str, int]:
+def run_resident_activity(
+    task: str, full_realm_reward: str = "学会装备箱"
+) -> dict[str, int]:
     """GUI entry point."""
-    return ResidentActivityAutomation().run(task)
+    return ResidentActivityAutomation().run(task, full_realm_reward)
 
 
 def run_resident_activity_once(task: str) -> dict[str, int]:

@@ -1,6 +1,11 @@
 import unittest
 
-from auto.resident_activity import ResidentActivityAutomation, SIEGE_TASKS, _matches
+from auto.resident_activity import (
+    FULL_REALM_REWARDS,
+    ResidentActivityAutomation,
+    SIEGE_TASKS,
+    _matches,
+)
 
 
 def item(text, x=600, y=420):
@@ -82,6 +87,21 @@ class ResidentActivityTests(unittest.TestCase):
         driver = SweepDriver([[]])
         self.assertEqual(ResidentActivityAutomation(driver).sweep_current_activity(1), 1)
         self.assertEqual(driver.clicked, ["扫荡"])
+
+    def test_academy_chest_selects_salvation_supply_stage(self):
+        self.assertEqual(FULL_REALM_REWARDS["学会装备箱"], "特供·救世")
+        driver = FakeDriver([[
+            item("本日可获取奖励次数 1/3"),
+            item("全境特供"),
+            item("特供·救世"),
+            item("进入挑战"),
+            item("扫荡"),
+        ]])
+        completed = ResidentActivityAutomation(driver).run_limited_activity(
+            "全境特供", stage=FULL_REALM_REWARDS["学会装备箱"]
+        )
+        self.assertEqual(completed, 1)
+        self.assertIn("特供·救世", driver.clicked)
 
 
 if __name__ == "__main__":

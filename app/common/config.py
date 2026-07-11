@@ -100,6 +100,12 @@ class Config(RunningBusinessConfig):
     autoCollectTravelManual = ConfigItem(
         "RewardCollection", "TravelManual", True, None
     )
+    residentActivityFullRealmReward = ConfigItem(
+        "ResidentActivity",
+        "FullRealmReward",
+        "学会装备箱",
+        OptionsValidator(["学会装备箱", "黑月装备箱", "帝国装备箱"]),
+    )
 
 
 YEAR = 2023
