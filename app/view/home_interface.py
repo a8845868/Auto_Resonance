@@ -22,6 +22,7 @@ from qfluentwidgets import (
     InfoBarPosition,
     ScrollArea,
     ComboBox,
+    SwitchButton,
     isDarkTheme
 )
 
@@ -37,8 +38,21 @@ from auto.resident_activity import (
     run_resident_activity,
     run_resident_activity_once,
 )
+from auto.reward_collection import collect_rewards
 from app.utils.worker import Worker
 from qfluentwidgets import qconfig
+
+
+def run_resident_activity_with_rewards(
+    task: str,
+    daily_activity: bool,
+    travel_manual: bool,
+):
+    """Run the selected activity, then collect the enabled reward groups."""
+    result = run_resident_activity(task)
+    if daily_activity or travel_manual:
+        collect_rewards(daily_activity, travel_manual)
+    return result
 
 
 class BannerWidget(QWidget):
@@ -114,6 +128,7 @@ class HomeInterface(ScrollArea):
         self.vBoxLayout = QVBoxLayout(self.view)
         self.taskCheckboxGroup = CheckboxGroup(self.view)
         self.residentActivityWorker = None
+        self.rewardWorker = None
         self.__initWidget()
         self.loadSamples()
 
@@ -163,8 +178,37 @@ class HomeInterface(ScrollArea):
         taskSelectorLayout.addWidget(self.residentActivityTaskCombo)
         taskSelectorLayout.addStretch(1)
         basicInputView.vBoxLayout.insertWidget(1, taskSelector)
+
+        rewardSelector = QWidget(self.view)
+        rewardSelectorLayout = QHBoxLayout(rewardSelector)
+        rewardSelectorLayout.setContentsMargins(0, 0, 0, 0)
+        rewardSelectorLayout.addWidget(QLabel("自动领取奖励", rewardSelector))
+        rewardSelectorLayout.addWidget(QLabel("每日活跃", rewardSelector))
+        self.dailyRewardSwitch = SwitchButton(rewardSelector)
+        self.dailyRewardSwitch.setChecked(bool(cfg.autoCollectDailyActivity.value))
+        self.dailyRewardSwitch.checkedChanged.connect(
+            lambda value: qconfig.set(cfg.autoCollectDailyActivity, value)
+        )
+        rewardSelectorLayout.addWidget(self.dailyRewardSwitch)
+        rewardSelectorLayout.addWidget(QLabel("环游手册", rewardSelector))
+        self.manualRewardSwitch = SwitchButton(rewardSelector)
+        self.manualRewardSwitch.setChecked(bool(cfg.autoCollectTravelManual.value))
+        self.manualRewardSwitch.checkedChanged.connect(
+            lambda value: qconfig.set(cfg.autoCollectTravelManual, value)
+        )
+        rewardSelectorLayout.addWidget(self.manualRewardSwitch)
+        rewardSelectorLayout.addStretch(1)
+        basicInputView.vBoxLayout.insertWidget(2, rewardSelector)
         # self.taskCheckboxGroup.addCheckbox("购买桦石", cfg.huashi)
         # self.taskCheckboxGroup.addCheckbox("刷铁安局", cfg.railwaySafetyBureau)
+
+        basicInputView.addSampleCard(
+            icon=FluentIcon.ACCEPT,
+            title="领取奖励",
+            content="按上方开关领取每日活跃与环游手册奖励",
+            func=self.startRewardCollection,
+            routekey="LoggerInterface",
+        )
 
         basicInputView.addSampleCard(
             icon=FluentIcon.PLAY,
@@ -197,8 +241,10 @@ class HomeInterface(ScrollArea):
         if self.residentActivityWorker and self.residentActivityWorker.isRunning():
             return
         self.residentActivityWorker = Worker(
-            run_resident_activity,
+            run_resident_activity_with_rewards,
             task=cfg.residentActivityTask.value,
+            daily_activity=bool(cfg.autoCollectDailyActivity.value),
+            travel_manual=bool(cfg.autoCollectTravelManual.value),
         )
         self.residentActivityWorker.start()
 
@@ -210,3 +256,17 @@ class HomeInterface(ScrollArea):
             task=cfg.residentActivityTask.value,
         )
         self.residentActivityWorker.start()
+
+    def startRewardCollection(self):
+        if self.rewardWorker and self.rewardWorker.isRunning():
+            return
+        daily = bool(cfg.autoCollectDailyActivity.value)
+        manual = bool(cfg.autoCollectTravelManual.value)
+        if not daily and not manual:
+            return
+        self.rewardWorker = Worker(
+            collect_rewards,
+            daily_activity=daily,
+            travel_manual=manual,
+        )
+        self.rewardWorker.start()
