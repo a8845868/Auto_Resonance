@@ -106,6 +106,7 @@ venv.bak/
 # add
 .idea/
 .codex/
+_worktrees/
 
 # custom 
 logs/
