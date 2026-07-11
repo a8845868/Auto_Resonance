@@ -54,6 +54,10 @@ def stop():
     STOP = True
 
 
+def is_stopped() -> bool:
+    return STOP
+
+
 def kill():
     """
     关闭连接
@@ -69,6 +73,8 @@ def input_swipe(pos1=(919, 617), pos2=(919, 908), swipe_time: int = 100):
     :param pos2: 坐标2
     :param time: 操作时间(毫秒)
     """
+    if STOP:
+        raise StopExecution()
     num = 0
     # 添加随机值
     pos_x1 = control.ratio * pos1[0] + random.randint(*EXCURSIONX)
@@ -78,6 +84,8 @@ def input_swipe(pos1=(919, 617), pos2=(919, 908), swipe_time: int = 100):
 
     logger.debug(f"滑动 ({pos_x1}, {pos_y1}) -> ({pos_x2}, {pos_y2})")
     while abs(pos_x2 - pos_x1) > 10 or abs(pos_y2 - pos_y1) > 10:
+        if STOP:
+            raise StopExecution()
         if num >= 1:
             time.sleep(0.5)
         limit_pos_x1 = max(control.safe_area[0], min(pos_x1, control.safe_area[2]))
@@ -104,6 +112,8 @@ def input_tap(pos: Tuple[int, int] = (880, 362)):
 
     :param pos: 坐标
     """
+    if STOP:
+        raise StopExecution()
     control.input_tap(
         int(control.ratio * pos[0] + random.randint(*EXCURSIONX)), int(control.ratio * pos[1] + random.randint(*EXCURSIONY))
     )
@@ -132,14 +142,15 @@ def screenshot_image() -> cv.typing.MatLike:
     screenshot = cv.resize(screenshot, control.dsize, interpolation=cv.INTER_AREA)
     return screenshot
 
-def wait_stopped(threshold=7100000):
+def wait_stopped(threshold=7100000, timeout=15.0):
     """
     等待画面静止
     参数:
         :param threshold: 参数阈值
     """
     logger.info("等待图像静止")
-    while True:
+    start = time.perf_counter()
+    while time.perf_counter() - start < timeout:
         gray1 = cv.cvtColor(screenshot_image(), cv.COLOR_BGR2GRAY)
         # 等待画面变动，并再次截图
         time.sleep(0.5)
@@ -153,5 +164,7 @@ def wait_stopped(threshold=7100000):
         logger.debug(f"画面差异 {diff_sum}")
 
         if diff_sum < threshold:
-            break
+            return True
         time.sleep(1)
+    logger.warning(f"等待图像静止超时（{timeout}秒），继续后续识别")
+    return False

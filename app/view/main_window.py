@@ -145,7 +145,11 @@ class MainWindow(MSFluentWindow):
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        self.splashScreen.resize(self.size())
+        # Newer PySide6/qframelesswindow versions may deliver an early resize
+        # event from MSFluentWindow.__init__ before initWindow creates the
+        # splash screen.
+        if hasattr(self, "splashScreen"):
+            self.splashScreen.resize(self.size())
 
     def switchToCard(self, routeKey):
         """切换到指定界面"""

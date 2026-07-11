@@ -95,19 +95,49 @@ def click_station(name: str, cur_station: Optional[str] = None):
         time.sleep(0.5)
         wait_stopped(threshold=7100000)
 
-        source_x = 640
-        source_y = 360
+        # The current game version does not place the current station at the
+        # exact screen center.  Locate its visible label and pan relative to
+        # that real anchor; the old hard-coded (640, 360) can miss a distant
+        # target by hundreds of pixels.
+        source_x = 640.0
+        source_y = 360.0
+        map_ocr = screenshot().ocr()
+        for item in map_ocr:
+            if station in item["text"]:
+                position = item["position"]
+                source_x = (position[0][0] + position[2][0]) / 2
+                source_y = (position[0][1] + position[2][1]) / 2
+                logger.info(f"地图当前站点锚点: {station} ({source_x:.0f}, {source_y:.0f})")
+                break
         # 如果有路线则进行寻找
         x1 = source_x + city_differences[0] / 2.5
         y1 = source_y + city_differences[1] / 2.5
 
-        # 滑动到目标站点
-        input_swipe((x1, y1), (source_x, source_y), swipe_time=800)
+        # Long routes can be several screen widths apart. Android ignores a
+        # swipe when its start point is outside the screen, so split the map
+        # movement into valid in-screen gestures.
+        move_x = source_x - x1
+        move_y = source_y - y1
+        max_step = 760.0
+        steps = max(1, int(max(abs(move_x), abs(move_y)) / max_step) + 1)
+        step_x = move_x / steps
+        step_y = move_y / steps
+        gesture_cx, gesture_cy = 640.0, 360.0
+        logger.info(
+            f"地图分段拖动: 总位移({move_x:.0f}, {move_y:.0f}), {steps} 段"
+        )
+        for _ in range(steps):
+            start = (gesture_cx - step_x / 2, gesture_cy - step_y / 2)
+            end = (gesture_cx + step_x / 2, gesture_cy + step_y / 2)
+            input_swipe(start, end, swipe_time=450)
+            time.sleep(0.15)
         # 向回拖动避免画面长时间移动
         input_swipe(
             (source_x, source_y), (source_x - 10, source_y - 10), swipe_time=500
         )
-        wait_stopped(threshold=7100000)  # 等待滑动完成
+        # The current world map has a continuously animated background whose
+        # frame difference is normally around 7.3M-8.1M.
+        wait_stopped(threshold=8500000, timeout=12)  # 等待滑动完成
 
         image = screenshot()
         image.crop_image((0, 0), (1280, 654))
@@ -152,19 +182,31 @@ def get_station(is_go_home: bool = True):
 
     :param is_go_home: 是否返回主界面
     """
-    go_home()
-    input_tap((1170, 493))
-    time.sleep(1.0)
-    reslut = predict(
-        screenshot_image(), cropped_pos1=(166, 520), cropped_pos2=(470, 600)
-    )
-    if len(reslut) == 0:
-        raise ValueError("未识别到当前城市")
-    logger.info(f"当前站点: {reslut[0]['text']}")
+    result = []
+    for attempt in range(3):
+        # A fatigue failure can leave the negotiation reset-warning above the
+        # shop. Resolve it before trying to navigate to the city information.
+        visible = [item["text"] for item in screenshot().ocr()]
+        if any("退出后议价幅度将重置" in text for text in visible):
+            input_tap((768, 447))
+            time.sleep(2)
+        go_home()
+        input_tap((1170, 493))
+        time.sleep(1.0)
+        result = predict(
+            screenshot_image(), cropped_pos1=(166, 520), cropped_pos2=(470, 600)
+        )
+        if result:
+            break
+        logger.warning(f"第 {attempt + 1}/3 次未识别当前城市，重新回主界面")
+    if not result:
+        logger.error("连续 3 次未识别当前城市，安全暂停本轮")
+        return None
+    logger.info(f"当前站点: {result[0]['text']}")
     if is_go_home:
         # 返回主界面，回溯进入城市地图操作
         go_home()
-    return reslut[0]["text"]
+    return result[0]["text"]
 
 
 def go_city():
@@ -190,19 +232,22 @@ def go_outlets(name: str):
     """
     go_city()
     logger.info(f"前往 => {name}")
-    if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False):
+    # New stations append their local market name (for example
+    # "交易所-武林市集").  Matching "交易所" against the whole label needs a
+    # lower length ratio than the legacy 0.7 default.
+    if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False, score=0.3):
         return result
     input_swipe((457, 340), (457, 369), swipe_time=500)
-    if result := ocr_click(name, excursion_pos=(0, 80), log=False):
+    if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False, score=0.3):
         return result
     input_swipe((400, 340), (457, 340), swipe_time=500)
-    if result := ocr_click(name, excursion_pos=(0, 80), log=False):
+    if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False, score=0.3):
         return result
     input_swipe((969, 369), (457, 340), swipe_time=500)
-    if result := ocr_click(name, excursion_pos=(0, 80), log=False):
+    if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False, score=0.3):
         return result
     input_swipe((641, 246), (637, 615), swipe_time=500)
-    if result := ocr_click(name, excursion_pos=(0, 80)):
+    if result := blurry_ocr_click(name, excursion_pos=(0, 80), score=0.3):
         return result
 
 def go_shop():

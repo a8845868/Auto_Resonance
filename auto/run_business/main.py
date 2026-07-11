@@ -10,10 +10,12 @@ from typing import Any, Dict, Literal
 
 from loguru import logger
 
-from auto.module.strength import check_shop_strength, use_strength
+from auto.module.strength import can_afford_fatigue, prepare_negotiation
+from auto.module.dispatch import collect_dispatch_rewards
 from auto.run_business.buy import buy_business
 from auto.run_business.sell import sell_business
-from core.control.control import STOP, connect, input_tap, screenshot
+from core.control.control import connect, input_tap, screenshot
+from core.control.control import is_stopped, stop as stop_control
 from core.model import app
 from core.model.city_goods import RouteModel, RoutesModel
 from core.module.bgr import BGR
@@ -22,6 +24,7 @@ from core.preset.control import click
 from core.utils.utils import read_json, RESOURCES_PATH
 
 _city_sell_data: Any = read_json(RESOURCES_PATH / "goods/CityGoodsSellData.json")
+_city_tired_data: Dict[str, int] = read_json(RESOURCES_PATH / "goods/CityTiredData.json")
 city_sell_data = {
     city: dict(sorted(goods.items(), key=lambda item: item[1]["price"], reverse=True))
     for city, goods in _city_sell_data.items()
@@ -81,35 +84,52 @@ def run(routes: RoutesModel):
     if not status:
         logger.error("ADB连接失败")
         return False
+    # Dispatch rewards are opportunistic: no reminder means a fast no-op and
+    # recognition failure must never block the trading route.
+    try:
+        collect_dispatch_rewards()
+    except Exception:
+        logger.exception("自动领取委派奖励失败，跳过并继续跑商")
     city_name = get_station()
+    if not city_name:
+        logger.error("无法确定当前城市，已安全停止而非抛出异常")
+        return False
     if routes.city_data[0].sell_city_name == city_name:
         routes.city_data = [routes.city_data[1], routes.city_data[0]]
     for city in routes.city_data:
         logger.info(f"{city.buy_city_name}->{city.sell_city_name}")
-        click_station(city.buy_city_name, cur_station=city_name).wait()
-        go_business("buy")
-        if not check_shop_strength():
-            logger.info("检测到体力不足，使用快过期的提神棒棒糖")
-            click((974, 32))
-            if not use_strength():
-                logger.error("使用快过期的提神棒棒糖失败, 停止跑商")
-                return False
+        if not click_station(city.buy_city_name, cur_station=city_name).wait():
+            logger.error(f"无法到达买货城市 {city.buy_city_name}，停止本次跑商")
+            return False
+        if not go_business("buy"):
+            return False
+        buy_haggle = prepare_negotiation("buy", min(city.haggle_num, 2))
+        travel_cost = int(
+            _city_tired_data.get(f"{city.buy_city_name}-{city.sell_city_name}", 0)
+        )
+        if buy_haggle == 0 and not can_afford_fatigue(travel_cost):
+            logger.warning(
+                "恢复资源已用完，剩余疲劳不足以到达下一城市，本轮不进货并暂停"
+            )
+            return False
         goods_data = list(city.goods_data.keys())
         buy_business(
             goods_data[:1],
             goods_data[1:],
-            city.haggle_num,
+            buy_haggle,
             max_book=city.book,
         )
-        click_station(city.sell_city_name, cur_station=city_name).wait()
-        go_business("sell")
-        if not check_shop_strength():
-            logger.info("检测到体力不足，使用快过期的提神棒棒糖")
-            click((974, 32))
-            if not use_strength():
-                logger.error("使用快过期的提神棒棒糖失败, 停止跑商")
-                return False
-        sell_business(city.haggle_num)
+        if not click_station(city.sell_city_name, cur_station=city_name).wait():
+            logger.error(f"无法到达卖货城市 {city.sell_city_name}，停止本次跑商")
+            return False
+        if not go_business("sell"):
+            return False
+        sell_haggle = prepare_negotiation("sell", min(city.haggle_num, 2))
+        if sell_haggle == 0:
+            logger.warning("疲劳不足，本次不抬价，直接卖出以保证货物结算")
+        if not sell_business(sell_haggle):
+            logger.error("卖货未完成，不将本轮记为完成")
+            return False
         # 流程跑完，更改站点名称为当前出售商品的站点
         city_name = city.sell_city_name
     logger.info("运行完成")
@@ -144,8 +164,50 @@ def two_city_run(buy_city_name: str, sell_city_name: str):
     )
     logger.info(f"准备运行端点跑商，运行次数: {count}")
     for i in range(count):
-        if not run(routes) or STOP:
+        if not run(routes) or is_stopped():
             break
+
+
+def two_city_weekly_run(buy_city_name: str, sell_city_name: str, execution_batches: list[dict]):
+    """Execute an optimizer plan and change restock-book counts between batches."""
+    from core.services import record_completed_run
+
+    global STOP
+    STOP = False
+    buy_haggle_num = app.CityHaggle[buy_city_name]
+    sell_haggle_num = app.CityHaggle[sell_city_name]
+    total_runs = sum(int(batch["runs"]) for batch in execution_batches)
+    logger.info(f"准备运行周计划，共 {total_runs} 次完整往返，{len(execution_batches)} 个阶段")
+    completed = 0
+    for batch_index, batch in enumerate(execution_batches, start=1):
+        books = batch.get("books", {})
+        batch_runs = int(batch.get("runs", 0))
+        logger.info(f"周计划阶段 {batch_index}/{len(execution_batches)}: {batch_runs} 次完整往返，进货书 {books}")
+        for _ in range(batch_runs):
+            routes = RoutesModel(
+                city_data=[
+                    RouteModel(
+                        buy_city_name=buy_city_name,
+                        sell_city_name=sell_city_name,
+                        haggle_num=buy_haggle_num,
+                        book=int(books.get(buy_city_name, 0)),
+                        goods_data=city_sell_data[buy_city_name],
+                    ),
+                    RouteModel(
+                        buy_city_name=sell_city_name,
+                        sell_city_name=buy_city_name,
+                        haggle_num=sell_haggle_num,
+                        book=int(books.get(sell_city_name, 0)),
+                        goods_data=city_sell_data[sell_city_name],
+                    ),
+                ]
+            )
+            if not run(routes) or is_stopped():
+                logger.info(f"周计划停止，本次已完成 {completed}/{total_runs} 次完整往返")
+                return
+            completed += 1
+            record_completed_run(books)
+    logger.info(f"周计划完成，共 {completed} 次完整往返")
 
 
 def stop():
@@ -155,3 +217,4 @@ def stop():
     """
     global STOP
     STOP = True
+    stop_control()
