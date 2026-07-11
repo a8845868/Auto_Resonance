@@ -75,6 +75,11 @@ class Config(RunningBusinessConfig):
     # Mirror酱
     mirrorCdk = ConfigItem("Global", "mirrorCdk", "", None)
 
+    enableRewardCollection = ConfigItem("TaskQueue", "RewardCollection", True, None)
+    enableResidentActivity = ConfigItem("TaskQueue", "ResidentActivity", True, None)
+    enableResidentActivityOnce = ConfigItem("TaskQueue", "ResidentActivityOnce", False, None)
+    enableRunBusiness = ConfigItem("TaskQueue", "RunBusiness", False, None)
+
     residentActivityTask = ConfigItem(
         "ResidentActivity",
         "Task",
