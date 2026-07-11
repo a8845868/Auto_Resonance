@@ -7,7 +7,7 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 
 import sys
 
-from qfluentwidgets import ConfigItem, QConfig, Theme, qconfig, ConfigSerializer
+from qfluentwidgets import ConfigItem, QConfig, Theme, qconfig, ConfigSerializer, OptionsValidator
 
 from app.utils.config import CITYS
 from core.control.adb_port import EmulatorInfo, EmulatorType
@@ -52,6 +52,25 @@ class Config(RunningBusinessConfig):
 
     # Mirror酱
     mirrorCdk = ConfigItem("Global", "mirrorCdk", "", None)
+
+    residentActivityTask = ConfigItem(
+        "ResidentActivity",
+        "Task",
+        "利刃行动",
+        OptionsValidator(
+            [
+                "特殊订单",
+                "利刃行动",
+                "挑灯看剑",
+                "武器材质分析",
+                "骑士小说",
+                "我思我在",
+                "所知所闻",
+                "大的！",
+                "总体围剿",
+            ]
+        ),
+    )
 
 
 YEAR = 2023

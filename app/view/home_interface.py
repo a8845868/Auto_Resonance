@@ -14,13 +14,14 @@ from PySide6.QtGui import (
     QPainterPath,
     QPixmap,
 )
-from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 from qfluentwidgets import (
     FluentIcon,
     InfoBar,
     InfoBarIcon,
     InfoBarPosition,
     ScrollArea,
+    ComboBox,
     isDarkTheme
 )
 
@@ -31,6 +32,9 @@ from app.components.link_card import LinkCardView
 from app.components.settings.checkbox_group_card import CheckboxGroup
 from app.utils.constants import ICON_PATH
 from core.control.control import stop
+from auto.resident_activity import SIEGE_TASKS, run_resident_activity
+from app.utils.worker import Worker
+from qfluentwidgets import qconfig
 
 
 class BannerWidget(QWidget):
@@ -105,6 +109,7 @@ class HomeInterface(ScrollArea):
         self.view = QWidget(self)
         self.vBoxLayout = QVBoxLayout(self.view)
         self.taskCheckboxGroup = CheckboxGroup(self.view)
+        self.residentActivityWorker = None
         self.__initWidget()
         self.loadSamples()
 
@@ -141,8 +146,29 @@ class HomeInterface(ScrollArea):
         )
 
         basicInputView.vBoxLayout.insertWidget(0, tipBar)
+        taskSelector = QWidget(self.view)
+        taskSelectorLayout = QHBoxLayout(taskSelector)
+        taskSelectorLayout.setContentsMargins(0, 0, 0, 0)
+        taskSelectorLayout.addWidget(QLabel("利刃围剿任务", taskSelector))
+        self.residentActivityTaskCombo = ComboBox(taskSelector)
+        self.residentActivityTaskCombo.addItems(list(SIEGE_TASKS))
+        self.residentActivityTaskCombo.setCurrentText(cfg.residentActivityTask.value)
+        self.residentActivityTaskCombo.currentTextChanged.connect(
+            lambda value: qconfig.set(cfg.residentActivityTask, value)
+        )
+        taskSelectorLayout.addWidget(self.residentActivityTaskCombo)
+        taskSelectorLayout.addStretch(1)
+        basicInputView.vBoxLayout.insertWidget(1, taskSelector)
         # self.taskCheckboxGroup.addCheckbox("购买桦石", cfg.huashi)
         # self.taskCheckboxGroup.addCheckbox("刷铁安局", cfg.railwaySafetyBureau)
+
+        basicInputView.addSampleCard(
+            icon=FluentIcon.PLAY,
+            title="全域整备",
+            content="私贩追缴、全境特供及所选利刃围剿任务",
+            func=self.startResidentActivity,
+            routekey="LoggerInterface",
+        )
 
         basicInputView.addSampleCard(
             icon=":/gallery/images/controls/Button.png",
@@ -154,3 +180,12 @@ class HomeInterface(ScrollArea):
 
 
         self.vBoxLayout.addWidget(basicInputView)
+
+    def startResidentActivity(self):
+        if self.residentActivityWorker and self.residentActivityWorker.isRunning():
+            return
+        self.residentActivityWorker = Worker(
+            run_resident_activity,
+            task=cfg.residentActivityTask.value,
+        )
+        self.residentActivityWorker.start()
