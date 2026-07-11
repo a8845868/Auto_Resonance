@@ -19,6 +19,7 @@ from core.module.bgr import BGR
 from core.module.hsv import HSV
 from core.preset import click, find_text, go_home
 from core.preset.control import wait_gbr
+from auto.module.strength import exit_negotiation_safely
 
 
 def buy_business(
@@ -64,7 +65,8 @@ def buy_business(
         click_bargain_button(num)
         click_buy_button()
         time.sleep(0.5)
-        return input_tap((896, 676))
+        input_tap((896, 676))
+        return True
     else:
         logger.error("未购买物品")
         go_home()
@@ -196,8 +198,8 @@ def click_bargain_button_of_bargain(target_bargain=0):
             return True
         elif bgr == [62, 63, 63]:
             logger.info("疲劳不足")
-            input_tap((83, 36))
-            return True
+            exit_negotiation_safely()
+            return False
     return False
 
 
@@ -223,8 +225,8 @@ def click_bargain_button(num=0):
             return True
         elif bgr == [62, 63, 63]:
             logger.info("疲劳不足")
-            input_tap((83, 36))
-            return True
+            exit_negotiation_safely()
+            return False
         hsv = screenshot().crop_image((516, 224), (787, 439)).get_hsv((629, 271))
         logger.debug(f"降价是否成功颜色检查(HSV): {hsv}")
         if 95 <= hsv.h <= 105:

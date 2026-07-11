@@ -219,13 +219,26 @@ def go_home():
     返回主界面
     """
     logger.info("返回主界面")
-    while screenshot().match_template(RESOURCES_PATH / "main_map.png", 0.96) == False:
-        time.sleep(1)
-        logger.debug("尝试返回主界面")
-        click_image(
+    # The current game version animates the start button, so the old 0.96
+    # template threshold can loop forever even when the main screen is open.
+    # The lower-right start area is consistently orange on the main screen.
+    for attempt in range(15):
+        image = screenshot()
+        start_button = image.get_bgr((1200, 680))
+        if start_button.b < 90 and start_button.g > 100 and start_button.r > 160:
+            logger.info("已返回主界面")
+            return True
+        logger.debug(f"尝试返回主界面 ({attempt + 1}/15)")
+        clicked = click_image(
             RESOURCES_PATH / "go_home.png",
-            (154, 9),
-            (243, 67),
+            (0, 0),
+            (260, 90),
             trynum=1,
             check_err=False,
         )
+        if not clicked:
+            # 1280x720 game layout: stable top-left back button fallback.
+            input_tap((78, 38))
+        time.sleep(1.5)
+    logger.error("返回主界面超时，已停止继续点击")
+    return False

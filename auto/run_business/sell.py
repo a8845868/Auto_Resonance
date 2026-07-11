@@ -13,6 +13,7 @@ from core.control.control import input_tap, screenshot
 from core.exception.exception_handling import get_excption
 from core.module.bgr import BGR
 from core.preset.control import wait_gbr
+from auto.module.strength import exit_negotiation_safely
 
 
 def sell_business(num=0):
@@ -42,7 +43,8 @@ def sell_business(num=0):
         input_tap((896, 676))
         time.sleep(0.5)
         input_tap((896, 676))
-        return input_tap((896, 676))
+        input_tap((896, 676))
+        return True
 
 
 def is_empty_goods():
@@ -76,8 +78,8 @@ def click_bargain_button(num=0):
             return True
         elif bgr == [62, 63, 63]:
             logger.info("疲劳不足")
-            input_tap((83, 36))
-            return True
+            exit_negotiation_safely()
+            return False
         image = screenshot()
         image.crop_image((516, 224), (787, 439))
         hsv = image.get_hsv((626, 273))
