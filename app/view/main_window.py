@@ -157,8 +157,13 @@ class MainWindow(MSFluentWindow):
 
     def closeEvent(self, e):
         # 停止监听器线程
-        self.themeListener.terminate()
-        self.themeListener.deleteLater()
+        try:
+            self.themeListener.terminate()
+            self.themeListener.deleteLater()
+        except RuntimeError:
+            # Qt may deliver a second close event after the listener has
+            # already been deleted.
+            pass
         super().closeEvent(e)
 
     def _onThemeChangedFinished(self):
