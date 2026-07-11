@@ -22,6 +22,7 @@ from core.module.bgr import BGR
 from core.preset import click_station, get_station, go_outlets, wait_gbr
 from core.preset.control import click
 from core.utils.utils import read_json, RESOURCES_PATH
+from core.services.game_recovery import is_game_running, recover_game
 
 _city_sell_data: Any = read_json(RESOURCES_PATH / "goods/CityGoodsSellData.json")
 _city_tired_data: Dict[str, int] = read_json(RESOURCES_PATH / "goods/CityTiredData.json")
@@ -29,6 +30,13 @@ city_sell_data = {
     city: dict(sorted(goods.items(), key=lambda item: item[1]["price"], reverse=True))
     for city, goods in _city_sell_data.items()
 }
+
+
+def _inspect_recovered_station():
+    """Recreate the display controller before inspecting a restarted game."""
+    if not connect():
+        return None
+    return get_station()
 
 
 def show(routes: RoutesModel):
@@ -78,12 +86,30 @@ def go_business(type: Literal["buy", "sell"] = "buy"):
         return False
 
 
-def run(routes: RoutesModel):
+def run(routes: RoutesModel, recovery_attempts: int = 2):
     logger.info(show(routes))
     status = connect()
     if not status:
         logger.error("ADB连接失败")
         return False
+    try:
+        game_running = is_game_running()
+    except Exception as exc:
+        logger.warning(f"无法检查游戏进程，继续使用画面识别: {exc}")
+        game_running = True
+    if not game_running:
+        if recovery_attempts <= 0:
+            logger.error("游戏仍未运行，恢复次数已用尽")
+            return False
+        state = recover_game(
+            inspect_station=_inspect_recovered_station,
+            expected_cities={item.buy_city_name for item in routes.city_data},
+        )
+        if not state:
+            return False
+        # Reconnect the normal controller after Android recreated the display.
+        if not connect():
+            return False
     # Dispatch rewards are opportunistic: no reminder means a fast no-op and
     # recognition failure must never block the trading route.
     try:
@@ -136,6 +162,32 @@ def run(routes: RoutesModel):
     return True
 
 
+def run_with_recovery(routes: RoutesModel, recovery_attempts: int = 2):
+    """Run one round, restarting a crashed client and re-checking its station."""
+    for attempt in range(recovery_attempts + 1):
+        try:
+            return run(routes, recovery_attempts=recovery_attempts - attempt)
+        except Exception:
+            if is_stopped():
+                raise
+            logger.exception("跑商操作中断，检查游戏是否意外退出")
+            try:
+                running = is_game_running()
+            except Exception:
+                running = True
+            if running or attempt >= recovery_attempts:
+                logger.error("游戏仍在运行或恢复次数已用尽，安全停止本轮")
+                return False
+            state = recover_game(
+                inspect_station=_inspect_recovered_station,
+                expected_cities={item.buy_city_name for item in routes.city_data},
+            )
+            if not state:
+                return False
+            logger.info(f"已确认当前城市 {state.city}，重新核对路线后继续本轮")
+    return False
+
+
 def two_city_run(buy_city_name: str, sell_city_name: str):
     global STOP
     STOP = False
@@ -164,7 +216,7 @@ def two_city_run(buy_city_name: str, sell_city_name: str):
     )
     logger.info(f"准备运行端点跑商，运行次数: {count}")
     for i in range(count):
-        if not run(routes) or is_stopped():
+        if not run_with_recovery(routes) or is_stopped():
             break
 
 
@@ -202,7 +254,7 @@ def two_city_weekly_run(buy_city_name: str, sell_city_name: str, execution_batch
                     ),
                 ]
             )
-            if not run(routes) or is_stopped():
+            if not run_with_recovery(routes) or is_stopped():
                 logger.info(f"周计划停止，本次已完成 {completed}/{total_runs} 次完整往返")
                 return
             completed += 1
