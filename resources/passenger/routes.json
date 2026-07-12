@@ -1,0 +1,11 @@
+{
+  "version": "2026-05-25",
+  "source": "雷索纳斯客运表（2026.5.25已更新）.xlsx",
+  "routes": [
+    {"origin": "武林源", "destination": "岚心城", "revenue": 6003222, "fatigue": 95, "kind": "限时高收益"},
+    {"origin": "岚心城", "destination": "武林源", "revenue": 5785811, "fatigue": 95, "kind": "限时高收益"},
+    {"origin": "海角城", "destination": "岚心城", "revenue": 4821349, "fatigue": 75, "kind": "常规长途"},
+    {"origin": "远星大桥", "destination": "岚心城", "revenue": 4470974, "fatigue": 75, "kind": "常规长途"},
+    {"origin": "岚心城", "destination": "汇流塔", "revenue": 4771249, "fatigue": 78, "kind": "常规长途"}
+  ]
+}

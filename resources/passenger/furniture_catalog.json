@@ -1,0 +1,51 @@
+{
+  "version": "2026-05-25",
+  "source": "雷索纳斯客运表（2026.5.25已更新）.xlsx / 客箱成本计算",
+  "items": [
+    {"key":"seat_group","name":"乘客座椅4件套组","required":128,"source":"客厢座椅升级至5级","zone":"客厢","scores":{"comfort":210}},
+    {"key":"luretti_stand","name":"露蕾蒂站姿","required":8,"source":"7号自由港→炸鸡店→娃娃机","zone":"客厢","scores":{"comfort":52.5,"entertainment":105}},
+    {"key":"luretti_sit","name":"露蕾蒂坐姿","required":8,"source":"7号自由港→炸鸡店→娃娃机","zone":"客厢","scores":{"comfort":52.5,"entertainment":105}},
+    {"key":"shiny_stand","name":"闪耀露蕾蒂站姿","required":8,"source":"7号自由港→炸鸡店→娃娃机","zone":"客厢","scores":{"comfort":73.5,"entertainment":147}},
+    {"key":"shiny_sit","name":"闪耀露蕾蒂坐姿","required":8,"source":"7号自由港→炸鸡店→娃娃机","zone":"客厢","scores":{"comfort":73.5,"entertainment":147}},
+    {"key":"companion_claw","name":"“与你相伴”娃娃机","required":8,"source":"7号自由港→炸鸡店→娃娃机","zone":"客厢","scores":{"comfort":105,"entertainment":210}},
+    {"key":"phone_claw","name":"“如意电话亭”娃娃机","required":8,"source":"7号自由港→炸鸡店→娃娃机","zone":"客厢","scores":{"comfort":147,"entertainment":294}},
+    {"key":"telescope","name":"投币望远镜Lv3","required":8,"source":"商会家具店/家具升级","zone":"客厢","scores":{"comfort":18.9,"entertainment":56.7}},
+    {"key":"public_phone","name":"公共电话机Lv3","required":8,"source":"商会家具店/家具升级","zone":"客厢","scores":{"comfort":42,"entertainment":42}},
+    {"key":"vending","name":"自动售卖机Lv3","required":8,"source":"商会家具店/家具升级","zone":"客厢","scores":{"comfort":63,"food":80.4}},
+    {"key":"bathtub","name":"浴缸","required":8,"source":"各主城商会家具店","zone":"客厢","scores":{"comfort":315}},
+    {"key":"bar","name":"餐吧","required":8,"source":"各主城商会家具店","zone":"客厢","scores":{"comfort":201.6,"food":257.28}},
+    {"key":"treatment","name":"治疗台","required":13,"source":"商会家具店","zone":"护卫厢/客厢","scores":{"comfort":126,"medical":468}},
+    {"key":"gift_treatment","name":"治疗台（赠送）","required":1,"source":"任务赠送","zone":"护卫厢","scores":{"comfort":126,"medical":468}},
+    {"key":"hospital_bed","name":"救护病床（赠送）","required":1,"source":"任务赠送","zone":"护卫厢","scores":{"comfort":42,"medical":156}},
+    {"key":"medical_cabinet","name":"医疗设备柜（赠送）","required":1,"source":"任务赠送","zone":"护卫厢","scores":{"comfort":10.5,"medical":39}},
+    {"key":"medicine_cabinet","name":"药品柜（赠送）","required":1,"source":"任务赠送","zone":"护卫厢","scores":{"comfort":15.75,"medical":58.5}},
+    {"key":"green_plum","name":"绿梅","required":344,"source":"各主城商会家具店","zone":"客厢/护卫厢","scores":{"comfort":6.3,"plants":20.34}},
+    {"key":"silver_queen","name":"银皇后（赠送）","required":1,"source":"任务赠送","zone":"护卫厢","scores":{"comfort":3.15,"plants":10.17}},
+    {"key":"large_tank","name":"2000超大缸","required":1,"source":"海角城水族相关商店","zone":"护卫厢","scores":{"comfort":1050,"aquarium":1430}},
+    {"key":"small_tank","name":"24格小缸","required":6,"source":"海角城水族相关商店/赠送","zone":"客厢","scores":{"comfort":12.6,"aquarium":15.96}},
+    {"key":"goldfish_large","name":"流金（大缸）","required":1,"source":"海角城、修格里城每日买鱼","zone":"2000超大缸","scores":{"aquarium":5148}},
+    {"key":"goldfish_small","name":"流金（小缸）","required":6,"source":"海角城、修格里城每日买鱼","zone":"24格小缸","scores":{"aquarium":57.456}},
+    {"key":"steam_oven","name":"现代蒸烤套组","required":7,"source":"各主城商会家具店","zone":"客厢","scores":{"comfort":63,"food":80.4}},
+    {"key":"dining_chair","name":"现代餐椅","required":90,"source":"各主城商会家具店","zone":"客厢","scores":{"comfort":31.5,"food":40.2}},
+    {"key":"sewing_machine","name":"车载缝纫机","required":1,"source":"列车自带/制造设施","zone":"车长室","scores":{"comfort":151.2}},
+    {"key":"manufacturing_bench","name":"制造工作台","required":1,"source":"列车制造设施","zone":"车长室","scores":{"comfort":189,"entertainment":189}},
+    {"key":"mining_machine","name":"车载炼矿机","required":1,"source":"列车制造设施","zone":"车长室","scores":{"comfort":302.4,"entertainment":302.4}},
+    {"key":"processing_machine","name":"车载加工机床","required":1,"source":"列车制造设施","zone":"车长室","scores":{"comfort":210,"entertainment":210}},
+    {"key":"extractor","name":"阿妮塔萃取装置","required":1,"source":"列车制造设施","zone":"车长室","scores":{"comfort":100.8,"entertainment":100.8}},
+    {"key":"diagnostic","name":"诊断台","required":1,"source":"列车自带/升级","zone":"护卫厢","scores":{"comfort":56.7,"medical":347.13}}
+    ,{"key":"pet_villa","name":"一体式宠物别墅","required":9,"source":"修格里城宠物相关商店","zone":"默认车厢/护卫厢","scores":{}}
+    ,{"key":"bento_cabinet","name":"便当柜","required":1,"source":"列车固定家具","zone":"车长室","scores":{"comfort":42,"food":44}}
+    ,{"key":"trash_bin","name":"垃圾箱Lv11","required":1,"source":"列车垃圾箱升级","zone":"车长室","scores":{"comfort":254.1}}
+    ,{"key":"file_cabinet","name":"档案柜","required":1,"source":"列车固定家具","zone":"车长室","scores":{"comfort":52.5,"entertainment":52.5}}
+    ,{"key":"bookshelf","name":"书架","required":1,"source":"列车固定家具","zone":"车长室","scores":{"comfort":113.4,"entertainment":37.8}}
+    ,{"key":"captain_wardrobe","name":"列车长衣柜","required":1,"source":"列车固定家具","zone":"车长室","scores":{"comfort":75.6}}
+    ,{"key":"integrated_kitchen","name":"一体式厨房","required":1,"source":"列车固定家具","zone":"车长室","scores":{"comfort":56.7,"food":59.4}}
+    ,{"key":"integrated_dining","name":"一体式餐桌椅","required":1,"source":"列车固定家具","zone":"车长室","scores":{"comfort":12.6,"food":13.2}}
+    ,{"key":"control_console","name":"行车控制台","required":1,"source":"列车固定家具","zone":"车长室","scores":{"comfort":56.7}}
+    ,{"key":"console_chair","name":"控制台座椅","required":1,"source":"列车固定家具","zone":"车长室","scores":{"comfort":25.2}}
+    ,{"key":"fridge","name":"冰箱","required":1,"source":"列车固定家具","zone":"车长室","scores":{"comfort":25.2,"food":26.4}}
+    ,{"key":"train_computer","name":"车载电脑","required":1,"source":"列车固定家具","zone":"车长室","scores":{"comfort":16.8,"entertainment":50.4}}
+    ,{"key":"power_system","name":"电力系统","required":1,"source":"列车固定家具","zone":"车长室","scores":{"comfort":25.2}}
+    ,{"key":"clue_wall","name":"线索墙","required":1,"source":"列车固定家具","zone":"车长室","scores":{"comfort":29.4}}
+  ]
+}
