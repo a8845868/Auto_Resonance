@@ -3,7 +3,15 @@
 from datetime import datetime
 
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
 
 from core.services.task_schedule_state import set_next_run, task_timing
 
@@ -14,6 +22,10 @@ class TaskScheduleCard(QWidget):
     def __init__(self, task_key: str, parent=None):
         super().__init__(parent)
         self.taskKey = task_key
+        # ExpandLayout otherwise compresses a plain QWidget to roughly one
+        # text line, hiding the next-run editor and buttons.
+        self.setMinimumHeight(96)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.setObjectName("taskScheduleCard")
         self.setStyleSheet(
             "QWidget#taskScheduleCard { border: 1px solid rgba(128,128,128,.28); "
