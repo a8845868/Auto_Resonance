@@ -42,7 +42,9 @@ def sell_business(num=0, empty_ok=False):
         logger.error("检测到未成功出售物品")
         return False
     else:
-        click_bargain_button(num)
+        if num > 0 and not click_bargain_button(num):
+            logger.error("Maximum sell bargain was not completed; cancel sale")
+            return False
         if not click_sell_button():
             logger.error("Sell confirmation did not complete")
             return False
@@ -62,6 +64,29 @@ def sell_existing_cargo(num=0):
     selection is a valid clean-warehouse result during the preflight check.
     """
     return sell_business(num=num, empty_ok=True)
+
+
+def has_sellable_cargo():
+    """Probe the current sell page without spending fatigue.
+
+    Selecting all lets the exchange determine whether the warehouse contains
+    anything sellable in this city. Return home when the selection is empty so
+    the caller can continue with restocking.
+    """
+    start_time = time.perf_counter()
+    while time.perf_counter() - start_time < 15:
+        image = screenshot()
+        bgr = image.get_bgr((1156, 100))
+        if not (bgr.b == 0 and bgr.g == 0 and 90 <= bgr.r <= 100):
+            input_tap((1187, 103))
+            time.sleep(0.5)
+            break
+    if is_empty_goods():
+        logger.info("No sellable cargo detected; continue with restocking")
+        go_home()
+        return False
+    logger.info("Sellable residual cargo detected")
+    return True
 
 
 def is_empty_goods():
@@ -92,7 +117,7 @@ def click_bargain_button(num=0):
             time.sleep(1.0)
         elif bgr == [251, 253, 253]:
             logger.info("抬价次数不足")
-            return True
+            return False
         elif bgr == [62, 63, 63]:
             logger.info("疲劳不足")
             exit_negotiation_safely()

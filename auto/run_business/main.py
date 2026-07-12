@@ -13,7 +13,11 @@ from loguru import logger
 from auto.module.strength import can_afford_fatigue, prepare_negotiation
 from auto.module.dispatch import collect_dispatch_rewards
 from auto.run_business.buy import buy_business
-from auto.run_business.sell import sell_business, sell_existing_cargo
+from auto.run_business.sell import (
+    has_sellable_cargo,
+    sell_business,
+    sell_existing_cargo,
+)
 from core.control.control import connect, input_tap, screenshot
 from core.control.control import is_stopped, stop as stop_control
 from core.exception.exceptions import StopExecution
@@ -134,9 +138,17 @@ def run(routes: RoutesModel, recovery_attempts: int = 2):
     )
     if not go_business("sell"):
         return False
-    if not sell_existing_cargo():
-        logger.error("Failed to clear residual cargo; stop before restocking")
-        return False
+    if has_sellable_cargo():
+        sell_haggle = prepare_negotiation("sell", 2)
+        if sell_haggle == 0:
+            logger.error(
+                "Unable to prepare the maximum sell bargain; stop without "
+                "selling residual cargo"
+            )
+            return False
+        if not sell_existing_cargo(sell_haggle):
+            logger.error("Failed to clear residual cargo; stop before restocking")
+            return False
     for city in routes.city_data:
         logger.info(f"{city.buy_city_name}->{city.sell_city_name}")
         if not click_station(city.buy_city_name, cur_station=city_name).wait():
@@ -165,9 +177,12 @@ def run(routes: RoutesModel, recovery_attempts: int = 2):
             return False
         if not go_business("sell"):
             return False
-        sell_haggle = prepare_negotiation("sell", min(city.haggle_num, 2))
+        # Selling profit is always maximized: pursue the game's two-success cap
+        # regardless of the per-city buy-side haggle setting.
+        sell_haggle = prepare_negotiation("sell", 2)
         if sell_haggle == 0:
-            logger.warning("疲劳不足，本次不抬价，直接卖出以保证货物结算")
+            logger.error("Unable to prepare the maximum sell bargain; stop without selling")
+            return False
         if not sell_business(sell_haggle):
             logger.error("卖货未完成，不将本轮记为完成")
             return False
