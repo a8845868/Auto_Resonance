@@ -67,16 +67,20 @@ class ResidentActivityTests(unittest.TestCase):
         driver.pages = [[item("无法识别")]]
         self.assertEqual(ResidentActivityAutomation(driver)._reward_attempts(), 3)
 
-    def test_sweep_stops_when_button_disappears(self):
+    def test_sweep_stops_when_initial_button_disappears(self):
         class SweepDriver(FakeDriver):
             def click_text(self, text, **_):
-                if text != "扫荡":
-                    return False
                 self.clicked.append(text)
-                return len(self.clicked) <= 2
+                if text == "开始扫荡":
+                    return True
+                return self.clicked.count("扫荡") <= 2
 
         driver = SweepDriver([[]])
         self.assertEqual(ResidentActivityAutomation(driver).sweep_current_activity(3), 2)
+        self.assertEqual(
+            driver.clicked,
+            ["扫荡", "开始扫荡", "扫荡", "开始扫荡", "扫荡"],
+        )
 
     def test_single_sweep_has_hard_limit_of_one(self):
         class SweepDriver(FakeDriver):
@@ -86,7 +90,17 @@ class ResidentActivityTests(unittest.TestCase):
 
         driver = SweepDriver([[]])
         self.assertEqual(ResidentActivityAutomation(driver).sweep_current_activity(1), 1)
-        self.assertEqual(driver.clicked, ["扫荡"])
+        self.assertEqual(driver.clicked, ["扫荡", "开始扫荡"])
+
+    def test_sweep_is_not_counted_when_team_confirmation_is_missing(self):
+        class SweepDriver(FakeDriver):
+            def click_text(self, text, **_):
+                self.clicked.append(text)
+                return text == "扫荡"
+
+        driver = SweepDriver([[]])
+        self.assertEqual(ResidentActivityAutomation(driver).sweep_current_activity(1), 0)
+        self.assertEqual(driver.clicked, ["扫荡", "开始扫荡"])
 
     def test_academy_chest_selects_salvation_supply_stage(self):
         self.assertEqual(FULL_REALM_REWARDS["学会装备箱"], "特供·救世")
@@ -96,6 +110,7 @@ class ResidentActivityTests(unittest.TestCase):
             item("特供·救世"),
             item("进入挑战"),
             item("扫荡"),
+            item("开始扫荡"),
         ]])
         completed = ResidentActivityAutomation(driver).run_limited_activity(
             "全境特供", stage=FULL_REALM_REWARDS["学会装备箱"]

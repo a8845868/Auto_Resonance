@@ -53,11 +53,20 @@ def _center(item: dict) -> tuple[int, int]:
     )
 
 
-def _matches(actual: str, expected: str) -> bool:
-    normalized = actual.replace('"', "").replace("“", "").replace("”", "").strip()
-    expected = expected.replace("！", "!")
-    normalized = normalized.replace("！", "!")
-    return normalized == expected or expected in normalized
+def _normalize_text(text: str) -> str:
+    return (
+        text.replace('"', "")
+        .replace("“", "")
+        .replace("”", "")
+        .replace("！", "!")
+        .strip()
+    )
+
+
+def _matches(actual: str, expected: str, *, exact: bool = False) -> bool:
+    normalized = _normalize_text(actual)
+    expected = _normalize_text(expected)
+    return normalized == expected if exact else normalized == expected or expected in normalized
 
 
 @dataclass
@@ -86,10 +95,11 @@ class ScreenDriver:
         *,
         offset: tuple[int, int] = (0, 0),
         attempts: int = 5,
+        exact: bool = False,
     ) -> bool:
         for _ in range(attempts):
             for item in self.texts():
-                if _matches(item["text"], text):
+                if _matches(item["text"], text, exact=exact):
                     x, y = _center(item)
                     self.tap((x + offset[0], y + offset[1]))
                     self.sleep(1)
@@ -164,8 +174,14 @@ class ResidentActivityAutomation:
     def sweep_current_activity(self, max_attempts: int) -> int:
         completed = 0
         for _ in range(max_attempts):
-            if not self.driver.click_text("扫荡", attempts=2):
+            # Use exact matching so the confirmation button "开始扫荡" cannot
+            # be mistaken for the initial "扫荡" button on a stale dialog.
+            if not self.driver.click_text("扫荡", attempts=2, exact=True):
                 break
+            if not self.driver.click_text("开始扫荡", attempts=3, exact=True):
+                logger.warning("已打开扫荡队伍选择，但未找到“开始扫荡”，本次不计入完成")
+                break
+            self.driver.sleep(1.5)
             self.driver.dismiss_result()
             completed += 1
         return completed
@@ -215,13 +231,9 @@ class ResidentActivityAutomation:
         if not self.select_siege_task(task):
             return 0
 
-        completed = 0
-        for _ in range(safety_limit):
-            if not self.driver.click_text("扫荡", attempts=2):
-                logger.info("澄清度不足或扫荡不可用，停止利刃围剿")
-                break
-            self.driver.dismiss_result()
-            completed += 1
+        completed = self.sweep_current_activity(safety_limit)
+        if completed < safety_limit:
+            logger.info("澄清度不足、扫荡不可用或队伍确认失败，停止利刃围剿")
         logger.info(f"{task}完成 {completed} 次")
         return completed
 
