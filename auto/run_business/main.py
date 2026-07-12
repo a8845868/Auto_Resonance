@@ -15,6 +15,8 @@ from auto.module.dispatch import collect_dispatch_rewards
 from auto.run_business.buy import buy_business
 from auto.run_business.sell import (
     has_sellable_cargo,
+    is_sell_page,
+    read_raise_percent,
     sell_business,
     sell_existing_cargo,
 )
@@ -35,6 +37,29 @@ city_sell_data = {
     city: dict(sorted(goods.items(), key=lambda item: item[1]["price"], reverse=True))
     for city, goods in _city_sell_data.items()
 }
+
+
+def _prepare_max_sell_haggle():
+    """Preserve an already completed 20% sell negotiation when resuming."""
+    current_raise = read_raise_percent()
+    if current_raise is not None and current_raise >= 20.0:
+        logger.info("Current sell page is already at the 20% raise cap")
+        return 2
+    return prepare_negotiation("sell", 2)
+
+
+def _read_route_city_from_current_screen(routes: RoutesModel):
+    """Read one of the planned endpoint cities without leaving the sell page."""
+    texts = [item["text"] for item in screenshot().ocr()]
+    cities = {
+        name
+        for item in routes.city_data
+        for name in (item.buy_city_name, item.sell_city_name)
+    }
+    return next(
+        (city for city in cities if any(city in text for text in texts)),
+        None,
+    )
 
 
 def _inspect_recovered_station():
@@ -115,15 +140,20 @@ def run(routes: RoutesModel, recovery_attempts: int = 2):
         # Reconnect the normal controller after Android recreated the display.
         if not connect():
             return False
-    # Dispatch rewards are opportunistic: no reminder means a fast no-op and
-    # recognition failure must never block the trading route.
-    try:
-        collect_dispatch_rewards()
-    except StopExecution:
-        raise
-    except Exception:
-        logger.exception("自动领取委派奖励失败，跳过并继续跑商")
-    city_name = get_station()
+    resume_sell_page = is_sell_page()
+    if resume_sell_page:
+        logger.info("Sell-page recovery state detected; preserve it before all side tasks")
+        city_name = _read_route_city_from_current_screen(routes)
+    else:
+        # Dispatch rewards are opportunistic, but must never interrupt a sale
+        # whose 20% negotiation state is already on screen.
+        try:
+            collect_dispatch_rewards()
+        except StopExecution:
+            raise
+        except Exception:
+            logger.exception("自动领取委派奖励失败，跳过并继续跑商")
+        city_name = get_station()
     if not city_name:
         logger.error("无法确定当前城市，已安全停止而非抛出异常")
         return False
@@ -136,17 +166,24 @@ def run(routes: RoutesModel, recovery_attempts: int = 2):
         f"Preflight warehouse check in {city_name}: "
         "sell residual cargo before restocking"
     )
-    if not go_business("sell"):
+    if resume_sell_page or is_sell_page():
+        logger.info("Already on the exchange sell page; resume the current sale state")
+    elif not go_business("sell"):
         return False
-    if has_sellable_cargo():
-        sell_haggle = prepare_negotiation("sell", 2)
+    residual_route = next(
+        (item for item in routes.city_data if item.sell_city_name == city_name),
+        None,
+    )
+    residual_goods = list(residual_route.goods_data) if residual_route else []
+    if has_sellable_cargo(residual_goods):
+        sell_haggle = _prepare_max_sell_haggle()
         if sell_haggle == 0:
             logger.error(
                 "Unable to prepare the maximum sell bargain; stop without "
                 "selling residual cargo"
             )
             return False
-        if not sell_existing_cargo(sell_haggle):
+        if not sell_existing_cargo(sell_haggle, expected_goods=residual_goods):
             logger.error("Failed to clear residual cargo; stop before restocking")
             return False
     for city in routes.city_data:
@@ -179,11 +216,14 @@ def run(routes: RoutesModel, recovery_attempts: int = 2):
             return False
         # Selling profit is always maximized: pursue the game's two-success cap
         # regardless of the per-city buy-side haggle setting.
-        sell_haggle = prepare_negotiation("sell", 2)
+        sell_haggle = _prepare_max_sell_haggle()
         if sell_haggle == 0:
             logger.error("Unable to prepare the maximum sell bargain; stop without selling")
             return False
-        if not sell_business(sell_haggle):
+        if not sell_business(
+            sell_haggle,
+            expected_goods=list(city.goods_data),
+        ):
             logger.error("卖货未完成，不将本轮记为完成")
             return False
         # 流程跑完，更改站点名称为当前出售商品的站点
@@ -311,7 +351,11 @@ def adaptive_weekly_run():
         logger.info("没有待执行的本周跑商计划")
         return
     fallback = int(cfg.InventoryBooks.value)
-    actual = read_restock_book_count() if bool(cfg.AutoReadInventoryBooks.value) else None
+    if is_sell_page():
+        logger.info("当前处于卖货中间态，跳过进货书背包扫描以保留议价幅度")
+        actual = None
+    else:
+        actual = read_restock_book_count() if bool(cfg.AutoReadInventoryBooks.value) else None
     available = fallback if actual is None else actual
     if actual is not None:
         from qfluentwidgets import qconfig
