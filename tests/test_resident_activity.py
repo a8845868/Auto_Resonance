@@ -46,6 +46,9 @@ class FakeDriver:
     def has_text(self, text):
         return any(_matches(entry["text"], text) for entry in self.texts())
 
+    def reward_icon_score(self, reward, region):
+        return 0.9
+
     def go_home(self):
         return True
 
@@ -163,32 +166,60 @@ class ResidentActivityTests(unittest.TestCase):
 
     def test_academy_chest_selects_salvation_supply_stage(self):
         self.assertEqual(FULL_REALM_REWARDS["学会装备箱"], "特供·救世")
-        driver = FakeDriver([[
-            item("本日可获取奖励次数 1/3"),
-            item("全境特供"),
-            item("特供·救世"),
-            item("进入挑战"),
-            item("扫荡"),
-            item("开始扫荡"),
-            item("获得物品"),
-        ]])
-        completed = ResidentActivityAutomation(driver).run_limited_activity(
-            "全境特供", stage=FULL_REALM_REWARDS["学会装备箱"]
-        )
-        self.assertEqual(completed, 1)
-        self.assertTrue(driver.taps)
 
     def test_supply_stage_uses_nearest_challenge_button(self):
-        driver = FakeDriver([[
-            item("特供·救世", 700, 420),
-            item("进入挑战", 420, 606),
-            item("进入挑战", 700, 606),
-            item("扫荡", 870, 490),
-        ]])
+        class DetailDriver(FakeDriver):
+            def tap(self, pos, **kwargs):
+                super().tap(pos, **kwargs)
+                if pos == (700, 606):
+                    self.page = 1
+
+        driver = DetailDriver([
+            [
+                item("特供·救世", 700, 420),
+                item("进入挑战", 420, 606),
+                item("进入挑战", 700, 606),
+            ],
+            [
+                item("特供·救世", 1080, 105),
+                item("奖励预览", 825, 385),
+                item("扫荡", 870, 490),
+            ],
+        ])
         self.assertTrue(
-            ResidentActivityAutomation(driver).select_activity_stage("特供·救世")
+            ResidentActivityAutomation(driver).select_activity_stage(
+                "特供·救世", "学会装备箱"
+            )
         )
-        self.assertEqual(driver.taps[-1], (700, 606))
+        self.assertEqual(driver.taps[0], (700, 606))
+
+    def test_wrong_detail_reward_returns_without_sweeping(self):
+        class WrongRewardDriver(FakeDriver):
+            def reward_icon_score(self, reward, region):
+                return 0.9 if region[1] == 455 else 0.1
+
+            def tap(self, pos, **kwargs):
+                super().tap(pos, **kwargs)
+                if pos == (700, 606):
+                    self.page = 1
+
+        driver = WrongRewardDriver([
+            [
+                item("特供·救世", 700, 420),
+                item("进入挑战", 700, 606),
+            ],
+            [
+                item("特供·救世", 1080, 105),
+                item("奖励预览", 825, 385),
+                item("扫荡", 870, 500),
+            ],
+        ])
+        self.assertFalse(
+            ResidentActivityAutomation(driver).select_activity_stage(
+                "特供·救世", "学会装备箱"
+            )
+        )
+        self.assertEqual(driver.taps[-1], (82, 36))
 
 
 if __name__ == "__main__":

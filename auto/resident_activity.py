@@ -5,8 +5,10 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
 
+import cv2 as cv
 from loguru import logger
 
 from core.control.control import connect, input_swipe, input_tap, screenshot
@@ -44,6 +46,13 @@ SIEGE_REWARDS = {
     "大的！": ("尘鸣坚骨 / 裂首骨龙材料", "hard_bone.png"),
     "总体围剿": ("深眠木 / 游星之眼", "deep_sleep_wood.png"),
 }
+
+FULL_REALM_REWARD_ICONS = {
+    "学会装备箱": "academy_lost_chest.png",
+    "黑月装备箱": "blackmoon_lost_chest.png",
+    "帝国装备箱": "empire_lost_chest.png",
+}
+REWARD_ICON_DIR = Path(__file__).resolve().parents[1] / "resources" / "rewards"
 
 
 def _find_resonance_port(devices: list[EmulatorInfo]) -> Optional[int]:
@@ -133,6 +142,42 @@ class ScreenDriver:
 
     def has_text(self, text: str) -> bool:
         return any(_matches(item["text"], text) for item in self.texts())
+
+    def reward_icon_score(
+        self, reward: str, region: tuple[int, int, int, int]
+    ) -> float:
+        """Match a reward icon inside a card/detail reward-preview region."""
+        icon_name = FULL_REALM_REWARD_ICONS.get(reward)
+        if not icon_name:
+            return 0.0
+        source = cv.imread(str(REWARD_ICON_DIR / icon_name), cv.IMREAD_UNCHANGED)
+        if source is None:
+            return 0.0
+        if source.shape[2] == 4:
+            alpha = source[:, :, 3]
+            points = cv.findNonZero(alpha)
+            if points is None:
+                return 0.0
+            x, y, w, h = cv.boundingRect(points)
+            source = source[y : y + h, x : x + w, :3]
+
+        x1, y1, x2, y2 = region
+        haystack = screenshot().image[y1:y2, x1:x2]
+        if haystack.size == 0:
+            return 0.0
+        haystack = cv.cvtColor(haystack, cv.COLOR_BGR2GRAY)
+        source = cv.cvtColor(source, cv.COLOR_BGR2GRAY)
+        best = 0.0
+        for scale in (0.10, 0.12, 0.14, 0.16, 0.18, 0.20):
+            template = cv.resize(source, None, fx=scale, fy=scale)
+            if (
+                template.shape[0] >= haystack.shape[0]
+                or template.shape[1] >= haystack.shape[1]
+            ):
+                continue
+            result = cv.matchTemplate(haystack, template, cv.TM_CCOEFF_NORMED)
+            best = max(best, float(cv.minMaxLoc(result)[1]))
+        return best
 
     def go_home(self) -> bool:
         """Return to the station home without depending on a versioned screenshot."""
@@ -240,8 +285,43 @@ class ResidentActivityAutomation:
         self.driver.sleep(1)
         return True
 
-    def select_activity_stage(self, stage: str) -> bool:
-        """Click the challenge button belonging to the named reward stage."""
+    def reward_matches(
+        self, reward: str, region: tuple[int, int, int, int]
+    ) -> tuple[bool, float, dict[str, float]]:
+        """Require the expected chest to be the best of all known chest icons."""
+        scores = {
+            candidate: self.driver.reward_icon_score(candidate, region)
+            for candidate in FULL_REALM_REWARD_ICONS
+        }
+        expected = scores.get(reward, 0.0)
+        best = max(scores.values(), default=0.0)
+        return expected >= 0.58 and expected >= best - 0.01, expected, scores
+
+    def verify_activity_detail(self, stage: str, reward: str) -> bool:
+        """Verify both the detail title and its expected reward preview."""
+        items = self.driver.texts()
+        title_ok = any(
+            _matches(item["text"], stage, exact=True)
+            and _center(item)[0] > 900
+            and _center(item)[1] < 180
+            for item in items
+        )
+        preview_ok = any(_matches(item["text"], "奖励预览") for item in items)
+        reward_ok, reward_score, scores = self.reward_matches(
+            reward, (860, 320, 1210, 450)
+        )
+        if title_ok and preview_ok and reward_ok:
+            return True
+        logger.warning(
+            f"关卡详情校验失败：关卡名={title_ok}，奖励预览={preview_ok}，"
+            f"{reward}图标={reward_ok}({reward_score:.3f})，候选={scores}"
+        )
+        self.driver.tap((82, 36), precise=True)
+        self.driver.sleep(1)
+        return False
+
+    def select_activity_stage(self, stage: str, reward: str) -> bool:
+        """Locate a card by OCR title plus reward icon, then verify its detail."""
         for _ in range(7):
             items = self.driver.texts()
             stage_items = [
@@ -249,6 +329,15 @@ class ResidentActivityAutomation:
             ]
             if stage_items:
                 stage_x, _ = _center(stage_items[0])
+                reward_ok, reward_score, scores = self.reward_matches(
+                    reward, (max(420, stage_x - 125), 455, min(1245, stage_x + 125), 570)
+                )
+                if not reward_ok:
+                    logger.warning(
+                        f"列表卡片奖励校验失败：{stage} 未匹配到 {reward} "
+                        f"({reward_score:.3f})，候选={scores}"
+                    )
+                    return False
                 challenge_items = [
                     item
                     for item in items
@@ -260,12 +349,9 @@ class ResidentActivityAutomation:
                     challenge_items,
                     key=lambda item: abs(_center(item)[0] - stage_x),
                 )
-                for _ in range(2):
-                    self.driver.tap(_center(challenge), precise=True)
-                    self.driver.sleep(1.2)
-                    if self.driver.has_text("扫荡"):
-                        return True
-                return False
+                self.driver.tap(_center(challenge), precise=True)
+                self.driver.sleep(1.2)
+                return self.verify_activity_detail(stage, reward)
             self.driver.swipe_left()
         return False
 
@@ -304,7 +390,9 @@ class ResidentActivityAutomation:
             completed += 1
         return completed
 
-    def run_limited_activity(self, name: str, stage: Optional[str] = None) -> int:
+    def run_limited_activity(
+        self, name: str, stage: Optional[str] = None, reward: Optional[str] = None
+    ) -> int:
         if not self.click_activity_tab(name):
             logger.warning(f"未找到活动：{name}")
             return 0
@@ -313,7 +401,7 @@ class ResidentActivityAutomation:
             logger.info(f"{name}次数已用完")
             return 0
         if stage:
-            entered = self.select_activity_stage(stage)
+            entered = bool(reward) and self.select_activity_stage(stage, reward)
         else:
             entered = self.driver.click_text(
                 "进入挑战", attempts=3, exact=True, precise=True
@@ -389,7 +477,9 @@ class ResidentActivityAutomation:
             results.update({"全境特供": 0, task: 0})
             return results
         stage = FULL_REALM_REWARDS.get(full_realm_reward)
-        results["全境特供"] = self.run_limited_activity("全境特供", stage=stage)
+        results["全境特供"] = self.run_limited_activity(
+            "全境特供", stage=stage, reward=full_realm_reward
+        )
         if not self.open_action_summary():
             results[task] = 0
             return results
