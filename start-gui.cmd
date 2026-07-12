@@ -1,10 +1,15 @@
 @echo off
 cd /d "%~dp0"
-if not exist ".venv\Scripts\pythonw.exe" goto missing
-start "" ".venv\Scripts\pythonw.exe" "gui_launcher.pyw"
+set "PYTHONW=%~dp0.venv\Scripts\pythonw.exe"
+if exist "%PYTHONW%" goto launch
+set "PYTHONW=%~dp0..\..\.venv\Scripts\pythonw.exe"
+if not exist "%PYTHONW%" goto missing
+
+:launch
+start "" "%PYTHONW%" "%~dp0gui_launcher.pyw"
 exit /b 0
 
 :missing
-echo Python environment not found: .venv\Scripts\pythonw.exe
+echo Python environment not found in this worktree or the main repository.
 pause
 exit /b 1

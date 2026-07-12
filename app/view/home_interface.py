@@ -22,6 +22,8 @@ from qfluentwidgets import (
     InfoBar,
     InfoBarIcon,
     InfoBarPosition,
+    PrimaryPushButton,
+    PushButton,
     ScrollArea,
     SwitchButton,
     isDarkTheme
@@ -329,6 +331,38 @@ class HomeInterface(ScrollArea):
         self.planSummaryLabel.setStyleSheet("font-size: 13px; line-height: 1.5;")
         planLayout.addWidget(self.planSummaryLabel)
         basicInputView.vBoxLayout.insertWidget(3, self.planPanel)
+
+        quickRunPanel = QWidget(self.view)
+        quickRunPanel.setObjectName("quickRunPanel")
+        quickRunPanel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        quickRunPanel.setStyleSheet(
+            "QWidget#quickRunPanel { background-color: rgba(30,120,210,0.16); "
+            "border: 1px solid rgba(67,165,255,0.75); border-radius: 12px; }"
+            "QWidget#quickRunPanel QLabel { border: none; background: transparent; }"
+        )
+        quickRunLayout = QHBoxLayout(quickRunPanel)
+        quickRunLayout.setContentsMargins(16, 12, 16, 12)
+        quickRunTextLayout = QVBoxLayout()
+        quickRunTitle = QLabel("自动扫荡", quickRunPanel)
+        quickRunTitle.setStyleSheet("font-size: 17px; font-weight: 700;")
+        self.quickPlanLabel = QLabel(quickRunPanel)
+        self.quickPlanLabel.setStyleSheet("font-size: 12px; color: #8f9ba8;")
+        quickRunTextLayout.addWidget(quickRunTitle)
+        quickRunTextLayout.addWidget(self.quickPlanLabel)
+        quickRunLayout.addLayout(quickRunTextLayout, 1)
+        self.quickRunButton = PrimaryPushButton(
+            FluentIcon.PLAY, "开始自动扫荡（按当前方案）", quickRunPanel
+        )
+        self.quickRunButton.setFixedHeight(42)
+        self.quickRunButton.clicked.connect(self.startResidentActivity)
+        quickRunLayout.addWidget(self.quickRunButton)
+        quickStopButton = PushButton("停止", quickRunPanel)
+        quickStopButton.setFixedHeight(42)
+        quickStopButton.clicked.connect(self.stopCurrentTask)
+        quickRunLayout.addWidget(quickStopButton)
+        # Keep the primary action immediately below Warning.  Reward selectors
+        # and the detailed plan remain below it and can scroll independently.
+        basicInputView.vBoxLayout.insertWidget(1, quickRunPanel)
         self.updateCurrentPlan()
         # self.taskCheckboxGroup.addCheckbox("购买桦石", cfg.huashi)
         # self.taskCheckboxGroup.addCheckbox("刷铁安局", cfg.railwaySafetyBureau)
@@ -437,6 +471,10 @@ class HomeInterface(ScrollArea):
         stage = FULL_REALM_REWARDS[reward]
         task = cfg.residentActivityTask.value
         main_drop = SIEGE_REWARDS[task][0]
+        if hasattr(self, "quickPlanLabel"):
+            self.quickPlanLabel.setText(
+                f"全境特供：{reward} · {stage}　｜　剩余澄清度：{task}"
+            )
         after_actions = []
         if bool(cfg.autoCollectDailyActivity.value):
             after_actions.append("每日活跃奖励")
