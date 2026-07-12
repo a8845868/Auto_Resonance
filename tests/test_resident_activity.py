@@ -4,8 +4,10 @@ from auto.resident_activity import (
     FULL_REALM_REWARDS,
     ResidentActivityAutomation,
     SIEGE_TASKS,
+    _find_resonance_port,
     _matches,
 )
+from core.control.adb_port import EmulatorInfo, EmulatorType
 
 
 def item(text, x=600, y=420):
@@ -52,6 +54,13 @@ class FakeDriver:
 
 
 class ResidentActivityTests(unittest.TestCase):
+    def test_resonance_port_is_selected_from_multiple_mumu_instances(self):
+        devices = [
+            EmulatorInfo("明日方舟", 16384, "", EmulatorType.MUMUV5, 0),
+            EmulatorInfo("雷索纳斯", 16544, "", EmulatorType.MUMUV5, 5),
+        ]
+        self.assertEqual(_find_resonance_port(devices), 16544)
+
     def test_all_siege_tasks_are_in_required_order(self):
         self.assertEqual(SIEGE_TASKS, (
             "特殊订单", "利刃行动", "挑灯看剑", "武器材质分析", "骑士小说",

@@ -458,6 +458,12 @@ class HomeInterface(ScrollArea):
             )
 
     def onActivityFinished(self, result):
+        if not any(result.values()):
+            self.setRunState(
+                "■  未执行：今日次数已用完，或当前任务暂不可进入",
+                "#f0a44b",
+            )
+            return
         details = "，".join(f"{name} {count} 次" for name, count in result.items())
         self.setRunState(f"✓  已完成：{details}", "#65c466")
 

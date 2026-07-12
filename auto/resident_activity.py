@@ -10,6 +10,7 @@ from typing import Callable, Optional
 from loguru import logger
 
 from core.control.control import connect, input_swipe, input_tap, screenshot
+from core.control.adb_port import EmulatorInfo, get_adb_port
 
 
 SIEGE_TASKS = (
@@ -43,6 +44,28 @@ SIEGE_REWARDS = {
     "大的！": ("尘鸣坚骨 / 裂首骨龙材料", "hard_bone.png"),
     "总体围剿": ("深眠木 / 游星之眼", "deep_sleep_wood.png"),
 }
+
+
+def _find_resonance_port(devices: list[EmulatorInfo]) -> Optional[int]:
+    """Return the live MuMu instance explicitly named for Resonance."""
+    for device in devices:
+        if device.port and "雷索纳斯" in device.name:
+            return int(device.port)
+    return None
+
+
+def connect_resonance() -> bool:
+    """Connect to Resonance instead of accepting any reachable emulator."""
+    try:
+        port = _find_resonance_port(get_adb_port())
+    except Exception:
+        logger.exception("自动识别雷索纳斯模拟器失败，回退到已配置端口")
+        port = None
+    if port:
+        logger.info(f"自动选择雷索纳斯模拟器 ADB 端口：{port}")
+        return bool(connect(port))
+    logger.warning("未发现名为“雷索纳斯”的 MuMu 实例，回退到已配置端口")
+    return bool(connect())
 
 
 def _center(item: dict) -> tuple[int, int]:
@@ -250,6 +273,11 @@ class ResidentActivityAutomation:
             self.driver.swipe_right()
         for _ in range(7):
             items = self.driver.texts()
+            if any(
+                _matches(item["text"], "挑战次数已用完") for item in items
+            ):
+                logger.info("利刃围剿今日挑战次数已用完")
+                return False
             for item in items:
                 if _matches(item["text"], task):
                     x, y = _center(item)
@@ -288,7 +316,7 @@ class ResidentActivityAutomation:
         return completed
 
     def run(self, task: str, full_realm_reward: str = "学会装备箱") -> dict[str, int]:
-        if not connect():
+        if not connect_resonance():
             raise RuntimeError("ADB连接失败")
         if not self.open_action_summary():
             return {"私贩追缴": 0, "全境特供": 0, task: 0}
@@ -309,7 +337,7 @@ class ResidentActivityAutomation:
 
     def run_once(self, task: str) -> dict[str, int]:
         """Run exactly one selected siege sweep for end-to-end verification."""
-        if not connect():
+        if not connect_resonance():
             raise RuntimeError("ADB连接失败")
         if not self.open_action_summary():
             return {task: 0}
