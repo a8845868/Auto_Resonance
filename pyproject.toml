@@ -37,3 +37,8 @@ dev = [
     "pytest>=8.1.1",
     "pyinstaller==6.13.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["_worktrees", ".git", ".venv"]
+addopts = ["--ignore=tests/tests"]
