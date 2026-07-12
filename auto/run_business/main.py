@@ -16,6 +16,7 @@ from auto.run_business.buy import buy_business
 from auto.run_business.sell import sell_business
 from core.control.control import connect, input_tap, screenshot
 from core.control.control import is_stopped, stop as stop_control
+from core.exception.exceptions import StopExecution
 from core.model import app
 from core.model.city_goods import RouteModel, RoutesModel
 from core.module.bgr import BGR
@@ -114,6 +115,8 @@ def run(routes: RoutesModel, recovery_attempts: int = 2):
     # recognition failure must never block the trading route.
     try:
         collect_dispatch_rewards()
+    except StopExecution:
+        raise
     except Exception:
         logger.exception("自动领取委派奖励失败，跳过并继续跑商")
     city_name = get_station()
@@ -260,6 +263,54 @@ def two_city_weekly_run(buy_city_name: str, sell_city_name: str, execution_batch
             completed += 1
             record_completed_run(books)
     logger.info(f"周计划完成，共 {completed} 次完整往返")
+
+
+def adaptive_weekly_run():
+    """Verify actual books, then keep or replace the remaining live-price plan."""
+    from app.common.config import cfg
+    from auto.inventory import read_restock_book_count
+    from core.services import (
+        OptimizationConfig,
+        load_weekly_plan,
+        optimize_live_routes,
+        progress_summary,
+        remaining_batches,
+        save_weekly_plan,
+    )
+
+    state = load_weekly_plan()
+    summary = progress_summary(state)
+    if not state or not summary or summary["finished"]:
+        logger.info("没有待执行的本周跑商计划")
+        return
+    fallback = int(cfg.InventoryBooks.value)
+    actual = read_restock_book_count() if bool(cfg.AutoReadInventoryBooks.value) else None
+    available = fallback if actual is None else actual
+    if actual is not None:
+        from qfluentwidgets import qconfig
+        qconfig.set(cfg.InventoryBooks, actual)
+    required = int(summary["remaining_books"])
+    if available >= required:
+        logger.info(f"进货书库存 {available} 本，足够完成剩余计划（需要 {required} 本）")
+        cycle = state["cycle"]
+        return two_city_weekly_run(cycle[0], cycle[1], remaining_batches(state))
+
+    logger.warning(f"进货书库存仅 {available} 本，少于剩余计划需要的 {required} 本，重新计算实时替代路线")
+    raw_config = dict(state.get("optimizer_config") or {})
+    raw_config["books"] = max(0, available)
+    raw_config["weekly_fatigue"] = max(1, int(summary["remaining_fatigue"]))
+    try:
+        replacement = optimize_live_routes(OptimizationConfig(**raw_config))
+        state = save_weekly_plan(replacement)
+        cycle = state["cycle"]
+        logger.info(f"已切换替代路线: {cycle[0]} → {cycle[1]} → {cycle[0]}，计划使用 {replacement['books_used']} 本")
+        return two_city_weekly_run(cycle[0], cycle[1], remaining_batches(state))
+    except StopExecution:
+        raise
+    except Exception:
+        logger.exception("科伦巴实时替代路线计算失败，降级为原路线不使用进货书")
+        safe_batches = [{"runs": summary["remaining_runs"], "books": {city: 0 for city in state["cycle"]}}]
+        return two_city_weekly_run(state["cycle"][0], state["cycle"][1], safe_batches)
 
 
 def stop():

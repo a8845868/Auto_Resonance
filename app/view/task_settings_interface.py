@@ -14,6 +14,7 @@ from qfluentwidgets import (
 
 from app.common.config import cfg
 from app.common.style_sheet import StyleSheet
+from app.components.task_schedule_card import TaskScheduleCard
 from auto.resident_activity import FULL_REALM_REWARDS, SIEGE_REWARDS, SIEGE_TASKS
 
 
@@ -103,6 +104,8 @@ class RewardCollectionInterface(TaskSettingsPage):
             cfg.enableRewardCollection,
             self.scrollWidget,
         ))
+        self.scheduleCard = TaskScheduleCard("reward_collection", self.scrollWidget)
+        self.layout.addWidget(self.scheduleCard)
 
         self.layout.addWidget(SwitchSettingCard(
             FluentIcon.CALENDAR,
@@ -129,6 +132,8 @@ class ResidentActivityInterface(TaskSettingsPage):
             cfg.enableResidentActivity,
             self.scrollWidget,
         ))
+        self.scheduleCard = TaskScheduleCard("resident_activity", self.scrollWidget)
+        self.layout.addWidget(self.scheduleCard)
 
         self.planPanel = QWidget(self.scrollWidget)
         self.planPanel.setObjectName("currentPlanPanel")

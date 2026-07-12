@@ -1,6 +1,7 @@
 """Single-threaded task scheduler used by the home page."""
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Callable
 
 from loguru import logger
@@ -8,6 +9,7 @@ from PySide6.QtCore import QThread, Signal
 
 from core.control.control import reset_stop, stop
 from core.exception.exceptions import StopExecution
+from core.services.task_schedule_state import next_daily_reset
 
 
 @dataclass(frozen=True)
@@ -15,6 +17,15 @@ class QueuedTask:
     name: str
     run: Callable[[], object]
     stop: Callable[[], None] = stop
+    key: str = ""
+    next_run_factory: Callable[[datetime], datetime] = next_daily_reset
+    failure_retry_seconds: int = 600
+
+    def next_run_after(self, succeeded: bool, now: datetime | None = None) -> datetime:
+        now = now or datetime.now()
+        if succeeded:
+            return self.next_run_factory(now)
+        return now + timedelta(seconds=self.failure_retry_seconds)
 
 
 class TaskQueueWorker(QThread):
@@ -24,6 +35,7 @@ class TaskQueueWorker(QThread):
     taskStarted = Signal(str, int, int)
     taskFinished = Signal(str, bool)
     taskResult = Signal(str, object)
+    taskCompleted = Signal(object, bool, object)
     error = Signal(str)
 
     def __init__(self, tasks: list[QueuedTask], parent=None):
@@ -58,6 +70,7 @@ class TaskQueueWorker(QThread):
             self.taskFinished.emit(task.name, succeeded)
             if succeeded:
                 self.taskResult.emit(task.name, result)
+            self.taskCompleted.emit(task, succeeded, result)
         self._current = None
         self.queueChanged.emit([])
 

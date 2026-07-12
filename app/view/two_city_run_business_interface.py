@@ -20,6 +20,7 @@ from app.common.signal_bus import signalBus
 from app.common.style_sheet import StyleSheet
 from app.utils.worker import Worker
 from app.components.primary_push_load_card import PrimaryPushLoadCard
+from app.components.task_schedule_card import TaskScheduleCard
 from app.components.settings.spin_box_setting_card import SpinBoxSettingCard
 from app.utils.config import CITYS, CITY_GOODS, CITY_POSITIONS
 from core.model.config import config
@@ -74,6 +75,7 @@ class TwoRunBusinessInterface(ScrollArea):
             cfg.enableRunBusiness,
             self.scrollWidget,
         )
+        self.scheduleCard = TaskScheduleCard("run_business", self.scrollWidget)
         self.isSpeedCard = SwitchSettingCard(
             FIF.MARKET,
             "是否自动加速",
@@ -90,6 +92,23 @@ class TwoRunBusinessInterface(ScrollArea):
         self.isAutoPickCard.setValue(config.global_config.is_auto_pick)
         self.isSpeedCard.switchButton.checkedChanged.connect(self.saveAutomationOptions)
         self.isAutoPickCard.switchButton.checkedChanged.connect(self.saveAutomationOptions)
+        self.bookBudgetWidget = QWidget(self.scrollWidget)
+        self.bookBudgetWidget.setObjectName("bookBudgetWidget")
+        self.bookBudgetWidget.setStyleSheet(
+            "#bookBudgetWidget { background: rgba(255,255,255,0.05);"
+            "border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; }"
+        )
+        budgetLayout = QHBoxLayout(self.bookBudgetWidget)
+        budgetLayout.setContentsMargins(16, 12, 16, 12)
+        self.bookBudgetSummaryLabel = QLabel(self.bookBudgetWidget)
+        self.bookBudgetSummaryLabel.setWordWrap(True)
+        budgetLayout.addWidget(self.bookBudgetSummaryLabel, 1)
+        self.openBookPlannerButton = PushSettingCard(
+            "打开规划器", FIF.CALENDAR, "进货书规划", "查看固定来源、站点和付费项目", self.bookBudgetWidget
+        )
+        self.openBookPlannerButton.setFixedWidth(360)
+        budgetLayout.addWidget(self.openBookPlannerButton)
+        self.bookBudgetWidget.setFixedHeight(108)
         self.liveOptimizeCard = PrimaryPushLoadCard(
             "实时计算",
             FIF.SYNC,
@@ -106,7 +125,7 @@ class TwoRunBusinessInterface(ScrollArea):
         )
         self.applyOptimizeCard.button.setEnabled(False)
         self.optimizerWidget = QWidget(self.scrollWidget)
-        self.optimizerWidget.setFixedHeight(225)
+        self.optimizerWidget.setFixedHeight(275)
         optimizerLayout = QGridLayout(self.optimizerWidget)
         optimizerLayout.setContentsMargins(16, 8, 16, 8)
 
@@ -120,18 +139,21 @@ class TwoRunBusinessInterface(ScrollArea):
             return spin
 
         self.optimizerCargoSpinBox = add_optimizer_spin(0, 0, "货舱", cfg.OptimizerCargo, 1, 5000)
-        self.optimizerBooksSpinBox = add_optimizer_spin(0, 1, "每周进货书", cfg.OptimizerBooks, 0, 50)
+        self.optimizerBooksSpinBox = add_optimizer_spin(0, 1, "每周进货书", cfg.OptimizerBooks, 0, 999)
         self.optimizerFatigueSpinBox = add_optimizer_spin(0, 2, "每周疲劳", cfg.OptimizerFatigue, 1, 20000)
         self.optimizerTradeLevelSpinBox = add_optimizer_spin(1, 0, "贸易等级", cfg.OptimizerTradeLevel, 0, 100)
         self.optimizerBargainSpinBox = add_optimizer_spin(1, 1, "砍价次数上限", cfg.OptimizerBargainTries, 0, 10)
         self.optimizerRaiseSpinBox = add_optimizer_spin(1, 2, "抬价次数上限", cfg.OptimizerRaiseTries, 0, 10)
+        self.passengerSeatsSpinBox = add_optimizer_spin(2, 0, "固定客位", cfg.PassengerSeats, 0, 1024)
+        self.passengerTripsSpinBox = add_optimizer_spin(2, 1, "每周客运次数", cfg.PassengerTripsPerWeek, 0, 100)
+        self.passengerRevenueSpinBox = add_optimizer_spin(2, 2, "满编单次收益(万)", cfg.PassengerReferenceRevenueWan, 0, 5000)
         self.optimizerResultLabel = QLabel("尚未计算新的周计划", self.optimizerWidget)
         self.optimizerResultLabel.setWordWrap(True)
-        optimizerLayout.addWidget(self.optimizerResultLabel, 2, 0, 1, 6)
+        optimizerLayout.addWidget(self.optimizerResultLabel, 3, 0, 1, 6)
         self.weeklyProgressLabel = QLabel("本周尚未套用计划", self.optimizerWidget)
         self.weeklyProgressLabel.setWordWrap(True)
         self.weeklyProgressLabel.setStyleSheet("padding-top: 6px; color: #35d7e8;")
-        optimizerLayout.addWidget(self.weeklyProgressLabel, 3, 0, 1, 6)
+        optimizerLayout.addWidget(self.weeklyProgressLabel, 4, 0, 1, 6)
         self.buyCountCard = SpinBoxSettingCard(
             cfg.BuyCount,
             FIF.ACCEPT,
@@ -264,6 +286,7 @@ class TwoRunBusinessInterface(ScrollArea):
         for item, label, maximum in role_fields:
             card = SpinBoxSettingCard(item, FIF.PEOPLE, label, label, spin_box_max=maximum, parent=self.roleGroup)
             self.roleGroup.viewLayout.addWidget(card)
+        self.refreshBookBudget()
 
     def __initLayout(self):
         self.titleLabel.move(36, 30)
@@ -274,10 +297,12 @@ class TwoRunBusinessInterface(ScrollArea):
         self.expandLayout.setContentsMargins(36, 0, 36, 0)
 
         self.expandLayout.addWidget(self.enableRunBusinessCard)
+        self.expandLayout.addWidget(self.scheduleCard)
         self.expandLayout.addWidget(self.isSpeedCard)
         self.expandLayout.addWidget(self.isAutoPickCard)
         self.expandLayout.addWidget(self.routeSelectionWidget)
         self.expandLayout.addWidget(self.routeTradeSettingsWidget)
+        self.expandLayout.addWidget(self.bookBudgetWidget)
         self.expandLayout.addWidget(self.liveOptimizeCard)
         self.expandLayout.addWidget(self.optimizerWidget)
         self.expandLayout.addWidget(self.applyOptimizeCard)
@@ -289,11 +314,23 @@ class TwoRunBusinessInterface(ScrollArea):
     def connectSignalToSlot(self):
         self.liveOptimizeCard.clicked.connect(self.calculateLiveRoute)
         self.applyOptimizeCard.clicked.connect(self.applyOptimizedRoute)
+        self.openBookPlannerButton.clicked.connect(lambda: signalBus.switchToCard.emit("BookPlannerInterface"))
+        signalBus.bookBudgetChanged.connect(self.refreshBookBudget)
 
     def saveAutomationOptions(self):
         config.global_config.is_speed = self.isSpeedCard.isChecked()
         config.global_config.is_auto_pick = self.isAutoPickCard.isChecked()
         config.save_config()
+
+    def refreshBookBudget(self, *_):
+        planned = int(cfg.OptimizerBooks.value)
+        self.optimizerBooksSpinBox.blockSignals(True)
+        self.optimizerBooksSpinBox.setValue(planned)
+        self.optimizerBooksSpinBox.blockSignals(False)
+        self.bookBudgetSummaryLabel.setText(
+            f"进货书规划器已同步：本周按 {planned} 本计算；当前背包兜底值 {int(cfg.InventoryBooks.value)} 本。\n"
+            "固定免费来源、购买站点和浮动付费项目请在独立规划器中维护。"
+        )
 
     def calculateLiveRoute(self):
         from core.services import OptimizationConfig, optimize_live_routes
@@ -324,6 +361,12 @@ class TwoRunBusinessInterface(ScrollArea):
             tax_cut_percent=float(cfg.OptimizerTaxCutPercent.value),
             extra_buy_percent=float(cfg.OptimizerExtraBuyPercent.value),
             drive_fatigue_reduction=int(cfg.OptimizerDriveFatigueReduction.value),
+            passenger_seats=self.passengerSeatsSpinBox.value(),
+            passenger_trips_per_week=self.passengerTripsSpinBox.value(),
+            passenger_reference_capacity=int(cfg.PassengerReferenceCapacity.value),
+            passenger_reference_trip_revenue=self.passengerRevenueSpinBox.value() * 10_000,
+            passenger_occupancy_percent=int(cfg.PassengerOccupancy.value),
+            passenger_fatigue_per_trip=int(cfg.PassengerFatiguePerTrip.value),
         )
         self.optimizerWorker = Worker(optimize_live_routes, config=config)
         self.optimizerWorker.result.connect(self.onOptimizationFinished)
@@ -341,7 +384,8 @@ class TwoRunBusinessInterface(ScrollArea):
             f"新计划（尚未套用）：{cycle[0]} → {cycle[1]} → {cycle[0]}\n"
             f"本周任务：完整往返 {result['repeats']} 次（去一趟再回来，算1次往返）\n"
             f"进货书安排：{batch_text}，合计使用 {result['books_used']} 本\n"
-            f"预计利润 {result['profit']:,}；预计总疲劳 {round(result['fatigue'])}；价格更新 {result['price_time']}"
+            f"货运 {result['cargo_profit']:,} + 固定客运 {result['passenger_profit']:,}"
+            f" = 周总利润 {result['combined_profit']:,}；预计总疲劳 {round(result['fatigue'])}；价格更新 {result['price_time']}"
         )
         self.applyOptimizeCard.button.setEnabled(True)
 
@@ -476,11 +520,12 @@ class TwoRunBusinessInterface(ScrollArea):
             "端点跑商",
             lambda: self._runBusinessTask(buy_city_name, sell_city_name),
             stop,
+            key="run_business",
         )
 
     def _runBusinessTask(self, buy_city_name: str, sell_city_name: str):
-        from auto.run_business import stop, two_city_run, two_city_weekly_run
-        from core.services import load_weekly_plan, progress_summary, remaining_batches
+        from auto.run_business import adaptive_weekly_run, two_city_run
+        from core.services import load_weekly_plan, progress_summary
         saved_plan = load_weekly_plan()
         weekly_plan_matches = saved_plan and saved_plan["cycle"] == [buy_city_name, sell_city_name]
         if weekly_plan_matches:
@@ -488,11 +533,7 @@ class TwoRunBusinessInterface(ScrollArea):
             if summary and summary["finished"]:
                 logger.info("本周跑商计划已经完成，跳过端点跑商")
                 return
-            return two_city_weekly_run(
-                buy_city_name=buy_city_name,
-                sell_city_name=sell_city_name,
-                execution_batches=remaining_batches(saved_plan),
-            )
+            return adaptive_weekly_run()
         return two_city_run(
             buy_city_name=buy_city_name,
             sell_city_name=sell_city_name,

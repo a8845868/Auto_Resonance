@@ -34,8 +34,7 @@ def connect(adb_port: Optional[int] = None):
 
     :param order: ADB端口
     """
-    global control, STOP
-    STOP = False
+    global control
     device = app.Global.device
     if device.is_mumu:
         control = NEMU()

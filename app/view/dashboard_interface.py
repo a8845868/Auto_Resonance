@@ -1,6 +1,6 @@
 """ALAS-inspired scheduler overview with integrated live log."""
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QSplitter, QVBoxLayout, QWidget
 from qfluentwidgets import FluentIcon, PlainTextEdit, PrimaryPushButton, PushButton, ScrollArea
 
@@ -11,6 +11,12 @@ from app.view.logger_interface import LoguruHandler
 from auto.resident_activity import run_resident_activity
 from auto.reward_collection import collect_rewards
 from core.logger import logger
+from core.services.task_schedule_state import (
+    completed_history,
+    is_task_due,
+    record_task_execution,
+    task_timing,
+)
 
 
 class StatusPanel(QFrame):
@@ -42,6 +48,12 @@ class DashboardInterface(ScrollArea):
         super().__init__(parent)
         self.queueWorker = None
         self.businessTaskProvider = lambda: None
+        self.additionalTaskProviders = []
+        self.schedulerArmed = False
+        self.scheduleTimer = QTimer(self)
+        self.scheduleTimer.setInterval(30_000)
+        self.scheduleTimer.timeout.connect(self._runDueTasks)
+        self.scheduleTimer.start()
         self.currentTask = None
         self.scrollWidget = QWidget(self)
         self.mainLayout = QVBoxLayout(self.scrollWidget)
@@ -81,9 +93,11 @@ class DashboardInterface(ScrollArea):
         scheduler_layout.addWidget(scheduler_title)
         self.runningPanel = StatusPanel("运行中", scheduler)
         self.pendingPanel = StatusPanel("队列中", scheduler)
-        self.finishedPanel = StatusPanel("本轮已完成", scheduler)
+        self.finishedPanel = StatusPanel("已完成", scheduler)
+        self.waitingPanel = StatusPanel("等待中", scheduler)
         scheduler_layout.addWidget(self.runningPanel)
         scheduler_layout.addWidget(self.pendingPanel)
+        scheduler_layout.addWidget(self.waitingPanel)
         scheduler_layout.addWidget(self.finishedPanel)
 
         logs = QWidget(splitter)
@@ -109,6 +123,7 @@ class DashboardInterface(ScrollArea):
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
         self.mainLayout.addWidget(splitter, 1)
+        self.refreshScheduleOverview()
 
     def _loadRecentLog(self):
         """Show recent history immediately, then continue with live log events."""
@@ -125,35 +140,80 @@ class DashboardInterface(ScrollArea):
     def setBusinessTaskProvider(self, provider):
         self.businessTaskProvider = provider
 
-    def _enabledTasks(self):
+    def addTaskProvider(self, provider):
+        self.additionalTaskProviders.append(provider)
+
+    def _allEnabledTasks(self):
         tasks = []
         if bool(cfg.enableResidentActivity.value):
-            task = cfg.residentActivityTask.value
+            activity_task = cfg.residentActivityTask.value
             reward = cfg.residentActivityFullRealmReward.value
-            tasks.append(QueuedTask("扫荡与全域整备", lambda: run_resident_activity(task, reward)))
+            tasks.append(QueuedTask(
+                "扫荡与全域整备",
+                lambda task=activity_task, full_reward=reward: run_resident_activity(task, full_reward),
+                key="resident_activity",
+            ))
         if bool(cfg.enableRewardCollection.value):
             daily = bool(cfg.autoCollectDailyActivity.value)
             manual = bool(cfg.autoCollectTravelManual.value)
             if daily or manual:
-                tasks.append(QueuedTask("领取任务奖励", lambda: collect_rewards(daily, manual)))
+                tasks.append(QueuedTask(
+                    "领取任务奖励",
+                    lambda: collect_rewards(daily, manual),
+                    key="reward_collection",
+                ))
         business = self.businessTaskProvider()
         if business:
             tasks.append(business)
+        for provider in self.additionalTaskProviders:
+            provided_task = provider()
+            if provided_task:
+                tasks.append(provided_task)
         return tasks
 
+    def _enabledTasks(self):
+        tasks = self._allEnabledTasks()
+        due = [task for task in tasks if not task.key or is_task_due(task.key)]
+        waiting = []
+        for task in tasks:
+            if task in due:
+                continue
+            next_run = task_timing(task.key).get("next_run", "").replace("T", " ")
+            waiting.append(f"{task.name}  ·  {next_run}")
+        self.waitingPanel.setTasks(waiting)
+        return due
+
+    def refreshScheduleOverview(self):
+        history = completed_history()
+        self._completed = [
+            f"{'完成' if item.get('status') == 'completed' else '失败/停止'}  "
+            f"{item.get('name', item.get('key', '任务'))}  ·  {item.get('last_run', '').replace('T', ' ')}"
+            for item in history[:12]
+        ]
+        self.finishedPanel.setTasks(self._completed)
+        waiting = []
+        for task in self._allEnabledTasks():
+            if task.key and not is_task_due(task.key):
+                next_run = task_timing(task.key).get("next_run", "").replace("T", " ")
+                waiting.append(f"{task.name}  ·  {next_run}")
+        self.waitingPanel.setTasks(waiting)
+
     def startTaskQueue(self):
+        self.schedulerArmed = True
         if self.queueWorker and self.queueWorker.isRunning():
             return
         tasks = self._enabledTasks()
         if not tasks:
-            self.pendingPanel.setTasks(["未启用可执行任务，请在左侧功能页开启"])
+            if self.waitingPanel.content.text() != "无任务":
+                self.pendingPanel.setTasks(["当前没有到期任务；可清空某项的下次执行时间以立即运行"])
+            else:
+                self.pendingPanel.setTasks(["未启用可执行任务，请在左侧功能页开启"])
             return
-        self.finishedPanel.setTasks([])
-        self._completed = []
         self.queueWorker = TaskQueueWorker(tasks, self)
         self.queueWorker.taskStarted.connect(self._taskStarted)
         self.queueWorker.taskFinished.connect(self._taskFinished)
         self.queueWorker.taskResult.connect(self._taskResult)
+        self.queueWorker.taskCompleted.connect(self._taskCompleted)
         self.queueWorker.queueChanged.connect(self.pendingPanel.setTasks)
         self.queueWorker.error.connect(lambda message: logger.error(message))
         self.queueWorker.finished.connect(self._queueFinished)
@@ -162,11 +222,19 @@ class DashboardInterface(ScrollArea):
         self.queueWorker.start()
 
     def stopTaskQueue(self):
+        self.schedulerArmed = False
         if self.queueWorker and self.queueWorker.isRunning():
             self.queueWorker.stop()
             self.stopButton.setEnabled(False)
             if self.currentTask == "扫荡与全域整备":
                 self.activityStateChanged.emit("■  已请求停止", "#f0a44b")
+
+    def _runDueTasks(self):
+        """Wake scheduled tasks without keeping the queue worker blocked."""
+        if not self.schedulerArmed or (self.queueWorker and self.queueWorker.isRunning()):
+            return
+        if any(not task.key or is_task_due(task.key) for task in self._allEnabledTasks()):
+            self.startTaskQueue()
 
     def _taskStarted(self, name, index, total):
         self.currentTask = name
@@ -175,8 +243,6 @@ class DashboardInterface(ScrollArea):
             self.activityStateChanged.emit("●  运行中：正在执行全域整备", "#43a5ff")
 
     def _taskFinished(self, name, succeeded):
-        self._completed.append(f"{'完成' if succeeded else '停止/失败'}  {name}")
-        self.finishedPanel.setTasks(self._completed)
         if name == "扫荡与全域整备":
             if succeeded:
                 self.activityStateChanged.emit("✓  扫荡方案执行完成", "#65c466")
@@ -189,15 +255,29 @@ class DashboardInterface(ScrollArea):
         details = "，".join(f"{task} {count} 次" for task, count in result.items())
         self.activityStateChanged.emit(f"✓  已完成：{details}", "#65c466")
 
+    def _taskCompleted(self, task, succeeded, result):
+        if not task.key:
+            return
+        record_task_execution(
+            task.key,
+            task.name,
+            succeeded,
+            task.next_run_after(succeeded),
+            result,
+        )
+        self.refreshScheduleOverview()
+
     def _queueFinished(self):
         self.runningPanel.setTasks([])
         self.pendingPanel.setTasks([])
         self.startButton.setEnabled(True)
         self.stopButton.setEnabled(False)
+        self.refreshScheduleOverview()
         self.queueWorker.deleteLater()
         self.queueWorker = None
 
     def shutdown(self):
+        self.scheduleTimer.stop()
         if self.queueWorker and self.queueWorker.isRunning():
             self.queueWorker.stop()
             self.queueWorker.wait(3000)
