@@ -19,6 +19,7 @@ class RunningBusinessConfig(QConfig):
 
     BuyCount = ConfigItem("RunBuy", "BuyCount", 0, None)
     UseSilverBranch = ConfigItem("RunBuy", "UseSilverBranch", False, None)
+    UseNegotiationBook = ConfigItem("RunBuy", "UseNegotiationBook", False, None)
     OptimizerCargo = ConfigItem("WeeklyOptimizer", "Cargo", 1121, None)
     OptimizerBooks = ConfigItem("WeeklyOptimizer", "Books", 10, None)
     OptimizerFatigue = ConfigItem("WeeklyOptimizer", "Fatigue", 5292, None)

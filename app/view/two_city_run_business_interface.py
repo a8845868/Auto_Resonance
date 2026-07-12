@@ -168,6 +168,13 @@ class TwoRunBusinessInterface(ScrollArea):
             configItem=cfg.UseSilverBranch,
             parent=self.scrollWidget,
         )
+        self.useNegotiationBookCard = SwitchSettingCard(
+            FIF.BOOK_SHELF,
+            "议价次数不足时使用议价书",
+            "卖货抬价次数耗尽后，消耗议价书重置次数并继续抬价到上限",
+            configItem=cfg.UseNegotiationBook,
+            parent=self.scrollWidget,
+        )
         self.routeSelectionWidget = QWidget(self.scrollWidget)
         self.routeSelectionWidget.setObjectName("routeSelectionWidget")
         # ExpandLayout cannot reliably infer the size hint of a plain QWidget
@@ -310,6 +317,7 @@ class TwoRunBusinessInterface(ScrollArea):
         self.expandLayout.addWidget(self.roleGroup)
         self.expandLayout.addWidget(self.buyCountCard)
         self.expandLayout.addWidget(self.useSilverBranchCard)
+        self.expandLayout.addWidget(self.useNegotiationBookCard)
 
     def connectSignalToSlot(self):
         self.liveOptimizeCard.clicked.connect(self.calculateLiveRoute)

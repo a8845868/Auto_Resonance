@@ -9,6 +9,7 @@ import time
 
 from loguru import logger
 
+from app.common.config import cfg
 from core.control.control import input_tap, screenshot
 from core.exception.exception_handling import get_excption
 from core.module.bgr import BGR
@@ -106,6 +107,7 @@ def click_bargain_button(num=0):
     """
     logger.info(f"议价次数: {num}")
     start = time.perf_counter()
+    book_resets = 0
     while time.perf_counter() - start < 15:
         if num <= 0:
             return True
@@ -117,7 +119,19 @@ def click_bargain_button(num=0):
             time.sleep(1.0)
         elif bgr == [251, 253, 253]:
             logger.info("抬价次数不足")
-            return False
+            if not bool(cfg.UseNegotiationBook.value):
+                logger.info("未开启使用议价书，停止本次出售")
+                return False
+            if book_resets >= 10:
+                logger.error("议价书重置已达安全上限，停止本次出售")
+                return False
+            if not reset_negotiation_with_book():
+                return False
+            book_resets += 1
+            # A reset re-enables the bargain button. Keep the remaining
+            # success target and continue until the two-success cap is met.
+            start = time.perf_counter()
+            continue
         elif bgr == [62, 63, 63]:
             logger.info("疲劳不足")
             exit_negotiation_safely()
@@ -133,6 +147,23 @@ def click_bargain_button(num=0):
             logger.info("抬价失败")
         # 等待降价动画消失
         wait_gbr((629, 101), BGR(30, 50, 65), BGR(40, 60, 75))
+    return False
+
+
+def reset_negotiation_with_book(timeout=6):
+    """Use one negotiation book from the exhausted-attempt prompt."""
+    logger.info("议价次数已耗尽，尝试使用议价书重新议价")
+    input_tap((1177, 461))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        texts = [item["text"] for item in screenshot().ocr()]
+        if any("重新议价" in text for text in texts):
+            input_tap((960, 512))
+            time.sleep(2)
+            logger.info("已使用议价书重置议价次数，继续抬价")
+            return True
+        time.sleep(0.5)
+    logger.error("未识别到使用议价书的重新议价确认框")
     return False
 
 
