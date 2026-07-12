@@ -180,13 +180,15 @@ class ResidentActivityAutomation:
         screen_marker: Optional[str] = None,
         attempts: int = 3,
     ) -> bool:
-        """Click a large action button without the normal random tap offset."""
+        """Click an action label precisely, with a measured fallback point."""
+        # ADB evidence shows the label center is the reliable hit target.  The
+        # visual center of buttons that also contain a cost row can miss.
         if self.driver.click_text(
             text, attempts=attempts, exact=True, precise=True
         ):
             return True
         if screen_marker and self.driver.has_text(screen_marker):
-            logger.warning(f"未识别到“{text}”文字，使用固定按钮中心兜底")
+            logger.warning(f"未识别到“{text}”文字，使用已验证坐标兜底")
             self.driver.tap(fallback, precise=True)
             self.driver.sleep(1)
             return True
@@ -199,14 +201,14 @@ class ResidentActivityAutomation:
             # be mistaken for the initial "扫荡" button on a stale dialog.
             if not self.click_action_button(
                 "扫荡",
-                fallback=(875, 490),
+                fallback=(871, 490),
                 screen_marker="难度选择",
                 attempts=2,
             ):
                 break
             if not self.click_action_button(
                 "开始扫荡",
-                fallback=(775, 525),
+                fallback=(771, 526),
                 screen_marker="选择队伍",
                 attempts=3,
             ):
@@ -247,20 +249,35 @@ class ResidentActivityAutomation:
         for _ in range(4):
             self.driver.swipe_right()
         for _ in range(7):
-            for item in self.driver.texts():
+            items = self.driver.texts()
+            for item in items:
                 if _matches(item["text"], task):
                     x, y = _center(item)
-                    # The challenge button is directly below the task title.
-                    self.driver.tap((x, min(y + 190, 606)), precise=True)
-                    self.driver.sleep(1)
-                    return True
+                    challenge_items = [
+                        candidate
+                        for candidate in items
+                        if _matches(candidate["text"], "进入挑战", exact=True)
+                    ]
+                    if challenge_items:
+                        challenge = min(
+                            challenge_items,
+                            key=lambda candidate: abs(_center(candidate)[0] - x),
+                        )
+                        target = _center(challenge)
+                    else:
+                        target = (x, min(y + 190, 606))
+                    for _ in range(2):
+                        self.driver.tap(target, precise=True)
+                        self.driver.sleep(1.2)
+                        if self.driver.has_text("扫荡"):
+                            return True
+                    logger.warning(f"已点击{task}的进入挑战，但未进入任务详情")
+                    return False
             self.driver.swipe_left()
         logger.error(f"未找到利刃围剿任务：{task}")
         return False
 
     def run_siege(self, task: str, safety_limit: int = 100) -> int:
-        if not self.driver.click_text("利刃围剿"):
-            return 0
         if not self.select_siege_task(task):
             return 0
 
@@ -295,8 +312,6 @@ class ResidentActivityAutomation:
         if not connect():
             raise RuntimeError("ADB连接失败")
         if not self.open_action_summary():
-            return {task: 0}
-        if not self.driver.click_text("利刃围剿"):
             return {task: 0}
         if not self.select_siege_task(task):
             return {task: 0}

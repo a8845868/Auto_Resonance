@@ -59,10 +59,24 @@ class ResidentActivityTests(unittest.TestCase):
         ))
 
     def test_select_siege_task_scrolls_and_taps_challenge_below_title(self):
-        driver = FakeDriver([[item("特殊订单")], [item("武器材质分析", 700, 410)]])
+        class TaskDriver(FakeDriver):
+            def tap(self, pos, **_):
+                super().tap(pos)
+                if pos[1] > 500:
+                    self.page = 2
+
+        driver = TaskDriver([
+            [item("特殊订单")],
+            [
+                item("武器材质分析", 700, 410),
+                item("进入挑战", 700, 606),
+                item("进入挑战", 1000, 606),
+            ],
+            [item("扫荡", 870, 490)],
+        ])
         automation = ResidentActivityAutomation(driver)
         self.assertTrue(automation.select_siege_task("武器材质分析"))
-        self.assertEqual(driver.taps[-1], (700, 600))
+        self.assertEqual(driver.taps[-1], (700, 606))
 
     def test_reward_attempts_uses_ocr_counter_and_safe_fallback(self):
         driver = FakeDriver([[item("本日可获取奖励次数 2/3")]])
@@ -116,11 +130,11 @@ class ResidentActivityTests(unittest.TestCase):
         self.assertTrue(
             automation.click_action_button(
                 "开始扫荡",
-                fallback=(775, 525),
+                fallback=(771, 526),
                 screen_marker="选择队伍",
             )
         )
-        self.assertEqual(driver.taps, [(775, 525)])
+        self.assertEqual(driver.taps, [(771, 526)])
 
     def test_academy_chest_selects_salvation_supply_stage(self):
         self.assertEqual(FULL_REALM_REWARDS["学会装备箱"], "特供·救世")
