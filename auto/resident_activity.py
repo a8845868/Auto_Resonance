@@ -54,6 +54,20 @@ FULL_REALM_REWARD_ICONS = {
 }
 REWARD_ICON_DIR = Path(__file__).resolve().parents[1] / "resources" / "rewards"
 
+# The emulator image is normalized to 1280 x 720.  Click the safe centre of
+# each complete button (measured from real ADB screenshots), never the centre
+# of an OCR text box.
+ENTER_CHALLENGE_Y = 610
+SWEEP_BUTTON_CENTER = (872, 501)
+START_SWEEP_BUTTON_CENTER = (772, 526)
+
+DETAIL_SWEEP_ROI = (780, 455, 970, 540)
+DETAIL_MARKER_ROI = (55, 645, 170, 705)
+TEAM_TITLE_ROI = (540, 130, 735, 200)
+TEAM_START_ROI = (635, 485, 930, 565)
+# The reward title animates between y≈119 and y≈222 on different frames.
+REWARD_TITLE_ROI = (500, 70, 820, 270)
+
 
 def _find_resonance_port(devices: list[EmulatorInfo]) -> Optional[int]:
     """Return the live MuMu instance explicitly named for Resonance."""
@@ -249,26 +263,58 @@ class ResidentActivityAutomation:
             self.driver.sleep(delay)
         return False
 
-    def click_action_button(
-        self,
+    @staticmethod
+    def text_in_roi(
+        items: list[dict],
         text: str,
+        roi: tuple[int, int, int, int],
         *,
-        fallback: tuple[int, int],
-        screen_marker: Optional[str] = None,
-        attempts: int = 3,
+        exact: bool = True,
     ) -> bool:
-        """Click an action label precisely, with a measured fallback point."""
-        # ADB evidence shows the label center is the reliable hit target.  The
-        # visual center of buttons that also contain a cost row can miss.
-        if self.driver.click_text(
-            text, attempts=attempts, exact=True, precise=True
-        ):
-            return True
-        if screen_marker and self.driver.has_text(screen_marker):
-            logger.warning(f"未识别到“{text}”文字，使用已验证坐标兜底")
-            self.driver.tap(fallback, precise=True)
-            self.driver.sleep(1)
-            return True
+        """Return true only when OCR text appears inside the expected area."""
+        x1, y1, x2, y2 = roi
+        for item in items:
+            x, y = _center(item)
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                if _matches(item["text"], text, exact=exact):
+                    return True
+        return False
+
+    def wait_for_screen(
+        self,
+        markers: tuple[tuple[str, tuple[int, int, int, int]], ...],
+        *,
+        attempts: int,
+        delay: float = 0.5,
+    ) -> bool:
+        """Confirm a screen using all of its region-locked OCR markers."""
+        for _ in range(attempts):
+            items = self.driver.texts()
+            if all(self.text_in_roi(items, text, roi) for text, roi in markers):
+                return True
+            self.driver.sleep(delay)
+        return False
+
+    def enter_first_visible_challenge(self) -> bool:
+        """Enter the leftmost visible card through its full blue button."""
+        for _ in range(3):
+            items = self.driver.texts()
+            candidates = [
+                item
+                for item in items
+                if _matches(item["text"], "进入挑战")
+                and 400 <= _center(item)[0] <= 1240
+                and 570 <= _center(item)[1] <= 635
+            ]
+            if candidates:
+                x = min(_center(item)[0] for item in candidates)
+                self.driver.tap((x, ENTER_CHALLENGE_Y), precise=True)
+                self.driver.sleep(1.2)
+                return self.wait_for_screen(
+                    (("扫荡", DETAIL_SWEEP_ROI), ("难度选择", DETAIL_MARKER_ROI)),
+                    attempts=6,
+                )
+            self.driver.sleep(0.5)
         return False
 
     def click_activity_tab(self, name: str) -> bool:
@@ -307,14 +353,16 @@ class ResidentActivityAutomation:
             for item in items
         )
         preview_ok = any(_matches(item["text"], "奖励预览") for item in items)
+        sweep_ok = self.text_in_roi(items, "扫荡", DETAIL_SWEEP_ROI)
         reward_ok, reward_score, scores = self.reward_matches(
             reward, (860, 320, 1210, 450)
         )
-        if title_ok and preview_ok and reward_ok:
+        if title_ok and preview_ok and reward_ok and sweep_ok:
             return True
         logger.warning(
             f"关卡详情校验失败：关卡名={title_ok}，奖励预览={preview_ok}，"
-            f"{reward}图标={reward_ok}({reward_score:.3f})，候选={scores}"
+            f"扫荡按钮={sweep_ok}，{reward}图标={reward_ok}({reward_score:.3f})，"
+            f"候选={scores}"
         )
         self.driver.tap((82, 36), precise=True)
         self.driver.sleep(1)
@@ -341,15 +389,14 @@ class ResidentActivityAutomation:
                 challenge_items = [
                     item
                     for item in items
-                    if _matches(item["text"], "进入挑战", exact=True)
+                    if _matches(item["text"], "进入挑战")
+                    and 570 <= _center(item)[1] <= 635
+                    and abs(_center(item)[0] - stage_x) <= 140
                 ]
                 if not challenge_items:
+                    logger.warning(f"{stage} 卡片下方未识别到对应的进入挑战按钮")
                     return False
-                challenge = min(
-                    challenge_items,
-                    key=lambda item: abs(_center(item)[0] - stage_x),
-                )
-                self.driver.tap(_center(challenge), precise=True)
+                self.driver.tap((stage_x, ENTER_CHALLENGE_Y), precise=True)
                 self.driver.sleep(1.2)
                 return self.verify_activity_detail(stage, reward)
             self.driver.swipe_left()
@@ -358,32 +405,30 @@ class ResidentActivityAutomation:
     def sweep_current_activity(self, max_attempts: int) -> int:
         completed = 0
         for _ in range(max_attempts):
-            # Strict four-screen state machine:
-            # 进入挑战 -> 扫荡 -> 开始扫荡 -> 获得物品.
-            if not self.wait_for_text("扫荡", attempts=3):
-                logger.info("未处于包含“扫荡”的任务详情页，停止")
-                break
-            # Use exact matching so the confirmation button "开始扫荡" cannot
-            # be mistaken for the initial "扫荡" button on a stale dialog.
-            if not self.click_action_button(
-                "扫荡",
-                fallback=(871, 490),
-                screen_marker="难度选择",
-                attempts=2,
+            # Strict region-locked state machine:
+            # detail -> team selection -> reward result.  A matching word in a
+            # background layer cannot unlock a click for another screen.
+            if not self.wait_for_screen(
+                (("扫荡", DETAIL_SWEEP_ROI), ("难度选择", DETAIL_MARKER_ROI)),
+                attempts=4,
             ):
+                logger.info("未确认处于关卡详情页，停止扫荡")
                 break
-            if not self.wait_for_text("开始扫荡", attempts=6):
+
+            self.driver.tap(SWEEP_BUTTON_CENTER, precise=True)
+            self.driver.sleep(0.8)
+            if not self.wait_for_screen(
+                (("选择队伍", TEAM_TITLE_ROI), ("开始扫荡", TEAM_START_ROI)),
+                attempts=8,
+            ):
                 logger.warning("点击“扫荡”后未进入队伍选择页，本次不计入完成")
                 break
-            if not self.click_action_button(
-                "开始扫荡",
-                fallback=(771, 526),
-                screen_marker="选择队伍",
-                attempts=3,
+
+            self.driver.tap(START_SWEEP_BUTTON_CENTER, precise=True)
+            self.driver.sleep(0.8)
+            if not self.wait_for_screen(
+                (("获得物品", REWARD_TITLE_ROI),), attempts=14
             ):
-                logger.warning("已打开扫荡队伍选择，但未找到“开始扫荡”，本次不计入完成")
-                break
-            if not self.wait_for_text("获得物品", attempts=12):
                 logger.warning("点击“开始扫荡”后未出现“获得物品”，本次不计入完成")
                 break
             self.driver.dismiss_result()
@@ -403,9 +448,7 @@ class ResidentActivityAutomation:
         if stage:
             entered = bool(reward) and self.select_activity_stage(stage, reward)
         else:
-            entered = self.driver.click_text(
-                "进入挑战", attempts=3, exact=True, precise=True
-            ) and self.wait_for_text("扫荡", attempts=5)
+            entered = self.enter_first_visible_challenge()
         if not entered:
             logger.warning(f"{name}没有可进入的挑战")
             return 0
@@ -440,13 +483,19 @@ class ResidentActivityAutomation:
                             challenge_items,
                             key=lambda candidate: abs(_center(candidate)[0] - x),
                         )
-                        target = _center(challenge)
+                        target = (_center(challenge)[0], ENTER_CHALLENGE_Y)
                     else:
-                        target = (x, min(y + 190, 606))
+                        target = (x, ENTER_CHALLENGE_Y)
                     for _ in range(2):
                         self.driver.tap(target, precise=True)
                         self.driver.sleep(1.2)
-                        if self.driver.has_text("扫荡"):
+                        if self.wait_for_screen(
+                            (
+                                ("扫荡", DETAIL_SWEEP_ROI),
+                                ("难度选择", DETAIL_MARKER_ROI),
+                            ),
+                            attempts=3,
+                        ):
                             return True
                     logger.warning(f"已点击{task}的进入挑战，但未进入任务详情")
                     return False
