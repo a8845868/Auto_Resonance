@@ -62,6 +62,30 @@ def calculate_station_differences(station_map_data: dict):
 # 计算站点之间的差值
 STATION_DIFFERENCES = calculate_station_differences(STATION_POS_DATA)
 
+# CityPosData and the /2.5 gesture calibration were recorded at the default
+# (middle) world-map zoom. The game remembers the last zoom level, so a route
+# started at minimum zoom can overshoot by several screens.
+WORLD_MAP_OPEN_POS = (1201, 666)
+WORLD_MAP_BACK_POS = (84, 40)
+WORLD_MAP_DEFAULT_ZOOM_POS = (1151, 465)
+
+
+def _open_world_map_at_default_zoom():
+    input_tap(WORLD_MAP_OPEN_POS)
+    time.sleep(0.6)
+    wait_stopped(threshold=8500000, timeout=8)
+
+    input_tap(WORLD_MAP_DEFAULT_ZOOM_POS)
+    time.sleep(0.8)
+
+    # Zooming keeps the previous viewport centre. Reopening makes the game
+    # focus the current station again and restores a stable coordinate origin.
+    input_tap(WORLD_MAP_BACK_POS)
+    time.sleep(0.8)
+    input_tap(WORLD_MAP_OPEN_POS)
+    time.sleep(0.8)
+    wait_stopped(threshold=8500000, timeout=8)
+
 
 def click_station(name: str, cur_station: Optional[str] = None):
     """
@@ -89,11 +113,7 @@ def click_station(name: str, cur_station: Optional[str] = None):
         raise ValueError(f"未找到站点 {name} 的图片")
     city_differences = STATION_DIFFERENCES.get((station, name))
     if city_differences:
-        # 点击地图
-        input_tap((1201, 666))
-        # 等待地图打开
-        time.sleep(0.5)
-        wait_stopped(threshold=7100000)
+        _open_world_map_at_default_zoom()
 
         # The current game version does not place the current station at the
         # exact screen center.  Locate its visible label and pan relative to
@@ -126,11 +146,25 @@ def click_station(name: str, cur_station: Optional[str] = None):
         logger.info(
             f"地图分段拖动: 总位移({move_x:.0f}, {move_y:.0f}), {steps} 段"
         )
-        for _ in range(steps):
+        result = None
+        target_visible = False
+        for step in range(steps):
             start = (gesture_cx - step_x / 2, gesture_cy - step_y / 2)
             end = (gesture_cx + step_x / 2, gesture_cy + step_y / 2)
             input_swipe(start, end, swipe_time=450)
-            time.sleep(0.15)
+            time.sleep(0.45)
+
+            # ADB/NEMU gestures have momentum. Stop as soon as the destination
+            # enters view instead of blindly executing all calculated swipes.
+            probe = screenshot()
+            probe.crop_image((0, 0), (1280, 654))
+            result = probe.match_template(
+                RESOURCES_PATH / "stations" / STATION_NAME2PNG[name], 0.95
+            )
+            if result or any(name in item["text"] for item in probe.ocr()):
+                target_visible = True
+                logger.info(f"目标站点已在第 {step + 1}/{steps} 段拖动后进入视野")
+                break
         # 向回拖动避免画面长时间移动
         input_swipe(
             (source_x, source_y), (source_x - 10, source_y - 10), swipe_time=500
@@ -139,11 +173,12 @@ def click_station(name: str, cur_station: Optional[str] = None):
         # frame difference is normally around 7.3M-8.1M.
         wait_stopped(threshold=8500000, timeout=12)  # 等待滑动完成
 
-        image = screenshot()
-        image.crop_image((0, 0), (1280, 654))
-        result = image.match_template(
-            RESOURCES_PATH / "stations" / STATION_NAME2PNG[name], 0.95
-        )
+        if not result and not target_visible:
+            image = screenshot()
+            image.crop_image((0, 0), (1280, 654))
+            result = image.match_template(
+                RESOURCES_PATH / "stations" / STATION_NAME2PNG[name], 0.95
+            )
         if result:
             # 点击站点
             input_tap(result.loc)
