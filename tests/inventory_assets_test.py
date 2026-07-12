@@ -1,8 +1,15 @@
+from auto.inventory import _is_train_in_transit
 from core.services.inventory_assets import classify_asset, merge_assets, parse_amount, parse_ocr_assets
 
 
 def box(x, y, text):
     return {"text": text, "position": ((x, y), (x + 80, y), (x + 80, y + 25), (x, y + 25))}
+
+
+def test_train_in_transit_detection_blocks_inventory_navigation():
+    assert _is_train_in_transit([{"text": "自动巡航中"}, {"text": "剩余行程：830km"}])
+    assert _is_train_in_transit([{"text": "目的地：武林源"}, {"text": "车厢内"}])
+    assert not _is_train_in_transit([{"text": "目的地"}, {"text": "资产"}])
 
 
 def test_parse_amount_supports_game_abbreviations():

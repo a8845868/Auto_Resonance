@@ -21,6 +21,16 @@ def _center(item: dict) -> tuple[float, float]:
     return ((position[0][0] + position[2][0]) / 2, (position[0][1] + position[2][1]) / 2)
 
 
+def _is_train_in_transit(items: list[dict]) -> bool:
+    """Detect the driving HUD, where station-only menus cannot be opened."""
+    texts = [str(item.get("text", "")).replace(" ", "") for item in items]
+    if any(marker in text for marker in ("自动巡航", "剩余行程") for text in texts):
+        return True
+    has_destination = any("目的地" in text for text in texts)
+    has_carriage = any("车厢内" in text or "副官室" in text for text in texts)
+    return has_destination and has_carriage
+
+
 def _home_iron_currency(items: list[dict]) -> list[Asset]:
     """The home screen labels the primary balance as `资产`, not `铁盟币`."""
     label = next((item for item in items if item["text"].strip() == "资产"), None)
@@ -169,8 +179,13 @@ def scan_inventory_assets(max_pages: int = 6) -> list[Asset]:
     """Scan visible currencies and backpack pages; duplicates keep the largest count."""
     if not connect():
         raise RuntimeError("ADB 连接失败，请先在“ADB信息”中确认模拟器连接")
+    initial_items = screenshot().ocr()
+    if _is_train_in_transit(initial_items):
+        raise RuntimeError("列车正在行驶，当前无法打开资产页面；请到站后重新扫描")
+    should_restore_home = False
     try:
-        go_home()
+        if not go_home():
+            raise RuntimeError("无法返回站点主画面；请确认列车已到站后重试")
         # The home screen contains many unrelated numbers; only retain known currency-like rows.
         home_items = screenshot().ocr()
         currencies = _home_iron_currency(home_items)
@@ -178,6 +193,7 @@ def scan_inventory_assets(max_pages: int = 6) -> list[Asset]:
         snapshots = [currencies]
         if not _open_assets_entry():
             raise RuntimeError("未找到游戏主界面的资产入口图标；请停留在主界面后重试")
+        should_restore_home = True
         time.sleep(1.2)
         first_frame = screenshot()
         first_ocr = first_frame.ocr()
@@ -202,10 +218,11 @@ def scan_inventory_assets(max_pages: int = 6) -> list[Asset]:
         logger.info(f"资产扫描完成：识别到 {len(assets)} 类物品")
         return assets
     finally:
-        try:
-            go_home()
-        except Exception:
-            logger.warning("资产扫描结束后返回主界面失败")
+        if should_restore_home:
+            try:
+                go_home()
+            except Exception:
+                logger.warning("资产扫描结束后返回主界面失败")
 
 
 def _parse_count(text: str) -> int | None:
