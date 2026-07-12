@@ -13,7 +13,7 @@ from loguru import logger
 from auto.module.strength import can_afford_fatigue, prepare_negotiation
 from auto.module.dispatch import collect_dispatch_rewards
 from auto.run_business.buy import buy_business
-from auto.run_business.sell import sell_business
+from auto.run_business.sell import sell_business, sell_existing_cargo
 from core.control.control import connect, input_tap, screenshot
 from core.control.control import is_stopped, stop as stop_control
 from core.exception.exceptions import StopExecution
@@ -125,6 +125,18 @@ def run(routes: RoutesModel, recovery_attempts: int = 2):
         return False
     if routes.city_data[0].sell_city_name == city_name:
         routes.city_data = [routes.city_data[1], routes.city_data[0]]
+    # Interrupted runs can leave cargo from the other city in the warehouse.
+    # Inspect the exchange sell page before buying, clear what is sellable in
+    # the current city, then restock and depart as usual.
+    logger.info(
+        f"Preflight warehouse check in {city_name}: "
+        "sell residual cargo before restocking"
+    )
+    if not go_business("sell"):
+        return False
+    if not sell_existing_cargo():
+        logger.error("Failed to clear residual cargo; stop before restocking")
+        return False
     for city in routes.city_data:
         logger.info(f"{city.buy_city_name}->{city.sell_city_name}")
         if not click_station(city.buy_city_name, cur_station=city_name).wait():

@@ -12,11 +12,12 @@ from loguru import logger
 from core.control.control import input_tap, screenshot
 from core.exception.exception_handling import get_excption
 from core.module.bgr import BGR
+from core.preset import go_home
 from core.preset.control import wait_gbr
 from auto.module.strength import exit_negotiation_safely
 
 
-def sell_business(num=0):
+def sell_business(num=0, empty_ok=False):
     """
     说明:
         出售所有商品
@@ -34,17 +35,33 @@ def sell_business(num=0):
             time.sleep(0.5)
             break
     if is_empty_goods():
+        if empty_ok:
+            logger.info("No sellable cargo detected; continue with restocking")
+            go_home()
+            return True
         logger.error("检测到未成功出售物品")
         return False
     else:
         click_bargain_button(num)
-        click_sell_button()
+        if not click_sell_button():
+            logger.error("Sell confirmation did not complete")
+            return False
         time.sleep(0.5)
         input_tap((896, 676))
         time.sleep(0.5)
         input_tap((896, 676))
         input_tap((896, 676))
         return True
+
+
+def sell_existing_cargo(num=0):
+    """Sell cargo currently available in the exchange, if any.
+
+    The sell page is the source of truth for the warehouse: selecting all
+    exposes every item that can be sold in the current city. An empty
+    selection is a valid clean-warehouse result during the preflight check.
+    """
+    return sell_business(num=num, empty_ok=True)
 
 
 def is_empty_goods():
