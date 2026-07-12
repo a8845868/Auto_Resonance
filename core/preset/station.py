@@ -13,10 +13,16 @@ from core.control.control import input_tap, screenshot
 from core.model.config import config
 from core.module.bgr import BGR
 from core.preset.control import go_home
+from core.services.train_eta import (
+    TrainArrivalEstimator,
+    parse_remaining_distance,
+    polling_interval,
+)
 from core.utils.utils import RESOURCES_PATH
 
 FIGHT_TIME = 300
 MAP_WAIT_TIME = 3000
+DISTANCE_OCR_INTERVAL = 15.0
 
 # pick_mask = cv.imread("resources/mask/pick_mask.png", cv.IMREAD_GRAYSCALE)
 # _, pick_mask = cv.threshold(pick_mask, 128, 255, cv.THRESH_BINARY)
@@ -51,7 +57,11 @@ class STATION:
             return True
         logger.info("进入行车监听")
         start = time.perf_counter()
+        estimator = TrainArrivalEstimator()
+        eta_seconds = None
+        last_distance_ocr = float("-inf")
         while time.perf_counter() - start < MAP_WAIT_TIME:
+            now = time.perf_counter()
             image = screenshot()
             # 0-2攻击检测，3-4拦截检测
             attack_bgrs = image.get_bgrs(
@@ -64,6 +74,19 @@ class STATION:
             logger.debug(f"行车攻击检测: {attack_bgrs}")
             logger.debug(f"行车检测: {reach_bgrs}")
             logger.debug(f"是否进站检测: {run_bgr}")
+            if now - last_distance_ocr >= DISTANCE_OCR_INTERVAL:
+                last_distance_ocr = now
+                distance = parse_remaining_distance(image.ocr())
+                if distance is not None:
+                    eta_seconds = estimator.observe(distance, now)
+                    if eta_seconds is None:
+                        logger.info(f"剩余行程 {distance:.1f}km，正在采集速度样本")
+                    else:
+                        logger.info(
+                            f"剩余行程 {distance:.1f}km，平均速度 "
+                            f"{estimator.speed * 3600:.1f}km/h，预计 "
+                            f"{eta_seconds:.0f} 秒到站"
+                        )
             if (
                 BGR(8, 168, 234) <= attack_bgrs[0] <= BGR(10, 171, 245)
                 and BGR(8, 168, 234) <= attack_bgrs[1] <= BGR(10, 171, 245)
@@ -98,7 +121,11 @@ class STATION:
                 time.sleep(0.5)
             if config.global_config.is_auto_pick:
                 input_tap((781, 484))  # 捡垃圾
-            time.sleep(0.3)
+            time.sleep(
+                polling_interval(
+                    eta_seconds, auto_pick=config.global_config.is_auto_pick
+                )
+            )
         logger.error("站点超时")
         return False
 
