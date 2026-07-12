@@ -53,6 +53,39 @@ class FakeDriver:
         pass
 
 
+class SweepFlowDriver(FakeDriver):
+    def __init__(self, max_sweeps=1, team_available=True):
+        super().__init__([[]])
+        self.state = "detail"
+        self.completed = 0
+        self.max_sweeps = max_sweeps
+        self.team_available = team_available
+
+    def texts(self):
+        labels = {
+            "detail": [item("扫荡")],
+            "team": [item("开始扫荡")] if self.team_available else [],
+            "reward": [item("获得物品")],
+        }
+        return labels[self.state]
+
+    def click_text(self, text, **_):
+        self.clicked.append(text)
+        if text == "扫荡" and self.state == "detail":
+            if self.completed >= self.max_sweeps:
+                return False
+            self.state = "team"
+            return True
+        if text == "开始扫荡" and self.state == "team" and self.team_available:
+            self.state = "reward"
+            return True
+        return False
+
+    def dismiss_result(self):
+        self.completed += 1
+        self.state = "detail"
+
+
 class ResidentActivityTests(unittest.TestCase):
     def test_resonance_port_is_selected_from_multiple_mumu_instances(self):
         devices = [
@@ -94,14 +127,7 @@ class ResidentActivityTests(unittest.TestCase):
         self.assertEqual(ResidentActivityAutomation(driver)._reward_attempts(), 3)
 
     def test_sweep_stops_when_initial_button_disappears(self):
-        class SweepDriver(FakeDriver):
-            def click_text(self, text, **_):
-                self.clicked.append(text)
-                if text == "开始扫荡":
-                    return True
-                return self.clicked.count("扫荡") <= 2
-
-        driver = SweepDriver([[]])
+        driver = SweepFlowDriver(max_sweeps=2)
         self.assertEqual(ResidentActivityAutomation(driver).sweep_current_activity(3), 2)
         self.assertEqual(
             driver.clicked,
@@ -109,24 +135,14 @@ class ResidentActivityTests(unittest.TestCase):
         )
 
     def test_single_sweep_has_hard_limit_of_one(self):
-        class SweepDriver(FakeDriver):
-            def click_text(self, text, **_):
-                self.clicked.append(text)
-                return True
-
-        driver = SweepDriver([[]])
+        driver = SweepFlowDriver(max_sweeps=3)
         self.assertEqual(ResidentActivityAutomation(driver).sweep_current_activity(1), 1)
         self.assertEqual(driver.clicked, ["扫荡", "开始扫荡"])
 
     def test_sweep_is_not_counted_when_team_confirmation_is_missing(self):
-        class SweepDriver(FakeDriver):
-            def click_text(self, text, **_):
-                self.clicked.append(text)
-                return text == "扫荡"
-
-        driver = SweepDriver([[]])
+        driver = SweepFlowDriver(team_available=False)
         self.assertEqual(ResidentActivityAutomation(driver).sweep_current_activity(1), 0)
-        self.assertEqual(driver.clicked, ["扫荡", "开始扫荡"])
+        self.assertEqual(driver.clicked, ["扫荡"])
 
     def test_action_button_uses_precise_fixed_center_when_ocr_misses(self):
         class FallbackDriver(FakeDriver):
@@ -154,6 +170,7 @@ class ResidentActivityTests(unittest.TestCase):
             item("进入挑战"),
             item("扫荡"),
             item("开始扫荡"),
+            item("获得物品"),
         ]])
         completed = ResidentActivityAutomation(driver).run_limited_activity(
             "全境特供", stage=FULL_REALM_REWARDS["学会装备箱"]

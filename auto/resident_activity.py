@@ -195,6 +195,15 @@ class ResidentActivityAutomation:
                 return int(match.group(1))
         return fallback
 
+    def wait_for_text(
+        self, text: str, *, attempts: int = 10, delay: float = 0.5
+    ) -> bool:
+        for _ in range(attempts):
+            if self.driver.has_text(text):
+                return True
+            self.driver.sleep(delay)
+        return False
+
     def click_action_button(
         self,
         text: str,
@@ -220,6 +229,11 @@ class ResidentActivityAutomation:
     def sweep_current_activity(self, max_attempts: int) -> int:
         completed = 0
         for _ in range(max_attempts):
+            # Strict four-screen state machine:
+            # 进入挑战 -> 扫荡 -> 开始扫荡 -> 获得物品.
+            if not self.wait_for_text("扫荡", attempts=3):
+                logger.info("未处于包含“扫荡”的任务详情页，停止")
+                break
             # Use exact matching so the confirmation button "开始扫荡" cannot
             # be mistaken for the initial "扫荡" button on a stale dialog.
             if not self.click_action_button(
@@ -229,6 +243,9 @@ class ResidentActivityAutomation:
                 attempts=2,
             ):
                 break
+            if not self.wait_for_text("开始扫荡", attempts=6):
+                logger.warning("点击“扫荡”后未进入队伍选择页，本次不计入完成")
+                break
             if not self.click_action_button(
                 "开始扫荡",
                 fallback=(771, 526),
@@ -237,7 +254,9 @@ class ResidentActivityAutomation:
             ):
                 logger.warning("已打开扫荡队伍选择，但未找到“开始扫荡”，本次不计入完成")
                 break
-            self.driver.sleep(1.5)
+            if not self.wait_for_text("获得物品", attempts=12):
+                logger.warning("点击“开始扫荡”后未出现“获得物品”，本次不计入完成")
+                break
             self.driver.dismiss_result()
             completed += 1
         return completed
