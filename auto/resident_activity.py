@@ -226,6 +226,49 @@ class ResidentActivityAutomation:
             return True
         return False
 
+    def click_activity_tab(self, name: str) -> bool:
+        """Click the left navigation tab, not the duplicate page heading."""
+        matches = [
+            item
+            for item in self.driver.texts()
+            if _matches(item["text"], name, exact=True)
+        ]
+        if not matches:
+            return False
+        target = min(matches, key=lambda item: _center(item)[0])
+        self.driver.tap(_center(target), precise=True)
+        self.driver.sleep(1)
+        return True
+
+    def select_activity_stage(self, stage: str) -> bool:
+        """Click the challenge button belonging to the named reward stage."""
+        for _ in range(7):
+            items = self.driver.texts()
+            stage_items = [
+                item for item in items if _matches(item["text"], stage, exact=True)
+            ]
+            if stage_items:
+                stage_x, _ = _center(stage_items[0])
+                challenge_items = [
+                    item
+                    for item in items
+                    if _matches(item["text"], "进入挑战", exact=True)
+                ]
+                if not challenge_items:
+                    return False
+                challenge = min(
+                    challenge_items,
+                    key=lambda item: abs(_center(item)[0] - stage_x),
+                )
+                for _ in range(2):
+                    self.driver.tap(_center(challenge), precise=True)
+                    self.driver.sleep(1.2)
+                    if self.driver.has_text("扫荡"):
+                        return True
+                return False
+            self.driver.swipe_left()
+        return False
+
     def sweep_current_activity(self, max_attempts: int) -> int:
         completed = 0
         for _ in range(max_attempts):
@@ -262,21 +305,20 @@ class ResidentActivityAutomation:
         return completed
 
     def run_limited_activity(self, name: str, stage: Optional[str] = None) -> int:
-        if not self.driver.click_text(name):
+        if not self.click_activity_tab(name):
             logger.warning(f"未找到活动：{name}")
             return 0
         attempts = self._reward_attempts()
         if attempts == 0:
             logger.info(f"{name}次数已用完")
             return 0
-        if stage and not self.driver.click_text(stage, attempts=3):
-            logger.warning(f"{name}未找到目标奖励关卡：{stage}")
-            return 0
-        # The selected limited activity opens its stage list. Enter the visible
-        # challenge and then use the sweep button on the detail screen.
-        if not self.driver.click_text(
-            "进入挑战", attempts=3, exact=True, precise=True
-        ):
+        if stage:
+            entered = self.select_activity_stage(stage)
+        else:
+            entered = self.driver.click_text(
+                "进入挑战", attempts=3, exact=True, precise=True
+            ) and self.wait_for_text("扫荡", attempts=5)
+        if not entered:
             logger.warning(f"{name}没有可进入的挑战")
             return 0
         completed = self.sweep_current_activity(attempts)

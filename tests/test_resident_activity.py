@@ -176,7 +176,19 @@ class ResidentActivityTests(unittest.TestCase):
             "全境特供", stage=FULL_REALM_REWARDS["学会装备箱"]
         )
         self.assertEqual(completed, 1)
-        self.assertIn("特供·救世", driver.clicked)
+        self.assertTrue(driver.taps)
+
+    def test_supply_stage_uses_nearest_challenge_button(self):
+        driver = FakeDriver([[
+            item("特供·救世", 700, 420),
+            item("进入挑战", 420, 606),
+            item("进入挑战", 700, 606),
+            item("扫荡", 870, 490),
+        ]])
+        self.assertTrue(
+            ResidentActivityAutomation(driver).select_activity_stage("特供·救世")
+        )
+        self.assertEqual(driver.taps[-1], (700, 606))
 
 
 if __name__ == "__main__":
