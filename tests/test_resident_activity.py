@@ -25,7 +25,7 @@ class FakeDriver:
     def texts(self):
         return self.pages[self.page]
 
-    def tap(self, pos):
+    def tap(self, pos, **_):
         self.taps.append(pos)
 
     def sleep(self, _):
@@ -39,6 +39,9 @@ class FakeDriver:
 
     def click_text(self, text, **_):
         self.clicked.append(text)
+        return any(_matches(entry["text"], text) for entry in self.texts())
+
+    def has_text(self, text):
         return any(_matches(entry["text"], text) for entry in self.texts())
 
     def go_home(self):
@@ -101,6 +104,23 @@ class ResidentActivityTests(unittest.TestCase):
         driver = SweepDriver([[]])
         self.assertEqual(ResidentActivityAutomation(driver).sweep_current_activity(1), 0)
         self.assertEqual(driver.clicked, ["扫荡", "开始扫荡"])
+
+    def test_action_button_uses_precise_fixed_center_when_ocr_misses(self):
+        class FallbackDriver(FakeDriver):
+            def click_text(self, text, **_):
+                self.clicked.append(text)
+                return False
+
+        driver = FallbackDriver([[item("选择队伍")]])
+        automation = ResidentActivityAutomation(driver)
+        self.assertTrue(
+            automation.click_action_button(
+                "开始扫荡",
+                fallback=(775, 525),
+                screen_marker="选择队伍",
+            )
+        )
+        self.assertEqual(driver.taps, [(775, 525)])
 
     def test_academy_chest_selects_salvation_supply_stage(self):
         self.assertEqual(FULL_REALM_REWARDS["学会装备箱"], "特供·救世")

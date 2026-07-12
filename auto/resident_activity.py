@@ -78,8 +78,8 @@ class ScreenDriver:
     def texts(self) -> list[dict]:
         return screenshot().ocr()
 
-    def tap(self, pos: tuple[int, int]) -> None:
-        input_tap(pos)
+    def tap(self, pos: tuple[int, int], *, precise: bool = False) -> None:
+        input_tap(pos, random_offset=not precise)
 
     def swipe_left(self) -> None:
         input_swipe((1100, 450), (500, 450), swipe_time=650)
@@ -96,12 +96,13 @@ class ScreenDriver:
         offset: tuple[int, int] = (0, 0),
         attempts: int = 5,
         exact: bool = False,
+        precise: bool = False,
     ) -> bool:
         for _ in range(attempts):
             for item in self.texts():
                 if _matches(item["text"], text, exact=exact):
                     x, y = _center(item)
-                    self.tap((x + offset[0], y + offset[1]))
+                    self.tap((x + offset[0], y + offset[1]), precise=precise)
                     self.sleep(1)
                     return True
             self.sleep(0.5)
@@ -171,14 +172,44 @@ class ResidentActivityAutomation:
                 return int(match.group(1))
         return fallback
 
+    def click_action_button(
+        self,
+        text: str,
+        *,
+        fallback: tuple[int, int],
+        screen_marker: Optional[str] = None,
+        attempts: int = 3,
+    ) -> bool:
+        """Click a large action button without the normal random tap offset."""
+        if self.driver.click_text(
+            text, attempts=attempts, exact=True, precise=True
+        ):
+            return True
+        if screen_marker and self.driver.has_text(screen_marker):
+            logger.warning(f"未识别到“{text}”文字，使用固定按钮中心兜底")
+            self.driver.tap(fallback, precise=True)
+            self.driver.sleep(1)
+            return True
+        return False
+
     def sweep_current_activity(self, max_attempts: int) -> int:
         completed = 0
         for _ in range(max_attempts):
             # Use exact matching so the confirmation button "开始扫荡" cannot
             # be mistaken for the initial "扫荡" button on a stale dialog.
-            if not self.driver.click_text("扫荡", attempts=2, exact=True):
+            if not self.click_action_button(
+                "扫荡",
+                fallback=(875, 490),
+                screen_marker="难度选择",
+                attempts=2,
+            ):
                 break
-            if not self.driver.click_text("开始扫荡", attempts=3, exact=True):
+            if not self.click_action_button(
+                "开始扫荡",
+                fallback=(775, 525),
+                screen_marker="选择队伍",
+                attempts=3,
+            ):
                 logger.warning("已打开扫荡队伍选择，但未找到“开始扫荡”，本次不计入完成")
                 break
             self.driver.sleep(1.5)
@@ -199,7 +230,9 @@ class ResidentActivityAutomation:
             return 0
         # The selected limited activity opens its stage list. Enter the visible
         # challenge and then use the sweep button on the detail screen.
-        if not self.driver.click_text("进入挑战", attempts=3):
+        if not self.driver.click_text(
+            "进入挑战", attempts=3, exact=True, precise=True
+        ):
             logger.warning(f"{name}没有可进入的挑战")
             return 0
         completed = self.sweep_current_activity(attempts)
@@ -218,7 +251,7 @@ class ResidentActivityAutomation:
                 if _matches(item["text"], task):
                     x, y = _center(item)
                     # The challenge button is directly below the task title.
-                    self.driver.tap((x, min(y + 190, 620)))
+                    self.driver.tap((x, min(y + 190, 606)), precise=True)
                     self.driver.sleep(1)
                     return True
             self.driver.swipe_left()
