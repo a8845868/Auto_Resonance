@@ -64,8 +64,12 @@ def save_weekly_plan(result: dict) -> dict[str, Any]:
         "completed_books": completed_books,
         "books_total": int(result.get("books_used", 0)),
         "cycle_fatigue": float(result.get("cycle_fatigue", 0)),
-        "expected_profit": int(result.get("profit", 0)),
+        "expected_profit": int(result.get("combined_profit", result.get("profit", 0))),
+        "cargo_profit": int(result.get("cargo_profit", result.get("profit", 0))),
+        "passenger_profit": int(result.get("passenger_profit", 0)),
+        "passenger_plan": result.get("passenger_plan", {}),
         "price_time": result.get("price_time", ""),
+        "optimizer_config": result.get("optimizer_config", {}),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
     _write_state(state)

@@ -33,6 +33,10 @@ from app.components.update_message_box import UpdateMessageBox
 from app.utils.constants import ICON_PATH, ROOT_PATH
 from app.utils.utils import is_chinese
 from app.view.two_city_run_business_interface import TwoRunBusinessInterface
+from app.view.book_planner_interface import BookPlannerInterface
+from app.view.inventory_interface import InventoryInterface
+from app.view.gacha_planner_interface import GachaPlannerInterface
+from app.view.passenger_planner_interface import PassengerPlannerInterface
 from core.utils.update.base_update_utils import UpdateStatus
 from core.utils.update.mirror_update_utils import MirrorUpdateUtils
 
@@ -78,6 +82,10 @@ class MainWindow(FluentWindow):
         self.addSubInterface(self.homeInterface, FIF.HOME, "主页")
         self.addSubInterface(self.residentActivityInterface, FIF.PLAY, "扫荡配置")
         self.addSubInterface(self.rewardCollectionInterface, FIF.ACCEPT, "领取任务奖励")
+        self.addSubInterface(self.bookPlannerInterface, FIF.CALENDAR, "进货书规划")
+        self.addSubInterface(self.inventoryInterface, FIF.ALBUM, "货币规划")
+        self.addSubInterface(self.gachaPlannerInterface, FIF.SHOPPING_CART, "抽卡规划")
+        self.addSubInterface(self.passengerPlannerInterface, FIF.PEOPLE, "客运规划")
         self.addSubInterface(self.two_run_business_interface, FIF.TRAIN, "端点跑商")
         self.addSubInterface(self.adb_data_interface, FIF.GAME, "ADB信息")
 
@@ -123,10 +131,25 @@ class MainWindow(FluentWindow):
         self.residentActivityInterface = ResidentActivityInterface(self)
         self.rewardCollectionInterface = RewardCollectionInterface(self)
         self.settingInterface = SettingInterface(self)
+        self.bookPlannerInterface = BookPlannerInterface(self)
+        self.inventoryInterface = InventoryInterface(self)
+        self.gachaPlannerInterface = GachaPlannerInterface(self)
+        self.passengerPlannerInterface = PassengerPlannerInterface(self)
         self.two_run_business_interface = TwoRunBusinessInterface(self)
         self.homeInterface.setBusinessTaskProvider(
             self.two_run_business_interface.buildQueuedTask
         )
+        self.homeInterface.addTaskProvider(self.passengerPlannerInterface.buildQueuedTask)
+        for page in (
+            self.residentActivityInterface,
+            self.rewardCollectionInterface,
+            self.two_run_business_interface,
+            self.passengerPlannerInterface,
+        ):
+            page.scheduleCard.scheduleChanged.connect(
+                self.homeInterface.refreshScheduleOverview
+            )
+        self.homeInterface.refreshScheduleOverview()
         self.homeInterface.activityStateChanged.connect(
             self.residentActivityInterface.setRunState
         )

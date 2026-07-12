@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import math
+from dataclasses import asdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 import requests
 
 from core.utils.utils import RESOURCES_PATH, read_json
+from core.services.passenger_planner import PassengerPlanConfig, estimate_passenger_plan
 
 
 PRICE_API = "https://www.resonance-columba.com/api/get-prices"
@@ -38,6 +40,12 @@ class OptimizationConfig:
     tax_cut_percent: float = 0.0
     extra_buy_percent: float = 0.0
     drive_fatigue_reduction: int = 0
+    passenger_seats: int = 64
+    passenger_trips_per_week: int = 7
+    passenger_reference_capacity: int = 512
+    passenger_reference_trip_revenue: int = 5_894_517
+    passenger_occupancy_percent: int = 100
+    passenger_fatigue_per_trip: int = 95
 
 
 def _normalize_city(name: str) -> str:
@@ -158,6 +166,8 @@ def _distribute_books(gains: list[list[int]], total_books: int) -> tuple[int, li
 def optimize_live_routes(config: OptimizationConfig = OptimizationConfig()) -> dict:
     products, upstream_cities, cities, fatigue, belongs_to = _load_metadata()
     prices, latest_timestamp = _fetch_prices(products, upstream_cities)
+    passenger_fatigue = max(0, config.passenger_trips_per_week) * max(0, config.passenger_fatigue_per_trip)
+    freight_fatigue_budget = max(0, config.weekly_fatigue - passenger_fatigue)
 
     def master(city: str) -> str:
         return belongs_to.get(city, city)
@@ -274,7 +284,7 @@ def optimize_live_routes(config: OptimizationConfig = OptimizationConfig()) -> d
             cycle_fatigue = sum(leg["fatigue"] for leg in base_legs)
             if cycle_fatigue <= 0:
                 continue
-            repeats = int(config.weekly_fatigue // cycle_fatigue)
+            repeats = int(freight_fatigue_budget // cycle_fatigue)
             if repeats <= 0:
                 continue
             base_profit = repeats * sum(leg["profit"] for leg in base_legs)
@@ -334,4 +344,22 @@ def optimize_live_routes(config: OptimizationConfig = OptimizationConfig()) -> d
         "max_bargain_tries": config.max_bargain_tries,
         "max_raise_tries": config.max_raise_tries,
     }
+    best["optimizer_config"] = asdict(config)
+    passenger_plan = estimate_passenger_plan(
+        PassengerPlanConfig(
+            seats=config.passenger_seats,
+            trips_per_week=config.passenger_trips_per_week,
+            reference_capacity=config.passenger_reference_capacity,
+            reference_trip_revenue=config.passenger_reference_trip_revenue,
+            occupancy_percent=config.passenger_occupancy_percent,
+            fatigue_per_trip=config.passenger_fatigue_per_trip,
+        )
+    )
+    best["cargo_profit"] = best["profit"]
+    best["passenger_plan"] = passenger_plan
+    best["passenger_profit"] = passenger_plan["weekly_revenue"]
+    best["combined_profit"] = best["cargo_profit"] + best["passenger_profit"]
+    best["cargo_fatigue"] = best["fatigue"]
+    best["passenger_fatigue"] = passenger_plan["weekly_fatigue"]
+    best["fatigue"] = best["cargo_fatigue"] + best["passenger_fatigue"]
     return best

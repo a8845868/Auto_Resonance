@@ -37,6 +37,35 @@ class RunningBusinessConfig(QConfig):
     OptimizerTaxCutPercent = ConfigItem("WeeklyRole", "TaxCutPercent", 0, None)
     OptimizerExtraBuyPercent = ConfigItem("WeeklyRole", "ExtraBuyPercent", 0, None)
     OptimizerDriveFatigueReduction = ConfigItem("WeeklyRole", "DriveFatigueReduction", 0, None)
+    PassengerSeats = ConfigItem("PassengerPlanner", "Seats", 64, None)
+    PassengerTripsPerWeek = ConfigItem("PassengerPlanner", "TripsPerWeek", 7, None)
+    PassengerReferenceCapacity = ConfigItem("PassengerPlanner", "ReferenceCapacity", 512, None)
+    PassengerReferenceRevenueWan = ConfigItem("PassengerPlanner", "ReferenceRevenueWan", 589, None)
+    PassengerOccupancy = ConfigItem("PassengerPlanner", "OccupancyPercent", 100, None)
+    PassengerFatiguePerTrip = ConfigItem("PassengerPlanner", "FatiguePerTrip", 95, None)
+    PassengerTargetCarriages = ConfigItem("PassengerBuild", "TargetCarriages", 8, None)
+    PassengerBuiltExtraCarriages = ConfigItem("PassengerBuild", "BuiltExtraCarriages", 0, None)
+    PassengerInstalledSeatGroups = ConfigItem("PassengerBuild", "InstalledSeatGroups", 0, None)
+    PassengerCurrentIron = ConfigItem("PassengerBuild", "CurrentIron", 0, None)
+    PassengerRouteObjective = ConfigItem("PassengerOperation", "RouteObjective", "当前利润优先", None)
+    PassengerOrigin = ConfigItem("PassengerOperation", "Origin", "武林源", None)
+    PassengerDestination = ConfigItem("PassengerOperation", "Destination", "岚心城", None)
+    PassengerObservedRevenueWan = ConfigItem("PassengerOperation", "ObservedRevenueWan", 0, None)
+    PassengerRouteFatigue = ConfigItem("PassengerOperation", "RouteFatigue", 95, None)
+    for rating_key in ("Comfort", "Food", "Entertainment", "Pets", "Aquarium", "Plants", "Medical"):
+        locals()[f"PassengerRating{rating_key}"] = ConfigItem("PassengerBuild", f"Rating{rating_key}", 0, None)
+    InventoryBooks = ConfigItem("BookBudget", "CurrentInventory", 0, None)
+    AutoReadInventoryBooks = ConfigItem("BookBudget", "AutoReadInventory", True, None)
+    BookPlannerMigrated = ConfigItem("BookBudget", "PlannerV2Migrated", False, None)
+
+    from core.services.book_budget import BOOK_SOURCES
+    for source in BOOK_SOURCES:
+        locals()[f"BookSource_{source.key}_Enabled"] = ConfigItem(
+            "BookBudget", f"{source.key}.enabled", source.default_enabled, None
+        )
+        locals()[f"BookSource_{source.key}_Amount"] = ConfigItem(
+            "BookBudget", f"{source.key}.amount", source.default_amount, None
+        )
 
     for city in CITYS:
         # 特殊适配7号自由港
@@ -79,6 +108,7 @@ class Config(RunningBusinessConfig):
     enableResidentActivity = ConfigItem("TaskQueue", "ResidentActivity", True, None)
     enableResidentActivityOnce = ConfigItem("TaskQueue", "ResidentActivityOnce", False, None)
     enableRunBusiness = ConfigItem("TaskQueue", "RunBusiness", False, None)
+    enablePassengerBuildMonitor = ConfigItem("TaskQueue", "PassengerBuildMonitor", False, None)
 
     residentActivityTask = ConfigItem(
         "ResidentActivity",
