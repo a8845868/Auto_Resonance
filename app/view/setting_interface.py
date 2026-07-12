@@ -10,13 +10,12 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QLabel, QWidget
 from qfluentwidgets import ExpandLayout, PrimaryPushSettingCard
 from qfluentwidgets import FluentIcon as FIF
-from qfluentwidgets import ScrollArea, SettingCardGroup, SwitchSettingCard
+from qfluentwidgets import ScrollArea, SettingCardGroup
 
 from app.common.config import cfg
 from app.common.style_sheet import StyleSheet
 from app.components.settings.custom_adb_setting_card import CustomAdbSettingCard
 from app.components.settings.line_edit_setting_card import LineEditSettingCard
-from core.model.config import config
 from core.model.emulator import emulator_list
 
 MIRROR_URL = "https://mirrorchyan.com/zh/projects?rid=Auto_Resonance&source=auto-resonance-release"
@@ -86,32 +85,10 @@ class SettingInterface(ScrollArea):
         #     "ADB地址",
         #     parent=self.musicInThisPCGroup,
         # )
-        self.isSpeedCard = SwitchSettingCard(
-            FIF.MARKET,
-            "是否自动加速",
-            "是否自动使用加速弹丸",
-            parent=self.musicInThisPCGroup,
-        )
-        self.isAutoPickCard = SwitchSettingCard(
-            FIF.TILES,
-            "是否自动拾取",
-            "是否自动拾取掉落物",
-            parent=self.musicInThisPCGroup,
-        )
-        self.isSpeedCard.setValue(config.global_config.is_speed)
-        self.isSpeedCard.switchButton.checkedChanged.connect(self.__onCheckedChanged)
-        self.isAutoPickCard.setValue(config.global_config.is_auto_pick)
-        self.isAutoPickCard.switchButton.checkedChanged.connect(self.__onCheckedChanged)
-
         self.mirrorCard.clicked.connect(
             lambda: QDesktopServices.openUrl(QUrl(MIRROR_URL))
         )
         self.__initWidget()
-
-    def __onCheckedChanged(self):
-        config.global_config.is_speed = self.isSpeedCard.isChecked()
-        config.global_config.is_auto_pick = self.isAutoPickCard.isChecked()
-        config.save_config()
 
     def __initWidget(self):
         self.resize(1000, 800)
@@ -139,8 +116,6 @@ class SettingInterface(ScrollArea):
         self.musicInThisPCGroup.addSettingCard(self.mirrorCdkCard)
         self.musicInThisPCGroup.addSettingCard(self.mirrorCard)
         self.musicInThisPCGroup.addSettingCard(self.adbOrderCard)
-        self.musicInThisPCGroup.addSettingCard(self.isSpeedCard)
-        self.musicInThisPCGroup.addSettingCard(self.isAutoPickCard)
 
         # add setting card group to layout
         self.expandLayout.setSpacing(28)

@@ -54,6 +54,12 @@ def stop():
     STOP = True
 
 
+def reset_stop():
+    """Clear a previous global stop request before a new queue starts."""
+    global STOP
+    STOP = False
+
+
 def is_stopped() -> bool:
     return STOP
 

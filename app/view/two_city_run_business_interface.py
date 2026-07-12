@@ -22,6 +22,7 @@ from app.utils.worker import Worker
 from app.components.primary_push_load_card import PrimaryPushLoadCard
 from app.components.settings.spin_box_setting_card import SpinBoxSettingCard
 from app.utils.config import CITYS, CITY_GOODS, CITY_POSITIONS
+from core.model.config import config
 
 
 class TwoRunBusinessInterface(ScrollArea):
@@ -66,13 +67,29 @@ class TwoRunBusinessInterface(ScrollArea):
 
     def loadSamples(self):
         """load samples"""
-        self.testRunBusinessCard = PrimaryPushLoadCard(
-            "开始", FIF.PLAY, "开始端点跑商", "按当前路线和配置启动自动跑商", self.scrollWidget
+        self.enableRunBusinessCard = SwitchSettingCard(
+            FIF.TRAIN,
+            "加入任务序列",
+            "端点跑商",
+            cfg.enableRunBusiness,
+            self.scrollWidget,
         )
-        self.stopRunBusinessCard = PushSettingCard(
-            "停止", FIF.CANCEL, "停止运行", "安全停止当前跑商任务", self.scrollWidget
+        self.isSpeedCard = SwitchSettingCard(
+            FIF.MARKET,
+            "是否自动加速",
+            "是否自动使用加速弹丸",
+            parent=self.scrollWidget,
         )
-        self.stopRunBusinessCard.button.setEnabled(False)
+        self.isAutoPickCard = SwitchSettingCard(
+            FIF.TILES,
+            "是否自动拾取",
+            "是否自动拾取掉落物",
+            parent=self.scrollWidget,
+        )
+        self.isSpeedCard.setValue(config.global_config.is_speed)
+        self.isAutoPickCard.setValue(config.global_config.is_auto_pick)
+        self.isSpeedCard.switchButton.checkedChanged.connect(self.saveAutomationOptions)
+        self.isAutoPickCard.switchButton.checkedChanged.connect(self.saveAutomationOptions)
         self.liveOptimizeCard = PrimaryPushLoadCard(
             "实时计算",
             FIF.SYNC,
@@ -256,6 +273,9 @@ class TwoRunBusinessInterface(ScrollArea):
 
         self.expandLayout.setContentsMargins(36, 0, 36, 0)
 
+        self.expandLayout.addWidget(self.enableRunBusinessCard)
+        self.expandLayout.addWidget(self.isSpeedCard)
+        self.expandLayout.addWidget(self.isAutoPickCard)
         self.expandLayout.addWidget(self.routeSelectionWidget)
         self.expandLayout.addWidget(self.routeTradeSettingsWidget)
         self.expandLayout.addWidget(self.liveOptimizeCard)
@@ -263,16 +283,17 @@ class TwoRunBusinessInterface(ScrollArea):
         self.expandLayout.addWidget(self.applyOptimizeCard)
         self.expandLayout.addWidget(self.prestigeGroup)
         self.expandLayout.addWidget(self.roleGroup)
-        self.expandLayout.addWidget(self.testRunBusinessCard)
-        self.expandLayout.addWidget(self.stopRunBusinessCard)
         self.expandLayout.addWidget(self.buyCountCard)
         self.expandLayout.addWidget(self.useSilverBranchCard)
 
     def connectSignalToSlot(self):
-        self.testRunBusinessCard.clicked.connect(self.runBusiness)
-        self.stopRunBusinessCard.clicked.connect(self.stopBusiness)
         self.liveOptimizeCard.clicked.connect(self.calculateLiveRoute)
         self.applyOptimizeCard.clicked.connect(self.applyOptimizedRoute)
+
+    def saveAutomationOptions(self):
+        config.global_config.is_speed = self.isSpeedCard.isChecked()
+        config.global_config.is_auto_pick = self.isAutoPickCard.isChecked()
+        config.save_config()
 
     def calculateLiveRoute(self):
         from core.services import OptimizationConfig, optimize_live_routes
@@ -440,90 +461,39 @@ class TwoRunBusinessInterface(ScrollArea):
         )
         self.updateRouteTradeSettings()
 
-    def runBusiness(self):
-        from auto.run_business import stop, two_city_run, two_city_weekly_run
-        from core.services import load_weekly_plan, progress_summary, remaining_batches
+    def buildQueuedTask(self):
+        """Return the configured run-business task for the global scheduler."""
+        from app.utils.task_queue import QueuedTask
+        from auto.run_business import stop
 
+        if not bool(cfg.enableRunBusiness.value):
+            return None
         buy_city_name = self.buyCityComboBox.currentText()
         sell_city_name = self.sellCityComboBox.currentText()
-        if buy_city_name == sell_city_name:
-            logger.error("起点和终点不能相同")
-            InfoBar.warning(
-                title='',
-                content="请选择两个不同的城市",
-                orient=Qt.Orientation.Horizontal,
-                isClosable=False,
-                parent=self
-            )
-            return
-        if cfg.BuyCount.value <= 0:
-            InfoBar.warning(
-                title='',
-                content="运行次数必须大于 0",
-                orient=Qt.Orientation.Horizontal,
-                isClosable=False,
-                parent=self,
-            )
-            return
+        if buy_city_name == sell_city_name or cfg.BuyCount.value <= 0:
+            return None
+        return QueuedTask(
+            "端点跑商",
+            lambda: self._runBusinessTask(buy_city_name, sell_city_name),
+            stop,
+        )
 
-        signalBus.switchToCard.emit("LoggerInterface")
-        self.testRunBusinessCard.loading(True)
-        self.stopRunBusinessCard.button.setEnabled(True)
-        self.buyCityComboBox.setEnabled(False)
-        self.sellCityComboBox.setEnabled(False)
+    def _runBusinessTask(self, buy_city_name: str, sell_city_name: str):
+        from auto.run_business import stop, two_city_run, two_city_weekly_run
+        from core.services import load_weekly_plan, progress_summary, remaining_batches
         saved_plan = load_weekly_plan()
         weekly_plan_matches = saved_plan and saved_plan["cycle"] == [buy_city_name, sell_city_name]
         if weekly_plan_matches:
             summary = progress_summary(saved_plan)
             if summary and summary["finished"]:
-                InfoBar.success(
-                    title="本周计划已经完成",
-                    content="无需继续运行；如需按新行情重算，请重新计算并套用计划。",
-                    orient=Qt.Orientation.Horizontal,
-                    isClosable=False,
-                    parent=self,
-                )
-                self.testRunBusinessCard.loading(False)
-                self.stopRunBusinessCard.button.setEnabled(False)
-                self.buyCityComboBox.setEnabled(True)
-                self.sellCityComboBox.setEnabled(True)
+                logger.info("本周跑商计划已经完成，跳过端点跑商")
                 return
-            self.workers = Worker(
-                two_city_weekly_run,
-                stop,
+            return two_city_weekly_run(
                 buy_city_name=buy_city_name,
                 sell_city_name=sell_city_name,
                 execution_batches=remaining_batches(saved_plan),
             )
-        else:
-            self.workers = Worker(
-                two_city_run,
-                stop,
-                buy_city_name=buy_city_name,
-                sell_city_name=sell_city_name,
-            )
-        self.workers.start()
-        self.workers.finished.connect(lambda: self.on_worker_finished(self.workers))
-
-    def on_worker_finished(self, worker: Optional[Worker]):
-        # 线程完成时调用
-        self.testRunBusinessCard.loading(False)
-        self.stopRunBusinessCard.button.setEnabled(False)
-        self.buyCityComboBox.setEnabled(True)
-        self.sellCityComboBox.setEnabled(True)
-        self.refreshWeeklyProgress()
-        if worker:
-            worker.deleteLater()
-        self.workers = None
-
-    def stopBusiness(self):
-        if self.workers:
-            self.workers.stop()
-            self.stopRunBusinessCard.button.setEnabled(False)
-            InfoBar.success(
-                title="",
-                content="已发送停止请求",
-                orient=Qt.Orientation.Horizontal,
-                isClosable=False,
-                parent=self,
-            )
+        return two_city_run(
+            buy_city_name=buy_city_name,
+            sell_city_name=sell_city_name,
+        )

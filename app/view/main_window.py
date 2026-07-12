@@ -16,7 +16,7 @@ from qfluentwidgets import (
     InfoBadgePosition,
     InfoBar,
     InfoBarPosition,
-    MSFluentWindow,
+    FluentWindow,
     NavigationItemPosition,
     SplashScreen,
     FluentIconBase,
@@ -37,12 +37,12 @@ from core.utils.update.base_update_utils import UpdateStatus
 from core.utils.update.mirror_update_utils import MirrorUpdateUtils
 
 from .adb_data_interface import ADBDataInterface
-from .home_interface import HomeInterface
-from .logger_interface import LoggerInterface
+from .dashboard_interface import DashboardInterface
+from .task_settings_interface import ResidentActivityInterface, RewardCollectionInterface
 from .setting_interface import SettingInterface
 
 
-class MainWindow(MSFluentWindow):
+class MainWindow(FluentWindow):
 
     def __init__(self):
         super().__init__()
@@ -55,6 +55,8 @@ class MainWindow(MSFluentWindow):
         self.setInterface()
 
         self.initNavigation()
+        self.navigationInterface.setExpandWidth(190)
+        self.navigationInterface.expand(useAni=False)
 
         self.connectSignalToSlot()
 
@@ -74,16 +76,12 @@ class MainWindow(MSFluentWindow):
 
     def initNavigation(self):
         self.addSubInterface(self.homeInterface, FIF.HOME, "主页")
+        self.addSubInterface(self.residentActivityInterface, FIF.PLAY, "扫荡配置")
+        self.addSubInterface(self.rewardCollectionInterface, FIF.ACCEPT, "领取任务奖励")
         self.addSubInterface(self.two_run_business_interface, FIF.TRAIN, "端点跑商")
         self.addSubInterface(self.adb_data_interface, FIF.GAME, "ADB信息")
 
         # 底部按钮
-        self.addSubInterface(
-            self.loggerInterface,
-            FIF.ALIGNMENT,
-            "日志",
-            position=NavigationItemPosition.BOTTOM,
-        )
         self.updateButton = self.navigationInterface.addItem(
             routeKey="Update",
             icon=FIF.UPDATE,
@@ -100,13 +98,13 @@ class MainWindow(MSFluentWindow):
         )
 
     def initWindow(self):
-        self.resize(960, 780)
-        self.setMinimumWidth(760)
+        self.resize(1280, 820)
+        self.setMinimumSize(1050, 700)
         self.setWindowIcon(QIcon(str(ICON_PATH / "logo.ico")))
         self.setWindowTitle(f"黑月无人驾驶 - {VERSION}")
 
         self.setMicaEffectEnabled(isWin11())
-        self.setResizeEnabled(False)
+        self.setResizeEnabled(True)
 
         # create splash screen
         self.splashScreen = SplashScreen(self.windowIcon(), self)
@@ -121,10 +119,17 @@ class MainWindow(MSFluentWindow):
 
     def setInterface(self):
         # create sub interface
-        self.homeInterface = HomeInterface(self)
-        self.loggerInterface = LoggerInterface(self)
+        self.homeInterface = DashboardInterface(self)
+        self.residentActivityInterface = ResidentActivityInterface(self)
+        self.rewardCollectionInterface = RewardCollectionInterface(self)
         self.settingInterface = SettingInterface(self)
         self.two_run_business_interface = TwoRunBusinessInterface(self)
+        self.homeInterface.setBusinessTaskProvider(
+            self.two_run_business_interface.buildQueuedTask
+        )
+        self.homeInterface.activityStateChanged.connect(
+            self.residentActivityInterface.setRunState
+        )
         self.adb_data_interface = ADBDataInterface(self)
 
         self.update_message_box = UpdateMessageBox(self)
@@ -139,7 +144,11 @@ class MainWindow(MSFluentWindow):
         isTransparent=False,
     ):
         super().addSubInterface(
-            interface, icon, text, selectedIcon, position, isTransparent
+            interface,
+            icon,
+            text,
+            position=position,
+            isTransparent=isTransparent,
         )
         self.wights[interface.objectName()] = interface
 
@@ -157,6 +166,7 @@ class MainWindow(MSFluentWindow):
 
     def closeEvent(self, e):
         # 停止监听器线程
+        self.homeInterface.shutdown()
         try:
             self.themeListener.terminate()
             self.themeListener.deleteLater()
