@@ -35,10 +35,17 @@ def report_startup_error() -> None:
 if __name__ == "__main__":
     os.chdir(ROOT)
     LOG_FILE.unlink(missing_ok=True)
+    runtime_lease = None
     try:
+        from core.services.runtime_control import acquire_runtime
+
+        runtime_lease = acquire_runtime("gui")
         runpy.run_path(str(ROOT / "gui.py"), run_name="__main__")
     except SystemExit as error:
         if error.code not in (None, 0):
             report_startup_error()
     except BaseException:
         report_startup_error()
+    finally:
+        if runtime_lease is not None:
+            runtime_lease.release()

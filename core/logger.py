@@ -17,6 +17,7 @@ from version import __version__
 
 path_log = os.path.join("logs", "debug.log")
 LEVEL = "DEBUG"
+RUNNING_UNDER_PYTEST = "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ
 logger.remove()
 
 if not getattr(sys, "frozen", False) and sys.stdout is not None:
@@ -29,17 +30,18 @@ if not getattr(sys, "frozen", False) and sys.stdout is not None:
         "<level>{message}</level>",
     )
 
-logger.add(
-    path_log,
-    format="{time:HH:mm:ss} - "
-    "{level}\t| "
-    "{module}.{function}:{line} - "
-    " {message}",
-    rotation="1 days",
-    enqueue=True,
-    serialize=False,
-    encoding="utf-8",
-    retention="10 days",
-)
+if not RUNNING_UNDER_PYTEST:
+    logger.add(
+        path_log,
+        format="{time:HH:mm:ss} - "
+        "{level}\t| "
+        "{module}.{function}:{line} - "
+        " {message}",
+        rotation="1 days",
+        enqueue=True,
+        serialize=False,
+        encoding="utf-8",
+        retention="10 days",
+    )
 
 logger.info(f"当前版本: {__version__}")
