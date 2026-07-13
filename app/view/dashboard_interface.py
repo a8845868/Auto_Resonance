@@ -48,6 +48,7 @@ class DashboardInterface(ScrollArea):
         super().__init__(parent)
         self.queueWorker = None
         self.businessTaskProvider = lambda: None
+        self.priorityTaskProviders = []
         self.additionalTaskProviders = []
         self.schedulerArmed = False
         self.scheduleTimer = QTimer(self)
@@ -143,8 +144,16 @@ class DashboardInterface(ScrollArea):
     def addTaskProvider(self, provider):
         self.additionalTaskProviders.append(provider)
 
+    def addPriorityTaskProvider(self, provider):
+        """Register a task that must run before all ordinary daily tasks."""
+        self.priorityTaskProviders.append(provider)
+
     def _allEnabledTasks(self):
         tasks = []
+        for provider in self.priorityTaskProviders:
+            provided_task = provider()
+            if provided_task:
+                tasks.append(provided_task)
         if bool(cfg.enableResidentActivity.value):
             activity_task = cfg.residentActivityTask.value
             reward = cfg.residentActivityFullRealmReward.value

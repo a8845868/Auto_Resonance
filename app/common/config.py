@@ -110,6 +110,7 @@ class Config(RunningBusinessConfig):
     enableResidentActivityOnce = ConfigItem("TaskQueue", "ResidentActivityOnce", False, None)
     enableRunBusiness = ConfigItem("TaskQueue", "RunBusiness", False, None)
     enablePassengerBuildMonitor = ConfigItem("TaskQueue", "PassengerBuildMonitor", False, None)
+    enableFatiguePlanner = ConfigItem("TaskQueue", "FatiguePlanner", True, None)
 
     residentActivityTask = ConfigItem(
         "ResidentActivity",

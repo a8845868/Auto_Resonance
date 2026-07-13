@@ -42,7 +42,11 @@ from core.utils.update.mirror_update_utils import MirrorUpdateUtils
 
 from .adb_data_interface import ADBDataInterface
 from .dashboard_interface import DashboardInterface
-from .task_settings_interface import ResidentActivityInterface, RewardCollectionInterface
+from .task_settings_interface import (
+    FatiguePlannerInterface,
+    ResidentActivityInterface,
+    RewardCollectionInterface,
+)
 from .setting_interface import SettingInterface
 
 
@@ -82,6 +86,7 @@ class MainWindow(FluentWindow):
         self.addSubInterface(self.homeInterface, FIF.HOME, "主页")
         self.addSubInterface(self.residentActivityInterface, FIF.PLAY, "扫荡配置")
         self.addSubInterface(self.rewardCollectionInterface, FIF.ACCEPT, "领取任务奖励")
+        self.addSubInterface(self.fatiguePlannerInterface, FIF.CAFE, "疲劳规划")
         self.addSubInterface(self.bookPlannerInterface, FIF.CALENDAR, "进货书规划")
         self.addSubInterface(self.inventoryInterface, FIF.ALBUM, "货币规划")
         self.addSubInterface(self.gachaPlannerInterface, FIF.SHOPPING_CART, "抽卡规划")
@@ -130,6 +135,7 @@ class MainWindow(FluentWindow):
         self.homeInterface = DashboardInterface(self)
         self.residentActivityInterface = ResidentActivityInterface(self)
         self.rewardCollectionInterface = RewardCollectionInterface(self)
+        self.fatiguePlannerInterface = FatiguePlannerInterface(self)
         self.settingInterface = SettingInterface(self)
         self.bookPlannerInterface = BookPlannerInterface(self)
         self.inventoryInterface = InventoryInterface(self)
@@ -139,10 +145,14 @@ class MainWindow(FluentWindow):
         self.homeInterface.setBusinessTaskProvider(
             self.two_run_business_interface.buildQueuedTask
         )
+        self.homeInterface.addPriorityTaskProvider(
+            self.fatiguePlannerInterface.buildQueuedTask
+        )
         self.homeInterface.addTaskProvider(self.passengerPlannerInterface.buildQueuedTask)
         for page in (
             self.residentActivityInterface,
             self.rewardCollectionInterface,
+            self.fatiguePlannerInterface,
             self.two_run_business_interface,
             self.passengerPlannerInterface,
         ):
