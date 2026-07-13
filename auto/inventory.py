@@ -31,11 +31,25 @@ def _is_train_in_transit(items: list[dict]) -> bool:
     return has_destination and has_carriage
 
 
-def _home_iron_currency(items: list[dict]) -> list[Asset]:
-    """The home screen labels the primary balance as `资产`, not `铁盟币`."""
+STATION_PRIMARY_CURRENCIES = {
+    "武林源": "交子",
+}
+
+
+def _home_primary_currency(items: list[dict]) -> list[Asset]:
+    """Map the home-screen `资产` balance to the current station's currency."""
     label = next((item for item in items if item["text"].strip() == "资产"), None)
     if not label:
         return []
+    screen_text = " ".join(str(item.get("text", "")).replace(" ", "") for item in items)
+    currency_name = next(
+        (
+            currency
+            for station, currency in STATION_PRIMARY_CURRENCIES.items()
+            if station in screen_text
+        ),
+        "铁盟币",
+    )
     x, y = _center(label)
     candidates = []
     for item in items:
@@ -45,7 +59,12 @@ def _home_iron_currency(items: list[dict]) -> list[Asset]:
         nx, ny = _center(item)
         if 0 <= nx - x <= 180 and abs(ny - y) <= 35:
             candidates.append((abs(nx - x) + abs(ny - y), amount))
-    return [Asset("铁盟币", min(candidates)[1], "货币")] if candidates else []
+    return [Asset(currency_name, min(candidates)[1], "货币")] if candidates else []
+
+
+def _home_iron_currency(items: list[dict]) -> list[Asset]:
+    """Backward-compatible wrapper for callers/tests using the old name."""
+    return _home_primary_currency(items)
 
 
 def _read_unicode_image(path) -> cv.typing.MatLike | None:
@@ -109,7 +128,7 @@ def _parse_currency_icons(image, ocr_items: list[dict]) -> list[Asset]:
 
 
 def _parse_primary_currency_grid(image, ocr_items: list[dict]) -> list[Asset]:
-    """Read the four stable currency slots on the first Assets page."""
+    """Read the stable currency slots on the first Assets page."""
     height, width = image.shape[:2]
     numbers = []
     for item in ocr_items:
@@ -119,6 +138,7 @@ def _parse_primary_currency_grid(image, ocr_items: list[dict]) -> list[Asset]:
     # Count label centers observed on the normalized 1280x720 game canvas.
     slots = {
         "桦石": (0.495, 0.290),
+        "交子": (0.570, 0.290),
         "铁盟币": (0.684, 0.290),
         "绝命奖章": (0.804, 0.290),
         "赴命奖章": (0.390, 0.480),
@@ -188,7 +208,7 @@ def scan_inventory_assets(max_pages: int = 6) -> list[Asset]:
             raise RuntimeError("无法返回站点主画面；请确认列车已到站后重试")
         # The home screen contains many unrelated numbers; only retain known currency-like rows.
         home_items = screenshot().ocr()
-        currencies = _home_iron_currency(home_items)
+        currencies = _home_primary_currency(home_items)
         currencies.extend(asset for asset in parse_ocr_assets(home_items) if asset.category == "货币")
         snapshots = [currencies]
         if not _open_assets_entry():

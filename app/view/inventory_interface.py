@@ -85,7 +85,7 @@ class InventoryInterface(ScrollArea):
         for column in range(4):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        self.currencyTable.setMinimumHeight(260)
+        self.currencyTable.setMinimumHeight(40 + len(CURRENCIES) * 38)
         self.currencyTable.setIconSize(QSize(28, 28))
         for row, currency in enumerate(CURRENCIES):
             name_item = QTableWidgetItem(self._itemIcon(currency.name), currency.name)
@@ -193,8 +193,12 @@ class InventoryInterface(ScrollArea):
         layout.addWidget(self.inventoryTable)
 
         self._recalculate()
-        self.currencyTable.selectRow(3)
-        self._showCurrency(3)
+        default_row = next(
+            (row for row, currency in enumerate(CURRENCIES) if currency.key == "fu_ming"),
+            0,
+        )
+        self.currencyTable.selectRow(default_row)
+        self._showCurrency(default_row)
 
     def _showCurrency(self, row):
         if not 0 <= row < len(CURRENCIES):
@@ -243,7 +247,12 @@ class InventoryInterface(ScrollArea):
             self.activityTable.setItem(0, 0, QTableWidgetItem("来源存在，但公开资料没有稳定的固定产出数字，暂不计算虚假期望"))
             self.activityTable.setSpan(0, 0, 1, 5)
         sources = "<br>".join(f"• {escape(item)}" for item in currency.sources)
-        self.sourceLabel.setText(f'<b>其他获取渠道：</b><br>{sources}<br><a href="{escape(currency.source_url)}">核对资料来源</a>')
+        reference = (
+            f'<a href="{escape(currency.source_url)}">核对资料来源</a>'
+            if currency.source_url
+            else "资料来源：游戏内道具说明"
+        )
+        self.sourceLabel.setText(f"<b>其他获取渠道：</b><br>{sources}<br>{reference}")
         self._building_detail = False
         self._recalculate()
 
