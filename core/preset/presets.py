@@ -20,6 +20,7 @@ from core.control.control import (
 from core.module.bgr import BGR
 from core.image.ocr import predict
 from core.preset import blurry_ocr_click, go_home
+from core.services.screen_state import is_train_in_transit
 from core.utils.utils import RESOURCES_PATH, read_json
 
 from .control import click_image, ocr_click
@@ -68,6 +69,28 @@ STATION_DIFFERENCES = calculate_station_differences(STATION_POS_DATA)
 WORLD_MAP_OPEN_POS = (1201, 666)
 WORLD_MAP_BACK_POS = (84, 40)
 WORLD_MAP_DEFAULT_ZOOM_POS = (1151, 465)
+
+
+def _wait_for_departure(timeout: float = 12.0) -> bool:
+    """Wait through the station-platform transition until driving is real."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        image = screenshot()
+        if is_train_in_transit(image.ocr()):
+            logger.info("站台过渡完成，已确认进入自动巡航")
+            return True
+        # Some stations still show a short-lived explicit Join button, while
+        # newer ones transition automatically. Handle both without logging a
+        # false template error during the animation.
+        click_image(
+            RESOURCES_PATH / "map/join_station.png",
+            cropped_pos1=(719, 405),
+            cropped_pos2=(927, 485),
+            trynum=1,
+            check_err=False,
+        )
+        time.sleep(0.6)
+    return False
 
 
 def _open_world_map_at_default_zoom():
@@ -197,13 +220,10 @@ def click_station(name: str, cur_station: Optional[str] = None):
             trynum=5,
         ):
             time.sleep(1.0)
-            click_image(
-                RESOURCES_PATH / "map/join_station.png",
-                cropped_pos1=(719, 405),
-                cropped_pos2=(927, 485),
-                trynum=5,
-            )
-            return STATION(True)
+            if _wait_for_departure():
+                return STATION(True)
+            logger.error("站台过渡超时，未确认进入自动巡航")
+            return STATION(False)
         else:
             logger.error(f"未找到前往目的地按钮: {name}")
     else:

@@ -6,6 +6,7 @@ from loguru import logger
 import numpy as np
 from core.control.base_control import IADB
 from adb_shell.adb_device import AdbDeviceTcp
+from adb_shell.exceptions import TcpTimeoutException
 
 from core.model import app
 
@@ -28,6 +29,7 @@ class ADB(IADB):
             return False
         logger.info(f"ADB端口：{name}-{adb_port}")
         self.device = AdbDeviceTcp(self.adb_host, port=adb_port)
+        status = False
         try:
             status = self.device.connect()
             if not status:
@@ -35,10 +37,20 @@ class ADB(IADB):
             else:
                 image = self.screenshot()
                 height, width = image.shape[:2]
-                return self.check_resolution_ratio(width, height)
+                status = self.check_resolution_ratio(width, height)
+                return status
         except ConnectionRefusedError:
             status = False
             logger.error("ADB端口错误或者未打开模拟器，无法连接")
+        except TcpTimeoutException as error:
+            status = False
+            logger.error(f"ADB连接超时: {error}")
+        finally:
+            if not status:
+                try:
+                    self.device.close()
+                except Exception as error:
+                    logger.debug(f"ADB失败连接关闭异常: {error}")
         return status
 
     def input_swipe(self, x1: int, y1: int, x2: int, y2: int, millisecond: int = 100) -> None:
