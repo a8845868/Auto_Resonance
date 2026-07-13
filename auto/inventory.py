@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import time
 import json
+from collections import Counter
 
 import cv2 as cv
 import numpy as np
@@ -10,8 +11,13 @@ import numpy as np
 from loguru import logger
 
 from core.control.control import connect, input_swipe, input_tap, screenshot
+from core.exception.exceptions import StopExecution
 from core.preset import go_home
 from core.preset.control import blurry_ocr_click
+from core.services.screen_state import (
+    is_inventory_screen,
+    is_train_in_transit as _is_train_in_transit,
+)
 from core.utils.utils import RESOURCES_PATH
 from core.services.inventory_assets import Asset, merge_assets, parse_amount, parse_ocr_assets
 
@@ -19,16 +25,6 @@ from core.services.inventory_assets import Asset, merge_assets, parse_amount, pa
 def _center(item: dict) -> tuple[float, float]:
     position = item["position"]
     return ((position[0][0] + position[2][0]) / 2, (position[0][1] + position[2][1]) / 2)
-
-
-def _is_train_in_transit(items: list[dict]) -> bool:
-    """Detect the driving HUD, where station-only menus cannot be opened."""
-    texts = [str(item.get("text", "")).replace(" ", "") for item in items]
-    if any(marker in text for marker in ("自动巡航", "剩余行程") for text in texts):
-        return True
-    has_destination = any("目的地" in text for text in texts)
-    has_carriage = any("车厢内" in text or "副官室" in text for text in texts)
-    return has_destination and has_carriage
 
 
 STATION_PRIMARY_CURRENCIES = {
@@ -67,9 +63,9 @@ def _home_iron_currency(items: list[dict]) -> list[Asset]:
     return _home_primary_currency(items)
 
 
-def _read_unicode_image(path) -> cv.typing.MatLike | None:
+def _read_unicode_image(path, flags=cv.IMREAD_COLOR) -> cv.typing.MatLike | None:
     try:
-        return cv.imdecode(np.fromfile(str(path), dtype=np.uint8), cv.IMREAD_COLOR)
+        return cv.imdecode(np.fromfile(str(path), dtype=np.uint8), flags)
     except OSError:
         return None
 
@@ -158,41 +154,108 @@ def _parse_primary_currency_grid(image, ocr_items: list[dict]) -> list[Asset]:
     return found
 
 
+def _white_icon_mask(image: cv.typing.MatLike) -> cv.typing.MatLike:
+    """Keep the bright low-saturation glyph and discard its colored background."""
+    hsv = cv.cvtColor(image, cv.COLOR_BGR2HSV)
+    mask = cv.inRange(hsv, np.array([0, 0, 170]), np.array([180, 90, 255]))
+    return cv.morphologyEx(mask, cv.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8))
+
+
 def _find_assets_entry(image) -> tuple[tuple[int, int] | None, float]:
-    """Find the icon-only Assets entry across emulator/UI scale differences."""
+    """Find the Assets entry from its white glyph, ignoring transparent/blue pixels."""
     template = cv.imread(str(RESOURCES_PATH / "inventory" / "assets_entry.png"))
     if template is None:
         return None, 0.0
+    # The stored screenshot contains old scenery around the icon. Only the
+    # central white six-part glyph is stable across themes and game versions.
+    th, tw = template.shape[:2]
+    template = template[int(th * 0.16) : int(th * 0.87), int(tw * 0.16) : int(tw * 0.87)]
+    template_mask = _white_icon_mask(template)
+    ys, xs = np.where(template_mask > 0)
+    if not len(xs):
+        return None, 0.0
+    template_mask = template_mask[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
     # The icon lives in the top-right toolbar. Cropping avoids visually similar
     # white hexagons elsewhere on the home screen and makes matching faster.
     height, width = image.shape[:2]
     x1, y1 = int(width * 0.58), 0
     roi = image[y1 : int(height * 0.18), x1:width]
+    roi_mask = _white_icon_mask(roi)
     best_score = 0.0
     best_loc = None
-    for scale_percent in range(45, 91, 5):
+    for scale_percent in range(60, 141, 5):
         scale = scale_percent / 100
-        resized = cv.resize(template, None, fx=scale, fy=scale, interpolation=cv.INTER_AREA)
-        th, tw = resized.shape[:2]
-        if th >= roi.shape[0] or tw >= roi.shape[1]:
+        resized = cv.resize(template_mask, None, fx=scale, fy=scale, interpolation=cv.INTER_NEAREST)
+        glyph_h, glyph_w = resized.shape[:2]
+        if glyph_h >= roi_mask.shape[0] or glyph_w >= roi_mask.shape[1]:
             continue
-        result = cv.matchTemplate(roi, resized, cv.TM_CCOEFF_NORMED)
+        result = cv.matchTemplate(roi_mask, resized, cv.TM_CCOEFF_NORMED)
         _, score, _, loc = cv.minMaxLoc(result)
         if score > best_score:
             best_score = score
-            best_loc = (x1 + loc[0] + tw // 2, y1 + loc[1] + th // 2)
-    return (best_loc if best_score >= 0.66 else None), best_score
+            best_loc = (x1 + loc[0] + glyph_w // 2, y1 + loc[1] + glyph_h // 2)
+    return (best_loc if best_score >= 0.70 else None), best_score
+
+
+def _find_assets_text_entry(items: list[dict], width: int, height: int):
+    """Find the bottom-left balance label only as a station-home guard.
+
+    The label itself is not an entry.  Older code clicked it and then scanned
+    the unchanged station screen as though it were the backpack, producing
+    false icon matches.
+    """
+    for item in items:
+        if str(item.get("text", "")).replace(" ", "").strip() != "资产":
+            continue
+        x, y = _center(item)
+        if x <= width * 0.35 and y >= height * 0.78:
+            return int(x), int(y)
+    return None
+
+
+def _is_assets_inventory_screen(items: list[dict]) -> bool:
+    """Require the backpack's right-hand category rail before scanning it."""
+    return is_inventory_screen(items)
+
+
+def _wait_for_assets_inventory(timeout: float = 6.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _is_assets_inventory_screen(screenshot().ocr()):
+            return True
+        time.sleep(0.4)
+    return False
 
 
 def _open_assets_entry() -> bool:
     image = screenshot()
-    location, score = _find_assets_entry(image.image)
-    if location:
-        logger.info(f"识别到资产入口图标：{location}（匹配度 {score:.3f}）")
-        input_tap(location)
+    height, width = image.image.shape[:2]
+    items = image.ocr()
+    if _is_assets_inventory_screen(items):
         return True
-    logger.warning(f"未识别到资产入口图标（最高匹配度 {score:.3f}），尝试 OCR 兼容入口")
-    return blurry_ocr_click("背包", score=0.55, trynum=2, log=False)
+    # `资产` at bottom-left proves this is the station home, but is only a
+    # balance display.  The actual backpack entry is the white cube in the
+    # top-right toolbar.
+    if not _find_assets_text_entry(items, width, height):
+        logger.warning("当前画面未识别到站点主界面的资产余额，拒绝盲点背包入口")
+        return False
+    location, score = _find_assets_entry(image.image)
+    candidates = []
+    if location and location[0] >= width * 0.75 and location[1] <= height * 0.2:
+        candidates.append((location, f"模板匹配度 {score:.3f}"))
+    # Current UI: white cube icon at about 86% width / 9.5% height.  This
+    # normalized fallback is used only after the station-home guard above.
+    normalized_cube = (int(width * 0.858), int(height * 0.095))
+    if not candidates or abs(candidates[0][0][0] - normalized_cube[0]) > width * 0.06:
+        candidates.append((normalized_cube, "主界面归一化坐标"))
+    for candidate, source in candidates:
+        logger.info(f"点击右上角资产魔方图标：{candidate}（{source}）")
+        input_tap(candidate)
+        if _wait_for_assets_inventory():
+            logger.info("已确认进入资产背包（识别到右侧道具/材料分类栏）")
+            return True
+    logger.error("点击资产魔方后仍未识别到背包分类栏，停止背包扫描")
+    return False
 
 
 def scan_inventory_assets(max_pages: int = 6) -> list[Asset]:
@@ -250,49 +313,263 @@ def _parse_count(text: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def read_restock_book_count() -> int | None:
+def _is_restock_book_name(text: str) -> bool:
+    compact = str(text).replace(" ", "")
+    return "进货" in compact and "书" in compact and any(
+        marker in compact for marker in ("采买", "采购")
+    )
+
+
+def _restock_book_item(items: list[dict]) -> dict | None:
+    return next(
+        (item for item in items if _is_restock_book_name(item.get("text", ""))),
+        None,
+    )
+
+
+def _find_restock_book_icon(image) -> tuple[tuple[int, int] | None, float]:
+    """Locate the restock-book artwork in the item grid.
+
+    Item names are hidden until an icon is opened, so OCR-only scanning can
+    never discover the book from the grid.  The shipped transparent icon is
+    matched with its alpha mask across the visible item area instead.
+    """
+    if not isinstance(image, np.ndarray) or image.ndim != 3:
+        return None, 0.0
+    template = _read_unicode_image(
+        RESOURCES_PATH / "currency" / "进货采买书.png", cv.IMREAD_UNCHANGED
+    )
+    if template is None or template.ndim != 3 or template.shape[2] != 4:
+        return None, 0.0
+
+    alpha = template[:, :, 3]
+    ys, xs = np.where(alpha >= 32)
+    if not len(xs):
+        return None, 0.0
+    template_bgr = template[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1, :3]
+    template_mask = alpha[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
+
+    height, width = image.shape[:2]
+    x1, x2 = int(width * 0.29), int(width * 0.85)
+    y1, y2 = int(height * 0.10), int(height * 0.99)
+    roi = image[y1:y2, x1:x2]
+    best_score = 0.0
+    best_center = None
+    for scale_percent in range(55, 131, 5):
+        scale = scale_percent / 100
+        resized = cv.resize(template_bgr, None, fx=scale, fy=scale, interpolation=cv.INTER_AREA)
+        mask = cv.resize(template_mask, (resized.shape[1], resized.shape[0]), interpolation=cv.INTER_NEAREST)
+        th, tw = resized.shape[:2]
+        if th >= roi.shape[0] or tw >= roi.shape[1]:
+            continue
+        scores = cv.matchTemplate(roi, resized, cv.TM_CCORR_NORMED, mask=mask)
+        scores = np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+        _, score, _, location = cv.minMaxLoc(scores)
+        if score > best_score:
+            best_score = score
+            best_center = (x1 + location[0] + tw // 2, y1 + location[1] + th // 2)
+    return (best_center if best_score >= 0.78 else None), best_score
+
+
+def _restock_book_count_near_icon(
+    items: list[dict], location: tuple[int, int]
+) -> tuple[int, str] | None:
+    """Pair an icon only with the count directly beneath its own grid cell."""
+    x, y = location
+    candidates = []
+    for item in items:
+        raw = str(item.get("text", "")).strip()
+        count = _parse_count(raw)
+        if count is None or not re.fullmatch(r"(?:x|×)?\s*\d{1,5}", raw, re.IGNORECASE):
+            continue
+        nx, ny = _center(item)
+        if abs(nx - x) <= 70 and 15 <= ny - y <= 105:
+            candidates.append((abs(nx - x) + abs(ny - y) * 0.5, count, raw))
+    if not candidates:
+        return None
+    _, count, raw = min(candidates)
+    return count, raw
+
+
+def _confirm_restock_book_icon_count(initial_items, location, frames=3):
+    readings = []
+    raw_values = []
+    items = initial_items
+    for frame in range(frames):
+        result = _restock_book_count_near_icon(items, location)
+        if result:
+            count, raw = result
+            readings.append(count)
+            raw_values.append(str(raw))
+        if frame + 1 < frames:
+            time.sleep(0.25)
+            items = screenshot().ocr()
+    if not readings:
+        return None
+    count, confirmations = Counter(readings).most_common(1)[0]
+    if confirmations < 2:
+        logger.warning(f"进货书图标下方数量多帧 OCR 不一致: {readings}")
+        return None
+    return count, ", ".join(raw_values)
+
+
+def _restock_book_count_from_items(items: list[dict]) -> tuple[int, str] | None:
+    """Pair the restock-book label only with a nearby/inline quantity."""
+    for asset in parse_ocr_assets(items):
+        if _is_restock_book_name(asset.name):
+            return asset.count, asset.name
+
+    book = _restock_book_item(items)
+    if not book:
+        return None
+    # The opened detail card renders the canonical name on the left and
+    # `拥有：N` on the upper-right, much farther away than a normal grid pair.
+    for item in items:
+        raw = str(item.get("text", ""))
+        if "拥有" in raw and (count := _parse_count(raw)) is not None:
+            return count, raw
+    x, y = _center(book)
+    candidates = []
+    for item in items:
+        count = _parse_count(str(item.get("text", "")))
+        if count is None:
+            continue
+        nx, ny = _center(item)
+        if abs(nx - x) <= 150 and -35 <= ny - y <= 170:
+            candidates.append((abs(nx - x) + abs(ny - y) * 0.7, count, item["text"]))
+    if not candidates:
+        return None
+    _, count, raw = min(candidates)
+    return count, raw
+
+
+def _confirm_restock_book_count(initial_items: list[dict], frames=3):
+    readings = []
+    raw_values = []
+    items = initial_items
+    for frame in range(frames):
+        result = _restock_book_count_from_items(items)
+        if result:
+            count, raw = result
+            readings.append(count)
+            raw_values.append(str(raw))
+        if frame + 1 < frames:
+            time.sleep(0.25)
+            page_frame = screenshot()
+            items = page_frame.ocr()
+    if not readings:
+        return None
+    count, confirmations = Counter(readings).most_common(1)[0]
+    if confirmations < 2:
+        logger.warning(f"进货书数量多帧 OCR 不一致: {readings}")
+        return None
+    return count, ", ".join(raw_values)
+
+
+def _inventory_page_signature(items: list[dict]) -> tuple[str, ...]:
+    """Stable text signature used to detect the bottom of the scroll list."""
+    return tuple(sorted(str(item.get("text", "")).replace(" ", "") for item in items))
+
+
+def read_restock_book_count(max_pages: int = 10) -> int | None:
     """Best-effort inventory read; return None instead of blocking trading."""
+    stopped = False
+    should_restore_home = False
     try:
         if not connect():
             logger.warning("ADB 连接失败，无法读取背包进货书")
             return None
-        go_home()
+        if _is_train_in_transit(screenshot().ocr()):
+            logger.info("列车正在行驶，跳过进货书背包扫描，交给跑商恢复流程等待到站")
+            return None
+        if not go_home():
+            return None
+        should_restore_home = True
         if not _open_assets_entry():
             logger.warning("未找到背包入口，将使用界面填写的进货书库存")
             return None
         time.sleep(1.2)
-        items = screenshot().ocr()
-        book = next((item for item in items if "进货" in item["text"] and "书" in item["text"]), None)
-        if not book:
-            logger.warning("背包中未识别到进货采买书")
-            return None
-        position = book["position"]
-        x1, y1 = position[0]
-        x2, y2 = position[2]
-        input_tap(((x1 + x2) // 2, (y1 + y2) // 2))
-        time.sleep(0.6)
-        nearby = screenshot().ocr()
-        candidates = []
-        for item in nearby:
-            count = _parse_count(item["text"])
-            if count is None:
-                continue
-            item_position = item["position"]
-            ix1, iy1 = item_position[0]
-            ix2, iy2 = item_position[2]
-            distance = abs((ix1 + ix2) / 2 - (x1 + x2) / 2) + abs((iy1 + iy2) / 2 - (y1 + y2) / 2)
-            candidates.append((distance, count, item["text"]))
-        if not candidates:
-            logger.warning("已找到进货采买书，但数量 OCR 失败")
-            return None
-        _, count, raw = min(candidates)
-        logger.info(f"背包进货书数量: {count}（OCR: {raw}）")
-        return count
+        previous_signature = None
+        unchanged_pages = 0
+        for page in range(1, max_pages + 1):
+            page_frame = screenshot()
+            items = page_frame.ocr()
+            signature = _inventory_page_signature(items)
+            logger.info(f"扫描背包第 {page}/{max_pages} 页")
+
+            book = _restock_book_item(items)
+            if book:
+                logger.info(f"在背包第 {page} 页识别到进货采买书，开始多帧核对数量")
+                confirmed = _confirm_restock_book_count(items)
+                if not confirmed:
+                    x, y = _center(book)
+                    input_tap((int(x), int(y)))
+                    time.sleep(0.6)
+                    confirmed = _confirm_restock_book_count(screenshot().ocr())
+                if confirmed:
+                    count, raw = confirmed
+                    logger.info(f"背包进货书数量: {count}（多帧 OCR: {raw}）")
+                    return count
+                logger.warning("已找到进货采买书，但多帧数量核对失败，继续扫描")
+            else:
+                icon, score = _find_restock_book_icon(getattr(page_frame, "image", None))
+                if icon:
+                    logger.info(
+                        f"在背包第 {page} 页识别到进货采买书图标 {icon}"
+                        f"（匹配度 {score:.3f}），开始多帧核对数量"
+                    )
+                    confirmed = _confirm_restock_book_icon_count(items, icon)
+                    if confirmed:
+                        count, raw = confirmed
+                        # The number under the icon is already spatially paired;
+                        # opening the detail card supplies an independent name
+                        # check before the value is accepted.
+                        input_tap(icon)
+                        time.sleep(0.6)
+                        detail_items = screenshot().ocr()
+                        detail = _restock_book_count_from_items(detail_items)
+                        if detail and detail[0] == count:
+                            logger.info(
+                                f"背包进货书数量: {count}（图标多帧 OCR: {raw}；"
+                                "详情页名称与数量复核通过）"
+                            )
+                            return count
+                        logger.warning(
+                            f"进货书图标数量为 {count}，但详情页名称/数量未一致确认，"
+                            "继续扫描"
+                        )
+                        input_tap((640, 600))
+                        time.sleep(0.4)
+                    else:
+                        logger.warning(
+                            f"疑似进货书图标匹配度 {score:.3f}，但下方数量未通过多帧核对"
+                        )
+
+            if signature and signature == previous_signature:
+                unchanged_pages += 1
+            else:
+                unchanged_pages = 0
+            previous_signature = signature
+            if unchanged_pages >= 2:
+                logger.info("背包内容连续三次未变化，已到列表末页")
+                break
+            if page < max_pages:
+                input_swipe((930, 640), (930, 285), swipe_time=600)
+                time.sleep(0.9)
+
+        logger.warning(f"已翻查背包 {min(page, max_pages)} 页，仍未确认进货采买书数量")
+        return None
+    except StopExecution:
+        stopped = True
+        raise
     except Exception:
         logger.exception("读取背包进货书失败，将使用界面填写值")
         return None
     finally:
-        try:
-            go_home()
-        except Exception:
-            pass
+        if should_restore_home and not stopped:
+            try:
+                go_home()
+            except StopExecution:
+                raise
+            except Exception:
+                pass

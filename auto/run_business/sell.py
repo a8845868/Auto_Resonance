@@ -69,6 +69,20 @@ def sell_business(num=0, empty_ok=False, expected_goods=None):
     参数:
         :param num: 期望议价的价格
     """
+    # Validate the planned route while cargo is still visible. After "sell
+    # all", the game moves every card to the right selection panel and the
+    # left-side cargo OCR can no longer be used for route matching.
+    selection_preserved = is_all_cargo_selected()
+    if (
+        expected_goods
+        and not selection_preserved
+        and not cargo_contains_expected_goods(expected_goods)
+    ):
+        logger.error("Cargo does not match the planned endpoint route; cancel sale")
+        return False
+    if selection_preserved:
+        logger.info("Existing all-selected cargo state verified from quote and button state")
+
     # Bargaining resets the game's sell selection, so it must happen before
     # the single "sell all" click. A resumed 20% sell page is already at the
     # cap and must not be exited or bargained again.
@@ -82,45 +96,31 @@ def sell_business(num=0, empty_ok=False, expected_goods=None):
         logger.error("Maximum sell bargain was not completed; cancel sale")
         return False
 
-    start_time = time.perf_counter()
-    while time.perf_counter() - start_time < 15:
-        image = screenshot()
-        bgr = image.get_bgr((1156, 100))
-        logger.debug(f"是否出售货物颜色检查 {bgr}")
-        if not (bgr.b == 0 and bgr.g == 0 and 90 <= bgr.r <= 100):
-            logger.debug(f"出售全部货物颜色检查 {bgr}")
-            input_tap((1187, 103))
-            time.sleep(0.5)
-            break
-    if is_empty_goods():
-        if empty_ok:
-            logger.info("No sellable cargo detected; continue with restocking")
-            go_home()
-            return True
-        logger.error("检测到未成功出售物品")
+    if not is_all_cargo_selected() and not select_all_sellable_cargo():
+        # The left warehouse list and the right selected list are different
+        # states. A blank right panel means "selection did not apply", not
+        # "the warehouse is empty". Never restock while known cargo remains.
+        logger.error("Cargo is still visible but Sell All did not create a selection; cancel sale")
         return False
-    else:
-        quote = read_selected_sell_quote()
-        if not quote:
-            logger.error("Unable to read selected sale profit and total; cancel sale")
-            return False
-        profit, total = quote
-        logger.info(f"Selected endpoint sale verified: profit={profit}, total={total}")
-        if profit <= 0 or total <= 0:
-            logger.error("Selected cargo is not a profitable endpoint sale; cancel sale")
-            return False
-        if expected_goods and not cargo_contains_expected_goods(expected_goods):
-            logger.error("Selected cargo does not match the planned endpoint route; cancel sale")
-            return False
-        if not click_sell_button():
-            logger.error("Sell confirmation did not complete")
-            return False
-        time.sleep(0.5)
-        input_tap((896, 676))
-        time.sleep(0.5)
-        input_tap((896, 676))
-        input_tap((896, 676))
-        return True
+
+    quote = read_selected_sell_quote()
+    if not quote:
+        logger.error("Unable to read selected sale profit and total; cancel sale")
+        return False
+    profit, total = quote
+    logger.info(f"Selected endpoint sale verified: profit={profit}, total={total}")
+    if profit <= 0 or total <= 0:
+        logger.error("Selected cargo is not a profitable endpoint sale; cancel sale")
+        return False
+    if not click_sell_button():
+        logger.error("Sell confirmation did not complete")
+        return False
+    time.sleep(0.5)
+    input_tap((896, 676))
+    time.sleep(0.5)
+    input_tap((896, 676))
+    input_tap((896, 676))
+    return True
 
 
 def sell_existing_cargo(num=0, expected_goods=None):
@@ -133,17 +133,24 @@ def sell_existing_cargo(num=0, expected_goods=None):
     return sell_business(num=num, empty_ok=True, expected_goods=expected_goods)
 
 
-def _read_roi_number(pos1, pos2):
-    image = screenshot()
-    image.crop_image(pos1, pos2)
-    values = []
-    for item in image.ocr():
-        for raw in re.findall(r"-?\d[\d,]*(?:\.\d+)?", item["text"]):
-            try:
-                values.append(float(raw.replace(",", "")))
-            except ValueError:
-                continue
-    return max(values, key=abs) if values else None
+def _read_roi_number(pos1, pos2, timeout=5.0):
+    """Read a numeric ROI across multiple frames to tolerate NEMU blanks."""
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        image = screenshot()
+        image.crop_image(pos1, pos2)
+        values = []
+        for item in image.ocr():
+            for raw in re.findall(r"-?\d[\d,]*(?:\.\d+)?", item["text"]):
+                try:
+                    values.append(float(raw.replace(",", "")))
+                except ValueError:
+                    continue
+        if values:
+            return max(values, key=abs)
+        logger.warning("Numeric trade ROI was blank; retrying NEMU IPC capture")
+        time.sleep(FRAME_RETRY_INTERVAL)
+    return None
 
 
 def read_raise_percent():
@@ -154,14 +161,51 @@ def read_raise_percent():
 def is_sell_page():
     """Recognize an already-open exchange sell page for safe task resume."""
     try:
-        texts = [item["text"] for item in screenshot().ocr()]
+        image = screenshot()
+        texts = [item["text"] for item in image.ocr()]
     except StopExecution:
         raise
     except Exception as exc:
         logger.debug(f"Unable to inspect sell-page state: {exc}")
         return False
+    if any("退出后议价幅度将重置" in text for text in texts):
+        logger.info("Negotiation-exit warning detected; cancel it and preserve the sell state")
+        # Left button is Cancel. Never confirm here because confirmation resets
+        # the completed raise and leaves the exchange.
+        input_tap((319, 512))
+        time.sleep(1.5)
+        return True
     markers = ("我要卖", "抬价幅度", "卖出总价")
-    return sum(any(marker in text for text in texts) for marker in markers) >= 2
+    if sum(any(marker in text for text in texts) for marker in markers) >= 2:
+        return True
+
+    # OCR can miss the sell labels when all cargo cards have moved to the
+    # right selection panel. Use stable 1280x720 visual anchors for that exact
+    # resumable state: selected sell tab, white Sell action, orange bargain
+    # action and red "cancel all" selection button.
+    sell_tab = image.get_bgr((315, 675))
+    sell_action = image.get_bgr((1056, 647))
+    bargain_action = image.get_bgr((1176, 461))
+    cancel_all = image.get_bgr((1156, 100))
+    selected_sell_tab = min(tuple(sell_tab)) >= 200
+    visible_sell_action = min(tuple(sell_action)) >= 200
+    visible_bargain_action = (
+        bargain_action.b <= 10
+        and 120 <= bargain_action.g <= 200
+        and bargain_action.r >= 220
+    )
+    all_cargo_selected = (
+        cancel_all.b <= 10 and cancel_all.g <= 10 and 80 <= cancel_all.r <= 130
+    )
+    if (
+        selected_sell_tab
+        and visible_sell_action
+        and visible_bargain_action
+        and all_cargo_selected
+    ):
+        logger.info("Selected-cargo sell page detected from visual anchors")
+        return True
+    return False
 
 
 def read_selected_sell_quote():
@@ -171,6 +215,56 @@ def read_selected_sell_quote():
     if profit is None or total is None:
         return None
     return profit, total
+
+
+def is_all_cargo_selected():
+    """Recognize the red Cancel All state with a positive selected quote."""
+    image = screenshot()
+    cancel_all = image.get_bgr((1156, 100))
+    selected = cancel_all.b <= 10 and cancel_all.g <= 10 and 80 <= cancel_all.r <= 130
+    if not selected:
+        return False
+    quote = read_selected_sell_quote()
+    return bool(quote and quote[0] > 0 and quote[1] > 0)
+
+
+def _select_all_button_active(image=None) -> bool:
+    """Return whether Sell All has changed into the red Cancel All state."""
+    image = image or screenshot()
+    cancel_all = image.get_bgr((1156, 100))
+    return (
+        cancel_all.b <= 10
+        and cancel_all.g <= 10
+        and 80 <= cancel_all.r <= 130
+    )
+
+
+def select_all_sellable_cargo(attempts=5) -> bool:
+    """Apply Sell All and verify selection without ever toggling it off.
+
+    The old flow tapped once, then sampled one blank pixel in the right panel.
+    When that tap was dropped during dialogue animation it incorrectly treated
+    the blank selection as an empty warehouse. Here the red button state and a
+    positive quote are both required before the sale may continue.
+    """
+    for attempt in range(attempts):
+        image = screenshot()
+        if _select_all_button_active(image):
+            quote = read_selected_sell_quote()
+            if quote and quote[0] > 0 and quote[1] > 0:
+                logger.info(
+                    f"Sell All selection verified on attempt {attempt + 1}: "
+                    f"profit={quote[0]}, total={quote[1]}"
+                )
+                return True
+            logger.warning("Cancel All is active but selected quote is not ready; wait without deselecting")
+            time.sleep(0.6)
+            continue
+
+        logger.info(f"Apply Sell All selection ({attempt + 1}/{attempts})")
+        input_tap((1187, 103))
+        time.sleep(0.8)
+    return False
 
 
 def cargo_contains_expected_goods(expected_goods):
@@ -210,14 +304,6 @@ def has_sellable_cargo(expected_goods, max_pages=5):
     logger.info("No sellable residual cargo detected; continue with restocking")
     go_home()
     return False
-
-
-def is_empty_goods():
-    image = screenshot()
-    image.crop_image((870, 132), (994, 205))
-    bgr = image.get_bgr((898, 169))
-    logger.debug(f"货物是否为空检查 {bgr}")
-    return BGR(25, 33, 33) == bgr
 
 
 def click_bargain_button(num=0):
@@ -291,17 +377,63 @@ def reset_negotiation_with_book(timeout=6):
     return False
 
 
-def click_sell_button():
-    start = time.time()
-    while time.time() - start < 10:
-        input_tap((1056, 647))
-        time.sleep(1)
+def click_sell_button(timeout=25):
+    """Complete a sale and verify the settlement report.
+
+    Market volatility can insert an extra confirmation after the Sell click.
+    A colour change is not proof of settlement; only the settlement report (or
+    an emptied selected quote) is accepted as success.
+    """
+    deadline = time.time() + timeout
+    should_click_sell = True
+    while time.time() < deadline:
+        if should_click_sell:
+            input_tap((1056, 647))
+            should_click_sell = False
+            time.sleep(1)
+
         image = screenshot()
+        texts = [item["text"] for item in image.ocr()]
+        if any(
+            marker in text
+            for text in texts
+            for marker in ("SETTLEMENTREPORT", "结算报告", "点击空白处退出")
+        ):
+            logger.info("Settlement report detected; sale completed")
+            return True
+
+        if any("行情" in text and "波动" in text for text in texts):
+            logger.warning("Market volatility prompt detected; confirm and revalidate sale")
+            input_tap((960, 512))
+            time.sleep(1.5)
+            # The confirmation may settle immediately or return to the sell
+            # page with a refreshed quote. The next loop identifies either.
+            should_click_sell = False
+            continue
+
+        if any("本地商品" in text for text in texts):
+            logger.info("检测到包含本地商品，确认出售非本地货物")
+            input_tap((975, 498))
+            time.sleep(1.5)
+            continue
+
         bgr = image.get_bgr((1175, 470), offset=5)
         logger.debug(f"出售物品界面颜色检查: {bgr}")
         if bgr == [227, 131, 82]:
-            logger.info("检测到包含本地商品")
             input_tap((975, 498))
-        if bgr != [0, 183, 253] and bgr != [227, 131, 82] and bgr != [251, 253, 253]:
-            return True
+            time.sleep(1.5)
+            continue
+
+        if is_sell_page():
+            quote = read_selected_sell_quote(timeout=2.0)
+            if quote and quote[0] > 0 and quote[1] > 0:
+                logger.info(
+                    f"Sale still pending after prompt: profit={quote[0]}, total={quote[1]}"
+                )
+                should_click_sell = True
+            elif quote and quote[0] == 0 and quote[1] == 0:
+                logger.info("Selected quote cleared; sale completed")
+                return True
+        time.sleep(FRAME_RETRY_INTERVAL)
+    logger.error("Sale did not reach a verified settlement state")
     return False

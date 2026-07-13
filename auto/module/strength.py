@@ -1,5 +1,6 @@
 import re
 import time
+from dataclasses import dataclass
 from typing import Literal, Optional
 
 from loguru import logger
@@ -7,10 +8,24 @@ from loguru import logger
 from core.control.control import input_tap, screenshot
 from core.preset import go_outlets
 from core.preset.control import go_home
+from core.services.station_facilities import (
+    remember_rest_area_availability,
+    rest_area_availability,
+)
 from app.common.config import cfg
 
 
 Strength = tuple[int, int]
+RestAreaStatus = Literal[
+    "used", "not_needed", "unavailable", "exhausted", "failed"
+]
+
+
+@dataclass(frozen=True)
+class RestAreaRecovery:
+    fatigue: int
+    status: RestAreaStatus
+    used: int = 0
 
 
 def read_strength() -> Optional[Strength]:
@@ -56,6 +71,57 @@ def _wait_text(*texts: str, timeout: float = 8.0) -> bool:
     return False
 
 
+def _click_ocr_text(text: str) -> bool:
+    for item in screenshot().ocr():
+        if text not in str(item.get("text", "")):
+            continue
+        position = item.get("position")
+        if not position:
+            continue
+        center_x = (position[0][0] + position[2][0]) / 2
+        center_y = (position[0][1] + position[2][1]) / 2
+        input_tap((center_x, center_y))
+        return True
+    return False
+
+
+def _confirm_repeat_drink() -> bool:
+    """Accept the active-buff warning and suppress it for the rest of the day."""
+    if not _screen_has("还没有到失效时间", "再喝一杯"):
+        return False
+    if _screen_has("当天不再提醒"):
+        input_tap((576, 671))
+        time.sleep(0.3)
+    input_tap((960, 503))
+    return True
+
+
+def _skip_drink_animation(timeout: float = 8.0) -> bool:
+    """Click SKIP as soon as the drinking animation exposes it."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        # The FPS overlay can cover the final letter, while OCR still returns
+        # the stable top-right prefix `SKI`.
+        if _click_ocr_text("SKI"):
+            time.sleep(0.5)
+            return True
+        time.sleep(0.2)
+    # Stable 1280x720 fallback when OCR misses the animated label entirely.
+    input_tap((1205, 35))
+    time.sleep(0.5)
+    return False
+
+
+def _ensure_drink_selection() -> bool:
+    """Open the drink card again when an animation returns to the rest-area root."""
+    if _screen_has("银枝气泡水", "本次免费"):
+        return True
+    if not _screen_has("喝一杯", "休息区"):
+        return False
+    input_tap((960, 325))
+    return _wait_text("银枝气泡水", "本次免费", timeout=6)
+
+
 def exit_negotiation_safely() -> None:
     """Leave negotiation and resolve the reset-warning instead of stranding UI."""
     input_tap((83, 36))
@@ -71,7 +137,9 @@ def _open_fatigue_panel() -> bool:
 
 
 def _silver_prompt_visible() -> bool:
-    return _screen_has("是否使用银枝", "银枝气泡水")
+    # The free drink card is also named "银枝气泡水".  Only the separate
+    # confirmation dialog means that consuming a silver branch is required.
+    return _screen_has("是否使用银枝")
 
 
 def _resolve_silver_prompt() -> bool:
@@ -88,57 +156,122 @@ def _resolve_silver_prompt() -> bool:
     return False
 
 
-def _use_free_rest_area(starting_fatigue: int, target_fatigue: int) -> int:
-    """Use free drinks first, then optional silver drinks only as needed."""
+def _fatigue_after_drink(current: int, target: int) -> int:
+    """Prefer a fresh HUD reading, falling back to the known 50-point recovery."""
+    estimated = max(target, current - 50)
+    try:
+        observed = read_strength()
+    except (KeyError, TypeError, ValueError):
+        observed = None
+    if observed and 0 <= observed[0] < current:
+        return max(target, observed[0])
+    return estimated
+
+
+def _use_free_rest_area(
+    starting_fatigue: int,
+    target_fatigue: int = 0,
+    station_name: str | None = None,
+) -> RestAreaRecovery:
+    """Consume free or 500-iron drinks until fatigue is fully recovered.
+
+    Iron currency is intentionally treated as effectively free for this
+    workflow.  Only the separate silver-branch confirmation remains guarded by
+    the corresponding setting.
+    """
+    target_fatigue = max(0, target_fatigue)
+    availability = rest_area_availability(station_name)
+    if availability is False:
+        logger.info(f"站点 {station_name or '未知'} 不设休息区，跳过气泡水入口")
+        return RestAreaRecovery(starting_fatigue, "unavailable")
+
+    # The fatigue panel exposes this state before any navigation. It is a
+    # facility verdict, not a button that should be clicked until timeout.
+    if _screen_has("不在范围内"):
+        remember_rest_area_availability(station_name, False)
+        logger.info(
+            f"站点 {station_name or '未知'} 的疲劳面板已确认“不在范围内”，"
+            "本次及本进程后续均跳过休息区"
+        )
+        return RestAreaRecovery(starting_fatigue, "unavailable")
+
+    if starting_fatigue - target_fatigue < 50:
+        logger.info(
+            f"当前疲劳 {starting_fatigue}，不足气泡水单次恢复量 50；"
+            "为避免浪费，跳过气泡水"
+        )
+        return RestAreaRecovery(starting_fatigue, "not_needed")
+
     input_tap((1117, 344))  # 前往休息区
     if not _wait_text("喝一杯", "休息区", timeout=8):
-        logger.info("当前城市的休息区不可用")
-        return starting_fatigue
+        logger.warning("点击休息区后未确认到达；按画面异常处理，不继续执行便当")
+        return RestAreaRecovery(starting_fatigue, "failed")
 
-    # Open the drink selection. The first drink has no repeat-warning dialog.
-    input_tap((960, 325))
-    time.sleep(1.5)
+    if not _ensure_drink_selection():
+        logger.warning("已进入休息区但未显示气泡水选项；按画面异常处理")
+        return RestAreaRecovery(starting_fatigue, "failed")
+    remember_rest_area_availability(station_name, True)
 
     current = starting_fatigue
     used = 0
-    # Six free drinks plus a bounded number of optional silver drinks. The
-    # target prevents consuming paid items after enough fatigue was restored.
-    while used < 12 and current >= 50 and current > target_fatigue:
+    iron_or_free_used = 0
+    paid_used = 0
+    # Max fatigue is currently below 1,000.  Derive the required number of
+    # 50-point drinks and retain a defensive cap against a bad OCR value.
+    max_uses = min(24, max(0, (current - target_fatigue) // 50))
+    while used < max_uses and current - target_fatigue >= 50:
         if _silver_prompt_visible():
             if not _resolve_silver_prompt():
                 break
-            time.sleep(3)
-            input_tap((1215, 35))
-            time.sleep(4)
+            _skip_drink_animation()
+            _wait_text("喝一杯", "休息区", timeout=6)
             used += 1
-            current = max(0, current - 50)
+            paid_used += 1
+            current = _fatigue_after_drink(current, target_fatigue)
             continue
-        if not _screen_has("本次免费"):
-            # The drink list may need one click to expose the paid prompt.
-            if _screen_has("银枝气泡水"):
-                input_tap((960, 422))
-                time.sleep(1.5)
-                continue
+        if not _ensure_drink_selection():
+            logger.info("未能重新打开气泡水列表，停止连续恢复")
             break
+        is_free = _screen_has("本次免费")
+        has_iron_drink = _screen_has("银枝气泡水")
+        if not is_free and not has_iron_drink:
+            break
+        # Both the daily-free card and the 500-iron card are always allowed.
+        # A rare-currency cost is handled only if the separate silver prompt
+        # appears after this click.
         input_tap((960, 422))
-        time.sleep(1.5)
+        time.sleep(1.0)
+        paid = False
         if _silver_prompt_visible():
             if not _resolve_silver_prompt():
                 break
-        elif _screen_has("再喝一杯"):
-            input_tap((960, 503))
-        time.sleep(3)
-        # Skip the drinking animation when it is present.
-        input_tap((1215, 35))
-        time.sleep(4)
+            paid = True
+        else:
+            _confirm_repeat_drink()
+        _skip_drink_animation()
+        _wait_text("喝一杯", "休息区", timeout=6)
         used += 1
-        current = max(0, current - 50)
-        logger.info(f"休息区已免费喝酒 {used} 次，预计恢复 {used * 50} 疲劳")
-    return current
+        if paid:
+            paid_used += 1
+        else:
+            iron_or_free_used += 1
+        current = _fatigue_after_drink(current, target_fatigue)
+        logger.info(
+            f"休息区已饮用气泡水 {used} 次（免费/铁盟币 {iron_or_free_used}，"
+            f"银枝 {paid_used}），"
+            f"当前疲劳预计 {current}"
+        )
+    return RestAreaRecovery(
+        current,
+        "used" if used else "exhausted",
+        used,
+    )
 
 
 def _return_to_trade(trade_type: Literal["buy", "sell"]) -> bool:
-    go_home()
+    if not go_home():
+        logger.error("未能返回主界面，拒绝继续进入交易所")
+        return False
     if not go_outlets("交易所"):
         return False
     time.sleep(1.5)
@@ -183,7 +316,9 @@ def _use_all_safe_lunchboxes(current_fatigue: int) -> int:
 
 
 def recover_strength(
-    trade_type: Literal["buy", "sell"], min_available: int = 60
+    trade_type: Literal["buy", "sell"],
+    min_available: int = 60,
+    station_name: str | None = None,
 ) -> bool:
     """Recover fatigue with free rest-area drinks before safe batch lunches."""
     strength = read_strength()
@@ -191,18 +326,66 @@ def recover_strength(
         logger.error("无法读取当前疲劳值")
         return False
     current, maximum = strength
+
+    # Preserve the required resource order. If a non-wasteful drink is still
+    # available in principle but this station has no rest area, do not consume
+    # lunches first and do not report the daily plan as completed.
+    if rest_area_availability(station_name) is False and current >= 50:
+        logger.warning(
+            f"站点 {station_name or '未知'} 不设休息区，当前疲劳 {current} 可无浪费使用气泡水；"
+            "疲劳规划暂缓，便当保持不动"
+        )
+        return False
+
     if not _open_fatigue_panel():
         return False
 
-    current = _use_free_rest_area(current, max(0, maximum - min_available))
-    if not _return_to_trade(trade_type) or not _open_fatigue_panel():
+    # Free and 500-iron drinks are cheap recovery: continue to zero instead of
+    # stopping as soon as the current bargain reserve is satisfied.
+    rest_area = _use_free_rest_area(current, 0, station_name)
+    current = rest_area.fatigue
+    if rest_area.status == "failed":
+        go_home()
         return False
-    current = _use_all_safe_lunchboxes(current)
+    if rest_area.status == "unavailable" and current >= 50:
+        logger.warning(
+            "当前疲劳仍可无浪费使用气泡水；保留疲劳任务到有休息区的核心城市，"
+            "不提前使用便当"
+        )
+        go_home()
+        return False
 
-    # Recovery pages return to the city/home screen. Re-enter the same trading
-    # page so the caller can resume the interrupted bargain/sale operation.
+    # When the station has no rest area and drinking is not needed, the
+    # fatigue panel is still open; inspect the lunchbox directly and navigate
+    # back only once.
+    if rest_area.status == "unavailable":
+        if current > 0:
+            current = _use_all_safe_lunchboxes(current)
+        if not _return_to_trade(trade_type):
+            return False
+        final = read_strength()
+        if final:
+            logger.info(f"疲劳恢复完成: {final[0]}/{final[1]}")
+            return final[1] - final[0] >= min_available
+        return maximum - current >= min_available
+
     if not _return_to_trade(trade_type):
         return False
+    observed = read_strength()
+    if observed:
+        current, maximum = observed
+
+    if current > 0:
+        if not _open_fatigue_panel():
+            return False
+        current = _use_all_safe_lunchboxes(current)
+
+        # Recovery pages return to the city/home screen. Re-enter the same
+        # trading page so the caller can resume the interrupted operation.
+        if not _return_to_trade(trade_type):
+            return False
+    else:
+        logger.info("免费/铁盟币气泡水已将疲劳恢复至满状态，跳过便当柜")
     final = read_strength()
     if final:
         logger.info(f"疲劳恢复完成: {final[0]}/{final[1]}")
@@ -229,13 +412,11 @@ def prepare_negotiation(
     current, maximum = strength
     reserve = 80
     if maximum - current < reserve:
-        logger.info(
+        logger.warning(
             f"完成 2 次成功议价保守需要 {reserve} 疲劳，"
-            f"当前仅剩 {maximum - current}，尝试恢复"
+            f"当前仅剩 {maximum - current}；疲劳恢复已由独立疲劳规划负责"
         )
-        if not recover_strength(trade_type, min_available=reserve):
-            logger.warning("恢复资源不足，本次放弃议价")
-            return 0
+        return 0
     return desired_successes
 
 

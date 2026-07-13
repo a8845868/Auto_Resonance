@@ -11,10 +11,10 @@ from typing import Any, Dict, Literal
 from loguru import logger
 
 from auto.module.strength import can_afford_fatigue, prepare_negotiation
-from auto.module.dispatch import collect_dispatch_rewards
 from auto.run_business.buy import buy_business
 from auto.run_business.sell import (
     has_sellable_cargo,
+    is_all_cargo_selected,
     is_sell_page,
     read_raise_percent,
     sell_business,
@@ -27,7 +27,9 @@ from core.model import app
 from core.model.city_goods import RouteModel, RoutesModel
 from core.module.bgr import BGR
 from core.preset import click_station, get_station, go_outlets, wait_gbr
-from core.preset.control import click
+from core.preset.control import click, go_home
+from core.preset.station import STATION
+from core.services.screen_state import is_train_in_transit
 from core.utils.utils import read_json, RESOURCES_PATH
 from core.services.game_recovery import is_game_running, recover_game
 
@@ -51,15 +53,19 @@ def _prepare_max_sell_haggle():
 def _read_route_city_from_current_screen(routes: RoutesModel):
     """Read one of the planned endpoint cities without leaving the sell page."""
     texts = [item["text"] for item in screenshot().ocr()]
-    cities = {
-        name
-        for item in routes.city_data
-        for name in (item.buy_city_name, item.sell_city_name)
-    }
+    cities = _route_city_names(routes)
     return next(
         (city for city in cities if any(city in text for text in texts)),
         None,
     )
+
+
+def _route_city_names(routes: RoutesModel) -> set[str]:
+    return {
+        name
+        for item in routes.city_data
+        for name in (item.buy_city_name, item.sell_city_name)
+    }
 
 
 def _inspect_recovered_station():
@@ -67,6 +73,52 @@ def _inspect_recovered_station():
     if not connect():
         return None
     return get_station()
+
+
+def _wait_for_verified_arrival(max_false_arrivals: int = 3) -> bool:
+    """Wait for arrival and verify the train really stopped afterwards.
+
+    ``STATION.wait`` uses legacy fixed pixels and can report arrival on cabin
+    pages with similar colours. Never release the trading workflow until the
+    top-level HUD independently confirms that transit markers disappeared.
+    """
+    for attempt in range(max_false_arrivals):
+        # This is called only after a travel HUD was positively identified.
+        # Open the route map and let the existing interception/arrival monitor
+        # continue doing its job.
+        input_tap((78, 38))
+        time.sleep(1.0)
+        if not STATION(True).wait():
+            return False
+        if not go_home():
+            return False
+        if not is_train_in_transit(screenshot().ocr()):
+            logger.info("到站状态已二次确认，允许继续站点操作")
+            return True
+        logger.warning(
+            f"行车监控第 {attempt + 1}/{max_false_arrivals} 次返回后列车仍在行驶，"
+            "忽略固定像素误判并继续等待"
+        )
+    logger.error("行车监控连续误判到站，安全停止本轮跑商")
+    return False
+
+
+def _normalize_trade_startup_screen() -> bool:
+    """Resolve one startup state before any station-only side operation.
+
+    A restarted GUI may attach while the train is still moving. In that case
+    resume the existing travel monitor instead of repeatedly navigating home,
+    opening station-only menus, and misreading map artwork as a city name.
+    """
+    for pass_index in range(2):
+        image = screenshot()
+        if is_train_in_transit(image.ocr()):
+            logger.info("启动状态：检测到列车行驶中，恢复行车监控并等待到站")
+            return _wait_for_verified_arrival()
+        if pass_index == 0 and not go_home():
+            return False
+    logger.info("启动状态：已确认处于站点主界面")
+    return True
 
 
 def show(routes: RoutesModel):
@@ -84,17 +136,35 @@ def show(routes: RoutesModel):
     return message
 
 
+def _is_exchange_lobby(image=None) -> bool:
+    """Recognize the exchange action menu before attempting city navigation."""
+    image = image or screenshot()
+    texts = [item["text"] for item in image.ocr()]
+    markers = ("我要买", "我要卖", "交易品投资", "私人仓库")
+    return sum(any(marker in text for text in texts) for marker in markers) >= 2
+
+
 def go_business(type: Literal["buy", "sell"] = "buy"):
+    if is_train_in_transit(screenshot().ocr()):
+        logger.error("安全门禁：列车仍在行驶，拒绝执行前往交易所")
+        return False
+    if type == "sell" and is_sell_page():
+        logger.info("已在交易所卖货页，直接复用当前页面")
+        return True
     logger.info("前往交易所")
-    result = go_outlets("交易所")
-    is_join = wait_gbr(
-        pos=(286, 35),
-        min_gbr=BGR(250, 250, 250),
-        max_gbr=BGR(255, 255, 255),
-        cropped_pos1=(242, 11),
-        cropped_pos2=(414, 66),
-    )
-    if result and is_join:
+    if _is_exchange_lobby():
+        logger.info("已在交易所入口菜单，跳过城市寻路")
+        is_join = True
+    else:
+        result = go_outlets("交易所")
+        is_join = bool(result) and wait_gbr(
+            pos=(286, 35),
+            min_gbr=BGR(250, 250, 250),
+            max_gbr=BGR(255, 255, 255),
+            cropped_pos1=(242, 11),
+            cropped_pos2=(414, 66),
+        )
+    if is_join:
         if type == "buy":
             input_tap((927, 321))
         elif type == "sell":
@@ -133,7 +203,7 @@ def run(routes: RoutesModel, recovery_attempts: int = 2):
             return False
         state = recover_game(
             inspect_station=_inspect_recovered_station,
-            expected_cities={item.buy_city_name for item in routes.city_data},
+            expected_cities=_route_city_names(routes),
         )
         if not state:
             return False
@@ -145,17 +215,21 @@ def run(routes: RoutesModel, recovery_attempts: int = 2):
         logger.info("Sell-page recovery state detected; preserve it before all side tasks")
         city_name = _read_route_city_from_current_screen(routes)
     else:
-        # Dispatch rewards are opportunistic, but must never interrupt a sale
-        # whose 20% negotiation state is already on screen.
-        try:
-            collect_dispatch_rewards()
-        except StopExecution:
-            raise
-        except Exception:
-            logger.exception("自动领取委派奖励失败，跳过并继续跑商")
+        if not _normalize_trade_startup_screen():
+            return False
         city_name = get_station()
     if not city_name:
         logger.error("无法确定当前城市，已安全停止而非抛出异常")
+        return False
+    expected_cities = _route_city_names(routes)
+    if city_name not in expected_cities:
+        logger.error(
+            f"安全门禁：识别到非路线城市 {city_name!r}，预期为 {sorted(expected_cities)}；"
+            "拒绝进入清仓和交易所流程"
+        )
+        return False
+    if is_train_in_transit(screenshot().ocr()):
+        logger.error("安全门禁：城市识别后仍检测到行驶状态，拒绝执行清仓预检")
         return False
     if routes.city_data[0].sell_city_name == city_name:
         routes.city_data = [routes.city_data[1], routes.city_data[0]]
@@ -175,7 +249,10 @@ def run(routes: RoutesModel, recovery_attempts: int = 2):
         None,
     )
     residual_goods = list(residual_route.goods_data) if residual_route else []
-    if has_sellable_cargo(residual_goods):
+    cargo_selected = is_all_cargo_selected()
+    if cargo_selected:
+        logger.info("All cargo is already selected with a positive quote; skip cargo-name scan")
+    if cargo_selected or has_sellable_cargo(residual_goods):
         sell_haggle = _prepare_max_sell_haggle()
         if sell_haggle == 0:
             logger.error(
@@ -250,7 +327,7 @@ def run_with_recovery(routes: RoutesModel, recovery_attempts: int = 2):
                 return False
             state = recover_game(
                 inspect_station=_inspect_recovered_station,
-                expected_cities={item.buy_city_name for item in routes.city_data},
+                expected_cities=_route_city_names(routes),
             )
             if not state:
                 return False
@@ -287,11 +364,24 @@ def two_city_run(buy_city_name: str, sell_city_name: str):
     logger.info(f"准备运行端点跑商，运行次数: {count}")
     for i in range(count):
         if not run_with_recovery(routes) or is_stopped():
-            break
+            logger.warning(f"端点跑商未完成，已完成 {i}/{count} 轮")
+            return False
+    return True
 
 
-def two_city_weekly_run(buy_city_name: str, sell_city_name: str, execution_batches: list[dict]):
-    """Execute an optimizer plan and change restock-book counts between batches."""
+def two_city_weekly_run(
+    buy_city_name: str,
+    sell_city_name: str,
+    execution_batches: list[dict],
+    max_runs: int | None = None,
+):
+    """Execute complete round trips, optionally yielding after a safe run boundary.
+
+    A scheduled weekly plan may contain many round trips.  Limiting one worker
+    invocation to a small number of *complete* trips lets higher-priority tasks
+    that became due meanwhile run before the next trip, without ever stopping a
+    train halfway through a leg or leaving a sale unfinished.
+    """
     from core.services import record_completed_run
 
     global STOP
@@ -299,6 +389,7 @@ def two_city_weekly_run(buy_city_name: str, sell_city_name: str, execution_batch
     buy_haggle_num = app.CityHaggle[buy_city_name]
     sell_haggle_num = app.CityHaggle[sell_city_name]
     total_runs = sum(int(batch["runs"]) for batch in execution_batches)
+    run_limit = total_runs if max_runs is None else min(total_runs, max(1, int(max_runs)))
     logger.info(f"准备运行周计划，共 {total_runs} 次完整往返，{len(execution_batches)} 个阶段")
     completed = 0
     for batch_index, batch in enumerate(execution_batches, start=1):
@@ -326,10 +417,17 @@ def two_city_weekly_run(buy_city_name: str, sell_city_name: str, execution_batch
             )
             if not run_with_recovery(routes) or is_stopped():
                 logger.info(f"周计划停止，本次已完成 {completed}/{total_runs} 次完整往返")
-                return
+                return False
             completed += 1
             record_completed_run(books)
+            if completed >= run_limit and completed < total_runs:
+                logger.info(
+                    f"本次调度已在完整往返边界让出队列，完成 {completed}/{total_runs} 次；"
+                    "剩余计划将在下一次调度继续"
+                )
+                return True
     logger.info(f"周计划完成，共 {completed} 次完整往返")
+    return True
 
 
 def adaptive_weekly_run():
@@ -342,31 +440,56 @@ def adaptive_weekly_run():
         optimize_live_routes,
         progress_summary,
         remaining_batches,
+        roll_weekly_plan_forward,
         save_weekly_plan,
     )
 
     state = load_weekly_plan()
+    if not state:
+        state = roll_weekly_plan_forward()
+        if state:
+            logger.info(
+                f"检测到新一周，已沿用路线 {state['cycle'][0]} → "
+                f"{state['cycle'][1]} 并重置本周进度"
+            )
     summary = progress_summary(state)
     if not state or not summary or summary["finished"]:
         logger.info("没有待执行的本周跑商计划")
-        return
+        return bool(state and summary and summary["finished"])
     fallback = int(cfg.InventoryBooks.value)
-    if is_sell_page():
+    sell_resume = is_sell_page()
+    if sell_resume:
         logger.info("当前处于卖货中间态，跳过进货书背包扫描以保留议价幅度")
         actual = None
     else:
         actual = read_restock_book_count() if bool(cfg.AutoReadInventoryBooks.value) else None
+        if bool(cfg.AutoReadInventoryBooks.value) and actual is None:
+            logger.error(
+                "已开启自动读取进货书，但本次未能确认真实数量；"
+                "停止本次跑商，避免把识别失败误当成 0 本"
+            )
+            return False
     available = fallback if actual is None else actual
     if actual is not None:
         from qfluentwidgets import qconfig
         qconfig.set(cfg.InventoryBooks, actual)
     required = int(summary["remaining_books"])
-    if available >= required:
+    needs_reoptimization = bool(state.get("needs_reoptimization")) and not sell_resume
+    if available >= required and not needs_reoptimization:
         logger.info(f"进货书库存 {available} 本，足够完成剩余计划（需要 {required} 本）")
         cycle = state["cycle"]
-        return two_city_weekly_run(cycle[0], cycle[1], remaining_batches(state))
+        return two_city_weekly_run(cycle[0], cycle[1], remaining_batches(state), max_runs=1)
 
-    logger.warning(f"进货书库存仅 {available} 本，少于剩余计划需要的 {required} 本，重新计算实时替代路线")
+    if needs_reoptimization:
+        logger.info(
+            f"新周进货书库存已确认：{available} 本；"
+            "正在按真实库存重新计算剩余计划"
+        )
+    else:
+        logger.warning(
+            f"进货书库存仅 {available} 本，少于剩余计划需要的 {required} 本，"
+            "重新计算实时替代路线"
+        )
     raw_config = dict(state.get("optimizer_config") or {})
     raw_config["books"] = max(0, available)
     raw_config["weekly_fatigue"] = max(1, int(summary["remaining_fatigue"]))
@@ -375,13 +498,18 @@ def adaptive_weekly_run():
         state = save_weekly_plan(replacement)
         cycle = state["cycle"]
         logger.info(f"已切换替代路线: {cycle[0]} → {cycle[1]} → {cycle[0]}，计划使用 {replacement['books_used']} 本")
-        return two_city_weekly_run(cycle[0], cycle[1], remaining_batches(state))
+        return two_city_weekly_run(cycle[0], cycle[1], remaining_batches(state), max_runs=1)
     except StopExecution:
         raise
     except Exception:
         logger.exception("科伦巴实时替代路线计算失败，降级为原路线不使用进货书")
         safe_batches = [{"runs": summary["remaining_runs"], "books": {city: 0 for city in state["cycle"]}}]
-        return two_city_weekly_run(state["cycle"][0], state["cycle"][1], safe_batches)
+        return two_city_weekly_run(
+            state["cycle"][0],
+            state["cycle"][1],
+            safe_batches,
+            max_runs=1,
+        )
 
 
 def stop():

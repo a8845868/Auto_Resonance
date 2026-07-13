@@ -2,6 +2,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 import auto.run_business.main as business
+import auto.inventory as inventory
 import core.control.control as control
 from core.exception.exceptions import StopExecution
 
@@ -39,3 +40,14 @@ def test_adaptive_plan_does_not_treat_stop_as_optimizer_failure():
         with TestCase().assertRaises(StopExecution):
             business.adaptive_weekly_run()
     weekly_run.assert_not_called()
+
+
+def test_inventory_book_read_does_not_swallow_stop_request():
+    with patch.object(inventory, "connect", return_value=True), patch.object(
+        inventory, "go_home", side_effect=StopExecution()
+    ) as go_home, patch.object(inventory, "screenshot") as screenshot:
+        screenshot.return_value.ocr.return_value = []
+        with TestCase().assertRaises(StopExecution):
+            inventory.read_restock_book_count()
+
+    go_home.assert_called_once()

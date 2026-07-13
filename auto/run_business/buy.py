@@ -18,8 +18,24 @@ from core.image.image import Image
 from core.module.bgr import BGR
 from core.module.hsv import HSV
 from core.preset import click, find_text, go_home
-from core.preset.control import wait_gbr
 from auto.module.strength import exit_negotiation_safely
+
+
+BUY_BARGAIN_TIMEOUT = 45
+BUY_RESULT_TIMEOUT = 3.0
+BUY_RESULT_POLL_INTERVAL = 0.2
+
+
+def _wait_for_discount_result(timeout=BUY_RESULT_TIMEOUT):
+    """Poll the transient discount colour instead of one delayed frame."""
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        hsv = screenshot().crop_image((516, 224), (787, 439)).get_hsv((629, 271))
+        logger.debug(f"降价是否成功颜色检查(HSV): {hsv}")
+        if 95 <= hsv.h <= 105:
+            return True
+        time.sleep(BUY_RESULT_POLL_INTERVAL)
+    return False
 
 
 def buy_business(
@@ -212,14 +228,20 @@ def click_bargain_button(num=0):
     """
     logger.info(f"议价次数: {num}")
     start = time.perf_counter()
-    while time.perf_counter() - start < 15:
+    while time.perf_counter() - start < BUY_BARGAIN_TIMEOUT:
         if num <= 0:
             return True
         bgr = screenshot().get_bgr((1176, 461))
         logger.debug(f"降价界面颜色检查: {bgr}")
         if BGR(0, 123, 240) <= bgr <= BGR(2, 133, 255):
             input_tap((1177, 461))
-            time.sleep(1.0)
+            if _wait_for_discount_result():
+                logger.info("降价成功")
+                num -= 1
+            else:
+                logger.info("降价失败")
+            time.sleep(0.5)
+            continue
         elif bgr == [251, 253, 253]:
             logger.info("降价次数不足")
             return True
@@ -227,15 +249,7 @@ def click_bargain_button(num=0):
             logger.info("疲劳不足")
             exit_negotiation_safely()
             return False
-        hsv = screenshot().crop_image((516, 224), (787, 439)).get_hsv((629, 271))
-        logger.debug(f"降价是否成功颜色检查(HSV): {hsv}")
-        if 95 <= hsv.h <= 105:
-            logger.info("降价成功")
-            num -= 1
-        else:
-            logger.info("降价失败")
-        # 等待降价动画消失
-        wait_gbr((628, 102), BGR(60, 55, 30), BGR(70, 65, 40))
+        time.sleep(BUY_RESULT_POLL_INTERVAL)
     return False
 
 
