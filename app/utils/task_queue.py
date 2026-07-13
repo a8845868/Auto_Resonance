@@ -58,8 +58,10 @@ class TaskQueueWorker(QThread):
             result = None
             try:
                 result = task.run()
-                if self._stop_requested:
+                if self._stop_requested or not result:
                     succeeded = False
+                    if not self._stop_requested:
+                        logger.warning(f"任务未返回明确成功结果，按失败处理: {task.name}")
             except StopExecution:
                 succeeded = False
                 self._stop_requested = True

@@ -15,6 +15,12 @@ def collect_dispatch_rewards() -> bool:
     normal state and must not interrupt the trading workflow.
     """
     logger.info("检查委派奖励")
+    # Reward collection leaves the game on its own detail page.  The dispatch
+    # reminder exists only on the home HUD, so always normalize navigation
+    # before looking for it.
+    if not go_home():
+        logger.error("无法返回主界面，取消检查委派奖励")
+        return False
     visible_text = [item["text"] for item in screenshot().ocr()]
     if not any("委派奖励可收取" in text for text in visible_text):
         logger.info("当前没有可领取的委派奖励")

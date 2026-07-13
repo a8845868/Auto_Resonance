@@ -68,16 +68,26 @@ def record_task_execution(
 ) -> dict[str, Any]:
     now = now or datetime.now()
     state = load_task_schedule(path)
+    previous = state["tasks"].get(task_key, {})
+    attempt_time = now.isoformat(timespec="seconds")
+    previous_completed_at = previous.get("completed_at", "")
+    if not previous_completed_at and previous.get("status") == "completed":
+        previous_completed_at = previous.get("last_run", "")
     entry = {
         "key": task_key,
         "name": name,
-        "last_run": now.isoformat(timespec="seconds"),
+        "last_run": attempt_time,
+        "last_attempt": attempt_time,
+        "completed_at": attempt_time if succeeded else previous_completed_at,
         "next_run": next_run.isoformat(timespec="seconds") if next_run else "",
         "status": "completed" if succeeded else "failed_or_stopped",
         "result": result if isinstance(result, (dict, list, str, int, float, bool, type(None))) else str(result),
     }
     state["tasks"][task_key] = entry
-    state["completed"].insert(0, dict(entry))
+    history_entry = dict(entry)
+    if not succeeded:
+        history_entry["completed_at"] = ""
+    state["completed"].insert(0, history_entry)
     state["completed"] = state["completed"][:100]
     _save(state, path)
     return entry

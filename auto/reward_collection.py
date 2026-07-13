@@ -19,6 +19,7 @@ import numpy as np
 from loguru import logger
 
 from core.control.control import connect, input_tap, screenshot
+from core.services.screen_state import startup_screen_action
 
 
 STATE_PATH = Path("config") / "reward_state.json"
@@ -80,12 +81,49 @@ class RewardDriver:
         return any(_matches(item["text"], text) for item in self.texts())
 
     def go_home(self) -> bool:
-        for _ in range(12):
+        startup_recovery = False
+        for _ in range(45):
             texts = self.texts()
             if any(_matches(i["text"], marker) for i in texts for marker in ("访问城市", "启程", "作战终端")):
                 return True
+            action = startup_screen_action(texts)
+            if action == "cancel_resource_repair":
+                logger.warning("检测到资源完整性修复提示，取消修复")
+                self.tap((320, 500))
+                startup_recovery = True
+                self.sleep(1)
+                continue
+            if action == "enter_game":
+                logger.info("检测到游戏登录页，点击安全区域进入游戏")
+                self.tap((640, 560))
+                startup_recovery = True
+                self.sleep(4)
+                continue
+            if action == "dismiss_startup_overlay":
+                logger.info("关闭登录后的启动弹窗")
+                self.tap((100, 650))
+                startup_recovery = True
+                self.sleep(1)
+                continue
+            if action == "wait_for_game" or startup_recovery:
+                self.sleep(2)
+                continue
             self.tap((82, 36))
             self.sleep(0.8)
+        return False
+
+    def click_exact_text(self, text: str, attempts: int = 3) -> bool:
+        """Click an exact OCR label, avoiding prefix matches such as
+        ``环游手册等级`` when the requested bottom tab is ``环游手册``.
+        """
+        expected = text.replace(" ", "")
+        for _ in range(attempts):
+            for item in self.texts():
+                if item["text"].replace(" ", "") == expected:
+                    self.tap(_center(item))
+                    self.sleep(1)
+                    return True
+            self.sleep(0.4)
         return False
 
     def red_badge_shortcuts(self) -> list[tuple[int, int]]:
@@ -110,10 +148,26 @@ class RewardCollector:
         self.driver = driver or RewardDriver()
         self.state = _load_state()
 
+    def _page_is_open(self, page_marker: str) -> bool:
+        if self.driver.has_text(page_marker):
+            return True
+        if page_marker == "每日活跃":
+            texts = [item["text"] for item in self.driver.texts()]
+            return (
+                any(_matches(text, "完成进度") for text in texts)
+                and any(_matches(text, "活跃度") for text in texts)
+            )
+        return False
+
+    def _matching_text_count(self, text: str) -> int:
+        return sum(
+            1 for item in self.driver.texts()
+            if _matches(item["text"], text)
+        )
+
     def _open_from_home(self, page_marker: str) -> bool:
         if not self.driver.go_home():
-            logger.error("无法返回主界面，取消领取奖励")
-            return False
+            raise RuntimeError("无法返回主界面，取消领取奖励")
         candidates = self.driver.red_badge_shortcuts()
         learned = self.state.get("shortcut_positions", {}).get(page_marker)
         if learned:
@@ -121,15 +175,30 @@ class RewardCollector:
                 pos for pos in candidates
                 if abs(pos[0] - learned[0]) <= 35 and abs(pos[1] - learned[1]) <= 35
             ]
-            if not nearby:
-                logger.info(f"{page_marker}入口没有红点，当前无奖励可领取")
-                return False
-            candidates = nearby
+            if nearby:
+                # The learned coordinate is only a search hint.  Keep every
+                # current badge as a fallback because home shortcuts may move
+                # after an update or a resolution/layout change.
+                candidates = nearby + [pos for pos in candidates if pos not in nearby]
+            else:
+                # A missing badge normally means "nothing pending", not that
+                # the shortcut moved.  Open the learned shortcut once and
+                # inspect the page; if it is genuinely stale, the remaining
+                # current badges are still tried afterwards.
+                logger.info(f"{page_marker}入口当前无角标，使用缓存坐标复核页面")
+                learned_pos = tuple(learned)
+                candidates = [learned_pos] + [
+                    pos for pos in candidates if pos != learned_pos
+                ]
+
+        if not candidates:
+            logger.info(f"主界面没有发现可用于进入{page_marker}的提醒角标")
+            return False
 
         for pos in candidates:
             self.driver.tap(pos)
             self.driver.sleep(1.5)
-            if self.driver.has_text(page_marker):
+            if self._page_is_open(page_marker):
                 positions = self.state.setdefault("shortcut_positions", {})
                 positions[page_marker] = list(pos)
                 _save_state(self.state)
@@ -139,6 +208,18 @@ class RewardCollector:
         logger.info(f"没有找到带提醒角标的{page_marker}入口")
         return False
 
+    def _claim_one_click(self, area: str) -> bool:
+        """Claim a one-click batch and require the actionable button to go away."""
+        if not self.driver.click_text("一键领取", attempts=2):
+            return False
+        self.driver.tap((640, 660))
+        self.driver.sleep(0.8)
+        if self.driver.has_text("一键领取"):
+            logger.warning(f"{area}的一键领取按钮点击后仍存在，本次不计为已领取")
+            return False
+        logger.info(f"{area}的一键领取按钮已消失，确认领取成功")
+        return True
+
     def collect_daily_activity(self) -> int:
         cycle = _daily_cycle()
         if self.state.get("daily_activity_completed_cycle") == cycle:
@@ -146,29 +227,57 @@ class RewardCollector:
             return 0
         if not self._open_from_home("每日活跃"):
             return 0
-        self.driver.click_text("每日活跃", attempts=1)
 
-        # One task click currently claims all completed tasks, but keep a small
-        # loop for game versions that require individual clicks.
+        # One task click often claims all completed tasks, but require the
+        # actionable-label count to decrease before treating it as success.
         claimed = 0
         for _ in range(8):
+            before = self._matching_text_count("可领取")
+            if before == 0:
+                break
             if not self.driver.click_text("可领取", attempts=1):
+                break
+            self.driver.tap((640, 660))
+            self.driver.sleep(0.8)
+            after = self._matching_text_count("可领取")
+            if after >= before:
+                logger.warning("每日活跃的可领取状态点击后没有减少，本次不计成功")
                 break
             claimed += 1
 
-        # Stage boxes have fixed positions in the normalized layout.  Only tap
-        # boxes whose center area is yellow; blue/unavailable boxes are skipped.
+        # Stage boxes have fixed positions in the normalized layout.  The game
+        # claims every currently available stage box when any one yellow box is
+        # tapped, so never iterate over a stale pre-click screenshot.
         frame = self.driver.frame().image
         hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
+        yellow_boxes: list[tuple[int, int]] = []
         for x in (439, 562, 684, 806, 929, 1051):
             patch = hsv[135:195, x - 30:x + 30]
             yellow = cv.inRange(patch, np.array((15, 100, 120)), np.array((40, 255, 255)))
-            if cv.countNonZero(yellow) >= 25:
-                self.driver.tap((x, 164))
-                self.driver.sleep(0.8)
-                self.driver.tap((640, 660))
-                self.driver.sleep(0.5)
+            yellow_count = cv.countNonZero(yellow)
+            if yellow_count >= 25:
+                yellow_boxes.append((x, yellow_count))
+
+        if yellow_boxes:
+            x, before_yellow = yellow_boxes[0]
+            self.driver.tap((x, 164))
+            self.driver.sleep(0.8)
+            self.driver.tap((640, 660))
+            self.driver.sleep(0.5)
+            updated = cv.cvtColor(self.driver.frame().image, cv.COLOR_BGR2HSV)
+            updated_patch = updated[135:195, x - 30:x + 30]
+            updated_yellow = cv.inRange(
+                updated_patch,
+                np.array((15, 100, 120)),
+                np.array((40, 255, 255)),
+            )
+            if cv.countNonZero(updated_yellow) < before_yellow:
                 claimed += 1
+                logger.info(
+                    f"点击 1 个黄色阶段礼物盒，游戏已自动领取全部 {len(yellow_boxes)} 个可领奖励"
+                )
+            else:
+                logger.warning(f"每日活跃阶段箱 x={x} 点击后未发生变化，不计成功")
 
         # Only cache a completed day after the UI itself confirms 600 activity.
         # If it is below 600, later tasks can still make more rewards available.
@@ -191,19 +300,16 @@ class RewardCollector:
             return 0
         claimed = 0
         if self.driver.click_text("任务列表", attempts=2):
-            if self.driver.click_text("一键领取", attempts=2):
+            if self._claim_one_click("环游手册任务列表"):
                 claimed += 1
-                self.driver.tap((640, 660))
-                self.driver.sleep(0.8)
-        if not self.driver.click_text("环游手册", attempts=2):
+        if not self.driver.click_exact_text("环游手册", attempts=2):
+            logger.warning("未能准确点击底部‘环游手册’标签，暂不检查等级奖励")
             return claimed
 
         # The manual page has its own one-click claim at the bottom right.
         # It becomes marked with a red exclamation after task EXP raises levels.
-        if self.driver.click_text("一键领取", attempts=2):
+        if self._claim_one_click("环游手册等级奖励"):
             claimed += 1
-            self.driver.tap((640, 660))
-            self.driver.sleep(0.8)
         logger.info(f"环游手册奖励处理完成，共触发 {claimed} 次领取")
         return claimed
 

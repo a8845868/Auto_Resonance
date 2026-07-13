@@ -10,6 +10,7 @@ from app.utils.task_queue import QueuedTask, TaskQueueWorker
 from app.view.logger_interface import LoguruHandler
 from auto.resident_activity import run_resident_activity
 from auto.reward_collection import collect_rewards
+from auto.module.dispatch import collect_dispatch_rewards
 from core.logger import logger
 from core.services.task_schedule_state import (
     completed_history,
@@ -39,6 +40,17 @@ class StatusPanel(QFrame):
 
     def setTasks(self, tasks):
         self.content.setText("\n".join(tasks) if tasks else "无任务")
+
+
+def _collect_scheduled_rewards(daily: bool, manual: bool):
+    """Keep all reward side work inside the reward queue task."""
+    result = collect_rewards(daily, manual)
+    dispatch_collected = collect_dispatch_rewards()
+    payload = {"task_rewards": result, "dispatch_collected": dispatch_collected}
+    if not any(result.values()) and not dispatch_collected:
+        logger.warning("奖励任务没有确认领取任何奖励，本次不记完成，稍后重试")
+        return {}
+    return payload
 
 
 class DashboardInterface(ScrollArea):
@@ -168,7 +180,7 @@ class DashboardInterface(ScrollArea):
             if daily or manual:
                 tasks.append(QueuedTask(
                     "领取任务奖励",
-                    lambda: collect_rewards(daily, manual),
+                    lambda: _collect_scheduled_rewards(daily, manual),
                     key="reward_collection",
                 ))
         business = self.businessTaskProvider()

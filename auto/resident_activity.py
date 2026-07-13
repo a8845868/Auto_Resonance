@@ -10,6 +10,7 @@ from typing import Callable, Optional
 from loguru import logger
 
 from core.control.control import connect, input_swipe, input_tap, screenshot
+from core.services.screen_state import startup_screen_action
 
 
 SIEGE_TASKS = (
@@ -102,7 +103,8 @@ class ScreenDriver:
 
     def go_home(self) -> bool:
         """Return to the station home without depending on a versioned screenshot."""
-        for _ in range(12):
+        startup_recovery = False
+        for _ in range(45):
             texts = self.texts()
             if any(
                 _matches(item["text"], marker)
@@ -110,6 +112,28 @@ class ScreenDriver:
                 for marker in ("作战终端", "访问城市", "启程")
             ):
                 return True
+            action = startup_screen_action(texts)
+            if action == "cancel_resource_repair":
+                logger.warning("检测到资源完整性修复提示，取消修复")
+                self.tap((320, 500))
+                startup_recovery = True
+                self.sleep(1)
+                continue
+            if action == "enter_game":
+                logger.info("检测到游戏登录页，点击安全区域进入游戏")
+                self.tap((640, 560))
+                startup_recovery = True
+                self.sleep(4)
+                continue
+            if action == "dismiss_startup_overlay":
+                logger.info("关闭登录后的启动弹窗")
+                self.tap((100, 650))
+                startup_recovery = True
+                self.sleep(1)
+                continue
+            if action == "wait_for_game" or startup_recovery:
+                self.sleep(2)
+                continue
             self.tap((82, 36))
             self.sleep(1)
         return False
@@ -229,19 +253,17 @@ class ResidentActivityAutomation:
         if not connect():
             raise RuntimeError("ADB连接失败")
         if not self.open_action_summary():
-            return {"私贩追缴": 0, "全境特供": 0, task: 0}
+            raise RuntimeError("无法打开活动总览，未执行扫荡与全域整备")
 
         results = {"私贩追缴": self.run_limited_activity("私贩追缴")}
         # Limited activity detail screens have a back button. Re-open the summary
         # instead of relying on a particular post-reward screen.
         if not self.open_action_summary():
-            results.update({"全境特供": 0, task: 0})
-            return results
+            raise RuntimeError("无法重新打开活动总览，未完成全境特供")
         stage = FULL_REALM_REWARDS.get(full_realm_reward)
         results["全境特供"] = self.run_limited_activity("全境特供", stage=stage)
         if not self.open_action_summary():
-            results[task] = 0
-            return results
+            raise RuntimeError(f"无法重新打开活动总览，未完成{task}")
         results[task] = self.run_siege(task)
         return results
 

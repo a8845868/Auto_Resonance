@@ -31,3 +31,29 @@ def test_stop_clears_remaining_queue():
 
     assert completed == ["一"]
     assert worker.stop_requested
+
+
+def test_only_explicit_nonempty_results_are_completed():
+    outcomes = []
+    worker = TaskQueueWorker([
+        QueuedTask("false", lambda: False),
+        QueuedTask("none", lambda: None),
+        QueuedTask("zero", lambda: 0),
+        QueuedTask("true", lambda: True),
+        QueuedTask("details", lambda: {"completed": 0}),
+    ])
+    worker.taskCompleted.connect(
+        lambda task, succeeded, result: outcomes.append(
+            (task.name, succeeded, result)
+        )
+    )
+
+    worker.run()
+
+    assert [(name, succeeded) for name, succeeded, _ in outcomes] == [
+        ("false", False),
+        ("none", False),
+        ("zero", False),
+        ("true", True),
+        ("details", True),
+    ]

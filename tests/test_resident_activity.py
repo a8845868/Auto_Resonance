@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from auto.resident_activity import (
     FULL_REALM_REWARDS,
@@ -102,6 +103,15 @@ class ResidentActivityTests(unittest.TestCase):
         )
         self.assertEqual(completed, 1)
         self.assertIn("特供·救世", driver.clicked)
+
+    def test_home_navigation_failure_is_not_reported_as_zero_completion(self):
+        driver = FakeDriver([[]])
+        driver.go_home = lambda: False
+        automation = ResidentActivityAutomation(driver)
+
+        with patch("auto.resident_activity.connect", return_value=True):
+            with self.assertRaisesRegex(RuntimeError, "无法打开活动总览"):
+                automation.run("挑灯看剑")
 
 
 if __name__ == "__main__":
