@@ -15,6 +15,7 @@ from core.exception.exceptions import StopExecution
 from core.preset import go_home
 from core.preset.control import blurry_ocr_click
 from core.services.screen_state import (
+    is_inventory_item_detail,
     is_inventory_screen,
     is_train_in_transit as _is_train_in_transit,
 )
@@ -466,6 +467,42 @@ def _confirm_restock_book_count(initial_items: list[dict], frames=3):
     return count, ", ".join(raw_values)
 
 
+def _restock_book_detail_count(items: list[dict]) -> tuple[int, str] | None:
+    """Read only the canonical restock-book name and its owned count from a detail card."""
+    if not is_inventory_item_detail(items) or not _restock_book_item(items):
+        return None
+    for item in items:
+        raw = str(item.get("text", ""))
+        if "拥有" in raw and (count := _parse_count(raw)) is not None:
+            return count, raw
+    return None
+
+
+def _confirm_restock_book_detail_count(initial_items: list[dict], frames=3):
+    """Require the exact detail identity and owned count in at least two frames."""
+    readings = []
+    raw_values = []
+    detail_seen = False
+    items = initial_items
+    for frame in range(frames):
+        detail_seen = detail_seen or is_inventory_item_detail(items)
+        result = _restock_book_detail_count(items)
+        if result:
+            count, raw = result
+            readings.append(count)
+            raw_values.append(str(raw))
+        if frame + 1 < frames:
+            time.sleep(0.25)
+            items = screenshot().ocr()
+    if not readings:
+        return None, detail_seen
+    count, confirmations = Counter(readings).most_common(1)[0]
+    if confirmations < 2:
+        logger.warning(f"进货书详情数量多帧 OCR 不一致: {readings}")
+        return None, detail_seen
+    return (count, ", ".join(raw_values)), detail_seen
+
+
 def _inventory_page_signature(items: list[dict]) -> tuple[str, ...]:
     """Stable text signature used to detect the bottom of the scroll list."""
     return tuple(sorted(str(item.get("text", "")).replace(" ", "") for item in items))
@@ -518,28 +555,31 @@ def read_restock_book_count(max_pages: int = 10) -> int | None:
                         f"在背包第 {page} 页识别到进货采买书图标 {icon}"
                         f"（匹配度 {score:.3f}），开始多帧核对数量"
                     )
-                    confirmed = _confirm_restock_book_icon_count(items, icon)
-                    if confirmed:
-                        count, raw = confirmed
-                        # The number under the icon is already spatially paired;
-                        # opening the detail card supplies an independent name
-                        # check before the value is accepted.
+                    grid_confirmed = _confirm_restock_book_icon_count(items, icon)
+                    # A high-confidence icon may still have no OCR-readable grid
+                    # count. Open its detail card so the exact item name and
+                    # `拥有：N` can provide an independent multi-frame result.
+                    if grid_confirmed or score >= 0.90:
                         input_tap(icon)
                         time.sleep(0.6)
                         detail_items = screenshot().ocr()
-                        detail = _restock_book_count_from_items(detail_items)
-                        if detail and detail[0] == count:
+                        detail, detail_seen = _confirm_restock_book_detail_count(detail_items)
+                        if detail and (
+                            grid_confirmed is None or detail[0] == grid_confirmed[0]
+                        ):
+                            count, detail_raw = detail
+                            grid_raw = grid_confirmed[1] if grid_confirmed else "未识别"
                             logger.info(
-                                f"背包进货书数量: {count}（图标多帧 OCR: {raw}；"
-                                "详情页名称与数量复核通过）"
+                                f"背包进货书数量: {count}（格位多帧 OCR: {grid_raw}；"
+                                f"详情多帧 OCR: {detail_raw}）"
                             )
                             return count
                         logger.warning(
-                            f"进货书图标数量为 {count}，但详情页名称/数量未一致确认，"
-                            "继续扫描"
+                            "疑似进货书图标的详情名称/拥有数量未通过多帧确认，继续扫描"
                         )
-                        input_tap((640, 600))
-                        time.sleep(0.4)
+                        if detail_seen:
+                            input_tap((640, 600))
+                            time.sleep(0.4)
                     else:
                         logger.warning(
                             f"疑似进货书图标匹配度 {score:.3f}，但下方数量未通过多帧核对"

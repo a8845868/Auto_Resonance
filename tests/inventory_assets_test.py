@@ -1,4 +1,4 @@
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import auto.inventory as inventory
 import numpy as np
@@ -74,6 +74,35 @@ def test_restock_book_detail_card_reads_owned_count_far_from_name():
     assert inventory._restock_book_count_from_items(items) == (8, "拥有：8")
 
 
+def test_restock_book_detail_card_rejects_order_request_book():
+    items = [
+        box(530, 215, "\u8ba2\u5355\u8bf7\u6c42\u4e66"),
+        box(950, 175, "\u62e5\u6709\uff1a17"),
+        box(930, 218, "\u83b7\u53d6\u9014\u5f84"),
+    ]
+
+    assert inventory._restock_book_count_from_items(items) is None
+
+
+def detail_items(name="进货采买书", count="拥有：17"):
+    return [
+        box(530, 215, name),
+        box(950, 175, count),
+        box(930, 218, "获取途径"),
+        box(600, 672, "触碰空白区域退出"),
+    ]
+
+
+def test_strict_restock_book_detail_rejects_other_book_and_unowned_numbers():
+    assert inventory._restock_book_detail_count(detail_items("订单请求书")) is None
+    assert inventory._restock_book_detail_count([
+        box(530, 215, "进货采买书"),
+        box(930, 218, "获取途径"),
+        box(600, 260, "售价：17"),
+        box(600, 672, "触碰空白区域退出"),
+    ]) is None
+
+
 class OcrFrame:
     def __init__(self, items):
         self.items = items
@@ -102,6 +131,67 @@ def test_restock_book_scan_scrolls_past_first_page_and_confirms_twice():
     ):
         assert inventory.read_restock_book_count(max_pages=5) == 12
 
+    swipe.assert_called_once_with((930, 640), (930, 285), swipe_time=600)
+
+
+def test_restock_book_high_confidence_icon_uses_detail_when_grid_count_is_missing():
+    grid = [box(1100, 30, "道具"), box(1100, 100, "材料")]
+    detail = detail_items()
+    frames = [
+        OcrFrame([]),  # pre-navigation transit check
+        OcrFrame(grid),  # page frame
+        OcrFrame(grid),
+        OcrFrame(grid),  # grid-count confirmation remains unreadable
+        OcrFrame(detail),
+        OcrFrame(detail),
+        OcrFrame(detail),  # detail count is confirmed in multiple frames
+    ]
+    with patch.object(inventory, "connect", return_value=True), patch.object(
+        inventory, "go_home", return_value=True
+    ), patch.object(inventory, "_open_assets_entry", return_value=True), patch.object(
+        inventory, "screenshot", side_effect=frames
+    ), patch.object(
+        inventory, "_find_restock_book_icon", return_value=((598, 306), 0.956)
+    ), patch.object(inventory, "input_tap") as tap, patch.object(
+        inventory, "input_swipe"
+    ) as swipe, patch.object(inventory.time, "sleep"):
+        assert inventory.read_restock_book_count(max_pages=3) == 17
+
+    tap.assert_called_once_with((598, 306))
+    swipe.assert_not_called()
+
+
+def test_restock_book_rejects_order_request_detail_and_continues_scanning():
+    false_grid = [box(870, 710, "17")]
+    wrong_detail = detail_items("订单请求书")
+    book_page = [box(100, 100, "进货采买书"), box(105, 160, "×12")]
+    frames = [
+        OcrFrame([]),  # pre-navigation transit check
+        OcrFrame(false_grid),
+        OcrFrame(false_grid),
+        OcrFrame(false_grid),  # false icon grid count confirms as 17
+        OcrFrame(wrong_detail),
+        OcrFrame(wrong_detail),
+        OcrFrame(wrong_detail),  # exact detail identity rejects it
+        OcrFrame(book_page),
+        OcrFrame(book_page),
+        OcrFrame(book_page),  # next page confirms the real book
+    ]
+    with patch.object(inventory, "connect", return_value=True), patch.object(
+        inventory, "go_home", return_value=True
+    ), patch.object(inventory, "_open_assets_entry", return_value=True), patch.object(
+        inventory, "screenshot", side_effect=frames
+    ), patch.object(
+        inventory, "_find_restock_book_icon", return_value=((870, 676), 0.854)
+    ), patch.object(inventory, "input_tap") as tap, patch.object(
+        inventory, "input_swipe"
+    ) as swipe, patch.object(inventory.time, "sleep"):
+        assert inventory.read_restock_book_count(max_pages=3) == 12
+
+    assert tap.call_args_list == [
+        call((870, 676)),
+        call((640, 600)),
+    ]
     swipe.assert_called_once_with((930, 640), (930, 285), swipe_time=600)
 
 
