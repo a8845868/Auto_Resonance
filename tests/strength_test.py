@@ -12,8 +12,11 @@ class FakeOcrImage:
 
 
 class PositionedOcrImage:
+    def __init__(self, items=None):
+        self.items = items
+
     def ocr(self):
-        return [{
+        return self.items or [{
             "text": "SKIP",
             "position": [[1170, 20], [1240, 20], [1240, 50], [1170, 50]],
         }]
@@ -121,7 +124,8 @@ def test_separate_silver_branch_confirmation_is_detected():
         assert strength._silver_prompt_visible()
 
 
-def test_recover_strength_uses_free_drinks_to_zero_and_skips_lunchboxes():
+def test_recover_strength_records_drinks_and_inspects_lunchbox_after_full_recovery():
+    usage = {}
     with patch.object(
         strength,
         "read_strength",
@@ -133,12 +137,46 @@ def test_recover_strength_uses_free_drinks_to_zero_and_skips_lunchboxes():
     ) as use_free, patch.object(
         strength, "_return_to_trade", return_value=True
     ), patch.object(
-        strength, "_use_all_safe_lunchboxes"
+        strength, "_use_all_safe_lunchboxes", return_value=0
     ) as use_lunchboxes:
-        assert strength.recover_strength("sell", min_available=80)
+        assert strength.recover_strength("sell", min_available=80, usage=usage)
 
     use_free.assert_called_once_with(802, 0, None)
-    use_lunchboxes.assert_not_called()
+    use_lunchboxes.assert_called_once_with(0, usage)
+    assert usage == {"bubble_water_uses": 16}
+
+
+def test_lunchbox_inventory_reads_only_the_remaining_count_badge():
+    image = PositionedOcrImage([
+        {
+            "text": "7/14",
+            "position": [[650, 10], [750, 10], [750, 70], [650, 70]],
+        },
+        {
+            "text": "2",
+            "position": [[1140, 440], [1180, 440], [1180, 500], [1140, 500]],
+        },
+    ])
+
+    assert strength._lunchbox_inventory(image) == 2
+
+
+def test_safe_lunchbox_batch_records_inventory_consumption():
+    cabinet = PositionedOcrImage([{
+        "text": "2",
+        "position": [[1140, 440], [1180, 440], [1180, 500], [1140, 500]],
+    }])
+    confirmation = FakeOcrImage(["消除 100 疲劳值"])
+    usage = {}
+
+    with patch.object(strength, "_wait_text", return_value=True), patch.object(
+        strength, "screenshot", side_effect=[cabinet, confirmation]
+    ), patch.object(strength, "input_tap"), patch.object(strength.time, "sleep"):
+        remaining_fatigue = strength._use_all_safe_lunchboxes(200, usage)
+
+    assert remaining_fatigue == 100
+    assert usage["lunches_remaining"] == 0
+    assert usage["lunch_schedule"]
 
 
 def test_known_station_without_rest_area_is_skipped_without_clicking():
@@ -165,6 +203,7 @@ def test_recovery_defers_lunches_when_non_wasteful_drink_requires_another_city()
 
 
 def test_recovery_uses_safe_lunches_at_no_rest_station_for_urgent_shortfall():
+    usage = {}
     with patch.object(
         strength, "read_strength", side_effect=[(791, 816), (600, 816)]
     ), patch.object(
@@ -179,11 +218,12 @@ def test_recovery_uses_safe_lunches_at_no_rest_station_for_urgent_shortfall():
         strength, "_return_to_trade", return_value=True
     ):
         assert strength.recover_strength(
-            "buy", min_available=80, station_name="武林源"
+            "buy", min_available=80, station_name="武林源", usage=usage
         )
 
     open_panel.assert_called_once()
-    lunches.assert_called_once_with(791)
+    lunches.assert_called_once_with(791, usage)
+    assert usage == {"lunch_batches": 1, "lunch_fatigue_restored": 191}
 
 
 def test_negotiation_no_longer_starts_recovery_inside_trading():

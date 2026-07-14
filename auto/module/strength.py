@@ -12,6 +12,7 @@ from core.services.station_facilities import (
     remember_rest_area_availability,
     rest_area_availability,
 )
+from core.services.fatigue_planner import lunch_release_schedule
 from app.common.config import cfg
 
 
@@ -280,12 +281,37 @@ def _return_to_trade(trade_type: Literal["buy", "sell"]) -> bool:
     return True
 
 
-def _use_all_safe_lunchboxes(current_fatigue: int) -> int:
+def _lunchbox_inventory(image) -> int | None:
+    """Read the cabinet's remaining-count badge without guessing on OCR failure."""
+    candidates = []
+    for item in image.ocr():
+        text = str(item.get("text", "")).strip()
+        position = item.get("position")
+        if not position or not re.fullmatch(r"\d+", text):
+            continue
+        center_x = (position[0][0] + position[2][0]) / 2
+        center_y = (position[0][1] + position[2][1]) / 2
+        if 1100 <= center_x <= 1215 and 400 <= center_y <= 535:
+            candidates.append(int(text))
+    return candidates[-1] if candidates else None
+
+
+def _use_all_safe_lunchboxes(
+    current_fatigue: int,
+    usage: dict[str, object] | None = None,
+) -> int:
     """Use the cabinet's batch action only when its full recovery cannot waste."""
     input_tap((1117, 607))  # 前往便当柜
     if not _wait_text("便当柜", "BENTO CABINET", timeout=8):
         logger.info("未进入便当柜")
         return current_fatigue
+
+    cabinet_image = screenshot()
+    if usage is not None:
+        usage["lunch_schedule"] = lunch_release_schedule()
+        remaining = _lunchbox_inventory(cabinet_image)
+        if remaining is not None:
+            usage["lunches_remaining"] = remaining
 
     input_tap((1070, 427))  # 全部使用
     time.sleep(2)
@@ -311,6 +337,8 @@ def _use_all_safe_lunchboxes(current_fatigue: int) -> int:
     # Dismiss the recovery-result overlay before navigating away.
     input_tap((640, 600))
     time.sleep(2)
+    if usage is not None:
+        usage["lunches_remaining"] = 0
     logger.info(f"已一次使用全部安全便当，恢复 {recovery} 疲劳")
     return current_fatigue - recovery
 
@@ -319,6 +347,7 @@ def recover_strength(
     trade_type: Literal["buy", "sell"],
     min_available: int = 60,
     station_name: str | None = None,
+    usage: dict[str, object] | None = None,
 ) -> bool:
     """Recover fatigue with free rest-area drinks before safe batch lunches."""
     strength = read_strength()
@@ -352,6 +381,10 @@ def recover_strength(
     # stopping as soon as the current bargain reserve is satisfied.
     rest_area = _use_free_rest_area(current, 0, station_name)
     current = rest_area.fatigue
+    if usage is not None and rest_area.used:
+        usage["bubble_water_uses"] = (
+            usage.get("bubble_water_uses", 0) + rest_area.used
+        )
     if rest_area.status == "failed":
         go_home()
         return False
@@ -372,7 +405,15 @@ def recover_strength(
     # back only once.
     if rest_area.status == "unavailable":
         if current > 0:
-            current = _use_all_safe_lunchboxes(current)
+            before_lunch = current
+            current = _use_all_safe_lunchboxes(current, usage)
+            if usage is not None and current < before_lunch:
+                usage["lunch_batches"] = usage.get("lunch_batches", 0) + 1
+                usage["lunch_fatigue_restored"] = (
+                    usage.get("lunch_fatigue_restored", 0)
+                    + before_lunch
+                    - current
+                )
         if not _return_to_trade(trade_type):
             return False
         final = read_strength()
@@ -387,10 +428,16 @@ def recover_strength(
     if observed:
         current, maximum = observed
 
-    if current > 0:
+    if current > 0 or usage is not None:
         if not _open_fatigue_panel():
             return False
-        current = _use_all_safe_lunchboxes(current)
+        before_lunch = current
+        current = _use_all_safe_lunchboxes(current, usage)
+        if usage is not None and current < before_lunch:
+            usage["lunch_batches"] = usage.get("lunch_batches", 0) + 1
+            usage["lunch_fatigue_restored"] = (
+                usage.get("lunch_fatigue_restored", 0) + before_lunch - current
+            )
 
         # Recovery pages return to the city/home screen. Re-enter the same
         # trading page so the caller can resume the interrupted operation.
