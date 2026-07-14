@@ -8,14 +8,15 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 import re
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QKeySequence
+from PySide6.QtGui import (
+    QColor,
+    QFontDatabase,
+    QTextCharFormat,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
-    QAbstractItemView,
-    QApplication,
-    QHeaderView,
     QLabel,
-    QTableWidget,
-    QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -48,8 +49,8 @@ class LoguruHandler(QObject):
             self.new_log_signal.emit(message)
 
 
-class StructuredLogWidget(QTableWidget):
-    """Read-only, colour-coded log view with stable level/time columns."""
+class StructuredLogWidget(QTextEdit):
+    """Colour-coded text log with stable columns and native text selection."""
 
     _HISTORY_PATTERN = re.compile(
         r"^(?P<time>\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s*-\s*"
@@ -67,37 +68,24 @@ class StructuredLogWidget(QTableWidget):
     }
 
     def __init__(self, parent=None, maximum_rows=1000):
-        super().__init__(0, 3, parent)
+        super().__init__(parent)
         self.maximumRows = maximum_rows
         self._scrollTimer = QTimer(self)
         self._scrollTimer.setSingleShot(True)
         self._scrollTimer.setInterval(0)
-        self._scrollTimer.timeout.connect(self.scrollToBottom)
-        self.setHorizontalHeaderLabels(["级别", "时间", "消息"])
-        self.verticalHeader().hide()
-        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.setShowGrid(False)
-        self.setWordWrap(True)
-        self.setTextElideMode(Qt.TextElideMode.ElideNone)
-        self.setAlternatingRowColors(True)
-        self.setColumnWidth(0, 82)
-        self.setColumnWidth(1, 112)
-        header = self.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.verticalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.ResizeToContents
-        )
+        self._scrollTimer.timeout.connect(self._scrollToBottom)
+        self.setReadOnly(True)
+        self.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        self.document().setMaximumBlockCount(maximum_rows)
         self.setStyleSheet(
-            "QTableWidget { border: 1px solid rgba(128,128,128,0.28); "
+            "QTextEdit { border: 1px solid rgba(128,128,128,0.28); "
             "border-radius: 6px; background: rgba(20,20,20,0.12); }"
-            "QTableWidget::item { padding: 2px 7px; border: 0; }"
-            "QHeaderView::section { padding: 6px 7px; border: 0; "
-            "border-bottom: 1px solid rgba(128,128,128,0.28); "
-            "font-weight: 600; background: rgba(128,128,128,0.10); }"
         )
+
+    def _scrollToBottom(self):
+        scroll_bar = self.verticalScrollBar()
+        scroll_bar.setValue(scroll_bar.maximum())
 
     @classmethod
     def parseLine(cls, line):
@@ -116,48 +104,27 @@ class StructuredLogWidget(QTableWidget):
 
     def appendLog(self, line):
         level, timestamp, message = self.parseLine(line)
-        if self.rowCount() >= self.maximumRows:
-            self.removeRow(0)
-        row = self.rowCount()
-        self.insertRow(row)
-        values = (level, timestamp, message)
-        colour = self._LEVEL_COLOURS.get(level, self._LEVEL_COLOURS["INFO"])
-        for column, value in enumerate(values):
-            item = QTableWidgetItem(value)
-            item.setToolTip(value)
-            if column == 0:
-                item.setForeground(colour)
-                font = item.font()
-                font.setBold(True)
-                item.setFont(font)
-            elif column == 1:
-                item.setForeground(QColor("#22b8cf"))
-            self.setItem(row, column, item)
-        self.resizeRowToContents(row)
+        cursor = QTextCursor(self.document())
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if not self.document().isEmpty():
+            cursor.insertBlock()
+
+        level_format = QTextCharFormat()
+        level_format.setForeground(
+            self._LEVEL_COLOURS.get(level, self._LEVEL_COLOURS["INFO"])
+        )
+        level_format.setFontWeight(700)
+        time_format = QTextCharFormat()
+        time_format.setForeground(QColor("#22b8cf"))
+        message_format = QTextCharFormat()
+
+        cursor.insertText(f"{level:<8} ", level_format)
+        cursor.insertText(f"{timestamp:<12}", time_format)
+        cursor.insertText(" │ ", message_format)
+        cursor.insertText(message, message_format)
         # Restarting one owned timer coalesces history and live bursts into a
         # single scroll operation.  Qt also stops it automatically on destroy.
         self._scrollTimer.start()
-
-    def copySelection(self):
-        rows = sorted({index.row() for index in self.selectedIndexes()})
-        if not rows:
-            return
-        lines = []
-        for row in rows:
-            lines.append(
-                "\t".join(
-                    self.item(row, column).text() if self.item(row, column) else ""
-                    for column in range(self.columnCount())
-                )
-            )
-        QApplication.clipboard().setText("\n".join(lines))
-
-    def keyPressEvent(self, event):
-        if event.matches(QKeySequence.StandardKey.Copy):
-            self.copySelection()
-            event.accept()
-            return
-        super().keyPressEvent(event)
 
 
 class LoggerInterface(ScrollArea):

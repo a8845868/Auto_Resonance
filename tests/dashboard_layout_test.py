@@ -4,7 +4,8 @@ import sys
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QTextCursor
+from PySide6.QtWidgets import QApplication, QTextEdit
 
 from app.view.logger_interface import LoguruHandler, StructuredLogWidget
 
@@ -31,14 +32,14 @@ def test_structured_log_keeps_columns_colours_and_latest_rows():
     widget.appendLog("WARNING\x1f10:00:01.002\x1fsecond")
     widget.appendLog("ERROR\x1f10:00:02.003\x1fthird")
 
-    assert widget.rowCount() == 2
-    assert [widget.item(0, column).text() for column in range(3)] == [
-        "WARNING",
-        "10:00:01.002",
-        "second",
-    ]
-    assert widget.item(1, 0).foreground().color().name() == "#ef6461"
-    assert widget.item(1, 1).foreground().color().name() == "#22b8cf"
+    lines = widget.toPlainText().splitlines()
+    assert len(lines) == 2
+    assert lines[0].startswith("WARNING  10:00:01.002")
+    assert lines[0].endswith("│ second")
+    html = widget.toHtml().lower()
+    assert "#e5a445" in html
+    assert "#ef6461" in html
+    assert "#22b8cf" in html
 
 
 def test_loguru_handler_delivers_live_records_to_structured_view():
@@ -49,8 +50,8 @@ def test_loguru_handler_delivers_live_records_to_structured_view():
     handler.write("INFO\x1f11:22:33.444\x1flive message\n")
     app.processEvents()
 
-    assert widget.rowCount() == 1
-    assert widget.item(0, 2).text() == "live message"
+    assert widget.document().blockCount() == 1
+    assert widget.toPlainText().endswith("│ live message")
 
 
 def test_structured_log_coalesces_scroll_requests_on_one_owned_timer():
@@ -63,18 +64,21 @@ def test_structured_log_coalesces_scroll_requests_on_one_owned_timer():
     assert widget._scrollTimer.isActive()
 
 
-def test_structured_log_wraps_messages_and_copies_selected_rows():
+def test_structured_log_wraps_and_copies_an_arbitrary_character_range():
     app = _app()
     widget = StructuredLogWidget()
     widget.appendLog("WARNING\x1f12:00:00.001\x1fa long warning message")
-    widget.selectRow(0)
+    text = widget.toPlainText()
+    start = text.index("long")
+    cursor = widget.textCursor()
+    cursor.setPosition(start)
+    cursor.setPosition(start + len("long warning"), QTextCursor.MoveMode.KeepAnchor)
+    widget.setTextCursor(cursor)
 
-    widget.copySelection()
+    widget.copy()
 
-    assert widget.wordWrap() is True
-    assert app.clipboard().text() == (
-        "WARNING\t12:00:00.001\ta long warning message"
-    )
+    assert widget.lineWrapMode() == QTextEdit.LineWrapMode.WidgetWidth
+    assert app.clipboard().text() == "long warning"
 
 
 def test_structured_log_repeated_native_lifecycle_exits_cleanly():
