@@ -22,6 +22,14 @@ def test_connect_does_not_clear_existing_stop_request():
     control.reset_stop()
 
 
+def test_stop_execution_construction_does_not_log_error():
+    with patch("core.exception.exceptions.logger") as logger:
+        error = StopExecution()
+
+    assert str(error) == "停止执行程序"
+    logger.error.assert_not_called()
+
+
 def test_adaptive_plan_does_not_treat_stop_as_optimizer_failure():
     state = {"cycle": ["岚心城", "武林源"], "optimizer_config": {}}
     summary = {
