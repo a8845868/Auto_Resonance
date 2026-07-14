@@ -8,7 +8,8 @@ from auto.module.strength import read_strength, recover_strength
 from core.control.control import connect, input_tap
 from core.preset import get_station, go_outlets
 from core.preset.control import go_home
-from core.services.fatigue_planner import fatigue_cycle
+from core.services.fatigue_planner import fatigue_cycle, record_fatigue_usage
+from core.services.station_facilities import rest_area_availability
 
 
 MINIMUM_TRADING_FATIGUE = 80
@@ -36,7 +37,7 @@ def _open_exchange_buy_page() -> bool:
 
 
 def run_daily_fatigue_recovery() -> dict:
-    """Consume today's drinks, then all non-wasteful lunches, exactly once."""
+    """Use safe recovery now and keep the plan pending until drinks are checked."""
     if not connect():
         raise RuntimeError("疲劳规划无法连接模拟器")
     station_name = get_station()
@@ -51,11 +52,15 @@ def run_daily_fatigue_recovery() -> dict:
         f"开始每日疲劳规划: {before[0]}/{before[1]}；"
         "先用气泡水，再判断全部便当是否会浪费"
     )
-    if not recover_strength(
+    recovery_usage: dict[str, object] = {}
+    recovered = recover_strength(
         "buy",
         min_available=MINIMUM_TRADING_FATIGUE,
         station_name=station_name,
-    ):
+        usage=recovery_usage,
+    )
+    daily_usage = record_fatigue_usage(**recovery_usage)
+    if not recovered:
         logger.warning("疲劳恢复条件尚未满足，本次暂缓且不更新完成时间")
         go_home()
         return {
@@ -65,6 +70,7 @@ def run_daily_fatigue_recovery() -> dict:
             "station": station_name,
             "before": before[0],
             "maximum": before[1],
+            "usage": daily_usage,
         }
     after = _wait_strength()
     if not after:
@@ -74,12 +80,24 @@ def run_daily_fatigue_recovery() -> dict:
     result = {
         "success": True,
         "cycle": fatigue_cycle(),
+        "station": station_name,
         "before": before[0],
         "after": after[0],
         "maximum": after[1],
         "restored": max(0, before[0] - after[0]),
         "available": after[1] - after[0],
+        "usage": daily_usage,
     }
+    if rest_area_availability(station_name) is False and after[0] >= 50:
+        result.update(
+            deferred=True,
+            reason="lunch_only_waiting_for_rest_area",
+        )
+        logger.info(
+            "当前站点无休息区，便当仅完成安全保底；保留疲劳规划，"
+            "抵达有休息区站点后继续使用气泡水并重新判断便当"
+        )
+        return result
     logger.info(
         f"每日疲劳规划完成: {before[0]}/{before[1]} -> "
         f"{after[0]}/{after[1]}，恢复 {result['restored']}"
