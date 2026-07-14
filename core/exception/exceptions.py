@@ -1,3 +1,5 @@
+import builtins
+
 from loguru import logger
 
 
@@ -17,4 +19,4 @@ class TypeError(Exception):
 class StopExecution(Exception):
 
     def __init__(self):
-        super().__init__("停止执行程序")
+        builtins.Exception.__init__(self, "停止执行程序")
