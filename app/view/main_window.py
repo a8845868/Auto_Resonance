@@ -42,6 +42,7 @@ from core.utils.update.base_update_utils import UpdateStatus
 from core.utils.update.mirror_update_utils import MirrorUpdateUtils
 
 from .adb_data_interface import ADBDataInterface
+from .codex_debug_interface import CodexDebugInterface
 from .dashboard_interface import DashboardInterface
 from .task_settings_interface import (
     FatiguePlannerInterface,
@@ -86,6 +87,7 @@ class MainWindow(FluentWindow):
 
     def initNavigation(self):
         self.addSubInterface(self.homeInterface, FIF.HOME, "主页")
+        self.addSubInterface(self.debugInterface, FIF.DEVELOPER_TOOLS, "调试")
         self.addSubInterface(self.residentActivityInterface, FIF.PLAY, "扫荡配置")
         self.addSubInterface(self.rewardCollectionInterface, FIF.ACCEPT, "领取任务奖励")
         self.addSubInterface(self.fatiguePlannerInterface, FIF.CAFE, "疲劳规划")
@@ -136,6 +138,7 @@ class MainWindow(FluentWindow):
     def setInterface(self):
         # create sub interface
         self.homeInterface = DashboardInterface(self)
+        self.debugInterface = CodexDebugInterface(self)
         self.residentActivityInterface = ResidentActivityInterface(self)
         self.rewardCollectionInterface = RewardCollectionInterface(self)
         self.fatiguePlannerInterface = FatiguePlannerInterface(self)
@@ -206,6 +209,7 @@ class MainWindow(FluentWindow):
     def closeEvent(self, e):
         queue_stopped = self.homeInterface.shutdown()
         scan_stopped = self.adb_data_interface.shutdown()
+        self.debugInterface.shutdown()
         if not queue_stopped or not scan_stopped:
             e.ignore()
             if not self._closeRetryScheduled:

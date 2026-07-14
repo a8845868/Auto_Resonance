@@ -18,6 +18,7 @@ from core.services.codex_repair import (
     CodexRepairConfig,
     CodexRepairExecutor,
     ProcessContainmentUnavailable,
+    _requires_repository_deny,
     discover_codex_executable,
     list_legacy_worktrees,
     list_run_statuses,
@@ -27,6 +28,24 @@ from core.services.incident_learning import IncidentLearningStore
 
 
 REVISION = "a" * 40
+
+
+def test_repository_ancestor_deny_is_omitted_only_for_nested_windows_worktree(
+    tmp_path,
+):
+    repository = tmp_path / "repository"
+    nested = repository / "_worktrees" / "candidate"
+    external = tmp_path / "external-candidate"
+
+    assert (
+        _requires_repository_deny(repository, nested, platform_name="nt") is False
+    )
+    assert (
+        _requires_repository_deny(repository, nested, platform_name="posix") is True
+    )
+    assert (
+        _requires_repository_deny(repository, external, platform_name="nt") is True
+    )
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows Codex layout")
@@ -249,6 +268,8 @@ def test_diagnosis_uses_read_only_noninteractive_codex_and_runtime_guards(
     assert "--ephemeral" in codex_argv
     assert "--search" not in codex_argv
     assert "--add-dir" not in codex_argv
+    assert kwargs["output_reporter"] is not None
+    assert kwargs["visible_process"] is False
     assert kwargs["shell"] is False
     assert Path(kwargs["cwd"]) == Path(result.worktree_path)
     assert Path(result.worktree_path).is_dir()
@@ -267,6 +288,9 @@ def test_diagnosis_uses_read_only_noninteractive_codex_and_runtime_guards(
     assert Path(result.codex_output_path).is_file()
     assert "done" in Path(result.codex_output_path).read_text(encoding="utf-8")
     config = _parsed_config(codex_argv)
+    assert config["model_reasoning_effort"] == "minimal"
+    assert config["service_tier"] == "fast"
+    assert config["features"]["fast_mode"] is True
     if sys.platform == "win32":
         assert config["windows"]["sandbox"] == "elevated"
     profile = config["permissions"]["heiyue_diagnose"]
@@ -282,7 +306,7 @@ def test_diagnosis_uses_read_only_noninteractive_codex_and_runtime_guards(
     assert filesystem[":workspace_roots"][".codex"] == "read"
     assert filesystem[":workspace_roots"]["AGENTS.md"] == "read"
     assert filesystem[":workspace_roots"]["**/*.env"] == "deny"
-    assert filesystem[str(repository.resolve())] == "deny"
+    assert str(repository.resolve()) not in filesystem
     assert filesystem[str(repository.resolve() / ".venv")] == "read"
     assert filesystem[kwargs["env"]["TEMP"]] == "write"
     assert profile["network"]["enabled"] is False
@@ -336,6 +360,88 @@ def test_repair_keeps_detached_candidate_without_executing_model_authored_code(
         Path(argv[0]).name.casefold() in {"python.exe", "python"}
         for argv, _kwargs in runner.calls
     )
+
+
+def test_background_codex_output_is_jsonl_before_runner_returns(tmp_path):
+    observed = {}
+
+    def observe_output(_argv, kwargs):
+        reporter = kwargs.get("output_reporter")
+        assert reporter is not None
+        assert kwargs["visible_process"] is False
+        reporter("stdout", '{"type":"progress","message":"working"}')
+        reporter("stderr", "background warning")
+        output_path = next(
+            (tmp_path / "storage" / "runs").glob("*/codex-output.jsonl")
+        )
+        observed["records"] = [
+            json.loads(line)
+            for line in output_path.read_text(encoding="utf-8").splitlines()
+        ]
+        observed["raw"] = output_path.read_text(encoding="utf-8")
+
+    executor, _repository_root, storage = _executor(
+        tmp_path, _Runner(on_codex=observe_output)
+    )
+
+    result = executor.process(_incident(storage))
+
+    assert result.status == "diagnosed"
+    assert observed["records"] == [
+        {"type": "progress", "message": "working"},
+        {
+            "type": "stderr",
+            "stream": "stderr",
+            "text": "background warning",
+        },
+    ]
+    assert observed["raw"].startswith(
+        '{"type":"progress","message":"working"}\n'
+    )
+    final_records = [
+        json.loads(line)
+        for line in Path(result.codex_output_path).read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert final_records == observed["records"]
+
+
+def test_output_reporter_serializes_concurrent_streams_and_bounds_log(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("core.services.codex_repair.MAX_CAPTURE_CHARS", 2_000)
+
+    def report_concurrently(_argv, kwargs):
+        reporter = kwargs["output_reporter"]
+
+        def emit(stream_name):
+            for index in range(50):
+                reporter(stream_name, f"{stream_name}-{index}-" + "x" * 40)
+
+        import threading
+
+        threads = [
+            threading.Thread(target=emit, args=(stream_name,))
+            for stream_name in ("stdout", "stderr")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    executor, _repository_root, storage = _executor(
+        tmp_path, _Runner(on_codex=report_concurrently)
+    )
+
+    result = executor.process(_incident(storage))
+
+    payload = Path(result.codex_output_path).read_bytes()
+    assert len(payload) <= 2_000
+    records = [json.loads(line) for line in payload.decode("utf-8").splitlines()]
+    assert records
+    assert records[-1].get("truncated") is True
+    assert {record["stream"] for record in records[:-1]} <= {"stdout", "stderr"}
 
 
 def test_dirty_or_revision_mismatched_main_tree_blocks_repair_before_codex(tmp_path):
@@ -571,7 +677,7 @@ def test_installed_codex_accepts_generated_permission_profile(tmp_path):
     assert (
         f'<entry access="deny" escalatable="false"><path>'
         f'{executor.config.repository_root}</path></entry>'
-        in visible_text
+        not in visible_text
     )
 
 
@@ -648,6 +754,33 @@ expected["sibling_read"] = "allowed"
 raise SystemExit(0 if outcomes == expected else 9)
     """
     try:
+        try:
+            preflight = subprocess.run(
+                [
+                    codex,
+                    "sandbox",
+                    *arguments,
+                    "-P",
+                    "heiyue_repair",
+                    "-C",
+                    str(worktree),
+                    os.environ.get("COMSPEC", "cmd.exe"),
+                    "/d",
+                    "/c",
+                    "exit",
+                    "0",
+                ],
+                cwd=worktree,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=20,
+                shell=False,
+            )
+        except subprocess.TimeoutExpired:
+            pytest.skip("Codex elevated Windows sandbox preflight timed out")
+        assert preflight.returncode == 0, preflight.stderr or preflight.stdout
         try:
             completed = subprocess.run(
                 [

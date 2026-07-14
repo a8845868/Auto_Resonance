@@ -134,6 +134,24 @@ def _is_path_redirect(path: Path) -> bool:
         return True
 
 
+def _requires_repository_deny(
+    repository_root: Path,
+    working_directory: Path,
+    *,
+    platform_name: str | None = None,
+) -> bool:
+    """Avoid an ancestor Deny only for a nested Windows repair worktree."""
+
+    repository_root = repository_root.resolve()
+    working_directory = working_directory.resolve()
+    try:
+        working_directory.relative_to(repository_root)
+        nested = True
+    except ValueError:
+        nested = False
+    return (platform_name or os.name) != "nt" or not nested
+
+
 def _bounded(value: Any, limit: int = MAX_CAPTURE_CHARS) -> str:
     text = "" if value is None else str(value)
     if len(text) <= limit:
@@ -331,6 +349,9 @@ def run_process_tree(
     input_value = kwargs.pop("input", None)
     timeout = kwargs.pop("timeout", None)
     output_reporter = kwargs.pop("output_reporter", None)
+    visible_process = bool(
+        kwargs.pop("visible_process", output_reporter is not None)
+    )
     require_process_containment = bool(
         kwargs.pop("require_process_containment", False)
     )
@@ -344,7 +365,7 @@ def run_process_tree(
         kwargs["stdin"] = subprocess.PIPE
     if os.name == "nt":
         flags = int(kwargs.get("creationflags", 0))
-        if output_reporter is None:
+        if not visible_process:
             flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
         kwargs["creationflags"] = flags
@@ -392,7 +413,9 @@ def run_process_tree(
                 return
             try:
                 while not stop_readers.is_set():
-                    chunk = stream.readline(4_096)
+                    # Preserve native Codex JSONL event boundaries. Bound the
+                    # maximum allocation for a malformed/no-newline stream.
+                    chunk = stream.readline(MAX_CAPTURE_CHARS + 1)
                     if chunk in {"", b""}:
                         break
                     if stop_readers.is_set():
@@ -611,6 +634,11 @@ class CodexRepairExecutor:
         self._progress_reporter = progress_reporter
         self._visible_output_chars = 0
         self._visible_output_truncated = False
+        self._output_lock = threading.Lock()
+        self._active_output_path: Path | None = None
+        self._output_log_bytes = 0
+        self._output_log_records = 0
+        self._output_log_truncated = False
         self._active_result: RepairResult | None = None
         self._active_incident: Incident | None = None
         self.store = IncidentLearningStore(self.config.storage_root)
@@ -624,20 +652,111 @@ class CodexRepairExecutor:
             pass
 
     def _report_codex_output(self, stream_name: str, line: Any) -> None:
-        line_text = _bounded(line, 2_000).strip()
-        if not line_text or self._visible_output_truncated:
+        line_text = self._output_text(line).rstrip("\r\n")
+        self._append_output_record(stream_name, line_text)
+        visible_text = _bounded(line_text, 2_000).strip()
+        if not visible_text:
             return
-        remaining = MAX_VISIBLE_OUTPUT_CHARS - self._visible_output_chars
-        if remaining <= 0:
-            self._visible_output_truncated = True
-            self._progress("Codex 实时输出过长，窗口显示已截断；完整有界日志仍会保存。")
+        with self._output_lock:
+            if self._visible_output_truncated:
+                return
+            remaining = MAX_VISIBLE_OUTPUT_CHARS - self._visible_output_chars
+            if remaining <= 0:
+                self._visible_output_truncated = True
+                visible = ""
+                truncated = True
+            else:
+                visible = visible_text[:remaining]
+                self._visible_output_chars += len(visible)
+                truncated = len(visible_text) > remaining
+                if truncated:
+                    self._visible_output_truncated = True
+        if visible:
+            self._progress(f"Codex {stream_name}: {visible}")
+        if truncated:
+            self._progress(
+                "Codex live output was truncated in the visible window; "
+                "the bounded run log remains available."
+            )
+
+    @staticmethod
+    def _output_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return str(value)
+
+    def _start_output_log(self, path: Path) -> None:
+        with self._output_lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("", encoding="utf-8")
+            self._active_output_path = path
+            self._output_log_bytes = 0
+            self._output_log_records = 0
+            self._output_log_truncated = False
+
+    def _append_output_record(self, stream_name: str, line: Any) -> None:
+        path = self._active_output_path
+        if path is None:
             return
-        visible = line_text[:remaining]
-        self._visible_output_chars += len(visible)
-        self._progress(f"Codex {stream_name}: {visible}")
-        if len(line_text) > remaining:
-            self._visible_output_truncated = True
-            self._progress("Codex 实时输出过长，窗口显示已截断；完整有界日志仍会保存。")
+        stream_name = str(stream_name)
+        line_text = self._output_text(line).rstrip("\r\n")
+        parsed_stdout: Any = None
+        if stream_name == "stdout":
+            try:
+                parsed_stdout = json.loads(line_text)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed_stdout = None
+        if stream_name == "stdout" and isinstance(parsed_stdout, dict):
+            # Codex --json already emits JSON objects. Preserve those native
+            # event lines verbatim so existing JSONL viewers can consume them.
+            encoded = line_text + "\n"
+        else:
+            record = {
+                "type": "stderr" if stream_name == "stderr" else "stdout",
+                "stream": stream_name,
+                "text": line_text,
+            }
+            encoded = json.dumps(record, ensure_ascii=False) + "\n"
+        encoded_size = len(encoded.encode("utf-8"))
+        marker = json.dumps(
+            {
+                "type": "truncated",
+                "stream": "system",
+                "text": "... <run output truncated>",
+                "truncated": True,
+            },
+            ensure_ascii=False,
+        ) + "\n"
+        marker_size = len(marker.encode("utf-8"))
+        with self._output_lock:
+            if self._output_log_truncated:
+                return
+            remaining = MAX_CAPTURE_CHARS - self._output_log_bytes
+            if encoded_size + marker_size > remaining:
+                if marker_size <= remaining:
+                    try:
+                        with path.open("a", encoding="utf-8", newline="\n") as stream:
+                            stream.write(marker)
+                            stream.flush()
+                        self._output_log_bytes += marker_size
+                        self._output_log_records += 1
+                    except OSError:
+                        pass
+                self._output_log_truncated = True
+                return
+            try:
+                # One complete JSONL record is flushed while holding the lock,
+                # so stdout/stderr readers cannot interleave and status viewers
+                # can observe output before the child exits.
+                with path.open("a", encoding="utf-8", newline="\n") as stream:
+                    stream.write(encoded)
+                    stream.flush()
+                self._output_log_bytes += encoded_size
+                self._output_log_records += 1
+            except OSError:
+                pass
 
     def load_incident(self, path_or_id: str | os.PathLike[str]) -> Incident | None:
         return self.store.load_incident(path_or_id)
@@ -652,6 +771,10 @@ class CodexRepairExecutor:
     ) -> RepairResult:
         self._active_result = None
         self._active_incident = None
+        self._active_output_path = None
+        self._output_log_bytes = 0
+        self._output_log_records = 0
+        self._output_log_truncated = False
         self._visible_output_chars = 0
         self._visible_output_truncated = False
         try:
@@ -693,6 +816,7 @@ class CodexRepairExecutor:
         result.run_path = str(run_dir / "status.json")
         output_path = run_dir / "codex-output.jsonl"
         result.codex_output_path = str(output_path)
+        self._start_output_log(output_path)
         self._write_status(result)
 
         if not self.config.enabled:
@@ -748,10 +872,10 @@ class CodexRepairExecutor:
         if os.name == "nt":
             self._progress("正在检查 elevated Windows sandbox……")
             preflight_options: dict[str, Any] = {
-                "require_process_containment": True
+                "require_process_containment": True,
+                "output_reporter": self._report_codex_output,
+                "visible_process": self._progress_reporter is not None,
             }
-            if self._progress_reporter is not None:
-                preflight_options["output_reporter"] = self._report_codex_output
             try:
                 preflight = self._run(
                     [
@@ -811,6 +935,12 @@ class CodexRepairExecutor:
             "exec",
             "--ephemeral",
             "--ignore-user-config",
+            "-c",
+            'model_reasoning_effort="minimal"',
+            "-c",
+            'service_tier="fast"',
+            "-c",
+            "features.fast_mode=true",
             "--json",
             *permission_arguments,
             "-C",
@@ -818,11 +948,12 @@ class CodexRepairExecutor:
             "-",
         ]
         self._progress("正在调用 Codex CLI，请稍候……")
-        run_options: dict[str, Any] = {}
+        run_options: dict[str, Any] = {
+            "output_reporter": self._report_codex_output,
+            "visible_process": self._progress_reporter is not None,
+        }
         if os.name == "nt":
             run_options["require_process_containment"] = True
-        if self._progress_reporter is not None:
-            run_options["output_reporter"] = self._report_codex_output
         try:
             completed = self._run(
                 argv,
@@ -1231,7 +1362,11 @@ class CodexRepairExecutor:
         workspace_access = "write" if writable else "read"
         working_directory = working_directory.resolve()
         runtime_temp = runtime_temp.resolve()
+        repository_root = self.config.repository_root.resolve()
         venv_root = (self.config.repository_root / ".venv").resolve()
+        repository_deny = ""
+        if _requires_repository_deny(repository_root, working_directory):
+            repository_deny = f'{toml_string(str(repository_root))}="deny",'
         filesystem_value = (
             "{"
             '":root"="deny",'
@@ -1240,7 +1375,7 @@ class CodexRepairExecutor:
             f'":workspace_roots"={{"."="{workspace_access}",'
             '".git"="read",".codex"="read","AGENTS.md"="read",'
             '"**/*.env"="deny"},'
-            f'{toml_string(str(self.config.repository_root))}="deny",'
+            f"{repository_deny}"
             f'{toml_string(str(working_directory))}="{workspace_access}",'
             f'{toml_string(str(venv_root))}="read",'
             f'{toml_string(str(runtime_temp))}="write",'
@@ -1297,15 +1432,20 @@ Prior same-fingerprint experience:
 {history}
 """
 
-    @staticmethod
-    def _write_output(path: Path, stdout: Any, stderr: Any) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        output = _bounded(stdout)
-        error = _bounded(stderr)
-        path.write_text(
-            output + ("\n--- stderr ---\n" + error if error else ""),
-            encoding="utf-8",
-        )
+    def _write_output(self, path: Path, stdout: Any, stderr: Any) -> None:
+        if self._active_output_path != path:
+            self._start_output_log(path)
+        # The default runner has already delivered every line through the
+        # reporter. Mock/custom runners may only return CompletedProcess, so
+        # fall back to the bounded captures when nothing streamed.
+        with self._output_lock:
+            has_streamed_records = self._output_log_records > 0
+        if has_streamed_records:
+            return
+        for stream_name, value in (("stdout", stdout), ("stderr", stderr)):
+            text = _bounded(self._output_text(value))
+            for line in text.splitlines() or ([text] if text else []):
+                self._append_output_record(stream_name, line)
 
     def _write_status(self, result: RepairResult) -> None:
         if result.run_path:
