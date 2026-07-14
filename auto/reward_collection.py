@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 import json
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -56,6 +57,39 @@ def _center(item: dict) -> tuple[int, int]:
 
 def _matches(actual: str, expected: str) -> bool:
     return expected.replace(" ", "") in actual.replace(" ", "")
+
+
+def _daily_stage_boxes(image) -> list[tuple[int, int]]:
+    """Return currently claimable yellow stage boxes from a fresh frame."""
+    hsv = cv.cvtColor(image, cv.COLOR_BGR2HSV)
+    boxes = []
+    for x in (439, 562, 684, 806, 929, 1051):
+        patch = hsv[135:195, x - 30:x + 30]
+        yellow = cv.inRange(patch, np.array((15, 100, 120)), np.array((40, 255, 255)))
+        yellow_count = cv.countNonZero(yellow)
+        if yellow_count >= 25:
+            boxes.append((x, yellow_count))
+    return boxes
+
+
+def _daily_activity_value(items: list[dict]) -> int | None:
+    """Read the current daily activity total from its fixed normalized region."""
+    activity = None
+    for item in items:
+        x, y = _center(item)
+        if 150 <= x <= 300 and 160 <= y <= 240:
+            digits = "".join(character for character in item["text"] if character.isdigit())
+            if digits:
+                activity = max(activity or 0, int(digits))
+    return activity
+
+
+def _is_daily_activity_page(items: list[dict]) -> bool:
+    texts = [str(item.get("text", "")) for item in items]
+    return any(_matches(text, "每日活跃") for text in texts) or (
+        any(_matches(text, "完成进度") for text in texts)
+        and any(_matches(text, "活跃度") for text in texts)
+    )
 
 
 @dataclass
@@ -240,13 +274,37 @@ class RewardCollector:
         logger.info(f"{area}的一键领取按钮已消失，确认领取成功")
         return True
 
+    def _daily_completion_confirmed(self, frames: int = 2) -> bool:
+        """Require two clean frames before treating the daily reward page as complete."""
+        for frame_index in range(frames):
+            observation = self.driver.frame()
+            items = observation.ocr()
+            if not _is_daily_activity_page(items):
+                return False
+            activity = _daily_activity_value(items)
+            if activity is None or activity < 600:
+                return False
+            if any(_matches(str(item.get("text", "")), "可领取") for item in items):
+                return False
+            if _daily_stage_boxes(observation.image):
+                return False
+            if frame_index + 1 < frames:
+                self.driver.sleep(0.25)
+        return True
+
     def collect_daily_activity(self) -> int:
         cycle = _daily_cycle()
-        if self.state.get("daily_activity_completed_cycle") == cycle:
-            logger.info("本周期每日活跃奖励已全部领取，跳过检查")
-            return 0
+        cached_complete = self.state.get("daily_activity_completed_cycle") == cycle
         if not self._open_from_home("每日活跃"):
             return 0
+        if cached_complete:
+            logger.info("本周期存在每日活跃完成缓存，执行两帧轻量复核")
+            if self._daily_completion_confirmed():
+                logger.info("连续两帧确认无可领取任务和阶段箱，跳过重复领取")
+                return 0
+            self.state.pop("daily_activity_completed_cycle", None)
+            _save_state(self.state)
+            logger.warning("每日活跃完成缓存与当前页面不一致，已撤销并重新检查奖励")
 
         # One task click often claims all completed tasks, but require the
         # actionable-label count to decrease before treating it as success.
@@ -265,53 +323,44 @@ class RewardCollector:
                 break
             claimed += 1
 
-        # Stage boxes have fixed positions in the normalized layout.  The game
-        # claims every currently available stage box when any one yellow box is
-        # tapped, so never iterate over a stale pre-click screenshot.
-        frame = self.driver.frame().image
-        hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
-        yellow_boxes: list[tuple[int, int]] = []
-        for x in (439, 562, 684, 806, 929, 1051):
-            patch = hsv[135:195, x - 30:x + 30]
-            yellow = cv.inRange(patch, np.array((15, 100, 120)), np.array((40, 255, 255)))
-            yellow_count = cv.countNonZero(yellow)
-            if yellow_count >= 25:
-                yellow_boxes.append((x, yellow_count))
-
-        if yellow_boxes:
+        # Stage boxes have fixed positions in the normalized layout. Claim one
+        # fresh box at a time and rescan; never assume one click claimed all.
+        yellow_boxes = _daily_stage_boxes(self.driver.frame().image)
+        failed_attempts: Counter[int] = Counter()
+        for _ in range(6):
+            if not yellow_boxes:
+                break
             x, before_yellow = yellow_boxes[0]
             self.driver.tap((x, 164))
             self.driver.sleep(0.8)
             self.driver.tap((640, 660))
             self.driver.sleep(0.5)
-            updated = cv.cvtColor(self.driver.frame().image, cv.COLOR_BGR2HSV)
-            updated_patch = updated[135:195, x - 30:x + 30]
-            updated_yellow = cv.inRange(
-                updated_patch,
-                np.array((15, 100, 120)),
-                np.array((40, 255, 255)),
-            )
-            if cv.countNonZero(updated_yellow) < before_yellow:
+            updated_boxes = _daily_stage_boxes(self.driver.frame().image)
+            updated_by_x = dict(updated_boxes)
+            if x not in updated_by_x:
                 claimed += 1
                 logger.info(
-                    f"点击 1 个黄色阶段礼物盒，游戏已自动领取全部 {len(yellow_boxes)} 个可领奖励"
+                    f"每日活跃阶段奖励已触发，重新扫描后剩余 {len(updated_boxes)} 个黄色箱"
                 )
+                yellow_boxes = updated_boxes
             else:
-                logger.warning(f"每日活跃阶段箱 x={x} 点击后未发生变化，不计成功")
+                failed_attempts[x] += 1
+                if failed_attempts[x] < 2:
+                    logger.warning(f"每日活跃阶段箱 x={x} 首次点击后仍存在，稍后重试")
+                    self.driver.sleep(0.5)
+                    yellow_boxes = updated_boxes
+                    continue
+                logger.warning(f"每日活跃阶段箱 x={x} 连续点击无效，改试其他黄色箱")
+                yellow_boxes = [box for box in updated_boxes if box[0] != x] + [
+                    box for box in updated_boxes if box[0] == x
+                ]
 
-        # Only cache a completed day after the UI itself confirms 600 activity.
-        # If it is below 600, later tasks can still make more rewards available.
-        activity = None
-        for item in self.driver.texts():
-            x, y = _center(item)
-            if 150 <= x <= 300 and 160 <= y <= 240:
-                digits = "".join(character for character in item["text"] if character.isdigit())
-                if digits:
-                    activity = max(activity or 0, int(digits))
-        if activity is not None and activity >= 600:
+        # Reaching 600 only unlocks every stage. Cache completion only after two
+        # fresh frames also prove that no task or stage reward remains claimable.
+        if self._daily_completion_confirmed():
             self.state["daily_activity_completed_cycle"] = cycle
             _save_state(self.state)
-            logger.info("检测到每日活跃度已达 600，记录本周期奖励已完成")
+            logger.info("活跃度已达 600 且连续两帧无可领取奖励，记录本周期奖励已完成")
         logger.info(f"每日活跃奖励处理完成，共触发 {claimed} 次领取")
         return claimed
 

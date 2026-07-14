@@ -14,8 +14,36 @@ def isolate_reward_state(monkeypatch, tmp_path):
 
 
 class FakeFrame:
-    def __init__(self):
-        self.image = np.zeros((720, 1280, 3), dtype=np.uint8)
+    def __init__(self, image=None, items=None):
+        self.image = image if image is not None else np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.items = items or []
+
+    def ocr(self):
+        return self.items
+
+
+def ocr_box(x, y, text):
+    return {
+        "text": text,
+        "position": ((x - 20, y - 10), (x + 20, y - 10), (x + 20, y + 10), (x - 20, y + 10)),
+    }
+
+
+def yellow_stage_frame(*xs, items=None):
+    image = np.zeros((720, 1280, 3), dtype=np.uint8)
+    for x in xs:
+        image[135:195, x - 30:x + 30] = (0, 255, 255)
+    return FakeFrame(image, items)
+
+
+def daily_page_items(activity="600", claimable=False):
+    items = [
+        ocr_box(450, 60, "每日活跃"),
+        ocr_box(225, 200, activity),
+    ]
+    if claimable:
+        items.append(ocr_box(500, 610, "可领取"))
+    return items
 
 
 class FakeDriver:
@@ -73,7 +101,9 @@ def test_daily_stage_rewards_click_only_one_yellow_box():
     first.image = before
     second = FakeFrame()
     second.image = after
-    frames = iter([first, second])
+    # At 600 activity the game normally clears every yellow stage box after
+    # one click; the third frame is the later completion check.
+    frames = iter([first, second, FakeFrame()])
     driver.frame = lambda: next(frames)
     collector = RewardCollector(driver)
     collector.state = {}
@@ -81,6 +111,128 @@ def test_daily_stage_rewards_click_only_one_yellow_box():
     assert collector.collect_daily_activity() == 1
     stage_taps = [tap for tap in driver.taps if tap[1] == 164]
     assert stage_taps == [(439, 164)]
+
+
+def test_daily_stage_rewards_rescan_and_claim_each_remaining_box():
+    driver = FakeDriver()
+    frames = iter([
+        yellow_stage_frame(439, 562, 684),
+        yellow_stage_frame(562, 684),
+        yellow_stage_frame(684),
+        yellow_stage_frame(),
+        yellow_stage_frame(),  # completion check stops because OCR is absent
+    ])
+    driver.frame = lambda: next(frames)
+    collector = RewardCollector(driver)
+    collector.state = {}
+
+    assert collector.collect_daily_activity() == 3
+    assert [tap for tap in driver.taps if tap[1] == 164] == [
+        (439, 164),
+        (562, 164),
+        (684, 164),
+    ]
+
+
+def test_daily_completion_requires_two_clean_frames_at_600_or_more():
+    driver = FakeDriver()
+    driver.frame = Mock(side_effect=[
+        yellow_stage_frame(items=daily_page_items("600")),
+        yellow_stage_frame(items=daily_page_items("600")),
+    ])
+    collector = RewardCollector(driver)
+
+    assert collector._daily_completion_confirmed()
+    assert driver.frame.call_count == 2
+
+
+def test_daily_completion_rejects_600_when_a_later_frame_still_has_a_stage_box():
+    driver = FakeDriver()
+    driver.frame = Mock(side_effect=[
+        yellow_stage_frame(items=daily_page_items("600")),
+        yellow_stage_frame(562, items=daily_page_items("600")),
+    ])
+    collector = RewardCollector(driver)
+
+    assert not collector._daily_completion_confirmed()
+
+
+def test_daily_completion_rejects_claimable_text_even_at_600():
+    driver = FakeDriver()
+    driver.frame = Mock(return_value=yellow_stage_frame(items=daily_page_items("600", True)))
+    collector = RewardCollector(driver)
+
+    assert not collector._daily_completion_confirmed()
+
+
+def test_daily_completion_rejects_clean_frames_below_600():
+    driver = FakeDriver()
+    driver.frame = Mock(return_value=yellow_stage_frame(items=daily_page_items("599")))
+    collector = RewardCollector(driver)
+
+    assert not collector._daily_completion_confirmed()
+
+
+def test_daily_stage_reward_retries_when_first_click_does_not_clear_boxes():
+    driver = FakeDriver()
+    frames = iter([
+        yellow_stage_frame(439, 562),
+        yellow_stage_frame(439, 562),  # first click did not take effect
+        yellow_stage_frame(),  # retry triggers the game-side claim-all behavior
+        yellow_stage_frame(),  # completion check stops because OCR is absent
+    ])
+    driver.frame = lambda: next(frames)
+    collector = RewardCollector(driver)
+    collector.state = {}
+
+    assert collector.collect_daily_activity() == 1
+    assert [tap for tap in driver.taps if tap[1] == 164] == [(439, 164), (439, 164)]
+
+
+def test_daily_stage_reward_does_not_count_a_box_that_is_still_yellow():
+    reduced = np.zeros((720, 1280, 3), dtype=np.uint8)
+    reduced[145:180, 419:459] = (0, 255, 255)  # fewer pixels, still clearly yellow
+    driver = FakeDriver()
+    frames = iter([
+        yellow_stage_frame(439),
+        FakeFrame(reduced),
+        yellow_stage_frame(),
+        yellow_stage_frame(),  # completion check stops because OCR is absent
+    ])
+    driver.frame = lambda: next(frames)
+    collector = RewardCollector(driver)
+    collector.state = {}
+
+    assert collector.collect_daily_activity() == 1
+    assert [tap for tap in driver.taps if tap[1] == 164] == [(439, 164), (439, 164)]
+
+
+def test_cached_daily_completion_is_revalidated_and_revoked_when_page_disagrees(monkeypatch):
+    driver = FakeDriver()
+    collector = RewardCollector(driver)
+    cycle = _daily_cycle()
+    collector.state = {"daily_activity_completed_cycle": cycle}
+    monkeypatch.setattr(collector, "_open_from_home", Mock(return_value=True))
+    monkeypatch.setattr(
+        collector,
+        "_daily_completion_confirmed",
+        Mock(side_effect=[False, False]),
+    )
+
+    assert collector.collect_daily_activity() == 0
+    assert "daily_activity_completed_cycle" not in collector.state
+    collector._open_from_home.assert_called_once_with("每日活跃")
+
+
+def test_cached_daily_completion_still_opens_page_for_lightweight_confirmation(monkeypatch):
+    collector = RewardCollector(FakeDriver())
+    cycle = _daily_cycle()
+    collector.state = {"daily_activity_completed_cycle": cycle}
+    monkeypatch.setattr(collector, "_open_from_home", Mock(return_value=True))
+    monkeypatch.setattr(collector, "_daily_completion_confirmed", Mock(return_value=True))
+
+    assert collector.collect_daily_activity() == 0
+    collector._open_from_home.assert_called_once_with("每日活跃")
 
 
 def test_manual_claims_tasks_before_level_rewards():
