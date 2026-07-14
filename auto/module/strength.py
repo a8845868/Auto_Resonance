@@ -330,12 +330,20 @@ def recover_strength(
     # Preserve the required resource order. If a non-wasteful drink is still
     # available in principle but this station has no rest area, do not consume
     # lunches first and do not report the daily plan as completed.
-    if rest_area_availability(station_name) is False and current >= 50:
+    no_rest_area = rest_area_availability(station_name) is False
+    available = maximum - current
+    urgent_shortfall = available < max(0, min_available)
+    if no_rest_area and current >= 50 and not urgent_shortfall:
         logger.warning(
             f"站点 {station_name or '未知'} 不设休息区，当前疲劳 {current} 可无浪费使用气泡水；"
             "疲劳规划暂缓，便当保持不动"
         )
         return False
+    if no_rest_area and current >= 50 and urgent_shortfall:
+        logger.warning(
+            f"站点 {station_name or '未知'} 不设休息区，但当前可用疲劳 {available} "
+            f"低于最低安全余量 {min_available}；允许先使用不会浪费的便当"
+        )
 
     if not _open_fatigue_panel():
         return False
@@ -347,7 +355,11 @@ def recover_strength(
     if rest_area.status == "failed":
         go_home()
         return False
-    if rest_area.status == "unavailable" and current >= 50:
+    if (
+        rest_area.status == "unavailable"
+        and current >= 50
+        and not urgent_shortfall
+    ):
         logger.warning(
             "当前疲劳仍可无浪费使用气泡水；保留疲劳任务到有休息区的核心城市，"
             "不提前使用便当"

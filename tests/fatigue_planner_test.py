@@ -36,56 +36,53 @@ def test_daily_fatigue_task_is_independent_and_returns_explicit_result():
     ) as go_home:
         result = fatigue_recovery.run_daily_fatigue_recovery()
 
-    recover.assert_called_once_with("buy", min_available=0, station_name="岚心城")
+    recover.assert_called_once_with("buy", min_available=80, station_name="岚心城")
     assert result["success"] is True
     assert result["before"] == 612
     assert result["after"] == 12
     assert result["restored"] == 600
 
 
-def test_daily_fatigue_task_defers_at_station_without_rest_area():
+def test_daily_fatigue_task_uses_safe_lunches_at_station_without_rest_area():
     with patch.object(fatigue_recovery, "connect", return_value=True), patch.object(
         fatigue_recovery, "get_station", return_value="武林源"
     ), patch.object(
-        fatigue_recovery, "_open_exchange_buy_page"
-    ) as open_exchange, patch.object(
-        fatigue_recovery, "_wait_strength"
-    ) as wait_strength, patch.object(
-        fatigue_recovery, "recover_strength"
+        fatigue_recovery, "_open_exchange_buy_page", return_value=True
+    ), patch.object(
+        fatigue_recovery, "_wait_strength", side_effect=[(791, 816), (600, 816)]
+    ), patch.object(
+        fatigue_recovery, "recover_strength", return_value=True
     ) as recover, patch.object(
         fatigue_recovery, "go_home", return_value=True
     ) as go_home:
         result = fatigue_recovery.run_daily_fatigue_recovery()
 
     assert result["success"] is True
-    assert result["deferred"] is True
-    assert result["reason"] == "station_without_rest_area"
-    open_exchange.assert_not_called()
-    wait_strength.assert_not_called()
-    recover.assert_not_called()
-    go_home.assert_not_called()
+    assert result["success"] is True
+    assert result["restored"] == 191
+    recover.assert_called_once_with("buy", min_available=80, station_name="武林源")
+    go_home.assert_called_once()
 
 
-def test_daily_fatigue_task_does_not_open_exchange_at_low_fatigue_without_rest_area():
+def test_daily_fatigue_task_can_complete_at_no_rest_station_without_lunch_waste():
     with patch.object(fatigue_recovery, "connect", return_value=True), patch.object(
         fatigue_recovery, "get_station", return_value="武林源"
     ), patch.object(
-        fatigue_recovery, "_open_exchange_buy_page"
-    ) as open_exchange, patch.object(
+        fatigue_recovery, "_open_exchange_buy_page", return_value=True
+    ), patch.object(
         fatigue_recovery, "_wait_strength", return_value=(12, 816)
     ), patch.object(
-        fatigue_recovery, "recover_strength"
+        fatigue_recovery, "recover_strength", return_value=True
     ) as recover, patch.object(
         fatigue_recovery, "go_home", return_value=True
     ) as go_home:
         result = fatigue_recovery.run_daily_fatigue_recovery()
 
     assert result["success"] is True
-    assert result["deferred"] is True
-    assert result["reason"] == "station_without_rest_area"
-    open_exchange.assert_not_called()
-    recover.assert_not_called()
-    go_home.assert_not_called()
+    assert result["success"] is True
+    assert result["restored"] == 0
+    recover.assert_called_once_with("buy", min_available=80, station_name="武林源")
+    go_home.assert_called_once()
 
 
 def test_daily_fatigue_task_defers_with_explicit_success_when_recovery_is_unneeded():
