@@ -8,7 +8,7 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QLabel, QWidget
-from qfluentwidgets import ExpandLayout, PrimaryPushSettingCard
+from qfluentwidgets import ExpandLayout, PrimaryPushSettingCard, SwitchSettingCard
 from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import ScrollArea, SettingCardGroup
 
@@ -34,6 +34,7 @@ class SettingInterface(ScrollArea):
 
         # music folders
         self.musicInThisPCGroup = SettingCardGroup("配置", self.scrollWidget)
+        self.lifecycleGroup = SettingCardGroup("任务资源管理", self.scrollWidget)
         self.mirrorCdkCard = LineEditSettingCard(
             cfg.mirrorCdk,
             "Mirror酱 CDK",
@@ -78,6 +79,27 @@ class SettingInterface(ScrollArea):
             "修改该内容自动变为自定义ADB端口",
             parent=self.musicInThisPCGroup,
         )
+        self.autoGameLifecycleCard = SwitchSettingCard(
+            FIF.PLAY,
+            "任务自动管理游戏进程",
+            "队列有任务时启动当前 MuMu 多开实例和游戏；整批结束后关闭游戏进程",
+            configItem=cfg.enableAutoGameLifecycle,
+            parent=self.lifecycleGroup,
+        )
+        self.autoStartEmulatorCard = SwitchSettingCard(
+            FIF.GAME,
+            "模拟器未启动时自动开启",
+            "按当前选择的 MuMu 安装路径和多开 index 精确启动对应实例",
+            configItem=cfg.autoStartEmulator,
+            parent=self.lifecycleGroup,
+        )
+        self.closeEmulatorWhenIdleCard = SwitchSettingCard(
+            FIF.POWER_BUTTON,
+            "队列结束后同时关闭模拟器",
+            "默认仅关闭游戏以便节约资源；开启后还会关闭对应 MuMu 多开实例",
+            configItem=cfg.closeEmulatorWhenIdle,
+            parent=self.lifecycleGroup,
+        )
         # self.adbOrderCard = LineEditSettingCard(
         #     cfg.adbOrder,
         #     "ADB地址",
@@ -116,11 +138,15 @@ class SettingInterface(ScrollArea):
         self.musicInThisPCGroup.addSettingCard(self.mirrorCdkCard)
         self.musicInThisPCGroup.addSettingCard(self.mirrorCard)
         self.musicInThisPCGroup.addSettingCard(self.adbOrderCard)
+        self.lifecycleGroup.addSettingCard(self.autoGameLifecycleCard)
+        self.lifecycleGroup.addSettingCard(self.autoStartEmulatorCard)
+        self.lifecycleGroup.addSettingCard(self.closeEmulatorWhenIdleCard)
 
         # add setting card group to layout
         self.expandLayout.setSpacing(28)
         self.expandLayout.setContentsMargins(36, 10, 36, 0)
         self.expandLayout.addWidget(self.musicInThisPCGroup)
+        self.expandLayout.addWidget(self.lifecycleGroup)
 
     def showEvent(self, event):
         """当切换到该页面时，触发这个事件"""

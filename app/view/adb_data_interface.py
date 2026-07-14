@@ -27,6 +27,7 @@ class ADBDataInterface(ScrollArea):
         self.scrollWidget = QWidget(self)
 
         self.vBoxLayout = QVBoxLayout(self.scrollWidget)
+        self.scanWorker = None
 
         self.__initWidget()
 
@@ -52,9 +53,23 @@ class ADBDataInterface(ScrollArea):
 
     def start_port_scan(self):
         """动画结束后调用的方法"""
-        self.worker = Worker(get_adb_port)
-        self.worker.result.connect(self.update_adb)
-        self.worker.start()
+        if self.scanWorker is not None:
+            return
+        worker = Worker(get_adb_port, preferred=cfg.device.value)
+        self.scanWorker = worker
+        worker.result.connect(self.update_adb)
+        worker.finished.connect(lambda: self._scanFinished(worker))
+        worker.start()
+
+    def _scanFinished(self, worker):
+        if worker is self.scanWorker:
+            self.scanWorker = None
+        worker.deleteLater()
+
+    def shutdown(self) -> bool:
+        """Keep the page alive until its read-only discovery worker exits."""
+
+        return self.scanWorker is None
 
     def loadSamples(self):
         """load samples"""
@@ -65,12 +80,12 @@ class ADBDataInterface(ScrollArea):
     def update_adb(self, info_list: list[EmulatorInfo]):
         self.basicInputView.set_title("ADB信息")
         for info in info_list:
-            if not info.port:
-                continue
+            status = f"127.0.0.1:{info.port}" if info.port else "未启动"
+            content = f"{status} · {info.type.value} · 多开索引 {info.index}"
             self.basicInputView.addSampleCard(
                 icon=":/gallery/images/controls/Button.png",
                 title=info.name,
-                content=f"127.0.0.1:{info.port}",
+                content=content,
                 func=partial(self.set_port, info),
             )
 

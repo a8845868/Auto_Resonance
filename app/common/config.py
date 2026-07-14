@@ -112,6 +112,16 @@ class Config(RunningBusinessConfig):
     enablePassengerBuildMonitor = ConfigItem("TaskQueue", "PassengerBuildMonitor", False, None)
     enableFatiguePlanner = ConfigItem("TaskQueue", "FatiguePlanner", True, None)
 
+    enableAutoGameLifecycle = ConfigItem(
+        "EmulatorLifecycle", "Enabled", True, None
+    )
+    autoStartEmulator = ConfigItem(
+        "EmulatorLifecycle", "AutoStartEmulator", True, None
+    )
+    closeEmulatorWhenIdle = ConfigItem(
+        "EmulatorLifecycle", "CloseEmulatorWhenIdle", False, None
+    )
+
     residentActivityTask = ConfigItem(
         "ResidentActivity",
         "Task",

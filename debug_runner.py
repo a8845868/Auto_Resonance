@@ -65,10 +65,15 @@ def _base_status(lease, **updates) -> dict[str, Any]:
 
 
 def _run_debug_task(lease, command: dict[str, Any]) -> dict[str, Any]:
+    from app.common.config import cfg
     from core.control.control import reset_stop
     from core.exception.exceptions import StopExecution
     from core.logger import logger
     from core.services.debug_tasks import resolve_task
+    from core.services.emulator_lifecycle import (
+        EmulatorQueueLifecycle,
+        LifecycleOptions,
+    )
     from core.services.task_schedule_state import (
         record_task_execution,
         task_result_succeeded,
@@ -82,6 +87,14 @@ def _run_debug_task(lease, command: dict[str, Any]) -> dict[str, Any]:
         return {"success": False, "task": task_name, "error": str(error)}
 
     reset_stop()
+    if lease.stop_requested():
+        return {
+            "success": False,
+            "task": task.key,
+            "result": None,
+            "error": "后台调试进程正在停止，任务未启动",
+            "cleanup_error": "",
+        }
     write_debug_status(
         _base_status(
             lease,
@@ -95,7 +108,23 @@ def _run_debug_task(lease, command: dict[str, Any]) -> dict[str, Any]:
     result = None
     success = False
     error_text = ""
+    cleanup_error = ""
+    lifecycle = None
     try:
+        if bool(cfg.enableAutoGameLifecycle.value):
+            lifecycle = EmulatorQueueLifecycle(
+                cfg.device.value,
+                options=LifecycleOptions(
+                    auto_start_emulator=bool(cfg.autoStartEmulator.value),
+                    close_game_when_idle=True,
+                    close_emulator_when_idle=bool(
+                        cfg.closeEmulatorWhenIdle.value
+                    ),
+                ),
+            )
+            lifecycle.prepare(lambda: lease.stop_requested())
+        if lease.stop_requested():
+            raise StopExecution()
         result = task.run()
         success = task_result_succeeded(result)
         if not success:
@@ -107,6 +136,13 @@ def _run_debug_task(lease, command: dict[str, Any]) -> dict[str, Any]:
     except Exception as error:  # noqa: BLE001 - debug boundary must report all failures
         error_text = f"{type(error).__name__}: {error}"
         logger.exception(f"后台调试执行失败: {task.name}")
+    finally:
+        if lifecycle is not None:
+            try:
+                lifecycle.cleanup()
+            except Exception as error:  # noqa: BLE001 - keep task result authoritative
+                cleanup_error = f"{type(error).__name__}: {error}"
+                logger.exception("后台调试任务结束后的游戏资源清理失败")
 
     if bool(command.get("record")):
         record_task_execution(
@@ -121,6 +157,7 @@ def _run_debug_task(lease, command: dict[str, Any]) -> dict[str, Any]:
         "task": task.key,
         "result": _serializable(result),
         "error": error_text,
+        "cleanup_error": cleanup_error,
     }
     write_debug_status(
         _base_status(
@@ -130,7 +167,7 @@ def _run_debug_task(lease, command: dict[str, Any]) -> dict[str, Any]:
             last_command=command_id,
             last_success=success,
             last_result=_serializable(result),
-            last_error=error_text,
+            last_error=error_text or cleanup_error,
         )
     )
     return response

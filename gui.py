@@ -48,7 +48,7 @@ w.show()
 runtime_stop_timer = QTimer()
 runtime_stop_timer.setInterval(500)
 runtime_stop_timer.timeout.connect(
-    lambda: app.quit() if stop_requested_for_current_process() else None
+    lambda: w.close() if stop_requested_for_current_process() else None
 )
 runtime_stop_timer.start()
 app.exec()

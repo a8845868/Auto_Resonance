@@ -14,7 +14,7 @@ import numpy as np
 from loguru import logger
 
 from core.control.adb import ADB
-from core.control.adb_port import EmulatorType
+from core.control.adb_port import EmulatorInfo, EmulatorType
 from core.control.base_control import IADB
 from core.control.nemu import NEMU
 from core.exception.exceptions import StopExecution
@@ -26,6 +26,43 @@ EXCURSIONY = [-10, 10]
 STOP = False
 
 control: IADB = ADB()
+_runtime_device: EmulatorInfo | None = None
+_runtime_auto_start_emulator: bool | None = None
+
+
+def set_runtime_device(device: EmulatorInfo | None) -> None:
+    """Freeze the target used by an active queue independently of GUI config."""
+
+    global _runtime_device
+    _runtime_device = (
+        EmulatorInfo.from_dict(device.to_dict()) if device is not None else None
+    )
+
+
+def clear_runtime_device() -> None:
+    global _runtime_auto_start_emulator
+    set_runtime_device(None)
+    _runtime_auto_start_emulator = None
+
+
+def has_runtime_device() -> bool:
+    return _runtime_device is not None
+
+
+def set_runtime_auto_start_emulator(enabled: bool) -> None:
+    global _runtime_auto_start_emulator
+    _runtime_auto_start_emulator = bool(enabled)
+
+
+def get_runtime_auto_start_emulator() -> bool:
+    if _runtime_auto_start_emulator is None:
+        return True
+    return _runtime_auto_start_emulator
+
+
+def get_runtime_device() -> EmulatorInfo:
+    device = _runtime_device or app.Global.device
+    return EmulatorInfo.from_dict(device.to_dict())
 
 
 def connect(adb_port: Optional[int] = None):
@@ -35,24 +72,25 @@ def connect(adb_port: Optional[int] = None):
     :param order: ADB端口
     """
     global control
-    device = app.Global.device
+    device = get_runtime_device()
     if device.is_mumu:
-        control = NEMU()
+        control = NEMU(device)
         status = control.connect(adb_port)
         if status:
             return status
         else:
             logger.warning("MUMUIPC连接失败，尝试使用ADB连接")
     control = ADB()
-    status = control.connect(adb_port)
+    status = control.connect(adb_port if adb_port is not None else device.port)
     return status
 
 
 def connect_adb(adb_port: Optional[int] = None):
     """Force the TCP ADB transport for workflows that require shell evidence."""
     global control
+    device = get_runtime_device()
     control = ADB()
-    return control.connect(adb_port)
+    return control.connect(adb_port if adb_port is not None else device.port)
 
 
 def stop():

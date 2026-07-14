@@ -56,6 +56,7 @@ class MainWindow(FluentWindow):
     def __init__(self):
         super().__init__()
         self.wights = {}
+        self._closeRetryScheduled = False
 
         # 主题监听器
         self.themeListener = SystemThemeListener(self)
@@ -203,8 +204,14 @@ class MainWindow(FluentWindow):
         self.switchTo(self.wights[routeKey])
 
     def closeEvent(self, e):
-        # 停止监听器线程
-        self.homeInterface.shutdown()
+        queue_stopped = self.homeInterface.shutdown()
+        scan_stopped = self.adb_data_interface.shutdown()
+        if not queue_stopped or not scan_stopped:
+            e.ignore()
+            if not self._closeRetryScheduled:
+                self._closeRetryScheduled = True
+                QTimer.singleShot(250, self._retryClose)
+            return
         try:
             self.themeListener.terminate()
             self.themeListener.deleteLater()
@@ -213,6 +220,10 @@ class MainWindow(FluentWindow):
             # already been deleted.
             pass
         super().closeEvent(e)
+
+    def _retryClose(self):
+        self._closeRetryScheduled = False
+        self.close()
 
     def _onThemeChangedFinished(self):
         super()._onThemeChangedFinished()

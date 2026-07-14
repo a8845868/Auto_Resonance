@@ -6,7 +6,7 @@ from typing import Optional
 
 from loguru import logger
 import numpy as np
-from core.control.adb_port import EmulatorType
+from core.control.adb_port import EmulatorInfo, EmulatorType
 from core.control.base_control import IADB
 import cv2 as cv
 
@@ -34,8 +34,8 @@ def swipe_path(p0, p3, time):
     return path
 
 class NEMU(IADB):
-    def __init__(self) -> None:
-        self.device = app.Global.device
+    def __init__(self, device: EmulatorInfo | None = None) -> None:
+        self.device = device or app.Global.device
         self.path = self.device.path
         if self.device.type == EmulatorType.MUMUV5:
             path = os.path.join(self.path, "./nx_device/12.0/shell/sdk/external_renderer_ipc.dll")
@@ -87,4 +87,10 @@ class NEMU(IADB):
         return image
     
     def kill(self):
-        pass
+        connect_id = getattr(self, "connect_id", None)
+        if connect_id is None:
+            return
+        try:
+            self.nemu.nemu_disconnect(connect_id)
+        finally:
+            self.connect_id = None

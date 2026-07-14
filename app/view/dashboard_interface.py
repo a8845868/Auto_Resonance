@@ -12,6 +12,10 @@ from auto.resident_activity import run_resident_activity
 from auto.reward_collection import collect_rewards
 from auto.module.dispatch import collect_dispatch_rewards
 from core.logger import logger
+from core.services.emulator_lifecycle import (
+    EmulatorQueueLifecycle,
+    LifecycleOptions,
+)
 from core.services.task_schedule_state import (
     completed_history,
     is_task_due,
@@ -68,6 +72,7 @@ class DashboardInterface(ScrollArea):
         self.scheduleTimer.timeout.connect(self._runDueTasks)
         self.scheduleTimer.start()
         self.currentTask = None
+        self.shutdownRequested = False
         self.scrollWidget = QWidget(self)
         self.mainLayout = QVBoxLayout(self.scrollWidget)
         self.setObjectName("HomeInterface")
@@ -221,7 +226,9 @@ class DashboardInterface(ScrollArea):
 
     def startTaskQueue(self):
         self.schedulerArmed = True
-        if self.queueWorker and self.queueWorker.isRunning():
+        # Keep the finished worker reserved until its queued finished slot has
+        # run.  Otherwise an old slot can accidentally delete a new worker.
+        if self.queueWorker is not None:
             return
         tasks = self._enabledTasks()
         if not tasks:
@@ -230,14 +237,27 @@ class DashboardInterface(ScrollArea):
             else:
                 self.pendingPanel.setTasks(["未启用可执行任务，请在左侧功能页开启"])
             return
-        self.queueWorker = TaskQueueWorker(tasks, self)
+        lifecycle = None
+        if bool(cfg.enableAutoGameLifecycle.value):
+            lifecycle = EmulatorQueueLifecycle(
+                cfg.device.value,
+                options=LifecycleOptions(
+                    auto_start_emulator=bool(cfg.autoStartEmulator.value),
+                    close_game_when_idle=True,
+                    close_emulator_when_idle=bool(
+                        cfg.closeEmulatorWhenIdle.value
+                    ),
+                ),
+            )
+        self.queueWorker = TaskQueueWorker(tasks, self, lifecycle=lifecycle)
         self.queueWorker.taskStarted.connect(self._taskStarted)
         self.queueWorker.taskFinished.connect(self._taskFinished)
         self.queueWorker.taskResult.connect(self._taskResult)
         self.queueWorker.taskCompleted.connect(self._taskCompleted)
         self.queueWorker.queueChanged.connect(self.pendingPanel.setTasks)
         self.queueWorker.error.connect(lambda message: logger.error(message))
-        self.queueWorker.finished.connect(self._queueFinished)
+        worker = self.queueWorker
+        worker.finished.connect(lambda: self._queueFinished(worker))
         self.startButton.setEnabled(False)
         self.stopButton.setEnabled(True)
         self.queueWorker.start()
@@ -252,7 +272,7 @@ class DashboardInterface(ScrollArea):
 
     def _runDueTasks(self):
         """Wake scheduled tasks without keeping the queue worker blocked."""
-        if not self.schedulerArmed or (self.queueWorker and self.queueWorker.isRunning()):
+        if not self.schedulerArmed or self.queueWorker is not None:
             return
         if any(not task.key or is_task_due(task.key) for task in self._allEnabledTasks()):
             self.startTaskQueue()
@@ -288,20 +308,28 @@ class DashboardInterface(ScrollArea):
         )
         self.refreshScheduleOverview()
 
-    def _queueFinished(self):
+    def _queueFinished(self, worker):
+        if worker is not self.queueWorker:
+            worker.deleteLater()
+            return
         self.runningPanel.setTasks([])
         self.pendingPanel.setTasks([])
         self.startButton.setEnabled(True)
         self.stopButton.setEnabled(False)
         self.refreshScheduleOverview()
-        self.queueWorker.deleteLater()
+        worker.deleteLater()
         self.queueWorker = None
 
-    def shutdown(self):
+    def shutdown(self) -> bool:
+        """Request shutdown without blocking the Qt main thread."""
+
         self.scheduleTimer.stop()
-        if self.queueWorker and self.queueWorker.isRunning():
-            self.queueWorker.stop()
-            self.queueWorker.wait(3000)
+        if self.queueWorker is not None:
+            if self.queueWorker.isRunning() and not self.shutdownRequested:
+                self.shutdownRequested = True
+                self.queueWorker.stop()
+            return False
         if self.logSink is not None:
             logger.remove(self.logSink)
             self.logSink = None
+        return True
