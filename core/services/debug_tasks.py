@@ -27,29 +27,35 @@ class DebugTask:
 
 
 def _screen_state() -> dict:
-    from core.control.control import connect, screenshot
+    from core.control.control import connect, kill, screenshot
     from core.services.screen_state import is_train_in_transit
 
     if not connect():
         raise RuntimeError("无法连接模拟器")
-    items = screenshot().ocr()
-    texts = [item["text"] for item in items]
-    return {
-        "in_transit": is_train_in_transit(items),
-        "texts": texts,
-    }
+    try:
+        items = screenshot().ocr()
+        texts = [item["text"] for item in items]
+        return {
+            "in_transit": is_train_in_transit(items),
+            "texts": texts,
+        }
+    finally:
+        kill()
 
 
 def _station_state() -> dict:
-    from core.control.control import connect
+    from core.control.control import connect, kill
     from core.preset import get_station
 
     if not connect():
         raise RuntimeError("无法连接模拟器")
-    station = get_station()
-    if not station:
-        raise RuntimeError("未能确认当前站点")
-    return {"station": station}
+    try:
+        station = get_station()
+        if not station:
+            raise RuntimeError("未能确认当前站点")
+        return {"station": station}
+    finally:
+        kill()
 
 
 def _fatigue() -> object:
@@ -106,6 +112,26 @@ def _run_business() -> object:
     )
 
 
+def _shop_probe() -> object:
+    """Read-only catalog walk: every product dialog is cancelled."""
+    from auto.shop_purchase import probe_shop_catalog
+
+    return probe_shop_catalog(capture_evidence=True)
+
+
+def _shop_dialog_probe() -> object:
+    """Open one multi-buy dialog, select max, OCR-check it, then cancel."""
+    from auto.shop_purchase import probe_shop_quantity_dialog
+
+    return probe_shop_quantity_dialog(capture_evidence=True)
+
+
+def _shop_purchase() -> object:
+    from auto.shop_purchase import run_shop_purchase
+
+    return run_shop_purchase()
+
+
 def _next_fatigue(now: datetime) -> datetime:
     from core.services.fatigue_planner import next_fatigue_refresh
 
@@ -155,10 +181,28 @@ def _next_business(now: datetime) -> datetime:
     return next_daily_reset(now)
 
 
+def _shop_purchase_enabled() -> bool:
+    from core.services.shop_catalog import shop_plan_enabled
+
+    return shop_plan_enabled()
+
+
+def _next_shop_purchase(now: datetime) -> datetime:
+    from core.services.shop_catalog import next_shop_reset
+
+    return next_shop_reset(now)
+
+
 def task_registry() -> dict[str, DebugTask]:
     tasks = [
         DebugTask("screen", "只读画面识别", _screen_state),
         DebugTask("station", "识别当前站点", _station_state),
+        DebugTask("shop_probe", "只读扫描总部黑月商店", _shop_probe),
+        DebugTask(
+            "shop_dialog_probe",
+            "只读校验商店数量弹窗",
+            _shop_dialog_probe,
+        ),
         DebugTask(
             "fatigue_recovery",
             "疲劳规划",
@@ -196,6 +240,13 @@ def task_registry() -> dict[str, DebugTask]:
             enabled=_passenger_build_enabled,
             next_run_factory=_next_passenger_build,
         ),
+        DebugTask(
+            "shop_purchase",
+            "商店自动购买",
+            _shop_purchase,
+            enabled=_shop_purchase_enabled,
+            next_run_factory=_next_shop_purchase,
+        ),
     ]
     return {task.key: task for task in tasks}
 
@@ -213,6 +264,15 @@ TASK_ALIASES = {
     "客厢": "passenger_build_monitor",
     "resident": "resident_activity",
     "rewards": "reward_collection",
+    "shop": "shop_purchase",
+    "store": "shop_purchase",
+    "商店": "shop_purchase",
+    "shop-probe": "shop_probe",
+    "probe-shop": "shop_probe",
+    "商店探测": "shop_probe",
+    "shop-dry": "shop_dialog_probe",
+    "shop-dialog": "shop_dialog_probe",
+    "商店干跑": "shop_dialog_probe",
 }
 
 

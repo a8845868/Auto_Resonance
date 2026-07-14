@@ -41,6 +41,10 @@ def test_only_explicit_nonempty_results_are_completed():
         QueuedTask("zero", lambda: 0),
         QueuedTask("true", lambda: True),
         QueuedTask("details", lambda: {"completed": 0}),
+        QueuedTask("explicit-failure", lambda: {"success": False, "details": 1}),
+        QueuedTask("explicit-success", lambda: {"success": True}),
+        QueuedTask("malformed-success-string", lambda: {"success": "false"}),
+        QueuedTask("malformed-success-number", lambda: {"success": 1}),
     ])
     worker.taskCompleted.connect(
         lambda task, succeeded, result: outcomes.append(
@@ -56,4 +60,8 @@ def test_only_explicit_nonempty_results_are_completed():
         ("zero", False),
         ("true", True),
         ("details", True),
+        ("explicit-failure", False),
+        ("explicit-success", True),
+        ("malformed-success-string", False),
+        ("malformed-success-number", False),
     ]

@@ -9,6 +9,18 @@ from typing import Any
 STATE_PATH = Path("config/task_schedule.json")
 
 
+def task_result_succeeded(result: object) -> bool:
+    """Honor an explicit result status before falling back to truthiness.
+
+    Once a task returns a ``success`` field it is part of the task contract, so
+    malformed values fail closed instead of making strings such as ``"false"``
+    look successful merely because they are non-empty.
+    """
+    if isinstance(result, dict) and "success" in result:
+        return result.get("success") is True
+    return bool(result)
+
+
 def load_task_schedule(path: Path = STATE_PATH) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))

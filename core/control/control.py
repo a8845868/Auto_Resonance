@@ -48,6 +48,13 @@ def connect(adb_port: Optional[int] = None):
     return status
 
 
+def connect_adb(adb_port: Optional[int] = None):
+    """Force the TCP ADB transport for workflows that require shell evidence."""
+    global control
+    control = ADB()
+    return control.connect(adb_port)
+
+
 def stop():
     global STOP
     STOP = True

@@ -37,6 +37,7 @@ from app.view.book_planner_interface import BookPlannerInterface
 from app.view.inventory_interface import InventoryInterface
 from app.view.gacha_planner_interface import GachaPlannerInterface
 from app.view.passenger_planner_interface import PassengerPlannerInterface
+from app.view.shop_planner_interface import ShopPlannerInterface
 from core.utils.update.base_update_utils import UpdateStatus
 from core.utils.update.mirror_update_utils import MirrorUpdateUtils
 
@@ -91,6 +92,7 @@ class MainWindow(FluentWindow):
         self.addSubInterface(self.inventoryInterface, FIF.ALBUM, "货币规划")
         self.addSubInterface(self.gachaPlannerInterface, FIF.SHOPPING_CART, "抽卡规划")
         self.addSubInterface(self.passengerPlannerInterface, FIF.PEOPLE, "客运规划")
+        self.addSubInterface(self.shopPlannerInterface, FIF.SHOPPING_CART, "商店自动购买")
         self.addSubInterface(self.two_run_business_interface, FIF.TRAIN, "端点跑商")
         self.addSubInterface(self.adb_data_interface, FIF.GAME, "ADB信息")
 
@@ -141,6 +143,7 @@ class MainWindow(FluentWindow):
         self.inventoryInterface = InventoryInterface(self)
         self.gachaPlannerInterface = GachaPlannerInterface(self)
         self.passengerPlannerInterface = PassengerPlannerInterface(self)
+        self.shopPlannerInterface = ShopPlannerInterface(self)
         self.two_run_business_interface = TwoRunBusinessInterface(self)
         self.homeInterface.setBusinessTaskProvider(
             self.two_run_business_interface.buildQueuedTask
@@ -149,12 +152,14 @@ class MainWindow(FluentWindow):
             self.fatiguePlannerInterface.buildQueuedTask
         )
         self.homeInterface.addTaskProvider(self.passengerPlannerInterface.buildQueuedTask)
+        self.homeInterface.addTaskProvider(self.shopPlannerInterface.buildQueuedTask)
         for page in (
             self.residentActivityInterface,
             self.rewardCollectionInterface,
             self.fatiguePlannerInterface,
             self.two_run_business_interface,
             self.passengerPlannerInterface,
+            self.shopPlannerInterface,
         ):
             page.scheduleCard.scheduleChanged.connect(
                 self.homeInterface.refreshScheduleOverview

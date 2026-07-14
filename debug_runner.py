@@ -69,7 +69,10 @@ def _run_debug_task(lease, command: dict[str, Any]) -> dict[str, Any]:
     from core.exception.exceptions import StopExecution
     from core.logger import logger
     from core.services.debug_tasks import resolve_task
-    from core.services.task_schedule_state import record_task_execution
+    from core.services.task_schedule_state import (
+        record_task_execution,
+        task_result_succeeded,
+    )
 
     command_id = str(command["id"])
     task_name = str(command.get("task", ""))
@@ -94,7 +97,7 @@ def _run_debug_task(lease, command: dict[str, Any]) -> dict[str, Any]:
     error_text = ""
     try:
         result = task.run()
-        success = bool(result)
+        success = task_result_succeeded(result)
         if not success:
             error_text = "任务未返回明确成功结果"
             logger.warning(f"后台调试未完成: {task.name}；{error_text}")

@@ -9,7 +9,7 @@ from PySide6.QtCore import QThread, Signal
 
 from core.control.control import reset_stop, stop
 from core.exception.exceptions import StopExecution
-from core.services.task_schedule_state import next_daily_reset
+from core.services.task_schedule_state import next_daily_reset, task_result_succeeded
 
 
 @dataclass(frozen=True)
@@ -58,7 +58,7 @@ class TaskQueueWorker(QThread):
             result = None
             try:
                 result = task.run()
-                if self._stop_requested or not result:
+                if self._stop_requested or not task_result_succeeded(result):
                     succeeded = False
                     if not self._stop_requested:
                         logger.warning(f"任务未返回明确成功结果，按失败处理: {task.name}")
