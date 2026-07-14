@@ -264,18 +264,19 @@ def _is_idle_workshop_screen(texts: list[str]) -> bool:
     combined = _joined_text(texts)
     if "编组" not in combined:
         return False
-    if "工坊空置中" in combined:
-        return True
     has_active_status = any(
         marker in combined
         for marker in (
             "施工剩余时长",
+            "立刻完成",
             "立即完成",
             "施工已完成",
             CLAIM_COMPLETED_TEXT,
         )
     )
-    return "车库容量" in combined and not has_active_status
+    if has_active_status:
+        return False
+    return "工坊空置中" in combined or BUILD_CARRIAGE_TEXT in combined
 
 
 def _is_completed_build_screen(texts: list[str]) -> bool:
@@ -348,10 +349,7 @@ def _wait_for_build_started(timeout: float = BUILD_START_TIMEOUT) -> BuildScreen
     return last_state
 
 
-def _claim_completed_carriage(timeout: float = SCREEN_TRANSITION_TIMEOUT) -> bool:
-    """Claim a finished carriage and wait until the workshop is idle."""
-    if not _is_completed_build_screen(_read_screen_texts()):
-        return True
+def _click_claim_completed() -> None:
     if not blurry_ocr_click(
         CLAIM_COMPLETED_TEXT,
         score=0.55,
@@ -360,7 +358,18 @@ def _claim_completed_carriage(timeout: float = SCREEN_TRANSITION_TIMEOUT) -> boo
     ):
         # Stable green claim button; used only after the completed-state guard.
         input_tap((855, 130))
+
+
+def _claim_completed_carriage(
+    timeout: float = SCREEN_TRANSITION_TIMEOUT,
+    retry_interval: float = 2.0,
+) -> bool:
+    """Claim a finished carriage and wait until the workshop is idle."""
+    if not _is_completed_build_screen(_read_screen_texts()):
+        return True
+    _click_claim_completed()
     deadline = time.monotonic() + timeout
+    next_claim_attempt = time.monotonic() + max(0.0, retry_interval)
     dismissed_result = False
     while time.monotonic() < deadline and not is_stopped():
         texts = _read_screen_texts()
@@ -371,6 +380,13 @@ def _claim_completed_carriage(timeout: float = SCREEN_TRANSITION_TIMEOUT) -> boo
         if "建造成功" in combined and not dismissed_result:
             input_tap((1100, 650))
             dismissed_result = True
+        elif (
+            _is_completed_build_screen(texts)
+            and time.monotonic() >= next_claim_attempt
+        ):
+            logger.warning("完成状态仍存在，重试领取建造完成的客厢")
+            _click_claim_completed()
+            next_claim_attempt = time.monotonic() + max(0.0, retry_interval)
         time.sleep(0.8)
     return False
 
