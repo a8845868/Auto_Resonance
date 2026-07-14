@@ -19,6 +19,7 @@ from adb_shell.adb_device import AdbDeviceTcp
 from loguru import logger
 
 from core.control.adb_port import EmulatorInfo, EmulatorType
+from core.services.repair_safety import ensure_automation_allowed
 
 
 GAME_PACKAGE = "com.hermes.goda"
@@ -103,6 +104,7 @@ class MuMuManagerClient:
         return next((item for item in candidates if item.is_file()), candidates[0])
 
     def _run(self, *arguments: str) -> subprocess.CompletedProcess:
+        ensure_automation_allowed("执行 MuMuManager 命令")
         argv = [str(self.executable), *map(str, arguments)]
         kwargs = {
             "shell": False,
@@ -335,6 +337,7 @@ class EmulatorLifecycle:
         raise LifecycleError(f"等待 MuMu 多开实例启动超时: {self.label}")
 
     def _adb_shell(self, command: str) -> str:
+        ensure_automation_allowed("执行模拟器 ADB shell 命令")
         if not self.device.port:
             raise LifecycleError(f"{self.label} 没有可用的 ADB 端口")
         adb = None

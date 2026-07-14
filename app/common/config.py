@@ -122,6 +122,13 @@ class Config(RunningBusinessConfig):
         "EmulatorLifecycle", "CloseEmulatorWhenIdle", False, None
     )
 
+    enableCodexSelfHealing = ConfigItem(
+        "SelfHealing", "Enabled", False, None
+    )
+    allowCodexIsolatedRepair = ConfigItem(
+        "SelfHealing", "AllowIsolatedRepair", False, None
+    )
+
     residentActivityTask = ConfigItem(
         "ResidentActivity",
         "Task",

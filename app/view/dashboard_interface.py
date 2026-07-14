@@ -16,6 +16,7 @@ from core.services.emulator_lifecycle import (
     EmulatorQueueLifecycle,
     LifecycleOptions,
 )
+from core.services.self_healing import discover_log_incidents, submit_incident
 from core.services.task_schedule_state import (
     completed_history,
     is_task_due,
@@ -237,6 +238,18 @@ class DashboardInterface(ScrollArea):
             else:
                 self.pendingPanel.setTasks(["未启用可执行任务，请在左侧功能页开启"])
             return
+        self_healing_enabled = bool(cfg.enableCodexSelfHealing.value)
+        isolated_repair_allowed = bool(cfg.allowCodexIsolatedRepair.value)
+
+        def report_incident(incident):
+            # Keep dispatch policy consistent with the worker's halt policy for
+            # the entire batch, even if a setting is toggled mid-run.
+            submit_incident(
+                incident,
+                dispatch=self_healing_enabled,
+                allow_repair=isolated_repair_allowed,
+            )
+
         lifecycle = None
         if bool(cfg.enableAutoGameLifecycle.value):
             lifecycle = EmulatorQueueLifecycle(
@@ -249,7 +262,13 @@ class DashboardInterface(ScrollArea):
                     ),
                 ),
             )
-        self.queueWorker = TaskQueueWorker(tasks, self, lifecycle=lifecycle)
+        self.queueWorker = TaskQueueWorker(
+            tasks,
+            self,
+            lifecycle=lifecycle,
+            incident_reporter=report_incident,
+            halt_on_failure=self_healing_enabled,
+        )
         self.queueWorker.taskStarted.connect(self._taskStarted)
         self.queueWorker.taskFinished.connect(self._taskFinished)
         self.queueWorker.taskResult.connect(self._taskResult)
@@ -272,7 +291,14 @@ class DashboardInterface(ScrollArea):
 
     def _runDueTasks(self):
         """Wake scheduled tasks without keeping the queue worker blocked."""
-        if not self.schedulerArmed or self.queueWorker is not None:
+        if self.queueWorker is not None:
+            return
+        if bool(cfg.enableCodexSelfHealing.value):
+            discover_log_incidents(
+                dispatch=True,
+                allow_repair=bool(cfg.allowCodexIsolatedRepair.value),
+            )
+        if not self.schedulerArmed:
             return
         if any(not task.key or is_task_due(task.key) for task in self._allEnabledTasks()):
             self.startTaskQueue()
@@ -312,8 +338,17 @@ class DashboardInterface(ScrollArea):
         if worker is not self.queueWorker:
             worker.deleteLater()
             return
+        halted_for_repair = worker.halted_for_repair
+        if halted_for_repair:
+            self.schedulerArmed = False
         self.runningPanel.setTasks([])
-        self.pendingPanel.setTasks([])
+        if halted_for_repair:
+            self.pendingPanel.setTasks(
+                ["检测到异常，自动调度已暂停；请先审阅 Codex 诊断或候选修复"]
+            )
+            logger.warning("检测到任务异常，自动调度已熔断并等待人工审阅")
+        else:
+            self.pendingPanel.setTasks([])
         self.startButton.setEnabled(True)
         self.stopButton.setEnabled(False)
         self.refreshScheduleOverview()

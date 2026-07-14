@@ -15,7 +15,9 @@ import psutil
 
 
 ROOT = Path(__file__).resolve().parents[2]
-RUNTIME_DIR = ROOT / "logs" / "runtime"
+RUNTIME_DIR = Path(
+    os.environ.get("HEIYUE_RUNTIME_DIR", str(ROOT / "logs" / "runtime"))
+).expanduser().resolve()
 LEASE_PATH = RUNTIME_DIR / "owner.json"
 STOP_PATH = RUNTIME_DIR / "stop.json"
 DEBUG_STATUS_PATH = RUNTIME_DIR / "debug-status.json"

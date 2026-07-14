@@ -35,6 +35,7 @@ class SettingInterface(ScrollArea):
         # music folders
         self.musicInThisPCGroup = SettingCardGroup("配置", self.scrollWidget)
         self.lifecycleGroup = SettingCardGroup("任务资源管理", self.scrollWidget)
+        self.selfHealingGroup = SettingCardGroup("Codex 自愈", self.scrollWidget)
         self.mirrorCdkCard = LineEditSettingCard(
             cfg.mirrorCdk,
             "Mirror酱 CDK",
@@ -100,6 +101,20 @@ class SettingInterface(ScrollArea):
             configItem=cfg.closeEmulatorWhenIdle,
             parent=self.lifecycleGroup,
         )
+        self.codexSelfHealingCard = SwitchSettingCard(
+            FIF.SYNC,
+            "启用 Codex 自愈智能体",
+            "异常会保留本地现场；开启后在隔离工作树中启动 Codex 诊断",
+            configItem=cfg.enableCodexSelfHealing,
+            parent=self.selfHealingGroup,
+        )
+        self.codexIsolatedRepairCard = SwitchSettingCard(
+            FIF.SETTING,
+            "允许生成隔离修复",
+            "Codex 可在隔离沙箱内修改工作树并运行测试；候选仍需人工验证",
+            configItem=cfg.allowCodexIsolatedRepair,
+            parent=self.selfHealingGroup,
+        )
         # self.adbOrderCard = LineEditSettingCard(
         #     cfg.adbOrder,
         #     "ADB地址",
@@ -141,12 +156,15 @@ class SettingInterface(ScrollArea):
         self.lifecycleGroup.addSettingCard(self.autoGameLifecycleCard)
         self.lifecycleGroup.addSettingCard(self.autoStartEmulatorCard)
         self.lifecycleGroup.addSettingCard(self.closeEmulatorWhenIdleCard)
+        self.selfHealingGroup.addSettingCard(self.codexSelfHealingCard)
+        self.selfHealingGroup.addSettingCard(self.codexIsolatedRepairCard)
 
         # add setting card group to layout
         self.expandLayout.setSpacing(28)
         self.expandLayout.setContentsMargins(36, 10, 36, 0)
         self.expandLayout.addWidget(self.musicInThisPCGroup)
         self.expandLayout.addWidget(self.lifecycleGroup)
+        self.expandLayout.addWidget(self.selfHealingGroup)
 
     def showEvent(self, event):
         """当切换到该页面时，触发这个事件"""

@@ -47,6 +47,16 @@ def _serializable(value: object) -> object:
     return str(value)
 
 
+def _safe_repr(value: object, limit: int = 2000) -> str:
+    try:
+        text = repr(value)
+    except Exception as error:  # noqa: BLE001 - failure evidence is best effort
+        text = f"<repr failed: {type(error).__name__}: {error}>"
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... <truncated {len(text) - limit} chars>"
+
+
 def _base_status(lease, **updates) -> dict[str, Any]:
     previous = read_debug_status() or {}
     return {
@@ -64,7 +74,11 @@ def _base_status(lease, **updates) -> dict[str, Any]:
     }
 
 
-def _run_debug_task(lease, command: dict[str, Any]) -> dict[str, Any]:
+def _run_debug_task(
+    lease,
+    command: dict[str, Any],
+    incident_reporter=None,
+) -> dict[str, Any]:
     from app.common.config import cfg
     from core.control.control import reset_stop
     from core.exception.exceptions import StopExecution
@@ -110,6 +124,8 @@ def _run_debug_task(lease, command: dict[str, Any]) -> dict[str, Any]:
     error_text = ""
     cleanup_error = ""
     lifecycle = None
+    stage = "prepare"
+    incident = None
     try:
         if bool(cfg.enableAutoGameLifecycle.value):
             lifecycle = EmulatorQueueLifecycle(
@@ -125,16 +141,51 @@ def _run_debug_task(lease, command: dict[str, Any]) -> dict[str, Any]:
             lifecycle.prepare(lambda: lease.stop_requested())
         if lease.stop_requested():
             raise StopExecution()
+        stage = "task"
         result = task.run()
         success = task_result_succeeded(result)
         if not success:
             error_text = "任务未返回明确成功结果"
+            incident = {
+                "source": "debug_runner",
+                "task_key": task.key,
+                "task_name": task.name,
+                "failure_kind": "unexpected_result",
+                "message": error_text,
+                "expected": "task_result_succeeded(result) == True",
+                "observed": _safe_repr(result),
+                "traceback": "",
+                "context": {
+                    "command_id": command_id,
+                    "dispatch_allowed": True,
+                },
+            }
             logger.warning(f"后台调试未完成: {task.name}；{error_text}")
     except StopExecution:
         error_text = "任务收到停止请求"
         logger.warning(f"后台调试已停止: {task.name}")
     except Exception as error:  # noqa: BLE001 - debug boundary must report all failures
         error_text = f"{type(error).__name__}: {error}"
+        incident = {
+            "source": "debug_runner",
+            "task_key": task.key,
+            "task_name": task.name,
+            "failure_kind": (
+                "resource_startup_error" if stage == "prepare" else "exception"
+            ),
+            "message": error_text,
+            "expected": (
+                "模拟器与游戏资源准备成功"
+                if stage == "prepare"
+                else "任务无异常完成并返回成功结果"
+            ),
+            "observed": f"{stage} 阶段抛出异常",
+            "traceback": traceback.format_exc(),
+            "context": {
+                "command_id": command_id,
+                "dispatch_allowed": True,
+            },
+        }
         logger.exception(f"后台调试执行失败: {task.name}")
     finally:
         if lifecycle is not None:
@@ -143,6 +194,33 @@ def _run_debug_task(lease, command: dict[str, Any]) -> dict[str, Any]:
             except Exception as error:  # noqa: BLE001 - keep task result authoritative
                 cleanup_error = f"{type(error).__name__}: {error}"
                 logger.exception("后台调试任务结束后的游戏资源清理失败")
+
+    if cleanup_error:
+        if incident is not None:
+            incident["context"]["cleanup_error"] = cleanup_error
+            incident["context"]["dispatch_allowed"] = False
+        else:
+            incident = {
+                "source": "debug_runner",
+                "task_key": task.key,
+                "task_name": task.name,
+                "failure_kind": "resource_cleanup_error",
+                "message": cleanup_error,
+                "expected": "后台任务结束后释放游戏与模拟器资源",
+                "observed": "资源清理抛出异常",
+                "traceback": "",
+                "context": {
+                    "command_id": command_id,
+                    "dispatch_allowed": False,
+                },
+            }
+    if incident is not None and incident_reporter is not None:
+        try:
+            incident_reporter(incident)
+        except Exception as error:  # noqa: BLE001 - incident reporting is best effort
+            logger.warning(
+                f"记录 Codex 自愈事故失败: {type(error).__name__}: {error}"
+            )
 
     if bool(command.get("record")):
         record_task_execution(
@@ -174,8 +252,17 @@ def _run_debug_task(lease, command: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_daemon() -> int:
+    from app.common.config import cfg
     from core.control.control import kill, stop
     from core.logger import logger
+    from core.services.self_healing import discover_log_incidents, submit_incident
+
+    def report_incident(incident: dict[str, Any]) -> None:
+        submit_incident(
+            incident,
+            dispatch=bool(cfg.enableCodexSelfHealing.value),
+            allow_repair=bool(cfg.allowCodexIsolatedRepair.value),
+        )
 
     try:
         lease = acquire_runtime("debug")
@@ -200,6 +287,7 @@ def run_daemon() -> int:
     watcher.start()
     write_debug_status(_base_status(lease, started_at=_now()))
     logger.info(f"后台调试模式已启动，PID {lease.pid}；等待调试命令")
+    next_discovery = time.monotonic()
     try:
         while not stop_event.is_set():
             handled = False
@@ -216,7 +304,11 @@ def run_daemon() -> int:
                             "error": f"未知命令类型: {command.get('type')!r}",
                         }
                     else:
-                        response = _run_debug_task(lease, command)
+                        response = _run_debug_task(
+                            lease,
+                            command,
+                            incident_reporter=report_incident,
+                        )
                     write_response(command_id, response)
                 except Exception as error:  # noqa: BLE001 - keep daemon alive
                     command_id = command_path.stem
@@ -230,7 +322,30 @@ def run_daemon() -> int:
                         },
                     )
                     logger.exception("后台调试命令处理失败")
+                    report_incident(
+                        {
+                            "source": "debug_runner",
+                            "task_key": "command_dispatch",
+                            "task_name": "后台命令处理",
+                            "failure_kind": "exception",
+                            "message": f"{type(error).__name__}: {error}",
+                            "expected": "后台命令被正常解析并完成响应",
+                            "observed": "命令处理边界抛出异常",
+                            "traceback": traceback.format_exc(),
+                            "context": {
+                                "command_id": command_id,
+                                "dispatch_allowed": True,
+                            },
+                        }
+                    )
                 handled = True
+            if time.monotonic() >= next_discovery:
+                if bool(cfg.enableCodexSelfHealing.value):
+                    discover_log_incidents(
+                        dispatch=True,
+                        allow_repair=bool(cfg.allowCodexIsolatedRepair.value),
+                    )
+                next_discovery = time.monotonic() + 30.0
             if not handled:
                 write_debug_status(_base_status(lease))
                 stop_event.wait(0.25)

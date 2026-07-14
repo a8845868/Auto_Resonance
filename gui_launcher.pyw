@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import datetime as dt
+import json
 import os
 import runpy
 import sys
@@ -13,17 +14,64 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 LOG_FILE = ROOT / "logs" / "gui-startup-error.log"
+CONFIG_FILE = ROOT / "config" / "app.json"
+
+
+def _self_healing_flags() -> tuple[bool, bool]:
+    try:
+        document = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        settings = document.get("SelfHealing", {})
+        if not isinstance(settings, dict):
+            return False, False
+        return (
+            settings.get("Enabled") is True,
+            settings.get("AllowIsolatedRepair") is True,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return False, False
+
+
+def submit_startup_incident(traceback_text: str) -> None:
+    """Best-effort startup reporting that also works before the GUI imports."""
+
+    try:
+        from core.services.self_healing import submit_incident
+
+        enabled, allow_repair = _self_healing_flags()
+        submit_incident(
+            {
+                "source": "gui_launcher",
+                "task_key": "gui_startup",
+                "task_name": "图形界面启动",
+                "failure_kind": "exception",
+                "message": (
+                    traceback_text.strip().splitlines()[-1]
+                    if traceback_text.strip()
+                    else "GUI startup failed"
+                ),
+                "expected": "图形界面取得运行锁并成功启动",
+                "observed": "启动边界抛出异常",
+                "traceback": traceback_text,
+                "context": {"dispatch_allowed": True},
+            },
+            dispatch=enabled,
+            allow_repair=allow_repair,
+        )
+    except Exception:
+        pass
 
 
 def report_startup_error() -> None:
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    traceback_text = traceback.format_exc()
     details = (
         f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}]\n"
         f"Python: {sys.executable}\n"
         f"Working directory: {ROOT}\n\n"
-        f"{traceback.format_exc()}\n"
+        f"{traceback_text}\n"
     )
     LOG_FILE.write_text(details, encoding="utf-8")
+    submit_startup_incident(traceback_text)
     ctypes.windll.user32.MessageBoxW(
         0,
         f"图形界面启动失败。\n\n错误详情已保存到：\n{LOG_FILE}",

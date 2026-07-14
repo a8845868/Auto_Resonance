@@ -42,6 +42,8 @@ def test_startup_error_writes_traceback_and_shows_error(tmp_path, monkeypatch):
     launcher = _load_launcher()
     launcher.LOG_FILE = tmp_path / "gui-startup-error.log"
     messages = _capture_message_boxes(monkeypatch, launcher)
+    incidents = []
+    monkeypatch.setattr(launcher, "submit_startup_incident", incidents.append)
 
     try:
         raise RuntimeError("startup exploded")
@@ -50,5 +52,18 @@ def test_startup_error_writes_traceback_and_shows_error(tmp_path, monkeypatch):
 
     log = launcher.LOG_FILE.read_text(encoding="utf-8")
     assert "RuntimeError: startup exploded" in log
+    assert len(incidents) == 1
+    assert "RuntimeError: startup exploded" in incidents[0]
     assert len(messages) == 1
     assert "图形界面启动失败" in messages[0][1]
+
+
+def test_startup_report_reads_both_self_healing_switches(tmp_path):
+    launcher = _load_launcher()
+    launcher.CONFIG_FILE = tmp_path / "app.json"
+    launcher.CONFIG_FILE.write_text(
+        '{"SelfHealing":{"Enabled":true,"AllowIsolatedRepair":false}}',
+        encoding="utf-8",
+    )
+
+    assert launcher._self_healing_flags() == (True, False)

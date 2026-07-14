@@ -17,6 +17,8 @@ from subprocess import run
 import psutil
 from loguru import logger
 
+from core.services.repair_safety import ensure_automation_allowed
+
 
 class EmulatorType(Enum):
     MUMUV5 = "MuMuV5"
@@ -96,6 +98,8 @@ def get_mumu_manager_info(
     emulator_type: EmulatorType,
 ) -> list[EmulatorInfo]:
     """Read both the flat single-index and nested all-index JSON formats."""
+
+    ensure_automation_allowed("查询 MuMuManager 实例")
 
     try:
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)

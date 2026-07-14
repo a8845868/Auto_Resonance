@@ -20,6 +20,7 @@ from core.control.nemu import NEMU
 from core.exception.exceptions import StopExecution
 from core.image.image import Image
 from core.model import app
+from core.services.repair_safety import ensure_automation_allowed
 
 EXCURSIONX = [-10, 10]
 EXCURSIONY = [-10, 10]
@@ -71,6 +72,7 @@ def connect(adb_port: Optional[int] = None):
 
     :param order: ADB端口
     """
+    ensure_automation_allowed("连接 ADB/NEMU")
     global control
     device = get_runtime_device()
     if device.is_mumu:
@@ -87,6 +89,7 @@ def connect(adb_port: Optional[int] = None):
 
 def connect_adb(adb_port: Optional[int] = None):
     """Force the TCP ADB transport for workflows that require shell evidence."""
+    ensure_automation_allowed("连接 ADB")
     global control
     device = get_runtime_device()
     control = ADB()
@@ -123,6 +126,7 @@ def input_swipe(pos1=(919, 617), pos2=(919, 908), swipe_time: int = 100):
     :param pos2: 坐标2
     :param time: 操作时间(毫秒)
     """
+    ensure_automation_allowed("滑动游戏界面")
     if STOP:
         raise StopExecution()
     num = 0
@@ -162,6 +166,7 @@ def input_tap(pos: Tuple[int, int] = (880, 362)):
 
     :param pos: 坐标
     """
+    ensure_automation_allowed("点击游戏界面")
     if STOP:
         raise StopExecution()
     control.input_tap(
@@ -185,6 +190,7 @@ def screenshot_image() -> cv.typing.MatLike:
     """
     截图并返回图片对象
     """
+    ensure_automation_allowed("读取游戏画面")
     if STOP:
         raise StopExecution()
 

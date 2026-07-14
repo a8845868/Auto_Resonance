@@ -12,6 +12,7 @@ import cv2 as cv
 
 from core.control.nemu_dll.nemu_dll import init
 from core.model import app
+from core.services.repair_safety import ensure_automation_allowed
 
 def swipe_path(p0, p3, time):
     path = []
@@ -35,6 +36,7 @@ def swipe_path(p0, p3, time):
 
 class NEMU(IADB):
     def __init__(self, device: EmulatorInfo | None = None) -> None:
+        ensure_automation_allowed("加载 NEMU 控制接口")
         self.device = device or app.Global.device
         self.path = self.device.path
         if self.device.type == EmulatorType.MUMUV5:
@@ -46,6 +48,7 @@ class NEMU(IADB):
         self.nemu = init(path)
 
     def connect(self, adb_port: Optional[int] = None) -> bool:
+        ensure_automation_allowed("建立 NEMU 连接")
         logger.info("使用NEMUIPC连接")
         self.connect_id = self.nemu.nemu_connect(self.path, self.device.index)
         self.display_id = self.nemu.nemu_get_display_id(self.connect_id, b"com.hermes.goda", 0)
@@ -65,6 +68,7 @@ class NEMU(IADB):
         return self.check_resolution_ratio(self.width, self.height)
 
     def input_swipe(self, x1: int, y1: int, x2: int, y2: int, millisecond: int = 100) -> None:
+        ensure_automation_allowed("通过 NEMU 滑动游戏界面")
         points = swipe_path((x1, y1), (x2, y2), millisecond)
         for point in points:
             self.nemu.nemu_input_event_touch_down(self.connect_id, self.display_id, *point)
@@ -74,11 +78,13 @@ class NEMU(IADB):
 
 
     def input_tap(self, x: int, y: int):
+        ensure_automation_allowed("通过 NEMU 点击游戏界面")
         self.nemu.nemu_input_event_touch_down(self.connect_id, self.display_id, x, y)
         self.nemu.nemu_input_event_touch_up(self.connect_id, self.display_id)
         time.sleep(0.5)
 
     def screenshot(self) -> cv.typing.MatLike:
+        ensure_automation_allowed("通过 NEMU 读取游戏画面")
         self.nemu.nemu_capture_display(self.connect_id, self.display_id, self.length, self.width_ptr, self.height_ptr, self.pixels_pointer)
         image = np.frombuffer(self.pixels_array, dtype=np.uint8).reshape((self.height, self.width, 4))
 
@@ -87,6 +93,7 @@ class NEMU(IADB):
         return image
     
     def kill(self):
+        ensure_automation_allowed("关闭 NEMU 连接")
         connect_id = getattr(self, "connect_id", None)
         if connect_id is None:
             return

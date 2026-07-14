@@ -9,6 +9,7 @@ from adb_shell.adb_device import AdbDeviceTcp
 from adb_shell.exceptions import TcpTimeoutException
 
 from core.model import app
+from core.services.repair_safety import ensure_automation_allowed
 
 PNG_KEY = b"\x89PNG"
 
@@ -19,6 +20,7 @@ class ADB(IADB):
         self.device = AdbDeviceTcp(self.adb_host)
 
     def connect(self, adb_port: Optional[int] = None) -> bool:
+        ensure_automation_allowed("建立底层 ADB 连接")
         name = "自定义ADB端口"
         if adb_port is None:
             device = app.Global.device
@@ -54,6 +56,7 @@ class ADB(IADB):
         return status
 
     def input_swipe(self, x1: int, y1: int, x2: int, y2: int, millisecond: int = 100) -> None:
+        ensure_automation_allowed("通过 ADB 滑动游戏界面")
         shell = [
             "input",
             "swipe",
@@ -64,6 +67,7 @@ class ADB(IADB):
         time.sleep(millisecond / 1000)
 
     def input_tap(self, x: int, y: int):
+        ensure_automation_allowed("通过 ADB 点击游戏界面")
         shell = [
             "input",
             "tap",
@@ -73,6 +77,7 @@ class ADB(IADB):
         self.device.shell(" ".join(shell))
 
     def screenshot(self) -> cv.typing.MatLike:
+        ensure_automation_allowed("通过 ADB 读取游戏画面")
         screenshot_data = self.device.shell("screencap -p", decode=False)
         if isinstance(screenshot_data, str):
             raise Exception(f"无法获取屏幕截图: {screenshot_data}")
@@ -94,4 +99,5 @@ class ADB(IADB):
         说明:
             关闭ADB
         """
+        ensure_automation_allowed("关闭底层 ADB 连接")
         self.device.close()
