@@ -54,6 +54,12 @@ def test_screen_predicates_keep_navigation_stages_separate():
     assert passenger_build._is_completed_build_screen(
         ["编组", "施工已完成，等待列车长提取", "建造完成"]
     )
+    assert passenger_build._is_idle_workshop_screen(
+        ["维护", "编组", "车库容量", "04/09", "标准客厢", "空置车库"]
+    )
+    assert not passenger_build._is_idle_workshop_screen(
+        ["维护", "编组", "车库容量", "施工已完成，等待列车长提取", "建造完成"]
+    )
     assert passenger_build._is_carriage_build_dialog(
         ["建造所需时长：06:00:00", "消耗材料", "开始施工"]
     )

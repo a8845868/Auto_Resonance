@@ -262,7 +262,20 @@ def _is_workshop_screen(texts: list[str]) -> bool:
 
 def _is_idle_workshop_screen(texts: list[str]) -> bool:
     combined = _joined_text(texts)
-    return "编组" in combined and "工坊空置中" in combined
+    if "编组" not in combined:
+        return False
+    if "工坊空置中" in combined:
+        return True
+    has_active_status = any(
+        marker in combined
+        for marker in (
+            "施工剩余时长",
+            "立即完成",
+            "施工已完成",
+            CLAIM_COMPLETED_TEXT,
+        )
+    )
+    return "车库容量" in combined and not has_active_status
 
 
 def _is_completed_build_screen(texts: list[str]) -> bool:
