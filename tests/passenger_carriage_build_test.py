@@ -54,6 +54,24 @@ def test_screen_predicates_keep_navigation_stages_separate():
     assert passenger_build._is_completed_build_screen(
         ["编组", "施工已完成，等待列车长提取", "建造完成"]
     )
+    assert not passenger_build._is_idle_workshop_screen(
+        ["维护", "编组", "车库容量", "04/09", "标准客厢", "空置车库"]
+    )
+    assert passenger_build._is_idle_workshop_screen(
+        ["维护", "编组", "车库容量", "建造车厢"]
+    )
+    assert not passenger_build._is_idle_workshop_screen(
+        ["维护", "编组", "车库容量", "施工已完成，等待列车长提取", "建造完成"]
+    )
+    assert not passenger_build._is_idle_workshop_screen(
+        ["维护", "编组", "车库容量", "建造车厢", "立刻完成"]
+    )
+    assert not passenger_build._is_idle_workshop_screen(
+        ["维护", "编组", "车库容量", "建造车厢", "施工剩余时长：03:55:38"]
+    )
+    assert not passenger_build._is_idle_workshop_screen(
+        ["维护", "车库容量", "建造车厢"]
+    )
     assert passenger_build._is_carriage_build_dialog(
         ["建造所需时长：06:00:00", "消耗材料", "开始施工"]
     )
@@ -177,3 +195,27 @@ def test_claim_completed_carriage_dismisses_result_and_waits_for_idle():
         "建造完成", score=0.55, trynum=3, log=False
     )
     tap.assert_called_once_with((1100, 650))
+
+
+def test_claim_completed_carriage_retries_while_completed_state_persists():
+    completed = ["编组", "施工已完成，等待列车长提取", "建造完成"]
+    result = ["建造成功", "标准客厢"]
+    idle = ["编组", "建造车厢", "车库容量"]
+
+    with patch.object(
+        passenger_build,
+        "_read_screen_texts",
+        side_effect=[completed, completed, completed, result, idle],
+    ), patch.object(
+        passenger_build,
+        "blurry_ocr_click",
+        side_effect=[True, True, False],
+    ) as click_text, patch.object(
+        passenger_build, "input_tap"
+    ) as tap, patch.object(
+        passenger_build.time, "sleep"
+    ):
+        assert passenger_build._claim_completed_carriage(retry_interval=0)
+
+    assert click_text.call_count == 3
+    assert tap.call_args_list == [call((855, 130)), call((1100, 650))]
