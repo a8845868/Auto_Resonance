@@ -23,6 +23,7 @@ from core.services.repair_safety import ensure_automation_allowed
 
 
 GAME_PACKAGE = "com.hermes.goda"
+MANAGER_INFO_TIMEOUT_ATTEMPTS = 3
 
 
 class LifecycleError(RuntimeError):
@@ -286,6 +287,31 @@ class EmulatorLifecycle:
         )
         return bool(info.get("is_process_started")) and android_ready and port_ready
 
+    def _wait_for_emulator_info(
+        self,
+        deadline: float,
+        cancelled: Callable[[], bool] | None,
+    ) -> dict:
+        last_error: LifecycleError | None = None
+        for attempt in range(1, MANAGER_INFO_TIMEOUT_ATTEMPTS + 1):
+            self._check_cancelled(cancelled)
+            try:
+                return self.manager.info()  # type: ignore[union-attr]
+            except LifecycleError as exc:
+                if not isinstance(exc.__cause__, subprocess.TimeoutExpired):
+                    raise
+                last_error = exc
+                if attempt >= MANAGER_INFO_TIMEOUT_ATTEMPTS or self.monotonic() >= deadline:
+                    break
+                logger.warning(
+                    "MuMuManager 状态查询超时，"
+                    f"将在间隔后重试 ({attempt}/{MANAGER_INFO_TIMEOUT_ATTEMPTS}): {exc}"
+                )
+            self._pause(deadline, cancelled)
+        raise LifecycleError(
+            f"MuMuManager 状态查询连续超时 {attempt} 次: {last_error}"
+        ) from last_error
+
     def emulator_state(self) -> dict:
         if self.manager is None:
             raise UnsupportedEmulatorOperation("自定义 ADB 不支持查询宿主模拟器状态")
@@ -300,7 +326,8 @@ class EmulatorLifecycle:
             return snapshot_device(self.device)
 
         self._check_cancelled(cancelled)
-        info = self.manager.info()
+        deadline = self.monotonic() + max(0.0, self.options.emulator_start_timeout)
+        info = self._wait_for_emulator_info(deadline, cancelled)
         self._update_device_from_info(info)
         if self._emulator_ready(info):
             logger.info(f"MuMu 多开实例已运行: {self.label}，ADB {self.device.port}")
@@ -323,10 +350,9 @@ class EmulatorLifecycle:
             logger.info(f"MuMu 进程存在但 Android 未就绪，正在唤醒: {self.label}")
             self.manager.launch_emulator()
 
-        deadline = self.monotonic() + max(0.0, self.options.emulator_start_timeout)
         while True:
             self._check_cancelled(cancelled)
-            info = self.manager.info()
+            info = self._wait_for_emulator_info(deadline, cancelled)
             self._update_device_from_info(info)
             if self._emulator_ready(info):
                 logger.info(f"MuMu 多开实例就绪: {self.label}，ADB {self.device.port}")
