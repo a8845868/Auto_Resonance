@@ -49,6 +49,17 @@ SIEGE_REWARDS = {
     "总体围剿": ("深眠木 / 游星之眼", "deep_sleep_wood.png"),
 }
 
+# The emulator image is normalized to 1280 x 720. Only advance the sweep
+# state machine when the expected labels are present in their real screen
+# regions; matching the same word in a background layer is not sufficient.
+SWEEP_BUTTON_CENTER = (872, 501)
+START_SWEEP_BUTTON_CENTER = (772, 526)
+DETAIL_SWEEP_ROI = (780, 455, 970, 540)
+DETAIL_MARKER_ROI = (55, 645, 170, 705)
+TEAM_TITLE_ROI = (540, 130, 735, 200)
+TEAM_START_ROI = (635, 485, 930, 565)
+REWARD_TITLE_ROI = (500, 70, 820, 270)
+
 
 def _center(item: dict) -> tuple[int, int]:
     position = item["position"]
@@ -58,10 +69,21 @@ def _center(item: dict) -> tuple[int, int]:
     )
 
 
-def _matches(actual: str, expected: str) -> bool:
-    normalized = actual.replace('"', "").replace("“", "").replace("”", "").strip()
-    expected = expected.replace("！", "!")
-    normalized = normalized.replace("！", "!")
+def _normalize_text(text: str) -> str:
+    return (
+        text.replace('"', "")
+        .replace("“", "")
+        .replace("”", "")
+        .replace("！", "!")
+        .strip()
+    )
+
+
+def _matches(actual: str, expected: str, *, exact: bool = False) -> bool:
+    normalized = _normalize_text(actual)
+    expected = _normalize_text(expected)
+    if exact:
+        return normalized == expected
     return normalized == expected or expected in normalized
 
 
@@ -91,10 +113,11 @@ class ScreenDriver:
         *,
         offset: tuple[int, int] = (0, 0),
         attempts: int = 5,
+        exact: bool = False,
     ) -> bool:
         for _ in range(attempts):
             for item in self.texts():
-                if _matches(item["text"], text):
+                if _matches(item["text"], text, exact=exact):
                     x, y = _center(item)
                     self.tap((x + offset[0], y + offset[1]))
                     self.sleep(1)
@@ -102,8 +125,10 @@ class ScreenDriver:
             self.sleep(0.5)
         return False
 
-    def has_text(self, text: str) -> bool:
-        return any(_matches(item["text"], text) for item in self.texts())
+    def has_text(self, text: str, *, exact: bool = False) -> bool:
+        return any(
+            _matches(item["text"], text, exact=exact) for item in self.texts()
+        )
 
     def go_home(self) -> bool:
         """Return to the station home without depending on a versioned screenshot."""
@@ -205,11 +230,67 @@ class ResidentActivityAutomation:
                 return int(match.group(1))
         return fallback
 
+    @staticmethod
+    def text_in_roi(
+        items: list[dict],
+        text: str,
+        roi: tuple[int, int, int, int],
+        *,
+        exact: bool = True,
+    ) -> bool:
+        """Return true only when OCR text appears inside the expected area."""
+        x1, y1, x2, y2 = roi
+        for item in items:
+            x, y = _center(item)
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                if _matches(item["text"], text, exact=exact):
+                    return True
+        return False
+
+    def wait_for_screen(
+        self,
+        markers: tuple[tuple[str, tuple[int, int, int, int]], ...],
+        *,
+        attempts: int,
+        delay: float = 0.5,
+    ) -> bool:
+        """Confirm a screen using all region-locked OCR markers."""
+        for _ in range(attempts):
+            items = self.driver.texts()
+            if all(self.text_in_roi(items, text, roi) for text, roi in markers):
+                return True
+            self.driver.sleep(delay)
+        return False
+
     def sweep_current_activity(self, max_attempts: int) -> int:
         completed = 0
         for _ in range(max_attempts):
-            if not self.driver.click_text("扫荡", attempts=2):
+            # Strict state machine: detail -> team selection -> reward result.
+            # A sweep is counted only after the reward screen is observed.
+            if not self.wait_for_screen(
+                (("扫荡", DETAIL_SWEEP_ROI), ("难度选择", DETAIL_MARKER_ROI)),
+                attempts=4,
+            ):
+                logger.info("未确认处于关卡详情页，停止扫荡")
                 break
+
+            self.driver.tap(SWEEP_BUTTON_CENTER)
+            self.driver.sleep(0.8)
+            if not self.wait_for_screen(
+                (("选择队伍", TEAM_TITLE_ROI), ("开始扫荡", TEAM_START_ROI)),
+                attempts=8,
+            ):
+                logger.warning("点击“扫荡”后未进入队伍选择页，本次不计入完成")
+                break
+
+            self.driver.tap(START_SWEEP_BUTTON_CENTER)
+            self.driver.sleep(0.8)
+            if not self.wait_for_screen(
+                (("获得物品", REWARD_TITLE_ROI),), attempts=14
+            ):
+                logger.warning("点击“开始扫荡”后未出现“获得物品”，本次不计入完成")
+                break
+
             self.driver.dismiss_result()
             completed += 1
         return completed
@@ -259,13 +340,9 @@ class ResidentActivityAutomation:
         if not self.select_siege_task(task):
             return 0
 
-        completed = 0
-        for _ in range(safety_limit):
-            if not self.driver.click_text("扫荡", attempts=2):
-                logger.info("澄清度不足或扫荡不可用，停止利刃围剿")
-                break
-            self.driver.dismiss_result()
-            completed += 1
+        completed = self.sweep_current_activity(safety_limit)
+        if completed < safety_limit:
+            logger.info("澄清度不足、扫荡不可用或扫荡确认失败，停止利刃围剿")
         logger.info(f"{task}完成 {completed} 次")
         return completed
 
