@@ -1,3 +1,4 @@
+import json
 from unittest.mock import call, patch
 
 import auto.inventory as inventory
@@ -8,6 +9,10 @@ from core.services.inventory_assets import classify_asset, merge_assets, parse_a
 
 def box(x, y, text):
     return {"text": text, "position": ((x, y), (x + 80, y), (x + 80, y + 25), (x, y + 25))}
+
+
+def centered_box(x, y, text):
+    return box(x - 40, y - 12.5, text)
 
 
 def test_train_in_transit_detection_blocks_inventory_navigation():
@@ -223,3 +228,157 @@ def test_restock_book_icon_template_finds_hidden_name_grid_item():
     assert score > 0.9
     assert abs(location[0] - (x + 48)) <= 5
     assert abs(location[1] - (y + 48)) <= 5
+
+
+def test_full_page_icon_index_resolves_only_clear_name_and_count_pairs():
+    image = np.zeros((720, 1280, 3), dtype=np.uint8)
+    items = [
+        centered_box(500, 350, "8"),
+        centered_box(700, 350, "17"),
+        centered_box(1000, 350, "23"),
+    ]
+    matches = [
+        {"name": "桦石", "location": (500, 305), "score": 0.96},
+        {"name": "黑月采购券", "location": (505, 306), "score": 0.85},
+        {"name": "进货采买书", "location": (700, 305), "score": 0.93},
+        {"name": "再交涉请求书", "location": (704, 307), "score": 0.91},
+        {"name": "广告投放券", "location": (850, 305), "score": 0.95},
+    ]
+
+    with patch.object(inventory, "_match_inventory_icons", return_value=matches):
+        assets, probes = inventory._index_inventory_icon_page(image, items)
+
+    assert [(asset.name, asset.count) for asset in assets] == [("桦石", 8)]
+    assert {(probe["location"], probe["reason"]) for probe in probes} == {
+        ((700, 305), "template_conflict"),
+        ((850, 305), "missing_count"),
+        ((1000, 310), "unknown_icon"),
+    }
+
+
+def test_generic_inventory_detail_reads_confirmed_unknown_name_and_owned_count():
+    assert inventory._inventory_detail_asset(detail_items("新式补给箱", "拥有：27")) == inventory.Asset(
+        "新式补给箱", 27, "补给与票券"
+    )
+    assert inventory._inventory_detail_asset([
+        box(530, 215, "新式补给箱"),
+        box(600, 260, "售价：27"),
+        box(600, 672, "触碰空白区域退出"),
+    ]) is None
+
+
+def test_unknown_inventory_probe_learns_only_after_multiframe_detail_confirmation():
+    page_image = np.zeros((720, 1280, 3), dtype=np.uint8)
+    frames = [OcrFrame(detail_items("新式补给箱", "拥有：27")) for _ in range(3)]
+    probe = {"location": (598, 306), "candidates": (), "reason": "unknown_icon"}
+
+    with patch.object(inventory, "screenshot", side_effect=frames), patch.object(
+        inventory, "input_tap"
+    ) as tap, patch.object(inventory.time, "sleep"), patch.object(
+        inventory, "_inventory_icon_manifest", return_value={}
+    ), patch.object(inventory, "_learn_inventory_icon", return_value=True) as learn:
+        asset = inventory._probe_inventory_item(page_image, probe)
+
+    assert asset == inventory.Asset("新式补给箱", 27, "补给与票券")
+    learn.assert_called_once_with("新式补给箱", page_image, (598, 306))
+    assert tap.call_args_list == [call((598, 306)), call((640, 600))]
+
+
+def test_learned_inventory_icon_is_saved_and_registered_atomically(tmp_path, monkeypatch):
+    root = tmp_path / "resources"
+    icon_root = root / "currency"
+    icon_root.mkdir(parents=True)
+    (icon_root / "manifest.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(inventory, "RESOURCES_PATH", root)
+    image = np.zeros((720, 1280, 3), dtype=np.uint8)
+    image[258:354, 550:646] = (20, 120, 240)
+
+    assert inventory._learn_inventory_icon("新式/补给箱", image, (598, 306))
+
+    manifest = json.loads((icon_root / "manifest.json").read_text(encoding="utf-8"))
+    filename = manifest["新式/补给箱"]
+    learned = inventory._read_unicode_image(icon_root / filename, inventory.cv.IMREAD_UNCHANGED)
+    assert learned.shape == (96, 96, 4)
+    assert np.all(learned[:72, :, 3] == 255)
+    assert np.all(learned[72:, :, 3] == 0)
+    assert "/" not in filename
+    assert not inventory._learn_inventory_icon("新式/补给箱", image, (598, 306))
+
+
+def test_learned_rgb_inventory_icon_can_be_matched_again():
+    canvas = np.zeros((720, 1280, 3), dtype=np.uint8)
+    rng = np.random.default_rng(42)
+    template = rng.integers(0, 256, (96, 96, 3), dtype=np.uint8)
+    canvas[258:354, 550:646] = template
+
+    location, score = inventory._match_inventory_template(canvas, template)
+
+    assert score > 0.99
+    assert abs(location[0] - 598) <= 2
+    assert abs(location[1] - 306) <= 2
+
+
+def test_full_manifest_match_finds_multiple_icons_on_the_same_page():
+    names = {
+        "进货采买书": "进货采买书.png",
+        "再交涉请求书": "再交涉请求书.png",
+    }
+    canvas = np.full((720, 1280, 3), 35, dtype=np.uint8)
+    placements = {"进货采买书": (550, 258), "再交涉请求书": (812, 393)}
+    for name, filename in names.items():
+        template = inventory._read_unicode_image(
+            inventory.RESOURCES_PATH / "currency" / filename,
+            inventory.cv.IMREAD_UNCHANGED,
+        )
+        x, y = placements[name]
+        alpha = template[:, :, 3:4].astype(np.float32) / 255.0
+        canvas[y : y + 96, x : x + 96] = (
+            template[:, :, :3] * alpha
+            + canvas[y : y + 96, x : x + 96] * (1.0 - alpha)
+        ).astype(np.uint8)
+
+    with patch.object(inventory, "_inventory_icon_manifest", return_value=names):
+        matches = inventory._match_inventory_icons(canvas)
+
+    by_name = {match["name"]: match for match in matches}
+    assert set(by_name) == set(names)
+    assert by_name["进货采买书"]["score"] > 0.9
+    assert by_name["再交涉请求书"]["score"] > 0.9
+
+
+def test_full_inventory_scan_merges_pages_and_probes_only_uncertain_cells():
+    page_items = [box(1100, 30, "道具"), centered_box(500, 350, "8")]
+    frames = [
+        OcrFrame([]),  # transit guard
+        OcrFrame([]),  # home currencies
+        OcrFrame(page_items),
+        OcrFrame(page_items),
+    ]
+    probe = {"location": (700, 305), "candidates": (), "reason": "unknown_icon"}
+    indexed = [
+        ([inventory.Asset("桦石", 8, "货币")], [probe]),
+        ([inventory.Asset("进货采买书", 12, "补给与票券")], []),
+    ]
+    with patch.object(inventory, "connect", return_value=True), patch.object(
+        inventory, "go_home", return_value=True
+    ), patch.object(inventory, "_open_assets_entry", return_value=True), patch.object(
+        inventory, "screenshot", side_effect=frames
+    ), patch.object(
+        inventory, "_parse_primary_currency_grid", return_value=[]
+    ), patch.object(
+        inventory, "_index_inventory_icon_page", side_effect=indexed
+    ), patch.object(
+        inventory, "_probe_inventory_item",
+        return_value=inventory.Asset("新式补给箱", 27, "补给与票券"),
+    ) as probe_item, patch.object(inventory, "input_swipe") as swipe, patch.object(
+        inventory.time, "sleep"
+    ):
+        assets = inventory.scan_inventory_assets(max_pages=2)
+
+    assert {(asset.name, asset.count) for asset in assets} >= {
+        ("桦石", 8),
+        ("进货采买书", 12),
+        ("新式补给箱", 27),
+    }
+    probe_item.assert_called_once_with(frames[2].image, probe)
+    swipe.assert_called_once_with((930, 640), (930, 285), swipe_time=600)

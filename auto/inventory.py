@@ -20,7 +20,13 @@ from core.services.screen_state import (
     is_train_in_transit as _is_train_in_transit,
 )
 from core.utils.utils import RESOURCES_PATH
-from core.services.inventory_assets import Asset, merge_assets, parse_amount, parse_ocr_assets
+from core.services.inventory_assets import (
+    Asset,
+    classify_asset,
+    merge_assets,
+    parse_amount,
+    parse_ocr_assets,
+)
 
 
 def _center(item: dict) -> tuple[float, float]:
@@ -71,57 +77,166 @@ def _read_unicode_image(path, flags=cv.IMREAD_COLOR) -> cv.typing.MatLike | None
         return None
 
 
-def _parse_currency_icons(image, ocr_items: list[dict]) -> list[Asset]:
-    """Identify icon-only currencies on the Assets screen and pair their lower labels."""
-    icon_root = RESOURCES_PATH / "currency"
+INVENTORY_ICON_MIN_SCORE = 0.78
+INVENTORY_ICON_AUTO_SCORE = 0.90
+INVENTORY_ICON_MARGIN = 0.04
+INVENTORY_ICON_CLUSTER_DISTANCE = 68
+
+
+def _inventory_icon_manifest() -> dict[str, str]:
+    path = RESOURCES_PATH / "currency" / "manifest.json"
     try:
-        manifest = json.loads((icon_root / "manifest.json").read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return []
-    numbers = []
-    for item in ocr_items:
-        raw = item["text"].replace(",", "").strip()
-        if not raw.isdigit():
-            continue
-        amount = parse_amount(raw)
-        if amount is not None:
-            numbers.append((*_center(item), amount))
+        return {}
+    return {
+        str(name): str(filename)
+        for name, filename in data.items()
+        if isinstance(name, str) and isinstance(filename, str)
+    }
+
+
+def _match_inventory_template(image, template) -> tuple[tuple[int, int] | None, float]:
+    """Return the best visible-grid match for one transparent or learned template."""
+    if not isinstance(image, np.ndarray) or image.ndim != 3 or template is None:
+        return None, 0.0
     height, width = image.shape[:2]
-    x1, x2 = int(width * 0.30), int(width * 0.85)
-    y1, y2 = int(height * 0.10), int(height * 0.92)
+    x1, x2 = int(width * 0.29), int(width * 0.85)
+    y1, y2 = int(height * 0.10), int(height * 0.99)
     roi = image[y1:y2, x1:x2]
-    found = []
-    # These two can appear deeper in the item list. Core currencies use the
-    # stable first-page grid below because Wiki thumbnails include a different background.
-    for name in ("里程点数", "黑月采购券"):
-        filename = manifest.get(name)
-        template = _read_unicode_image(icon_root / filename) if filename else None
-        if template is None:
+    has_alpha = template.ndim == 3 and template.shape[2] == 4
+    if has_alpha:
+        alpha = template[:, :, 3]
+        ys, xs = np.where(alpha >= 32)
+        if not len(xs):
+            return None, 0.0
+        source = template[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1, :3]
+        source_mask = alpha[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
+    else:
+        source = template[:, :, :3]
+        source_mask = None
+
+    best_score = 0.0
+    best_center = None
+    # The control layer normalizes inventory frames to 1280x720 and both the
+    # shipped and learned icons are 96x96. A narrow scale band keeps a full
+    # manifest scan practical while still tolerating UI animation/rounding.
+    for scale_percent in range(90, 111, 5):
+        scale = scale_percent / 100
+        resized = cv.resize(source, None, fx=scale, fy=scale, interpolation=cv.INTER_AREA)
+        th, tw = resized.shape[:2]
+        if th >= roi.shape[0] or tw >= roi.shape[1]:
             continue
-        best_score, best_center = 0.0, None
-        for scale_percent in range(55, 126, 5):
-            resized = cv.resize(template, None, fx=scale_percent / 100, fy=scale_percent / 100, interpolation=cv.INTER_AREA)
-            th, tw = resized.shape[:2]
-            if th >= roi.shape[0] or tw >= roi.shape[1]:
-                continue
-            _, score, _, location = cv.minMaxLoc(cv.matchTemplate(roi, resized, cv.TM_CCOEFF_NORMED))
-            if score > best_score:
-                best_score = score
-                best_center = (x1 + location[0] + tw / 2, y1 + location[1] + th / 2)
-        if best_center is None or best_score < 0.76:
-            logger.debug(f"资产图标未匹配：{name}（{best_score:.3f}）")
+        if source_mask is not None:
+            mask = cv.resize(source_mask, (tw, th), interpolation=cv.INTER_NEAREST)
+            scores = cv.matchTemplate(roi, resized, cv.TM_CCORR_NORMED, mask=mask)
+        else:
+            scores = cv.matchTemplate(roi, resized, cv.TM_CCOEFF_NORMED)
+        scores = np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+        _, score, _, location = cv.minMaxLoc(scores)
+        if score > best_score:
+            best_score = float(score)
+            best_center = (x1 + location[0] + tw // 2, y1 + location[1] + th // 2)
+    return best_center, best_score
+
+
+def _match_inventory_icons(image) -> list[dict]:
+    """Match every icon registered in the resource manifest on the current page."""
+    icon_root = RESOURCES_PATH / "currency"
+    matches = []
+    for name, filename in _inventory_icon_manifest().items():
+        template = _read_unicode_image(icon_root / filename, cv.IMREAD_UNCHANGED)
+        location, score = _match_inventory_template(image, template)
+        if location is not None and score >= INVENTORY_ICON_MIN_SCORE:
+            matches.append({"name": name, "location": location, "score": score})
+    return matches
+
+
+def _cluster_inventory_icon_matches(matches: list[dict]) -> list[list[dict]]:
+    """Group competing template names that point at the same inventory slot."""
+    clusters: list[list[dict]] = []
+    for match in sorted(matches, key=lambda item: item["score"], reverse=True):
+        x, y = match["location"]
+        cluster = next(
+            (
+                group
+                for group in clusters
+                if min(
+                    (x - item["location"][0]) ** 2 + (y - item["location"][1]) ** 2
+                    for item in group
+                )
+                <= INVENTORY_ICON_CLUSTER_DISTANCE**2
+            ),
+            None,
+        )
+        if cluster is None:
+            clusters.append([match])
+        else:
+            cluster.append(match)
+    return clusters
+
+
+def _inventory_grid_numbers(items: list[dict], width=1280, height=720) -> list[dict]:
+    """Locate quantity-bearing cells; unmatched cells become unknown-item probes."""
+    numbers = []
+    for item in items:
+        raw = str(item.get("text", "")).replace(",", "").strip()
+        if not re.fullmatch(r"(?:x|×)?\s*\d{1,8}", raw, re.IGNORECASE):
             continue
-        ix, iy = best_center
-        nearby = [
-            (abs(nx - ix) + (ny - iy) * 0.4, amount)
-            for nx, ny, amount in numbers
-            if abs(nx - ix) <= 75 and 15 <= ny - iy <= 105
-        ]
-        if nearby:
-            amount = min(nearby)[1]
-            logger.info(f"资产图标识别：{name} {amount}（匹配度 {best_score:.3f}）")
-            found.append(Asset(name, amount, "货币"))
-    return found
+        x, y = _center(item)
+        if width * 0.29 <= x <= width * 0.85 and height * 0.40 <= y <= height * 0.98:
+            numbers.append({"location": (int(x), int(y - height * 0.055)), "count": _parse_count(raw), "raw": raw})
+    return numbers
+
+
+def _number_near_inventory_icon(numbers: list[dict], location: tuple[int, int]) -> dict | None:
+    x, y = location
+    candidates = [
+        (abs(item["location"][0] - x) + abs(item["location"][1] - y), item)
+        for item in numbers
+        if abs(item["location"][0] - x) <= 75 and abs(item["location"][1] - y) <= 85
+    ]
+    return min(candidates, default=(0, None))[1]
+
+
+def _index_inventory_icon_page(image, items: list[dict]) -> tuple[list[Asset], list[dict]]:
+    """Resolve unambiguous icon/count pairs and return only uncertain cells for probing."""
+    numbers = _inventory_grid_numbers(items, *image.shape[1::-1])
+    assets = []
+    probes = []
+    claimed_numbers: set[int] = set()
+    for cluster in _cluster_inventory_icon_matches(_match_inventory_icons(image)):
+        ranked = sorted(cluster, key=lambda item: item["score"], reverse=True)
+        best = ranked[0]
+        number = _number_near_inventory_icon(numbers, best["location"])
+        if number is not None:
+            claimed_numbers.add(id(number))
+        margin = best["score"] - ranked[1]["score"] if len(ranked) > 1 else 1.0
+        if (
+            best["score"] >= INVENTORY_ICON_AUTO_SCORE
+            and margin >= INVENTORY_ICON_MARGIN
+            and number is not None
+            and number["count"] is not None
+        ):
+            assets.append(Asset(best["name"], number["count"], classify_asset(best["name"])))
+            continue
+        probes.append(
+            {
+                "location": best["location"],
+                "candidates": tuple(item["name"] for item in ranked),
+                "reason": "missing_count" if number is None else "template_conflict",
+            }
+        )
+    for number in numbers:
+        if id(number) not in claimed_numbers:
+            probes.append(
+                {
+                    "location": number["location"],
+                    "candidates": (),
+                    "reason": "unknown_icon",
+                }
+            )
+    return assets, probes
 
 
 def _parse_primary_currency_grid(image, ocr_items: list[dict]) -> list[Asset]:
@@ -259,8 +374,163 @@ def _open_assets_entry() -> bool:
     return False
 
 
-def scan_inventory_assets(max_pages: int = 6) -> list[Asset]:
-    """Scan visible currencies and backpack pages; duplicates keep the largest count."""
+def _inventory_detail_asset(items: list[dict]) -> Asset | None:
+    """Read a complete item name and owned count from a verified detail overlay."""
+    if not is_inventory_item_detail(items):
+        return None
+    owned = next(
+        (
+            _parse_count(str(item.get("text", "")))
+            for item in items
+            if "拥有" in str(item.get("text", ""))
+        ),
+        None,
+    )
+    if owned is None:
+        return None
+
+    manifest_names = _inventory_icon_manifest()
+    normalized = {
+        name.replace(" ", ""): name
+        for name in manifest_names
+    }
+    for item in items:
+        compact = str(item.get("text", "")).replace(" ", "")
+        if compact in normalized:
+            name = normalized[compact]
+            return Asset(name, owned, classify_asset(name))
+
+    candidates = []
+    for item in items:
+        raw = str(item.get("text", "")).strip()
+        compact = raw.replace(" ", "")
+        if not compact or compact.isascii() or any(character.isdigit() for character in compact):
+            continue
+        x, y = _center(item)
+        if 430 <= x <= 900 and 185 <= y <= 255 and not any(
+            marker in compact
+            for marker in ("拥有", "获取途径", "触碰空白区域退出", "使用", "出售")
+        ):
+            candidates.append((abs(y - 228), -len(compact), compact))
+    if not candidates:
+        return None
+    name = min(candidates)[2]
+    return Asset(name, owned, classify_asset(name))
+
+
+def _confirm_inventory_detail_asset(initial_items: list[dict], frames=3):
+    """Accept a detail result only when the same name/count appears twice."""
+    readings = []
+    detail_seen = False
+    items = initial_items
+    for frame in range(frames):
+        detail_seen = detail_seen or is_inventory_item_detail(items)
+        asset = _inventory_detail_asset(items)
+        if asset is not None:
+            readings.append(asset)
+        if frame + 1 < frames:
+            time.sleep(0.25)
+            items = screenshot().ocr()
+    if not readings:
+        return None, detail_seen
+    key, confirmations = Counter((item.name, item.count) for item in readings).most_common(1)[0]
+    if confirmations < 2:
+        logger.warning(f"背包物品详情多帧 OCR 不一致: {[(a.name, a.count) for a in readings]}")
+        return None, detail_seen
+    name, count = key
+    return Asset(name, count, classify_asset(name)), detail_seen
+
+
+def _safe_inventory_icon_filename(name: str, manifest: dict[str, str]) -> str:
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .") or "unknown-item"
+    used = {filename.casefold() for filename in manifest.values()}
+    filename = f"{stem}.png"
+    suffix = 2
+    while filename.casefold() in used:
+        filename = f"{stem}-{suffix}.png"
+        suffix += 1
+    return filename
+
+
+def _learn_inventory_icon(name: str, page_image, location: tuple[int, int]) -> bool:
+    """Persist a confirmed unknown slot crop and atomically register it in the manifest."""
+    manifest = _inventory_icon_manifest()
+    if name in manifest or not isinstance(page_image, np.ndarray):
+        return False
+    x, y = location
+    height, width = page_image.shape[:2]
+    half = 48
+    x1, x2 = max(0, x - half), min(width, x + half)
+    y1, y2 = max(0, y - half), min(height, y + half)
+    crop = page_image[y1:y2, x1:x2]
+    if crop.shape[:2] != (96, 96):
+        return False
+    icon_root = RESOURCES_PATH / "currency"
+    manifest_path = icon_root / "manifest.json"
+    filename = _safe_inventory_icon_filename(name, manifest)
+    stem = filename[:-4]
+    suffix = 2
+    while (icon_root / filename).exists():
+        filename = f"{stem}-{suffix}.png"
+        suffix += 1
+    icon_path = icon_root / filename
+    temp_manifest = manifest_path.with_suffix(".json.tmp")
+    try:
+        # Learned crops contain the live count near their bottom edge. Store an
+        # alpha mask that excludes that band so a future quantity change does
+        # not invalidate the icon template.
+        learned = cv.cvtColor(crop, cv.COLOR_BGR2BGRA)
+        learned[:, :, 3] = 0
+        learned[:72, :, 3] = 255
+        encoded, buffer = cv.imencode(".png", learned)
+        if not encoded:
+            return False
+        buffer.tofile(str(icon_path))
+        manifest[name] = filename
+        temp_manifest.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temp_manifest.replace(manifest_path)
+    except OSError:
+        logger.exception(f"写入未知背包物品资源失败: {name}")
+        try:
+            if icon_path.exists() and name not in _inventory_icon_manifest():
+                icon_path.unlink()
+        except OSError:
+            pass
+        return False
+    logger.info(f"已学习背包物品图标: {name} -> {filename}")
+    return True
+
+
+def _probe_inventory_item(page_image, probe: dict) -> Asset | None:
+    """Open one uncertain slot, verify its detail, and learn unknown artwork."""
+    location = probe["location"]
+    input_tap(location)
+    time.sleep(0.6)
+    initial_items = screenshot().ocr()
+    asset, detail_seen = _confirm_inventory_detail_asset(initial_items)
+    if asset is not None and asset.name not in _inventory_icon_manifest():
+        _learn_inventory_icon(asset.name, page_image, location)
+    if detail_seen:
+        input_tap((640, 600))
+        time.sleep(0.4)
+    return asset
+
+
+def _deduplicate_inventory_probes(probes: list[dict]) -> list[dict]:
+    unique = []
+    for probe in sorted(probes, key=lambda item: (item["location"][1], item["location"][0])):
+        x, y = probe["location"]
+        if any((x - old["location"][0]) ** 2 + (y - old["location"][1]) ** 2 <= 55**2 for old in unique):
+            continue
+        unique.append(probe)
+    return unique
+
+
+def scan_inventory_assets(max_pages: int = 10) -> list[Asset]:
+    """Build a full-page icon index, probing only ambiguous or unknown cells."""
     if not connect():
         raise RuntimeError("ADB 连接失败，请先在“ADB信息”中确认模拟器连接")
     initial_items = screenshot().ocr()
@@ -282,22 +552,36 @@ def scan_inventory_assets(max_pages: int = 6) -> list[Asset]:
         first_frame = screenshot()
         first_ocr = first_frame.ocr()
         snapshots.append(_parse_primary_currency_grid(first_frame.image, first_ocr))
-        snapshots.append(_parse_currency_icons(first_frame.image, first_ocr))
-        previous_names: set[str] = set()
+        previous_signature = None
+        unchanged_pages = 0
         for page in range(max_pages):
             page_frame = first_frame if page == 0 else screenshot()
             page_ocr = first_ocr if page == 0 else page_frame.ocr()
-            if page > 0:
-                snapshots.append(_parse_currency_icons(page_frame.image, page_ocr))
+            signature = _inventory_page_signature(page_ocr)
+            icon_assets, probes = _index_inventory_icon_page(page_frame.image, page_ocr)
+            snapshots.append(icon_assets)
             current = parse_ocr_assets(page_ocr)
             snapshots.append(current)
-            names = {asset.name for asset in current}
-            if page > 0 and names == previous_names:
+            probes = _deduplicate_inventory_probes(probes)
+            logger.info(
+                f"扫描背包第 {page + 1}/{max_pages} 页："
+                f"模板确认 {len(icon_assets)} 项，待详情复核 {len(probes)} 项"
+            )
+            for probe in probes:
+                asset = _probe_inventory_item(page_frame.image, probe)
+                if asset is not None:
+                    snapshots.append([asset])
+            if signature and signature == previous_signature:
+                unchanged_pages += 1
+            else:
+                unchanged_pages = 0
+            previous_signature = signature
+            if unchanged_pages >= 2:
+                logger.info("背包内容连续三次未变化，已到列表末页")
                 break
-            previous_names = names
             if page < max_pages - 1:
                 input_swipe((930, 640), (930, 285), swipe_time=600)
-                time.sleep(0.8)
+                time.sleep(0.9)
         assets = merge_assets(*snapshots)
         logger.info(f"资产扫描完成：识别到 {len(assets)} 类物品")
         return assets
@@ -310,7 +594,7 @@ def scan_inventory_assets(max_pages: int = 6) -> list[Asset]:
 
 
 def _parse_count(text: str) -> int | None:
-    match = re.search(r"(?:x|×)?\s*(\d{1,5})", text.replace(",", ""), re.IGNORECASE)
+    match = re.search(r"(?:x|×)?\s*(\d{1,8})", text.replace(",", ""), re.IGNORECASE)
     return int(match.group(1)) if match else None
 
 
