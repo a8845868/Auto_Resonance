@@ -76,12 +76,68 @@ def test_dispatch_is_detached_and_cooldown_is_single_flight(tmp_path, monkeypatc
     assert second.reason == "cooldown"
     assert len(calls) == 1
     argv, kwargs = calls[0]
-    assert argv[-2:] == ["drain", "--enabled"]
+    if self_healing.os.name == "nt":
+        assert argv[-3:] == ["drain", "--enabled", "--visible"]
+        assert Path(argv[0]).name.casefold() == "python.exe"
+        assert kwargs["creationflags"] == getattr(
+            self_healing.subprocess, "CREATE_NEW_CONSOLE", 0
+        )
+        assert not (
+            kwargs["creationflags"]
+            & getattr(self_healing.subprocess, "DETACHED_PROCESS", 0)
+        )
+        assert not (
+            kwargs["creationflags"]
+            & getattr(self_healing.subprocess, "CREATE_NO_WINDOW", 0)
+        )
+        assert "stdout" not in kwargs
+        assert "stderr" not in kwargs
+    else:
+        assert argv[-2:] == ["drain", "--enabled"]
+        assert kwargs["start_new_session"] is True
+        assert kwargs["stdout"] is self_healing.subprocess.DEVNULL
     assert kwargs["shell"] is False
     assert kwargs["env"][self_healing.RUNNER_ENV_VAR] == "1"
     assert self_healing.REPAIR_ENV_VAR not in {
         key for key, value in kwargs["env"].items() if value == "1"
     }
+
+
+def test_windows_spawn_uses_visible_python_console(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(self_healing.os, "name", "nt")
+    monkeypatch.setattr(
+        self_healing, "_console_python_executable", lambda: r"C:\Python\python.exe"
+    )
+    monkeypatch.setattr(
+        self_healing.subprocess,
+        "CREATE_NEW_CONSOLE",
+        0x10,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        self_healing.subprocess,
+        "Popen",
+        lambda argv, **kwargs: calls.append((argv, kwargs)),
+    )
+
+    self_healing._spawn_runner(
+        storage_root=tmp_path,
+        global_claim=tmp_path / "claim.json",
+        global_token="token",
+    )
+
+    argv, kwargs = calls[0]
+    assert argv == [
+        r"C:\Python\python.exe",
+        str(self_healing.RUNNER_PATH),
+        "drain",
+        "--enabled",
+        "--visible",
+    ]
+    assert kwargs["creationflags"] == 0x10
+    assert "start_new_session" not in kwargs
+    assert "stdin" not in kwargs
 
 
 def test_second_switch_selects_repair_mode(tmp_path, monkeypatch):
@@ -275,3 +331,16 @@ def test_fresh_incomplete_global_claim_is_busy_until_launch_ttl_expires(tmp_path
 
     assert claimed is not None
     assert json.loads(claim_path.read_text(encoding="utf-8"))["token"] == claimed[1]
+
+
+def test_global_runner_active_is_read_only_liveness_check(tmp_path):
+    assert self_healing.global_runner_active(tmp_path) is False
+    claimed = self_healing.claim_global_dispatch(tmp_path)
+    assert claimed is not None
+    claim_path, token = claimed
+    assert self_healing.adopt_global_dispatch(claim_path, token) is True
+
+    assert self_healing.global_runner_active(tmp_path) is True
+
+    self_healing.release_global_dispatch(claim_path, token)
+    assert self_healing.global_runner_active(tmp_path) is False

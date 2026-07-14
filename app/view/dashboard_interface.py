@@ -1,5 +1,8 @@
 """ALAS-inspired scheduler overview with integrated live log."""
 
+import json
+from pathlib import Path
+
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QSplitter, QVBoxLayout, QWidget
 from qfluentwidgets import FluentIcon, PlainTextEdit, PrimaryPushButton, PushButton, ScrollArea
@@ -16,13 +19,174 @@ from core.services.emulator_lifecycle import (
     EmulatorQueueLifecycle,
     LifecycleOptions,
 )
-from core.services.self_healing import discover_log_incidents, submit_incident
+from core.services.codex_repair import (
+    DEFAULT_STORAGE_ROOT as SELF_HEALING_STORAGE_ROOT,
+    list_legacy_worktrees,
+    list_run_statuses,
+)
+from core.services.self_healing import (
+    discover_log_incidents,
+    global_runner_active,
+    submit_incident,
+)
 from core.services.task_schedule_state import (
     completed_history,
     is_task_due,
     record_task_execution,
     task_timing,
 )
+
+
+SELF_HEALING_REFRESH_INTERVAL_MS = 2_000
+_ACTIVE_REPAIR_STATUSES = {"starting", "running", "codex_running"}
+
+
+def _read_json_document(path):
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _latest_pending_dispatch(storage_root):
+    pending_dir = Path(storage_root) / "dispatch" / "pending"
+    try:
+        paths = sorted(
+            pending_dir.glob("*.json"),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    for path in paths:
+        document = _read_json_document(path)
+        if document:
+            return document
+    return None
+
+
+def _current_self_healing_status(storage_root=None):
+    """Read the newest durable run/queue state without mutating either store."""
+
+    root = Path(storage_root or SELF_HEALING_STORAGE_ROOT).resolve()
+    try:
+        statuses = list_run_statuses(root, limit=1)
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        statuses = []
+    latest = statuses[0] if statuses and isinstance(statuses[0], dict) else None
+    pending = _latest_pending_dispatch(root)
+    if (
+        storage_root is None
+        and latest
+        and str(latest.get("status", "")).casefold() in _ACTIVE_REPAIR_STATUSES
+        and not global_runner_active(root)
+    ):
+        latest = dict(latest)
+        latest["status"] = "interrupted_stale"
+        latest["reason"] = "runner_process_not_active"
+
+    def with_legacy(document):
+        result = dict(document or {})
+        if storage_root is None:
+            legacy = list_legacy_worktrees()
+            if legacy:
+                result["legacy_worktree_paths"] = legacy
+        return result
+
+    if latest and str(latest.get("status", "")).casefold() in _ACTIVE_REPAIR_STATUSES:
+        return with_legacy(latest)
+    if pending:
+        # The queue file remains present while its incident is processed. Once
+        # the run status for that same incident exists, it is more current than
+        # the queue marker, including its terminal candidate/diagnosis result.
+        if latest and str(latest.get("incident_id", "")) == str(
+            pending.get("incident_id", "")
+        ):
+            return with_legacy(latest)
+        return with_legacy({
+            "status": "queued",
+            "mode": pending.get("mode", ""),
+            "incident_id": pending.get("incident_id", ""),
+            "incident_path": pending.get("incident_path", ""),
+        })
+    return with_legacy(latest)
+
+
+def _one_line(value, limit=800):
+    text = " ".join(str(value or "").splitlines()).strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 14]}...<truncated>"
+
+
+def _self_healing_status_lines(status, *, enabled, allow_repair):
+    status = status if isinstance(status, dict) else {}
+    raw_status = _one_line(status.get("status"))
+    mode = _one_line(status.get("mode")) or (
+        "repair" if allow_repair else "diagnose"
+    )
+    status_labels = {
+        "starting": "运行中",
+        "running": "运行中",
+        "codex_running": "Codex 运行中",
+        "queued": "等待 Codex",
+        "candidate_unvalidated": "候选补丁未验证，需人工审查",
+        "diagnosed": "诊断完成",
+        "no_change": "完成，未产生修改",
+        "failed": "执行失败",
+        "blocked": "已阻止",
+        "disabled": "未启用",
+        "runner_failed": "运行器失败",
+        "interrupted": "已由操作员中断",
+        "interrupted_stale": "运行器已中断，现场已保留",
+    }
+    if raw_status:
+        state_label = status_labels.get(raw_status.casefold(), raw_status)
+        state_text = f"{state_label}（{raw_status}）"
+    else:
+        state_text = "等待异常" if enabled else "未启用"
+    mode_label = {"repair": "修复", "diagnose": "诊断"}.get(
+        mode.casefold(), mode or "未知"
+    )
+
+    branch_name = _one_line(status.get("branch_name"))
+    worktree_path = _one_line(status.get("worktree_path"))
+    if not branch_name and worktree_path:
+        # The current executor intentionally creates detached worktrees. Keep
+        # the branch field visible even before the service records it directly.
+        branch_name = "detached"
+    reason = _one_line(
+        status.get("failure_reason") or status.get("reason") or status.get("error")
+    )
+    output_path = _one_line(
+        status.get("output_path") or status.get("codex_output_path")
+    )
+    run_path = _one_line(status.get("run_path"))
+    incident_id = _one_line(status.get("incident_id"))
+    attempt_id = _one_line(status.get("attempt_id"))
+
+    lines = [
+        f"当前状态: {state_text}",
+        f"模式 mode: {mode_label}（{mode}）",
+        f"branch_name: {branch_name or '—'}",
+        f"worktree_path: {worktree_path or '—'}",
+    ]
+    if incident_id:
+        lines.append(f"incident_id: {incident_id}")
+    if attempt_id:
+        lines.append(f"attempt_id: {attempt_id}")
+    if reason:
+        lines.append(f"失败原因/说明: {reason}")
+    if output_path:
+        lines.append(f"输出路径: {output_path}")
+    if run_path and run_path != output_path:
+        lines.append(f"状态路径: {run_path}")
+    for legacy_path in status.get("legacy_worktree_paths") or []:
+        path_text = _one_line(legacy_path)
+        if path_text:
+            lines.append(f"历史外置工作树（只读保留）: {path_text}")
+    return lines
 
 
 class StatusPanel(QFrame):
@@ -85,6 +249,7 @@ class DashboardInterface(ScrollArea):
         self.mainLayout.setSpacing(14)
         StyleSheet.HOME_INTERFACE.apply(self)
         self._buildUi()
+        self._startSelfHealingStatusTimer()
 
     def _buildUi(self):
         title = QLabel("自动任务", self.scrollWidget)
@@ -111,10 +276,12 @@ class DashboardInterface(ScrollArea):
         scheduler_title.setStyleSheet("font-size: 20px; font-weight: 600;")
         scheduler_layout.addWidget(scheduler_title)
         self.runningPanel = StatusPanel("运行中", scheduler)
+        self.selfHealingPanel = StatusPanel("Codex 自愈", scheduler)
         self.pendingPanel = StatusPanel("队列中", scheduler)
         self.finishedPanel = StatusPanel("已完成", scheduler)
         self.waitingPanel = StatusPanel("等待中", scheduler)
         scheduler_layout.addWidget(self.runningPanel)
+        scheduler_layout.addWidget(self.selfHealingPanel)
         scheduler_layout.addWidget(self.pendingPanel)
         scheduler_layout.addWidget(self.waitingPanel)
         scheduler_layout.addWidget(self.finishedPanel)
@@ -143,6 +310,27 @@ class DashboardInterface(ScrollArea):
         splitter.setStretchFactor(1, 2)
         self.mainLayout.addWidget(splitter, 1)
         self.refreshScheduleOverview()
+        self.refreshSelfHealingStatus()
+
+    def _startSelfHealingStatusTimer(self):
+        self.selfHealingTimer = QTimer(self)
+        self.selfHealingTimer.setInterval(SELF_HEALING_REFRESH_INTERVAL_MS)
+        self.selfHealingTimer.timeout.connect(self.refreshSelfHealingStatus)
+        self.selfHealingTimer.start()
+
+    def refreshSelfHealingStatus(self):
+        """Refresh the read-only Codex state panel; never trigger remediation."""
+
+        try:
+            status = _current_self_healing_status()
+            lines = _self_healing_status_lines(
+                status,
+                enabled=bool(cfg.enableCodexSelfHealing.value),
+                allow_repair=bool(cfg.allowCodexIsolatedRepair.value),
+            )
+        except Exception:  # GUI status observation must not affect task execution
+            lines = ["当前状态: 状态读取失败", "请查看 logs/self_healing 状态文件"]
+        self.selfHealingPanel.setTasks(lines)
 
     def _loadRecentLog(self):
         """Show recent history immediately, then continue with live log events."""
@@ -359,6 +547,9 @@ class DashboardInterface(ScrollArea):
         """Request shutdown without blocking the Qt main thread."""
 
         self.scheduleTimer.stop()
+        self_healing_timer = getattr(self, "selfHealingTimer", None)
+        if self_healing_timer is not None:
+            self_healing_timer.stop()
         if self.queueWorker is not None:
             if self.queueWorker.isRunning() and not self.shutdownRequested:
                 self.shutdownRequested = True

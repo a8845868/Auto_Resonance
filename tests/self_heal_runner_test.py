@@ -84,3 +84,55 @@ def test_drain_processes_pending_incidents_serially_and_releases_global_claim(
     assert not claim_path.exists()
     for incident_path, _mode in processed:
         assert json.loads(Path(incident_path).read_text(encoding="utf-8"))["id"]
+
+
+def test_visible_process_releases_claim_before_waiting_for_enter(
+    tmp_path, monkeypatch, capsys
+):
+    events = []
+    claim_path = tmp_path / "global.json"
+    monkeypatch.setattr(self_heal_runner, "_storage_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        self_heal_runner,
+        "claim_global_dispatch",
+        lambda _root: (claim_path, "token"),
+    )
+    monkeypatch.setattr(
+        self_heal_runner, "adopt_global_dispatch", lambda *_args: True
+    )
+    monkeypatch.setattr(
+        self_heal_runner,
+        "release_global_dispatch",
+        lambda *_args: events.append("released"),
+    )
+    monkeypatch.setattr(
+        self_heal_runner,
+        "_execute_incident",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            succeeded=True,
+            status="diagnosed",
+            to_dict=lambda: {
+                "status": "diagnosed",
+                "branch_name": "codex/review",
+                "worktree_path": r"C:\review\tree",
+                "codex_output_path": r"C:\review\output.jsonl",
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        "builtins.input", lambda: events.append("input") or ""
+    )
+
+    exit_code = self_heal_runner.main(
+        ["process", "incident-1", "--enabled", "--visible"]
+    )
+
+    assert exit_code == 0
+    assert events == ["released", "input"]
+    output = capsys.readouterr().out
+    assert "incident: incident-1" in output
+    assert "mode: diagnose" in output
+    assert "status: diagnosed" in output
+    assert "branch: codex/review" in output
+    assert r"worktree: C:\review\tree" in output
+    assert r"output: C:\review\output.jsonl" in output

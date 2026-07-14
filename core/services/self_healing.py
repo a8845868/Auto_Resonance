@@ -1,7 +1,9 @@
 """Safe, no-throw bridge from runtime failures to the Codex repair runner.
 
 The runtime-facing functions in this module only persist a bounded incident and
-start a detached helper.  They never run Codex synchronously and never apply a
+start a helper.  On Windows the helper intentionally gets a visible console so
+the operator can follow diagnosis progress; other platforms keep the detached
+background behaviour.  They never run Codex synchronously and never apply a
 generated patch to the active checkout.
 """
 
@@ -315,6 +317,16 @@ def release_global_dispatch(path: Path, token: str) -> None:
         path.unlink(missing_ok=True)
 
 
+def global_runner_active(
+    storage_root: str | os.PathLike[str] | None = None,
+) -> bool:
+    """Read whether the durable global claim still names a live runner."""
+
+    root = Path(storage_root or DEFAULT_STORAGE_ROOT).resolve()
+    document = _read_json(_global_claim_path(root))
+    return bool(document and _process_is_current(document))
+
+
 def _queue_path(storage_root: Path, incident_id: str) -> Path:
     safe_id = hashlib.sha256(
         incident_id.encode("utf-8", errors="replace")
@@ -357,13 +369,34 @@ def pending_dispatches(storage_root: Path) -> list[tuple[Path, dict[str, Any]]]:
     return results
 
 
-def _runner_command() -> list[str]:
-    return [
-        sys.executable,
+def _console_python_executable() -> str:
+    """Return a console-capable Python executable for a Windows GUI parent."""
+
+    current = Path(sys.executable)
+    candidates = [
+        current if current.name.casefold() == "python.exe" else current.with_name("python.exe"),
+        Path(getattr(sys, "_base_executable", "") or ""),
+        ROOT / ".venv" / "Scripts" / "python.exe",
+    ]
+    for candidate in candidates:
+        if candidate.name.casefold() == "python.exe" and candidate.is_file():
+            return str(candidate)
+    # Keep startup best-effort.  Normal project and development launches use
+    # python.exe; this fallback produces a useful spawn failure for odd frozen
+    # deployments instead of silently choosing pythonw.exe again.
+    return str(current.with_name("python.exe"))
+
+
+def _runner_command(*, visible: bool = False) -> list[str]:
+    command = [
+        _console_python_executable() if visible else sys.executable,
         str(RUNNER_PATH),
         "drain",
         "--enabled",
     ]
+    if visible:
+        command.append("--visible")
+    return command
 
 
 def _spawn_runner(
@@ -380,21 +413,22 @@ def _spawn_runner(
     kwargs: dict[str, Any] = {
         "cwd": str(ROOT),
         "env": environment,
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
         "shell": False,
         "close_fds": True,
     }
     if os.name == "nt":
-        kwargs["creationflags"] = (
-            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "DETACHED_PROCESS", 0)
-            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        )
+        # A GUI/pythonw parent has no useful standard streams.  CREATE_NEW_CONSOLE
+        # gives the operator a real python.exe terminal and deliberately avoids
+        # DETACHED_PROCESS/CREATE_NO_WINDOW.
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
     else:
+        kwargs.update(
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         kwargs["start_new_session"] = True
-    subprocess.Popen(_runner_command(), **kwargs)
+    subprocess.Popen(_runner_command(visible=os.name == "nt"), **kwargs)
 
 
 def _ensure_global_runner(storage_root: Path) -> str:
@@ -558,6 +592,7 @@ __all__ = [
     "adopt_global_dispatch",
     "claim_global_dispatch",
     "discover_log_incidents",
+    "global_runner_active",
     "pending_dispatches",
     "release_global_dispatch",
     "submit_incident",
