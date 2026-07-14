@@ -16,9 +16,17 @@ class _Panel:
 class _Button:
     def __init__(self):
         self.enabled = None
+        self.text = None
+        self.icon = None
 
     def setEnabled(self, enabled):
         self.enabled = enabled
+
+    def setText(self, text):
+        self.text = text
+
+    def setIcon(self, icon):
+        self.icon = icon
 
 
 class _Signal:
@@ -46,9 +54,11 @@ def test_queue_failure_disarms_scheduler_before_timer_can_restart_tasks():
         schedulerArmed=True,
         runningPanel=_Panel(),
         pendingPanel=_Panel(),
-        startButton=_Button(),
-        stopButton=_Button(),
+        controlButton=_Button(),
         refreshScheduleOverview=lambda: None,
+    )
+    dashboard._setControlRunning = lambda running: DashboardInterface._setControlRunning(
+        dashboard, running
     )
 
     DashboardInterface._queueFinished(dashboard, worker)
@@ -74,6 +84,21 @@ def test_log_monitor_does_not_dispatch_while_queue_is_running(monkeypatch):
     DashboardInterface._runDueTasks(dashboard)
 
     assert calls == []
+
+
+def test_single_control_button_toggles_scheduler_state():
+    calls = []
+    dashboard = SimpleNamespace(
+        schedulerArmed=False,
+        startTaskQueue=lambda: calls.append("start"),
+        stopTaskQueue=lambda: calls.append("stop"),
+    )
+
+    DashboardInterface._toggleTaskQueue(dashboard)
+    dashboard.schedulerArmed = True
+    DashboardInterface._toggleTaskQueue(dashboard)
+
+    assert calls == ["start", "stop"]
 
 
 def test_queue_captures_one_self_healing_policy_snapshot(monkeypatch):
@@ -113,14 +138,17 @@ def test_queue_captures_one_self_healing_policy_snapshot(monkeypatch):
         _taskResult=lambda *_args: None,
         _taskCompleted=lambda *_args: None,
         pendingPanel=_Panel(),
-        startButton=_Button(),
-        stopButton=_Button(),
+        controlButton=_Button(),
+    )
+    dashboard._setControlRunning = lambda running: DashboardInterface._setControlRunning(
+        dashboard, running
     )
 
     DashboardInterface.startTaskQueue(dashboard)
     worker = dashboard.queueWorker
     assert worker.halt_on_failure is True
     assert worker.started is True
+    assert dashboard.controlButton.text == "停止全部任务"
 
     # Changing settings mid-batch must not split halt and dispatch policies.
     monkeypatch.setattr(cfg.enableCodexSelfHealing, "value", False)

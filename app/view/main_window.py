@@ -7,8 +7,8 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 from typing import Union
 
 from PySide6.QtCore import QSize, Qt, QTimer
-from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtGui import QAction, QIcon
+from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
 from loguru import logger
 from qfluentwidgets import DotInfoBadge
 from qfluentwidgets import FluentIcon as FIF
@@ -21,9 +21,10 @@ from qfluentwidgets import (
     SplashScreen,
     FluentIconBase,
     SystemThemeListener,
+    TransparentToolButton,
     isDarkTheme,
     setTheme,
-    MessageBox
+    MessageBox,
 )
 
 import app.common.resource  # 图标数据
@@ -63,6 +64,7 @@ class MainWindow(FluentWindow):
         self.themeListener = SystemThemeListener(self)
 
         self.initWindow()
+        self.initSystemTray()
         self.setInterface()
 
         self.initNavigation()
@@ -134,6 +136,49 @@ class MainWindow(FluentWindow):
         self.move(w // 2 - self.width() // 2, h // 2 - self.height() // 2)
         self.show()
         QApplication.processEvents()
+
+    def initSystemTray(self):
+        """Add an explicit title-bar action that keeps automation in the tray."""
+        self.trayIcon = QSystemTrayIcon(self.windowIcon(), self)
+        self.trayIcon.setToolTip(self.windowTitle())
+        tray_menu = QMenu(self)
+        restore_action = QAction("显示主窗口", self)
+        quit_action = QAction("退出", self)
+        restore_action.triggered.connect(self.restoreFromTray)
+        quit_action.triggered.connect(self.close)
+        tray_menu.addAction(restore_action)
+        tray_menu.addSeparator()
+        tray_menu.addAction(quit_action)
+        self.trayIcon.setContextMenu(tray_menu)
+        self.trayIcon.activated.connect(self._onTrayActivated)
+
+        self.trayButton = TransparentToolButton(FIF.DOWN, self.titleBar)
+        self.trayButton.setFixedSize(46, 32)
+        self.trayButton.setToolTip("最小化到托盘")
+        self.trayButton.clicked.connect(self.minimizeToTray)
+        self.titleBar.buttonLayout.insertWidget(0, self.trayButton)
+
+    def minimizeToTray(self):
+        if not self._systemTrayAvailable():
+            self.showMinimized()
+            return
+        self.trayIcon.show()
+        self.hide()
+
+    def _systemTrayAvailable(self):
+        return QSystemTrayIcon.isSystemTrayAvailable()
+
+    def restoreFromTray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _onTrayActivated(self, reason):
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self.restoreFromTray()
 
     def setInterface(self):
         # create sub interface
@@ -223,6 +268,7 @@ class MainWindow(FluentWindow):
             # Qt may deliver a second close event after the listener has
             # already been deleted.
             pass
+        self.trayIcon.hide()
         super().closeEvent(e)
 
     def _retryClose(self):
