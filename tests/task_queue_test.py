@@ -43,6 +43,10 @@ def test_only_explicit_nonempty_results_are_completed():
         QueuedTask("details", lambda: {"completed": 0}),
         QueuedTask("explicit-failure", lambda: {"success": False, "details": 1}),
         QueuedTask("explicit-success", lambda: {"success": True}),
+        QueuedTask(
+            "explicit-deferral",
+            lambda: {"success": True, "deferred": True},
+        ),
         QueuedTask("malformed-success-string", lambda: {"success": "false"}),
         QueuedTask("malformed-success-number", lambda: {"success": 1}),
     ])
@@ -62,6 +66,7 @@ def test_only_explicit_nonempty_results_are_completed():
         ("details", True),
         ("explicit-failure", False),
         ("explicit-success", True),
+        ("explicit-deferral", True),
         ("malformed-success-string", False),
         ("malformed-success-number", False),
     ]

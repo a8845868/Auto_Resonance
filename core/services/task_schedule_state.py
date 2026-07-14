@@ -21,6 +21,21 @@ def task_result_succeeded(result: object) -> bool:
     return bool(result)
 
 
+def task_result_deferred(result: object) -> bool:
+    """Return whether a successful task intentionally requested a retry.
+
+    A deferral is not a runtime failure and must not trigger self-healing, but
+    it also must not advance the task's completion timestamp or normal
+    schedule.  Requiring both fields to be the boolean ``True`` keeps malformed
+    result documents fail-closed.
+    """
+    return (
+        isinstance(result, dict)
+        and result.get("success") is True
+        and result.get("deferred") is True
+    )
+
+
 def load_task_schedule(path: Path = STATE_PATH) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -77,6 +92,8 @@ def record_task_execution(
     result: object = None,
     now: datetime | None = None,
     path: Path = STATE_PATH,
+    *,
+    deferred: bool = False,
 ) -> dict[str, Any]:
     now = now or datetime.now()
     state = load_task_schedule(path)
@@ -85,19 +102,26 @@ def record_task_execution(
     previous_completed_at = previous.get("completed_at", "")
     if not previous_completed_at and previous.get("status") == "completed":
         previous_completed_at = previous.get("last_run", "")
+    completed = bool(succeeded and not deferred)
     entry = {
         "key": task_key,
         "name": name,
         "last_run": attempt_time,
         "last_attempt": attempt_time,
-        "completed_at": attempt_time if succeeded else previous_completed_at,
+        "completed_at": attempt_time if completed else previous_completed_at,
         "next_run": next_run.isoformat(timespec="seconds") if next_run else "",
-        "status": "completed" if succeeded else "failed_or_stopped",
+        "status": (
+            "deferred"
+            if succeeded and deferred
+            else "completed"
+            if completed
+            else "failed_or_stopped"
+        ),
         "result": result if isinstance(result, (dict, list, str, int, float, bool, type(None))) else str(result),
     }
     state["tasks"][task_key] = entry
     history_entry = dict(entry)
-    if not succeeded:
+    if not completed:
         history_entry["completed_at"] = ""
     state["completed"].insert(0, history_entry)
     state["completed"] = state["completed"][:100]

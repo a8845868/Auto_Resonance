@@ -24,6 +24,7 @@ from core.services.task_schedule_state import (
     completed_history,
     is_task_due,
     record_task_execution,
+    task_result_deferred,
     task_timing,
 )
 
@@ -327,12 +328,14 @@ class DashboardInterface(ScrollArea):
     def _taskCompleted(self, task, succeeded, result):
         if not task.key:
             return
+        deferred = bool(succeeded and task_result_deferred(result))
         record_task_execution(
             task.key,
             task.name,
             succeeded,
-            task.next_run_after(succeeded),
+            task.next_run_after(succeeded and not deferred),
             result,
+            deferred=deferred,
         )
         self.refreshScheduleOverview()
 
