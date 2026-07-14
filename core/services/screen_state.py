@@ -1,6 +1,15 @@
 """Small, side-effect-free classifiers for top-level game screen state."""
 
 
+# The control layer normalizes every frame to 1280x720.  This point is the
+# middle of the wide blue confirmation button on the pre-login resource-pack
+# prompt, not merely the OCR text bounding box.
+RESOURCE_DOWNLOAD_CONFIRM_TAP = (640, 506)
+# Ordinary navigation keeps its existing 45-attempt limit.  Only after this
+# prompt is observed do callers grant roughly five minutes for downloading.
+RESOURCE_DOWNLOAD_WAIT_ATTEMPTS = 150
+
+
 def _texts(items: list[dict]) -> list[str]:
     return [str(item.get("text", "")).replace(" ", "") for item in items]
 
@@ -70,6 +79,14 @@ def startup_screen_action(items: list[dict]) -> str | None:
         return None
     if any("修复资源完整性" in text for text in texts):
         return "cancel_resource_repair"
+    has_download_prompt = any(
+        "需要下载资源包" in text
+        or ("下载" in text and "资源包" in text)
+        for text in texts
+    )
+    has_confirm_button = any("确认" in text for text in texts)
+    if has_download_prompt and has_confirm_button:
+        return "confirm_resource_download"
     if any(
         marker in text
         for text in texts

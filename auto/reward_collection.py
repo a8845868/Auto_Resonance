@@ -19,7 +19,11 @@ import numpy as np
 from loguru import logger
 
 from core.control.control import connect, input_tap, screenshot
-from core.services.screen_state import startup_screen_action
+from core.services.screen_state import (
+    RESOURCE_DOWNLOAD_CONFIRM_TAP,
+    RESOURCE_DOWNLOAD_WAIT_ATTEMPTS,
+    startup_screen_action,
+)
 
 
 STATE_PATH = Path("config") / "reward_state.json"
@@ -82,7 +86,11 @@ class RewardDriver:
 
     def go_home(self) -> bool:
         startup_recovery = False
-        for _ in range(45):
+        resource_download_seen = False
+        attempt = 0
+        attempt_limit = 45
+        while attempt < attempt_limit:
+            attempt += 1
             texts = self.texts()
             if any(_matches(i["text"], marker) for i in texts for marker in ("访问城市", "启程", "作战终端")):
                 return True
@@ -92,6 +100,18 @@ class RewardDriver:
                 self.tap((320, 500))
                 startup_recovery = True
                 self.sleep(1)
+                continue
+            if action == "confirm_resource_download":
+                logger.info("检测到登录前资源包更新提示，确认下载并等待完成")
+                self.tap(RESOURCE_DOWNLOAD_CONFIRM_TAP)
+                startup_recovery = True
+                if not resource_download_seen:
+                    attempt_limit = max(
+                        attempt_limit,
+                        attempt + RESOURCE_DOWNLOAD_WAIT_ATTEMPTS,
+                    )
+                    resource_download_seen = True
+                self.sleep(2)
                 continue
             if action == "enter_game":
                 logger.info("检测到游戏登录页，点击安全区域进入游戏")

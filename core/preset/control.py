@@ -17,6 +17,8 @@ from core.module.bgr import BGR
 from core.control.control import input_tap, screenshot
 from core.exception.exception_handling import get_excption
 from core.services.screen_state import (
+    RESOURCE_DOWNLOAD_CONFIRM_TAP,
+    RESOURCE_DOWNLOAD_WAIT_ATTEMPTS,
     is_inventory_item_detail,
     is_inventory_screen,
     is_top_level_hud,
@@ -230,7 +232,11 @@ def go_home():
     # template threshold can loop forever even when the main screen is open.
     # The lower-right start area is consistently orange on the main screen.
     startup_recovery = False
-    for attempt in range(45):
+    resource_download_seen = False
+    attempt = 0
+    attempt_limit = 45
+    while attempt < attempt_limit:
+        attempt += 1
         image = screenshot()
         start_button = image.get_bgr((1200, 680))
         if start_button.b < 90 and start_button.g > 100 and start_button.r > 160:
@@ -256,6 +262,18 @@ def go_home():
             startup_recovery = True
             time.sleep(1)
             continue
+        if startup_action == "confirm_resource_download":
+            logger.info("检测到登录前资源包更新提示，确认下载并等待完成")
+            input_tap(RESOURCE_DOWNLOAD_CONFIRM_TAP)
+            startup_recovery = True
+            if not resource_download_seen:
+                attempt_limit = max(
+                    attempt_limit,
+                    attempt + RESOURCE_DOWNLOAD_WAIT_ATTEMPTS,
+                )
+                resource_download_seen = True
+            time.sleep(2)
+            continue
         if startup_action == "enter_game":
             logger.info("检测到游戏登录页，点击安全区域进入游戏")
             input_tap((640, 560))
@@ -278,7 +296,7 @@ def go_home():
             logger.debug("游戏正在启动，等待主界面")
             time.sleep(2)
             continue
-        logger.debug(f"尝试返回主界面 ({attempt + 1}/45)")
+        logger.debug(f"尝试返回主界面 ({attempt}/{attempt_limit})")
         clicked = click_image(
             RESOURCES_PATH / "go_home.png",
             (0, 0),

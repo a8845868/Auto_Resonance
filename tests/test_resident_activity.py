@@ -1,10 +1,11 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from auto.resident_activity import (
     FULL_REALM_REWARDS,
     ResidentActivityAutomation,
     SIEGE_TASKS,
+    ScreenDriver,
     _matches,
 )
 
@@ -50,6 +51,21 @@ class FakeDriver:
 
 
 class ResidentActivityTests(unittest.TestCase):
+    def test_go_home_confirms_prelogin_resource_download(self):
+        driver = ScreenDriver(sleep=lambda _seconds: None)
+        driver.texts = Mock(side_effect=[
+            [item("需要下载资源包（共20.9MB）"), item("确认"), item("0%")],
+            [item("55%")],
+            [item("访问城市")],
+        ])
+        driver.tap = Mock()
+
+        self.assertTrue(driver.go_home())
+        self.assertEqual(
+            [call.args[0] for call in driver.tap.call_args_list],
+            [(640, 506)],
+        )
+
     def test_all_siege_tasks_are_in_required_order(self):
         self.assertEqual(SIEGE_TASKS, (
             "特殊订单", "利刃行动", "挑灯看剑", "武器材质分析", "骑士小说",

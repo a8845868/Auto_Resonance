@@ -65,9 +65,38 @@ def test_screen_state_separates_transit_from_station_home():
 
 def test_startup_screen_actions_keep_go_home_away_from_resource_repair():
     assert startup_screen_action(_items("修复资源完整性会自动退出游戏，是否继续？")) == "cancel_resource_repair"
+    assert startup_screen_action(
+        _items("需要下载资源包（共20.9MB）", "确认", "0%")
+    ) == "confirm_resource_download"
+    assert startup_screen_action(_items("正在下载资源包", "42%")) == "wait_for_game"
     assert startup_screen_action(_items("点击屏幕进入游戏")) == "enter_game"
     assert startup_screen_action(_items("81%")) == "wait_for_game"
     assert startup_screen_action(_items("触碰空白区域退出")) == "dismiss_startup_overlay"
+
+
+def test_go_home_confirms_prelogin_resource_pack_then_waits_for_login():
+    resource_prompt = FakeStartupImage(
+        ["需要下载资源包（共20.9MB）", "确认", "0%"]
+    )
+    download_progress = FakeStartupImage(["42%"])
+    login = FakeStartupImage(["点击屏幕进入游戏"])
+    station_home = FakeStationHomeImage(["资产", "车厢内", "副官室"])
+    with patch.object(
+        preset_control,
+        "screenshot",
+        # More than the ordinary 45-attempt navigation budget proves that the
+        # resource prompt grants its dedicated download wait window.
+        side_effect=[resource_prompt, *([download_progress] * 50), login, station_home],
+    ), patch.object(preset_control, "click_image") as click_image, patch.object(
+        preset_control, "input_tap"
+    ) as tap, patch.object(preset_control.time, "sleep"):
+        assert preset_control.go_home()
+
+    assert [call.args[0] for call in tap.call_args_list] == [
+        (640, 506),
+        (640, 560),
+    ]
+    click_image.assert_not_called()
 
 
 def test_inventory_detail_is_not_mistaken_for_startup_overlay():

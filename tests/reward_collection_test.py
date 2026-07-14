@@ -122,6 +122,7 @@ def test_reward_go_home_enters_login_safely_without_clicking_top_left():
     driver = RewardDriver(sleep=lambda _seconds: None)
     driver.texts = Mock(side_effect=[
         [{"text": "修复资源完整性会自动退出游戏，是否继续？"}],
+        [{"text": "需要下载资源包（共20.9MB）"}, {"text": "确认"}, {"text": "0%"}],
         [{"text": "点击屏幕进入游戏"}],
         [{"text": "81%"}],
         [{"text": "触碰空白区域退出"}],
@@ -132,6 +133,7 @@ def test_reward_go_home_enters_login_safely_without_clicking_top_left():
     assert driver.go_home()
     assert [call.args[0] for call in driver.tap.call_args_list] == [
         (320, 500),
+        (640, 506),
         (640, 560),
         (100, 650),
     ]
