@@ -219,3 +219,41 @@ def test_claim_completed_carriage_retries_while_completed_state_persists():
 
     assert click_text.call_count == 3
     assert tap.call_args_list == [call((855, 130)), call((1100, 650))]
+
+
+def test_monitor_uses_future_cached_due_time_for_normal_scheduled_run():
+    plan = {
+        "status": "building",
+        "completed_carriages": 5,
+        "target_carriages": 8,
+        "active_due_at": "2099-07-15T05:10:26+08:00",
+    }
+    summary = {"active": True, "due_now": False, "message": "cached building"}
+
+    with patch.object(passenger_build, "load_build_monitor_plan", return_value=plan), patch.object(
+        passenger_build, "build_monitor_summary", return_value=summary
+    ), patch.object(passenger_build, "start_next_passenger_carriage") as live_check:
+        assert passenger_build.run_build_monitor()
+
+    live_check.assert_not_called()
+
+
+def test_monitor_force_verify_bypasses_future_cached_due_time_and_resyncs():
+    plan = {
+        "status": "building",
+        "completed_carriages": 5,
+        "target_carriages": 8,
+        "active_due_at": "2099-07-15T05:10:26+08:00",
+    }
+    summary = {"active": True, "due_now": False, "message": "cached building"}
+    live_state = passenger_build.BuildScreenState(True, 12_345, True)
+
+    with patch.object(passenger_build, "load_build_monitor_plan", return_value=plan), patch.object(
+        passenger_build, "build_monitor_summary", return_value=summary
+    ), patch.object(
+        passenger_build, "start_next_passenger_carriage", return_value=live_state
+    ) as live_check, patch.object(passenger_build, "resync_active_build") as resync:
+        assert passenger_build.run_build_monitor(force_verify=True)
+
+    live_check.assert_called_once_with()
+    resync.assert_called_once_with(plan, remaining_seconds=12_345)

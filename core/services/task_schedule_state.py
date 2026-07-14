@@ -81,7 +81,21 @@ def set_next_run(task_key: str, value: datetime | str | None, path: Path = STATE
     if isinstance(value, datetime):
         value = value.isoformat(timespec="seconds")
     task["next_run"] = (value or "").strip()
+    task.pop("force_verify", None)
     _save(state, path)
+
+
+def request_immediate_run(task_key: str, path: Path = STATE_PATH) -> None:
+    """Schedule a task now and preserve that the run was explicitly requested."""
+    state = load_task_schedule(path)
+    task = state["tasks"].setdefault(task_key, {})
+    task["next_run"] = ""
+    task["force_verify"] = True
+    _save(state, path)
+
+
+def is_force_verify_requested(task_key: str, path: Path = STATE_PATH) -> bool:
+    return task_timing(task_key, path).get("force_verify") is True
 
 
 def record_task_execution(

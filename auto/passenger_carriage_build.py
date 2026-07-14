@@ -469,8 +469,8 @@ def start_next_passenger_carriage() -> BuildScreenState | None:
     return BuildScreenState(True, state.remaining_seconds, False)
 
 
-def run_build_monitor() -> bool:
-    """Perform one check; the GUI scheduler wakes this task again when due."""
+def run_build_monitor(*, force_verify: bool = False) -> bool:
+    """Perform one check; explicit manual runs bypass the cached due time."""
     state = load_build_monitor_plan()
     summary = build_monitor_summary(state)
     if not state:
@@ -479,9 +479,11 @@ def run_build_monitor() -> bool:
     if not summary["active"]:
         logger.info(summary["message"])
         return True
-    if state.get("active_due_at") and not summary["due_now"]:
+    if state.get("active_due_at") and not summary["due_now"] and not force_verify:
         logger.info(summary["message"])
         return True
+    if force_verify and state.get("active_due_at") and not summary["due_now"]:
+        logger.info("人工立即执行客厢监控，跳过预计完成时间并实时复核建造状态")
     if state.get("active_due_at"):
         final_carriage = int(state["completed_carriages"]) + 1 >= int(state["target_carriages"])
         screen_state = None

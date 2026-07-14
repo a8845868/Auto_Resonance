@@ -655,6 +655,7 @@ class PassengerPlannerInterface(ScrollArea):
     def buildQueuedTask(self):
         from app.utils.task_queue import QueuedTask
         from auto.passenger_carriage_build import run_build_monitor, stop
+        from core.services.task_schedule_state import is_force_verify_requested
 
         state = load_build_monitor_plan()
         summary = build_monitor_summary(state)
@@ -674,7 +675,9 @@ class PassengerPlannerInterface(ScrollArea):
 
         return QueuedTask(
             "客厢连续建造监控",
-            run_build_monitor,
+            lambda: run_build_monitor(
+                force_verify=is_force_verify_requested("passenger_build_monitor")
+            ),
             stop,
             key="passenger_build_monitor",
             next_run_factory=next_build_check,

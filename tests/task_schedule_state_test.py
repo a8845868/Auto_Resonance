@@ -2,8 +2,10 @@ from datetime import datetime, timedelta
 
 from core.services.task_schedule_state import (
     completed_history,
+    is_force_verify_requested,
     is_task_due,
     record_task_execution,
+    request_immediate_run,
     set_next_run,
     task_timing,
     task_result_deferred,
@@ -17,6 +19,39 @@ def test_empty_next_run_is_due_immediately(tmp_path):
     assert not is_task_due("reward", now, path)
     set_next_run("reward", None, path)
     assert is_task_due("reward", now, path)
+
+
+def test_explicit_immediate_run_requests_one_shot_live_verification(tmp_path):
+    path = tmp_path / "schedule.json"
+    request_immediate_run("passenger_build_monitor", path)
+
+    assert is_task_due("passenger_build_monitor", path=path)
+    assert is_force_verify_requested("passenger_build_monitor", path)
+
+    record_task_execution(
+        "passenger_build_monitor",
+        "客厢连续建造监控",
+        True,
+        datetime(2026, 7, 15, 5, 0, 0),
+        True,
+        datetime(2026, 7, 15, 0, 0, 0),
+        path,
+    )
+
+    assert not is_force_verify_requested("passenger_build_monitor", path)
+
+
+def test_saving_a_future_run_cancels_explicit_live_verification(tmp_path):
+    path = tmp_path / "schedule.json"
+    request_immediate_run("passenger_build_monitor", path)
+
+    set_next_run(
+        "passenger_build_monitor",
+        datetime(2026, 7, 15, 5, 10, 26),
+        path,
+    )
+
+    assert not is_force_verify_requested("passenger_build_monitor", path)
 
 
 def test_execution_persists_last_next_and_completed_history(tmp_path):

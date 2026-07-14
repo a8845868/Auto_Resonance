@@ -13,7 +13,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.services.task_schedule_state import set_next_run, task_timing
+from core.services.task_schedule_state import (
+    request_immediate_run,
+    set_next_run,
+    task_timing,
+)
 
 
 class TaskScheduleCard(QWidget):
@@ -64,14 +68,14 @@ class TaskScheduleCard(QWidget):
                 return
             set_next_run(self.taskKey, parsed)
         else:
-            set_next_run(self.taskKey, None)
+            request_immediate_run(self.taskKey)
         self.nextRunEdit.setStyleSheet("")
         self.refresh()
         self.scheduleChanged.emit()
 
     def clearNextRun(self):
         self.nextRunEdit.clear()
-        set_next_run(self.taskKey, None)
+        request_immediate_run(self.taskKey)
         self.refresh()
         self.scheduleChanged.emit()
 
