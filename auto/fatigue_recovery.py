@@ -45,7 +45,12 @@ def run_daily_fatigue_recovery() -> dict:
             f"当前站点 {station_name} 不设休息区；疲劳规划直接暂缓，"
             "不进入交易所、不吃便当、不更新完成时间"
         )
-        return {}
+        return {
+            "success": True,
+            "deferred": True,
+            "reason": "station_without_rest_area",
+            "station": station_name,
+        }
     if not _open_exchange_buy_page():
         raise RuntimeError("疲劳规划未能进入交易所买入页")
     before = _wait_strength()
@@ -58,13 +63,21 @@ def run_daily_fatigue_recovery() -> dict:
     if not recover_strength("buy", min_available=0, station_name=station_name):
         logger.warning("疲劳恢复条件尚未满足，本次暂缓且不更新完成时间")
         go_home()
-        return {}
+        return {
+            "success": True,
+            "deferred": True,
+            "reason": "recovery_conditions_not_met",
+            "station": station_name,
+            "before": before[0],
+            "maximum": before[1],
+        }
     after = _wait_strength()
     if not after:
         raise RuntimeError("疲劳规划无法读取恢复后疲劳")
     if not go_home():
         raise RuntimeError("疲劳恢复完成，但未能安全返回主界面")
     result = {
+        "success": True,
         "cycle": fatigue_cycle(),
         "before": before[0],
         "after": after[0],
