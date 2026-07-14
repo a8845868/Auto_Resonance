@@ -56,11 +56,25 @@ def _collect_scheduled_rewards(daily: bool, manual: bool):
     """Keep all reward side work inside the reward queue task."""
     result = collect_rewards(daily, manual)
     dispatch_collected = collect_dispatch_rewards()
-    payload = {"task_rewards": result, "dispatch_collected": dispatch_collected}
+    payload = {
+        "success": True,
+        "task_rewards": result,
+        "dispatch_collected": dispatch_collected,
+    }
     if not any(result.values()) and not dispatch_collected:
-        logger.warning("奖励任务没有确认领取任何奖励，本次不记完成，稍后重试")
-        return {}
+        payload.update(
+            deferred=True,
+            reason="nothing_claimed",
+        )
+        logger.info("奖励检查已完成但没有领取到奖励，10 分钟后复核")
     return payload
+
+
+def _history_status_label(status: str) -> str:
+    return {
+        "completed": "完成",
+        "deferred": "等待复核",
+    }.get(status, "失败/停止")
 
 
 class DashboardInterface(ScrollArea):
@@ -210,7 +224,7 @@ class DashboardInterface(ScrollArea):
     def refreshScheduleOverview(self):
         history = completed_history()
         self._completed = [
-            f"{'完成' if item.get('status') == 'completed' else '失败/停止'}  "
+            f"{_history_status_label(item.get('status', ''))}  "
             f"{item.get('name', item.get('key', '任务'))}  ·  {item.get('last_run', '').replace('T', ' ')}"
             for item in history[:12]
         ]

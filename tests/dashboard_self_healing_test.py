@@ -2,7 +2,12 @@ from types import SimpleNamespace
 
 from app.common.config import cfg
 import app.view.dashboard_interface as dashboard_module
-from app.view.dashboard_interface import DashboardInterface
+from app.view.dashboard_interface import (
+    DashboardInterface,
+    _collect_scheduled_rewards,
+    _history_status_label,
+)
+from core.services.task_schedule_state import task_result_deferred, task_result_succeeded
 
 
 class _Panel:
@@ -99,6 +104,78 @@ def test_single_control_button_toggles_scheduler_state():
     DashboardInterface._toggleTaskQueue(dashboard)
 
     assert calls == ["start", "stop"]
+
+
+def test_scheduled_rewards_defer_without_self_healing_when_nothing_is_claimable(monkeypatch):
+    monkeypatch.setattr(
+        dashboard_module,
+        "collect_rewards",
+        lambda daily, manual: {"daily": 0, "manual": 0},
+    )
+    monkeypatch.setattr(
+        dashboard_module,
+        "collect_dispatch_rewards",
+        lambda: False,
+    )
+
+    result = _collect_scheduled_rewards(True, True)
+
+    assert result == {
+        "success": True,
+        "deferred": True,
+        "reason": "nothing_claimed",
+        "task_rewards": {"daily": 0, "manual": 0},
+        "dispatch_collected": False,
+    }
+    assert task_result_succeeded(result)
+    assert task_result_deferred(result)
+
+
+def test_scheduled_rewards_complete_normally_after_a_confirmed_claim(monkeypatch):
+    monkeypatch.setattr(
+        dashboard_module,
+        "collect_rewards",
+        lambda daily, manual: {"daily": 1, "manual": 0},
+    )
+    monkeypatch.setattr(
+        dashboard_module,
+        "collect_dispatch_rewards",
+        lambda: False,
+    )
+
+    result = _collect_scheduled_rewards(True, True)
+
+    assert result["success"] is True
+    assert not task_result_deferred(result)
+
+
+def test_deferred_reward_uses_failure_interval_without_recording_completion(monkeypatch):
+    recorded = []
+    next_run_arguments = []
+    monkeypatch.setattr(
+        dashboard_module,
+        "record_task_execution",
+        lambda *args, **kwargs: recorded.append((args, kwargs)),
+    )
+    task = SimpleNamespace(
+        key="reward_collection",
+        name="领取任务奖励",
+        next_run_after=lambda succeeded: next_run_arguments.append(succeeded) or "retry-at",
+    )
+    dashboard = SimpleNamespace(refreshScheduleOverview=lambda: None)
+    result = {"success": True, "deferred": True, "reason": "nothing_claimed"}
+
+    DashboardInterface._taskCompleted(dashboard, task, True, result)
+
+    assert next_run_arguments == [False]
+    assert recorded[0][0][4] == result
+    assert recorded[0][1] == {"deferred": True}
+
+
+def test_deferred_history_is_not_labelled_as_failure():
+    assert _history_status_label("completed") == "完成"
+    assert _history_status_label("deferred") == "等待复核"
+    assert _history_status_label("failed") == "失败/停止"
 
 
 def test_queue_captures_one_self_healing_policy_snapshot(monkeypatch):

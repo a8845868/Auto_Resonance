@@ -261,16 +261,21 @@ class MainWindow(FluentWindow):
                 self._closeRetryScheduled = True
                 QTimer.singleShot(250, self._retryClose)
             return
+        self.trayIcon.hide()
+        self._stopThemeListener()
+        super().closeEvent(e)
+
+    def _stopThemeListener(self):
+        """Synchronize native listener shutdown before its QObject is deleted."""
         try:
+            self.themeListener.requestInterruption()
             self.themeListener.terminate()
+            self.themeListener.wait(1000)
             self.themeListener.deleteLater()
         except RuntimeError:
             # Qt may deliver a second close event after the listener has
             # already been deleted.
             pass
-        self.trayIcon.hide()
-        super().closeEvent(e)
-
     def _retryClose(self):
         self._closeRetryScheduled = False
         self.close()

@@ -58,6 +58,29 @@ def test_self_healing_halt_prevents_cascading_tasks():
     assert worker.halted_for_repair is True
 
 
+def test_deferred_reward_result_continues_queue_without_reporting_incident():
+    completed = []
+    incidents = []
+    worker = TaskQueueWorker(
+        [
+            QueuedTask(
+                "领取任务奖励",
+                lambda: {"success": True, "deferred": True},
+                key="reward_collection",
+            ),
+            QueuedTask("后续任务", lambda: completed.append("continued") or True),
+        ],
+        incident_reporter=incidents.append,
+        halt_on_failure=True,
+    )
+
+    worker.run()
+
+    assert completed == ["continued"]
+    assert incidents == []
+    assert worker.halted_for_repair is False
+
+
 def test_unexpected_result_keeps_observed_value_in_incident():
     incidents = []
     worker = TaskQueueWorker(
