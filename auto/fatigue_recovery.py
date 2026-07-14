@@ -9,7 +9,9 @@ from core.control.control import connect, input_tap
 from core.preset import get_station, go_outlets
 from core.preset.control import go_home
 from core.services.fatigue_planner import fatigue_cycle
-from core.services.station_facilities import rest_area_availability
+
+
+MINIMUM_TRADING_FATIGUE = 80
 
 
 def _wait_strength(timeout: float = 10.0):
@@ -40,17 +42,6 @@ def run_daily_fatigue_recovery() -> dict:
     station_name = get_station()
     if not station_name:
         raise RuntimeError("疲劳规划未能确认当前站点")
-    if rest_area_availability(station_name) is False:
-        logger.warning(
-            f"当前站点 {station_name} 不设休息区；疲劳规划直接暂缓，"
-            "不进入交易所、不吃便当、不更新完成时间"
-        )
-        return {
-            "success": True,
-            "deferred": True,
-            "reason": "station_without_rest_area",
-            "station": station_name,
-        }
     if not _open_exchange_buy_page():
         raise RuntimeError("疲劳规划未能进入交易所买入页")
     before = _wait_strength()
@@ -60,7 +51,11 @@ def run_daily_fatigue_recovery() -> dict:
         f"开始每日疲劳规划: {before[0]}/{before[1]}；"
         "先用气泡水，再判断全部便当是否会浪费"
     )
-    if not recover_strength("buy", min_available=0, station_name=station_name):
+    if not recover_strength(
+        "buy",
+        min_available=MINIMUM_TRADING_FATIGUE,
+        station_name=station_name,
+    ):
         logger.warning("疲劳恢复条件尚未满足，本次暂缓且不更新完成时间")
         go_home()
         return {

@@ -10,7 +10,7 @@ from typing import Any, Dict, Literal
 
 from loguru import logger
 
-from auto.module.strength import can_afford_fatigue, prepare_negotiation
+from auto.module.strength import can_afford_fatigue, prepare_negotiation, read_strength
 from auto.run_business.buy import buy_business
 from auto.run_business.sell import (
     has_sellable_cargo,
@@ -30,6 +30,10 @@ from core.preset import click_station, get_station, go_outlets, wait_gbr
 from core.preset.control import click, go_home
 from core.preset.station import STATION
 from core.services.screen_state import is_train_in_transit
+from core.services.task_schedule_state import (
+    task_result_deferred,
+    task_result_succeeded,
+)
 from core.utils.utils import read_json, RESOURCES_PATH
 from core.services.game_recovery import is_game_running, recover_game
 
@@ -58,6 +62,51 @@ def _read_route_city_from_current_screen(routes: RoutesModel):
         (city for city in cities if any(city in text for text in texts)),
         None,
     )
+
+
+def _fatigue_deferral(reason: str, required_available: int):
+    """Build a scheduler-safe deferral only for a verified fatigue shortage."""
+    strength = read_strength()
+    if strength is None:
+        logger.error("Unable to verify fatigue shortage; keep the task failed")
+        return None
+    current, maximum = strength
+    available = maximum - current
+    logger.warning(
+        f"Trading deferred: {reason}; available fatigue {available}, "
+        f"required {required_available}"
+    )
+    return {
+        "success": True,
+        "deferred": True,
+        "reason": reason,
+        "current": current,
+        "maximum": maximum,
+        "available": available,
+        "required_available": max(0, int(required_available)),
+    }
+
+
+def _clear_residual_cargo(residual_goods: list[str]):
+    """Clear route cargo left by an interrupted run before restocking."""
+    cargo_selected = is_all_cargo_selected()
+    if cargo_selected:
+        logger.info("All cargo is already selected with a positive quote; skip cargo-name scan")
+    if not (cargo_selected or has_sellable_cargo(residual_goods)):
+        return True
+
+    sell_haggle = _prepare_max_sell_haggle()
+    if sell_haggle == 0:
+        # Preserve the cargo and the maximum-sale policy. Resource exhaustion
+        # is an expected scheduling deferral, not a repair-worthy failure.
+        return _fatigue_deferral(
+            "insufficient_fatigue_for_residual_sale",
+            required_available=80,
+        ) or False
+    if not sell_existing_cargo(sell_haggle, expected_goods=residual_goods):
+        logger.error("Failed to clear residual cargo; stop before restocking")
+        return False
+    return True
 
 
 def _route_city_names(routes: RoutesModel) -> set[str]:
@@ -249,20 +298,11 @@ def run(routes: RoutesModel, recovery_attempts: int = 2):
         None,
     )
     residual_goods = list(residual_route.goods_data) if residual_route else []
-    cargo_selected = is_all_cargo_selected()
-    if cargo_selected:
-        logger.info("All cargo is already selected with a positive quote; skip cargo-name scan")
-    if cargo_selected or has_sellable_cargo(residual_goods):
-        sell_haggle = _prepare_max_sell_haggle()
-        if sell_haggle == 0:
-            logger.error(
-                "Unable to prepare the maximum sell bargain; stop without "
-                "selling residual cargo"
-            )
-            return False
-        if not sell_existing_cargo(sell_haggle, expected_goods=residual_goods):
-            logger.error("Failed to clear residual cargo; stop before restocking")
-            return False
+    residual_result = _clear_residual_cargo(residual_goods)
+    if task_result_deferred(residual_result):
+        return residual_result
+    if not residual_result:
+        return False
     for city in routes.city_data:
         logger.info(f"{city.buy_city_name}->{city.sell_city_name}")
         if not click_station(city.buy_city_name, cur_station=city_name).wait():
@@ -278,7 +318,10 @@ def run(routes: RoutesModel, recovery_attempts: int = 2):
             logger.warning(
                 "恢复资源已用完，剩余疲劳不足以到达下一城市，本轮不进货并暂停"
             )
-            return False
+            return _fatigue_deferral(
+                "insufficient_fatigue_for_route",
+                required_available=travel_cost,
+            ) or False
         goods_data = list(city.goods_data.keys())
         buy_business(
             goods_data[:1],
@@ -295,8 +338,10 @@ def run(routes: RoutesModel, recovery_attempts: int = 2):
         # regardless of the per-city buy-side haggle setting.
         sell_haggle = _prepare_max_sell_haggle()
         if sell_haggle == 0:
-            logger.error("Unable to prepare the maximum sell bargain; stop without selling")
-            return False
+            return _fatigue_deferral(
+                "insufficient_fatigue_for_endpoint_sale",
+                required_available=80,
+            ) or False
         if not sell_business(
             sell_haggle,
             expected_goods=list(city.goods_data),
@@ -363,7 +408,10 @@ def two_city_run(buy_city_name: str, sell_city_name: str):
     )
     logger.info(f"准备运行端点跑商，运行次数: {count}")
     for i in range(count):
-        if not run_with_recovery(routes) or is_stopped():
+        result = run_with_recovery(routes)
+        if task_result_deferred(result):
+            return result
+        if not task_result_succeeded(result) or is_stopped():
             logger.warning(f"端点跑商未完成，已完成 {i}/{count} 轮")
             return False
     return True
@@ -415,7 +463,13 @@ def two_city_weekly_run(
                     ),
                 ]
             )
-            if not run_with_recovery(routes) or is_stopped():
+            result = run_with_recovery(routes)
+            if task_result_deferred(result):
+                logger.info(
+                    f"周计划资源暂缓，本次已完成 {completed}/{total_runs} 次完整往返"
+                )
+                return result
+            if not task_result_succeeded(result) or is_stopped():
                 logger.info(f"周计划停止，本次已完成 {completed}/{total_runs} 次完整往返")
                 return False
             completed += 1

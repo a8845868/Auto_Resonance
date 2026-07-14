@@ -164,6 +164,28 @@ def test_recovery_defers_lunches_when_non_wasteful_drink_requires_another_city()
     lunches.assert_not_called()
 
 
+def test_recovery_uses_safe_lunches_at_no_rest_station_for_urgent_shortfall():
+    with patch.object(
+        strength, "read_strength", side_effect=[(791, 816), (600, 816)]
+    ), patch.object(
+        strength, "_open_fatigue_panel", return_value=True
+    ) as open_panel, patch.object(
+        strength,
+        "_use_free_rest_area",
+        return_value=strength.RestAreaRecovery(791, "unavailable"),
+    ), patch.object(
+        strength, "_use_all_safe_lunchboxes", return_value=600
+    ) as lunches, patch.object(
+        strength, "_return_to_trade", return_value=True
+    ):
+        assert strength.recover_strength(
+            "buy", min_available=80, station_name="武林源"
+        )
+
+    open_panel.assert_called_once()
+    lunches.assert_called_once_with(791)
+
+
 def test_negotiation_no_longer_starts_recovery_inside_trading():
     with patch.object(strength, "read_strength", return_value=(800, 816)), patch.object(
         strength, "recover_strength"
