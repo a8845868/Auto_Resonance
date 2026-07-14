@@ -27,6 +27,12 @@ def _stable_enrichment(monkeypatch):
     monkeypatch.setattr(self_healing, "_read_git_revision", lambda: "abc123")
     monkeypatch.setattr(self_healing, "_runtime_snapshot", lambda: None)
     monkeypatch.setattr(self_healing, "_tail", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(self_healing, "_complete_log_boundary", lambda *_args: (0, ""))
+    monkeypatch.setattr(
+        self_healing,
+        "_main_worktree_preflight",
+        lambda: {"dirty": False, "signature": "", "changed_files": []},
+    )
 
 
 def test_disabled_dispatch_still_records_incident(tmp_path, monkeypatch):
@@ -195,6 +201,139 @@ def test_different_fingerprints_share_one_global_runner(tmp_path, monkeypatch):
     assert len(self_healing.pending_dispatches(tmp_path)) == 2
 
 
+def test_dirty_worktree_preflight_deduplicates_without_spawning_runner(
+    tmp_path, monkeypatch
+):
+    _stable_enrichment(monkeypatch)
+    monkeypatch.setattr(
+        self_healing,
+        "_main_worktree_preflight",
+        lambda: {
+            "dirty": True,
+            "signature": "same-dirty-state",
+            "changed_files": ["core/services/self_healing.py"],
+        },
+    )
+    monkeypatch.setattr(
+        self_healing.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("spawned")),
+    )
+    first_incident = _incident()
+    first_incident["observed"] = "first failure"
+    second_incident = _incident()
+    second_incident["observed"] = "second failure"
+
+    first = self_healing.submit_incident(
+        first_incident,
+        dispatch=True,
+        allow_repair=True,
+        storage_root=tmp_path,
+        allow_during_tests=True,
+    )
+    second = self_healing.submit_incident(
+        second_incident,
+        dispatch=True,
+        allow_repair=True,
+        storage_root=tmp_path,
+        allow_during_tests=True,
+    )
+
+    assert first.reason == second.reason == "main_worktree_dirty"
+    assert first.dispatched is second.dispatched is False
+    assert self_healing.pending_dispatches(tmp_path) == []
+    status_paths = list((tmp_path / "runs").glob("*/status.json"))
+    assert len(status_paths) == 1
+    status = json.loads(status_paths[0].read_text(encoding="utf-8"))
+    assert status["preflight_only"] is True
+    assert status["codex_not_started"] is True
+    assert status["suppressed_count"] == 2
+    assert len(status["related_incident_ids"]) == 2
+    assert status["main_worktree_changed_files"] == [
+        "core/services/self_healing.py"
+    ]
+
+
+def test_dirty_preflight_allows_same_incident_after_worktree_is_clean(
+    tmp_path, monkeypatch
+):
+    _stable_enrichment(monkeypatch)
+    state = {"dirty": True}
+
+    def preflight():
+        return {
+            "dirty": state["dirty"],
+            "signature": "dirty-state" if state["dirty"] else "",
+            "changed_files": ["changed.py"] if state["dirty"] else [],
+        }
+
+    calls = []
+    monkeypatch.setattr(self_healing, "_main_worktree_preflight", preflight)
+    monkeypatch.setattr(
+        self_healing.subprocess,
+        "Popen",
+        lambda argv, **kwargs: calls.append((argv, kwargs)),
+    )
+
+    blocked = self_healing.submit_incident(
+        _incident(),
+        dispatch=True,
+        storage_root=tmp_path,
+        allow_during_tests=True,
+    )
+    state["dirty"] = False
+    retried = self_healing.submit_incident(
+        _incident(),
+        dispatch=True,
+        storage_root=tmp_path,
+        allow_during_tests=True,
+    )
+
+    assert blocked.reason == "main_worktree_dirty"
+    assert retried.dispatched is True
+    assert len(calls) == 1
+    assert not self_healing._preflight_blocker_path(tmp_path).exists()
+
+
+def test_worktree_becoming_dirty_during_enqueue_rolls_back_pending_and_claim(
+    tmp_path, monkeypatch
+):
+    _stable_enrichment(monkeypatch)
+    checks = iter(
+        (
+            {"dirty": False, "signature": "", "changed_files": []},
+            {
+                "dirty": True,
+                "signature": "raced-dirty-state",
+                "changed_files": ["raced.py"],
+            },
+            {
+                "dirty": True,
+                "signature": "raced-dirty-state",
+                "changed_files": ["raced.py"],
+            },
+        )
+    )
+    monkeypatch.setattr(self_healing, "_main_worktree_preflight", lambda: next(checks))
+    monkeypatch.setattr(
+        self_healing.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("spawned")),
+    )
+
+    result = self_healing.submit_incident(
+        _incident(),
+        dispatch=True,
+        storage_root=tmp_path,
+        allow_during_tests=True,
+    )
+
+    assert result.reason == "main_worktree_dirty"
+    assert self_healing.pending_dispatches(tmp_path) == []
+    claims = list((tmp_path / "dispatch" / "claims").glob("*.json"))
+    assert claims == []
+
+
 def test_dispatch_disallowed_context_never_spawns(tmp_path, monkeypatch):
     _stable_enrichment(monkeypatch)
     monkeypatch.setattr(
@@ -262,6 +401,55 @@ def test_log_monitor_starts_at_eof_then_discovers_appended_failure(
     assert second[0].incident_path is not None
     document = json.loads(second[0].incident_path.read_text(encoding="utf-8"))
     assert document["context"]["git_revision"] == "abc123"
+
+
+def test_structured_batch_incident_covers_same_batch_log_lines(tmp_path, monkeypatch):
+    root = tmp_path / "repository"
+    logs = root / "logs"
+    logs.mkdir(parents=True)
+    debug_log = logs / "debug.log"
+    debug_log.write_text("12:00:00 | INFO | startup complete\n", encoding="utf-8")
+    storage = tmp_path / "incidents"
+    monkeypatch.setattr(self_healing, "ROOT", root)
+    monkeypatch.setattr(self_healing, "_read_git_revision", lambda: "abc123")
+    monkeypatch.setattr(self_healing, "_runtime_snapshot", lambda: None)
+
+    assert self_healing.discover_log_incidents(
+        dispatch=False,
+        storage_root=storage,
+        allow_during_tests=True,
+    ) == []
+    with debug_log.open("a", encoding="utf-8") as stream:
+        stream.write("12:00:01 | ERROR | auto.run:1 - batch failure\n")
+
+    incident = _incident(batch_id="batch-1")
+    incident["source"] = "task_queue"
+    recorded = self_healing.submit_incident(
+        incident,
+        dispatch=False,
+        storage_root=storage,
+        allow_during_tests=True,
+    )
+
+    assert recorded.reason == "recorded_only"
+    document = json.loads(recorded.incident_path.read_text(encoding="utf-8"))
+    assert "batch failure" in document["context"]["recent_debug_log"]
+    assert document["context"]["recent_debug_log_covered_offset"] > 0
+    assert self_healing.discover_log_incidents(
+        dispatch=False,
+        storage_root=storage,
+        allow_during_tests=True,
+    ) == []
+
+    with debug_log.open("a", encoding="utf-8") as stream:
+        stream.write("12:00:02 | ERROR | auto.run:2 - later failure\n")
+    later = self_healing.discover_log_incidents(
+        dispatch=False,
+        storage_root=storage,
+        allow_during_tests=True,
+    )
+    assert len(later) == 1
+    assert later[0].incident_path is not None
 
 
 def test_spawn_failure_releases_claim_for_retry(tmp_path, monkeypatch):

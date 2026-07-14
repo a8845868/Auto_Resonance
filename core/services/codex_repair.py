@@ -30,6 +30,10 @@ REPAIR_ENV_VAR = "HEIYUE_CODEX_REPAIR"
 RUNNER_ENV_VAR = "HEIYUE_SELF_HEALING_RUNNER"
 RUNTIME_DIR_ENV_VAR = "HEIYUE_RUNTIME_DIR"
 TEST_PYTHON_ENV_VAR = "HEIYUE_TEST_PYTHON"
+CODEX_AUTOMATIC_WEB_SEARCH_MODE = "disabled"
+CODEX_AUTOMATIC_REASONING_EFFORT = "low"
+CODEX_AUTOMATIC_SERVICE_TIER = "fast"
+CODEX_AUTOMATIC_FAST_MODE = True
 MAX_CAPTURE_CHARS = 2_000_000
 MAX_VISIBLE_OUTPUT_CHARS = 100_000
 MAX_GIT_MARKER_BYTES = 4_096
@@ -599,6 +603,10 @@ class RepairResult:
     branch_name: str = ""
     codex_output_path: str = ""
     codex_returncode: int | None = None
+    codex_web_search_mode: str = CODEX_AUTOMATIC_WEB_SEARCH_MODE
+    codex_reasoning_effort: str = CODEX_AUTOMATIC_REASONING_EFFORT
+    codex_service_tier: str = CODEX_AUTOMATIC_SERVICE_TIER
+    codex_fast_mode: bool = CODEX_AUTOMATIC_FAST_MODE
     validation_returncode: int | None = None
     changed_files: list[str] = field(default_factory=list)
 
@@ -936,11 +944,13 @@ class CodexRepairExecutor:
             "--ephemeral",
             "--ignore-user-config",
             "-c",
-            'model_reasoning_effort="minimal"',
+            f'web_search="{result.codex_web_search_mode}"',
             "-c",
-            'service_tier="fast"',
+            f'model_reasoning_effort="{result.codex_reasoning_effort}"',
             "-c",
-            "features.fast_mode=true",
+            f'service_tier="{result.codex_service_tier}"',
+            "-c",
+            f"features.fast_mode={str(result.codex_fast_mode).lower()}",
             "--json",
             *permission_arguments,
             "-C",
@@ -1467,6 +1477,10 @@ Prior same-fingerprint experience:
                         "attempt_id": result.attempt_id,
                         "worktree_path": result.worktree_path,
                         "branch_name": result.branch_name,
+                        "codex_web_search_mode": result.codex_web_search_mode,
+                        "codex_reasoning_effort": result.codex_reasoning_effort,
+                        "codex_service_tier": result.codex_service_tier,
+                        "codex_fast_mode": result.codex_fast_mode,
                         "changed_files": result.changed_files,
                         "validation_returncode": result.validation_returncode,
                     },

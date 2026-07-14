@@ -26,6 +26,11 @@ def test_drain_processes_pending_incidents_serially_and_releases_global_claim(
     monkeypatch.setattr(self_healing, "_read_git_revision", lambda: "abc123")
     monkeypatch.setattr(self_healing, "_runtime_snapshot", lambda: None)
     monkeypatch.setattr(self_healing, "_tail", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(
+        self_healing,
+        "_main_worktree_preflight",
+        lambda: {"dirty": False, "signature": "", "changed_files": []},
+    )
     spawned = []
     monkeypatch.setattr(
         self_healing.subprocess,

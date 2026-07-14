@@ -13,6 +13,10 @@ from qfluentwidgets import PlainTextEdit, ScrollArea
 from app.common.config import cfg
 from app.common.style_sheet import StyleSheet
 from core.services.codex_repair import (
+    CODEX_AUTOMATIC_FAST_MODE,
+    CODEX_AUTOMATIC_REASONING_EFFORT,
+    CODEX_AUTOMATIC_SERVICE_TIER,
+    CODEX_AUTOMATIC_WEB_SEARCH_MODE,
     DEFAULT_STORAGE_ROOT as SELF_HEALING_STORAGE_ROOT,
     list_legacy_worktrees,
     list_run_statuses,
@@ -153,11 +157,38 @@ def _self_healing_status_lines(status, *, enabled, allow_repair):
         status.get("codex_output_path") or status.get("output_path")
     )
     status_path = _one_line(status.get("run_path") or status.get("status_path"))
+    strategy_persisted = "codex_reasoning_effort" in status
+    reasoning_effort = (
+        _one_line(status.get("codex_reasoning_effort"))
+        or CODEX_AUTOMATIC_REASONING_EFFORT
+    )
+    service_tier = (
+        _one_line(status.get("codex_service_tier"))
+        or CODEX_AUTOMATIC_SERVICE_TIER
+    )
+    web_search_mode = (
+        _one_line(status.get("codex_web_search_mode"))
+        or CODEX_AUTOMATIC_WEB_SEARCH_MODE
+    )
+    fast_mode = status.get("codex_fast_mode", CODEX_AUTOMATIC_FAST_MODE)
+    if status.get("preflight_only"):
+        strategy_source = "当前默认；预检已阻止，Codex 未启动"
+    elif strategy_persisted:
+        strategy_source = "本次运行"
+    elif raw_status and raw_status.casefold() != "queued":
+        strategy_source = "当前默认；该旧记录未保存实际参数"
+    else:
+        strategy_source = "当前默认"
 
     lines = [
         f"{state_caption}: {state_text}",
         f"自愈模式: {mode_label}（{mode}）",
-        "Codex 策略: minimal reasoning · Fast",
+        (
+            f"Codex 策略（{strategy_source}）: reasoning={reasoning_effort} · "
+            f"service_tier={service_tier} · "
+            f"fast_mode={'on' if fast_mode else 'off'} · "
+            f"web_search={web_search_mode}"
+        ),
         f"branch_name: {branch_name or '—'}",
         f"worktree_path: {worktree_path or '—'}",
     ]
@@ -167,6 +198,22 @@ def _self_healing_status_lines(status, *, enabled, allow_repair):
             lines.append(f"{key}: {value}")
     if reason:
         lines.append(f"失败原因/说明: {reason}")
+    if status.get("preflight_only"):
+        lines.append("预检结果: 主工作树存在未提交修改，Codex 未启动")
+    try:
+        suppressed_count = int(status.get("suppressed_count", 0) or 0)
+    except (TypeError, ValueError):
+        suppressed_count = 0
+    if suppressed_count > 1:
+        lines.append(
+            f"已合并阻止: {suppressed_count} 个事故（未重复打开 Codex CLI）"
+        )
+    dirty_files = status.get("main_worktree_changed_files") or []
+    if isinstance(dirty_files, (list, tuple)) and dirty_files:
+        preview = ", ".join(_one_line(item, 160) for item in dirty_files[:8])
+        if len(dirty_files) > 8:
+            preview += f" 等 {len(dirty_files)} 项"
+        lines.append(f"主工作树修改: {preview}")
     if output_path:
         lines.append(f"输出路径: {output_path}")
     if status_path and status_path != output_path:

@@ -288,9 +288,15 @@ def test_diagnosis_uses_read_only_noninteractive_codex_and_runtime_guards(
     assert Path(result.codex_output_path).is_file()
     assert "done" in Path(result.codex_output_path).read_text(encoding="utf-8")
     config = _parsed_config(codex_argv)
-    assert config["model_reasoning_effort"] == "minimal"
+    assert config["web_search"] == "disabled"
+    assert config["model_reasoning_effort"] == "low"
     assert config["service_tier"] == "fast"
     assert config["features"]["fast_mode"] is True
+    status = json.loads(Path(result.run_path).read_text(encoding="utf-8"))
+    assert status["codex_web_search_mode"] == config["web_search"]
+    assert status["codex_reasoning_effort"] == config["model_reasoning_effort"]
+    assert status["codex_service_tier"] == config["service_tier"]
+    assert status["codex_fast_mode"] == config["features"]["fast_mode"]
     if sys.platform == "win32":
         assert config["windows"]["sandbox"] == "elevated"
     profile = config["permissions"]["heiyue_diagnose"]
@@ -310,6 +316,47 @@ def test_diagnosis_uses_read_only_noninteractive_codex_and_runtime_guards(
     assert filesystem[str(repository.resolve() / ".venv")] == "read"
     assert filesystem[kwargs["env"]["TEMP"]] == "write"
     assert profile["network"]["enabled"] is False
+
+
+def test_installed_codex_low_fast_smoke_disables_web_search(tmp_path):
+    if os.environ.get("HEIYUE_RUN_CODEX_MODEL_SMOKE") != "1":
+        pytest.skip("requires an explicit real Codex model smoke run")
+    codex = discover_codex_executable()
+    if codex is None:
+        pytest.skip("Codex CLI is not installed")
+
+    runner = _Runner(changed=False)
+    executor, _repository, storage = _executor(tmp_path, runner)
+    result = executor.process(_incident(storage))
+    codex_argv, kwargs = next(
+        call
+        for call in runner.calls
+        if Path(call[0][0]).name == "codex.exe" and "exec" in call[0]
+    )
+    codex_argv[0] = codex
+
+    completed = subprocess.run(
+        codex_argv,
+        cwd=kwargs["cwd"],
+        env=kwargs["env"],
+        input=(
+            "Do not use tools or edit files. Reply with exactly "
+            "SELF_HEAL_SMOKE_OK."
+        ),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        timeout=90,
+        shell=False,
+    )
+
+    combined_output = f"{completed.stdout}\n{completed.stderr}"
+    assert completed.returncode == 0, combined_output
+    assert "cannot be used with reasoning.effort 'low'" not in combined_output
+    assert "Unsupported value: 'low'" not in combined_output
+    assert "SELF_HEAL_SMOKE_OK" in completed.stdout
+    assert result.status == "diagnosed"
 
 
 def test_repair_keeps_detached_candidate_without_executing_model_authored_code(
@@ -1063,6 +1110,10 @@ def test_running_status_exposes_project_worktree_and_branch_before_codex(tmp_pat
     assert result.status == "candidate_unvalidated"
     assert observed["status"] == "codex_running"
     assert observed["branch_name"] == result.branch_name
+    assert observed["codex_web_search_mode"] == "disabled"
+    assert observed["codex_reasoning_effort"] == "low"
+    assert observed["codex_service_tier"] == "fast"
+    assert observed["codex_fast_mode"] is True
     assert Path(observed["worktree_path"]).is_relative_to(
         repository / "_worktrees"
     )

@@ -78,6 +78,10 @@ def test_status_text_exposes_strategy_branch_worktree_and_paths():
                 "started_at": "2026-07-14T08:53:10Z",
                 "finished_at": "2026-07-14T08:53:11Z",
                 "reason": "diagnosing_failure",
+                "codex_reasoning_effort": "high",
+                "codex_service_tier": "standard",
+                "codex_fast_mode": False,
+                "codex_web_search_mode": "disabled",
                 "codex_output_path": r"C:\project\logs\codex-output.jsonl",
                 "run_path": r"C:\project\logs\status.json",
             },
@@ -87,7 +91,11 @@ def test_status_text_exposes_strategy_branch_worktree_and_paths():
     )
 
     assert "Codex 运行中" in text
-    assert "minimal reasoning · Fast" in text
+    assert "Codex 策略（本次运行）" in text
+    assert "reasoning=high" in text
+    assert "service_tier=standard" in text
+    assert "fast_mode=off" in text
+    assert "web_search=disabled" in text
     assert "codex/self-heal/incident-attempt" in text
     assert "_worktrees" in text
     assert "incident_id: incident" in text
@@ -105,6 +113,35 @@ def test_status_text_exposes_strategy_branch_worktree_and_paths():
         )
     )
     assert "最近状态: 已阻止（blocked）" in terminal
+    assert "Codex 策略（当前默认；该旧记录未保存实际参数）" in terminal
+    assert "reasoning=low" in terminal
+
+
+def test_dirty_preflight_status_says_codex_was_not_started_and_is_merged():
+    text = "\n".join(
+        debug_module._self_healing_status_lines(
+            {
+                "status": "blocked",
+                "mode": "repair",
+                "reason": "main_worktree_dirty",
+                "preflight_only": True,
+                "codex_not_started": True,
+                "suppressed_count": 3,
+                "main_worktree_changed_files": [
+                    "core/services/self_healing.py",
+                    "tests/self_healing_test.py",
+                ],
+            },
+            enabled=True,
+            allow_repair=True,
+        )
+    )
+
+    assert "预检已阻止，Codex 未启动" in text
+    assert "主工作树存在未提交修改，Codex 未启动" in text
+    assert "已合并阻止: 3 个事故" in text
+    assert "未重复打开 Codex CLI" in text
+    assert "core/services/self_healing.py" in text
 
 
 def test_output_reader_handles_native_json_wrappers_and_old_plain_text(tmp_path):

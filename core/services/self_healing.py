@@ -35,6 +35,8 @@ STORAGE_ENV_VAR = "HEIYUE_SELF_HEALING_STORAGE_ROOT"
 GLOBAL_CLAIM_ENV_VAR = "HEIYUE_SELF_HEALING_GLOBAL_CLAIM"
 GLOBAL_TOKEN_ENV_VAR = "HEIYUE_SELF_HEALING_GLOBAL_TOKEN"
 DEFAULT_COOLDOWN_SECONDS = 60 * 60
+PREFLIGHT_GIT_TIMEOUT_SECONDS = 3.0
+MAX_PREFLIGHT_CHANGED_FILES = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +123,27 @@ def _tail(path: Path, *, max_bytes: int = 24_000, max_lines: int = 80) -> str:
     return "\n".join(text.splitlines()[-max_lines:])
 
 
+def _complete_log_boundary(path: Path, *, max_bytes: int = 64_000) -> tuple[int, str]:
+    """Return the last complete-line byte boundary and current file identity."""
+
+    try:
+        with path.open("rb") as stream:
+            stat_result = os.fstat(stream.fileno())
+            size = int(stat_result.st_size)
+            start = max(0, size - max_bytes)
+            stream.seek(start)
+            payload = stream.read(size - start)
+    except OSError:
+        return 0, ""
+    newline_at = max(payload.rfind(b"\n"), payload.rfind(b"\r"))
+    boundary = start + newline_at + 1 if newline_at >= 0 else 0
+    identity = (
+        f"{getattr(stat_result, 'st_dev', 0)}:"
+        f"{getattr(stat_result, 'st_ino', 0)}"
+    )
+    return boundary, identity
+
+
 def _runtime_snapshot() -> Mapping[str, Any] | None:
     try:
         from core.services.runtime_control import runtime_owner
@@ -138,9 +161,14 @@ def _base_context(*, include_recent_log: bool) -> dict[str, Any]:
         "runtime_owner": _runtime_snapshot(),
     }
     if include_recent_log:
-        recent_log = _tail(ROOT / "logs" / "debug.log")
+        debug_log = ROOT / "logs" / "debug.log"
+        covered_offset, log_identity = _complete_log_boundary(debug_log)
+        recent_log = _tail(debug_log)
         if recent_log:
             context["recent_debug_log"] = recent_log
+        if covered_offset:
+            context["recent_debug_log_covered_offset"] = covered_offset
+            context["recent_debug_log_identity"] = log_identity
     return context
 
 
@@ -155,6 +183,31 @@ def _enrich_incident(value: Incident | Mapping[str, Any]) -> Incident | Mapping[
         context.setdefault(key, item)
     document["context"] = context
     return document
+
+
+def _merge_structured_batch_logs(
+    store: IncidentLearningStore,
+    incident: Incident,
+) -> None:
+    """Fold complete debug-log lines from a structured batch into its evidence."""
+
+    if incident.source != "task_queue":
+        return
+    context = incident.context if isinstance(incident.context, Mapping) else {}
+    batch_id = str(context.get("batch_id") or "").strip()
+    try:
+        covered_offset = int(context.get("recent_debug_log_covered_offset") or 0)
+    except (TypeError, ValueError):
+        return
+    if not batch_id or covered_offset <= 0:
+        return
+    store.advance_log_cursor(
+        ROOT / "logs" / "debug.log",
+        covered_offset,
+        expected_identity=str(context.get("recent_debug_log_identity") or ""),
+        batch_id=batch_id,
+        incident_id=incident.id,
+    )
 
 
 def _claim_dispatch(
@@ -224,6 +277,149 @@ def _write_json_atomic(path: Path, document: Mapping[str, Any]) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _main_worktree_preflight() -> dict[str, Any] | None:
+    """Inspect the checkout before any visible runner process is created."""
+
+    try:
+        completed = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            cwd=str(ROOT),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=PREFLIGHT_GIT_TIMEOUT_SECONDS,
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    payload = completed.stdout or ""
+    if not payload.strip("\0\r\n"):
+        return {"dirty": False, "signature": "", "changed_files": []}
+
+    changed_files: list[str] = []
+    entries = payload.split("\0")
+    index = 0
+    while index < len(entries) and len(changed_files) < MAX_PREFLIGHT_CHANGED_FILES:
+        entry = entries[index]
+        index += 1
+        if len(entry) < 4:
+            continue
+        status = entry[:2]
+        path = entry[3:]
+        if path:
+            changed_files.append(path)
+        if ("R" in status or "C" in status) and index < len(entries):
+            source = entries[index]
+            index += 1
+            if source and len(changed_files) < MAX_PREFLIGHT_CHANGED_FILES:
+                changed_files.append(source)
+    return {
+        "dirty": True,
+        "signature": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        "changed_files": changed_files,
+    }
+
+
+def _preflight_blocker_path(storage_root: Path) -> Path:
+    return storage_root / "dispatch" / "blockers" / "main-worktree-dirty.json"
+
+
+def _clear_preflight_blocker(storage_root: Path) -> None:
+    _preflight_blocker_path(storage_root).unlink(missing_ok=True)
+
+
+def _record_dirty_preflight_block(
+    incident: Incident,
+    *,
+    allow_repair: bool,
+    storage_root: Path,
+    preflight: Mapping[str, Any],
+) -> None:
+    """Persist one live blocked status for all incidents sharing dirty state."""
+
+    blocker_path = _preflight_blocker_path(storage_root)
+    marker = _read_json(blocker_path) or {}
+    signature = str(preflight.get("signature") or "")
+    runs_dir = (storage_root / "runs").resolve()
+    status_path: Path | None = None
+    status: dict[str, Any] | None = None
+    if marker.get("signature") == signature:
+        candidate = Path(str(marker.get("status_path") or ""))
+        try:
+            candidate = candidate.resolve()
+            if candidate.is_relative_to(runs_dir):
+                status = _read_json(candidate)
+                if status:
+                    status_path = candidate
+        except (OSError, ValueError):
+            status = None
+
+    now = _utc_now()
+    if status is None or status_path is None:
+        attempt_id = uuid.uuid4().hex
+        run_dir = runs_dir / f"preflight-main-worktree-dirty-{attempt_id[:12]}"
+        status_path = run_dir / "status.json"
+        status = {
+            "attempt_id": attempt_id,
+            "started_at": now,
+            "suppressed_count": 0,
+            "related_incident_ids": [],
+        }
+
+    related_ids = [
+        str(item)
+        for item in status.get("related_incident_ids", [])
+        if str(item).strip()
+    ]
+    if incident.id not in related_ids:
+        related_ids.append(incident.id)
+    del related_ids[:-50]
+    status.update(
+        {
+            "incident_id": incident.id,
+            "latest_incident_id": incident.id,
+            "fingerprint": incident.fingerprint,
+            "mode": "repair" if allow_repair else "diagnose",
+            "status": "blocked",
+            "reason": "main_worktree_dirty",
+            "finished_at": now,
+            "updated_at": now,
+            "run_path": str(status_path),
+            "worktree_path": "",
+            "branch_name": "",
+            "codex_output_path": "",
+            "codex_returncode": None,
+            "validation_returncode": None,
+            "changed_files": [],
+            "main_worktree_changed_files": list(
+                preflight.get("changed_files") or []
+            )[:MAX_PREFLIGHT_CHANGED_FILES],
+            "preflight_only": True,
+            "codex_not_started": True,
+            "preflight_signature": signature,
+            "suppressed_count": int(status.get("suppressed_count", 0)) + 1,
+            "related_incident_ids": related_ids,
+        }
+    )
+    _write_json_atomic(status_path, status)
+    _write_json_atomic(
+        blocker_path,
+        {
+            "reason": "main_worktree_dirty",
+            "signature": signature,
+            "status_path": str(status_path),
+            "updated_at": now,
+        },
+    )
 
 
 def _process_is_current(document: Mapping[str, Any]) -> bool:
@@ -434,6 +630,11 @@ def _spawn_runner(
 def _ensure_global_runner(storage_root: Path) -> str:
     if not pending_dispatches(storage_root):
         return "empty"
+    preflight = _main_worktree_preflight()
+    if preflight and preflight.get("dirty"):
+        return "main_worktree_dirty"
+    if preflight is not None:
+        _clear_preflight_blocker(storage_root)
     global_claim = claim_global_dispatch(storage_root)
     if global_claim is None:
         return "active"
@@ -463,6 +664,22 @@ def _dispatch_saved(
     context = incident.context if isinstance(incident.context, Mapping) else {}
     if context.get("dispatch_allowed") is False:
         return SubmissionResult(path, incident.fingerprint, False, "dispatch_disallowed")
+    preflight = _main_worktree_preflight()
+    if preflight and preflight.get("dirty"):
+        _record_dirty_preflight_block(
+            incident,
+            allow_repair=allow_repair,
+            storage_root=storage_root,
+            preflight=preflight,
+        )
+        return SubmissionResult(
+            path,
+            incident.fingerprint,
+            False,
+            "main_worktree_dirty",
+        )
+    if preflight is not None:
+        _clear_preflight_blocker(storage_root)
     claim, reason = _claim_dispatch(
         storage_root,
         incident.fingerprint,
@@ -476,7 +693,7 @@ def _dispatch_saved(
             _ensure_global_runner(storage_root)
         return SubmissionResult(path, incident.fingerprint, False, reason)
     try:
-        _enqueue_dispatch(
+        pending_path = _enqueue_dispatch(
             incident,
             allow_repair=allow_repair,
             storage_root=storage_root,
@@ -485,6 +702,26 @@ def _dispatch_saved(
         claim.unlink(missing_ok=True)
         return SubmissionResult(path, incident.fingerprint, False, "enqueue_failed")
     runner_state = _ensure_global_runner(storage_root)
+    if runner_state == "main_worktree_dirty":
+        # The checkout changed between the first preflight and queue wake-up.
+        # Roll back this enqueue/claim so the dirty-state blocker remains the
+        # only dispatch record and the same incident can retry once clean.
+        pending_path.unlink(missing_ok=True)
+        claim.unlink(missing_ok=True)
+        raced_preflight = _main_worktree_preflight()
+        if raced_preflight and raced_preflight.get("dirty"):
+            _record_dirty_preflight_block(
+                incident,
+                allow_repair=allow_repair,
+                storage_root=storage_root,
+                preflight=raced_preflight,
+            )
+        return SubmissionResult(
+            path,
+            incident.fingerprint,
+            False,
+            "main_worktree_dirty",
+        )
     if runner_state == "active":
         return SubmissionResult(path, incident.fingerprint, False, "queued")
     if runner_state == "spawn_failed":
@@ -516,6 +753,7 @@ def submit_incident(
     try:
         store = IncidentLearningStore(root)
         saved = store.record_incident(_enrich_incident(incident))
+        _merge_structured_batch_logs(store, saved)
         if not dispatch:
             return SubmissionResult(
                 saved.persisted_path,

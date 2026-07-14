@@ -457,11 +457,31 @@ def _process_file_lock(path: Path):
     """Serialize experience read-modify-write cycles across GUI/runner processes."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+b") as stream:
-        stream.seek(0, os.SEEK_END)
-        if stream.tell() == 0:
-            stream.write(b"\0")
-            stream.flush()
+    with path.open("a+b", buffering=0) as stream:
+        if os.name == "nt":
+            # Windows byte-range locks are mandatory. Two fresh processes can
+            # both observe an empty file, then one locks the byte while the
+            # other's buffered sentinel is being flushed. Use unbuffered I/O
+            # and retry only that initialization race; once another process
+            # has extended the file, normal msvcrt locking serializes access.
+            import time
+
+            deadline = time.monotonic() + 10.0
+            while True:
+                stream.seek(0, os.SEEK_END)
+                if stream.tell() > 0:
+                    break
+                try:
+                    stream.write(b"\0")
+                    break
+                except PermissionError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+        else:
+            stream.seek(0, os.SEEK_END)
+            if stream.tell() == 0:
+                stream.write(b"\0")
         stream.seek(0)
         if os.name == "nt":
             import msvcrt
@@ -725,6 +745,52 @@ class IncidentLearningStore:
             return _concise(result)
 
     get_prior_context = prior_context
+
+    def advance_log_cursor(
+        self,
+        log_path: str | os.PathLike[str],
+        offset: int,
+        *,
+        expected_identity: str = "",
+        batch_id: str = "",
+        incident_id: str = "",
+    ) -> bool:
+        """Mark complete log bytes already retained by a structured incident."""
+
+        path = Path(log_path).resolve()
+        try:
+            stat_result = path.stat()
+        except OSError:
+            return False
+        identity = _path_identity(stat_result)
+        if expected_identity and expected_identity != identity:
+            return False
+        target = min(max(0, int(offset)), int(stat_result.st_size))
+        if target <= 0:
+            return False
+
+        with self._lock, _process_file_lock(self.lock_path):
+            cursor = _load_cursor(self)
+            files = cursor["files"]
+            key = os.path.normcase(str(path))
+            previous = files.get(key)
+            if not isinstance(previous, Mapping):
+                previous = {}
+            previous_identity = str(previous.get("identity", ""))
+            previous_offset = int(previous.get("offset", 0) or 0)
+            if previous_identity == identity and previous_offset >= target:
+                return False
+            files[key] = {
+                "identity": identity,
+                "offset": target,
+                "anchor": _file_anchor(path, target),
+                "remainder": "",
+                "updated_at": self._now(),
+                "covered_by_batch_id": _truncate_text(batch_id, 200),
+                "covered_by_incident_id": _truncate_text(incident_id, 200),
+            }
+            _atomic_write_json(self.cursor_path, cursor)
+        return True
 
     def discover_log_anomalies(
         self,
