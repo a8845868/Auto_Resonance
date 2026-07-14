@@ -282,6 +282,131 @@ def test_auto_start_disabled_rejects_stopped_emulator():
     assert manager.events == []
 
 
+def test_ensure_ready_retries_transient_manager_info_failure():
+    device = _device()
+    adb = FakeAdbState()
+
+    class FlakyInfoManager(FakeManager):
+        def __init__(self):
+            super().__init__(device, adb, running=True)
+            self.info_calls = 0
+
+        def info(self):
+            self.info_calls += 1
+            if self.info_calls == 1:
+                timeout = subprocess.TimeoutExpired(["MuMuManager", "info"], 10)
+                raise LifecycleError("MuMuManager command timed out: info -v 5") from timeout
+            return super().info()
+
+    manager = FlakyInfoManager()
+    clock = FakeClock()
+    lifecycle = EmulatorLifecycle(
+        device,
+        manager=manager,
+        adb_factory=adb.factory,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        options=LifecycleOptions(poll_interval=0.1),
+    )
+
+    ready = lifecycle.ensure_emulator_ready()
+
+    assert ready.port == 16544
+    assert manager.info_calls == 2
+    assert clock.now == pytest.approx(0.1)
+    assert manager.events == []
+
+
+def test_ensure_ready_stops_after_three_manager_info_timeouts():
+    device = _device()
+    adb = FakeAdbState()
+
+    class TimeoutManager(FakeManager):
+        def __init__(self):
+            super().__init__(device, adb, running=True)
+            self.info_calls = 0
+
+        def info(self):
+            self.info_calls += 1
+            timeout = subprocess.TimeoutExpired(["MuMuManager", "info"], 10)
+            raise LifecycleError("MuMuManager command timed out: info -v 5") from timeout
+
+    manager = TimeoutManager()
+    clock = FakeClock()
+    lifecycle = EmulatorLifecycle(
+        device,
+        manager=manager,
+        adb_factory=adb.factory,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        options=LifecycleOptions(emulator_start_timeout=10, poll_interval=0.1),
+    )
+
+    with pytest.raises(LifecycleError, match="连续超时 3 次"):
+        lifecycle.ensure_emulator_ready()
+
+    assert manager.info_calls == 3
+    assert clock.now == pytest.approx(0.2)
+    assert manager.events == []
+
+
+def test_ensure_ready_does_not_retry_non_timeout_manager_error():
+    device = _device()
+    adb = FakeAdbState()
+
+    class InvalidInfoManager(FakeManager):
+        def __init__(self):
+            super().__init__(device, adb, running=True)
+            self.info_calls = 0
+
+        def info(self):
+            self.info_calls += 1
+            raise LifecycleError("MuMuManager 返回了无效 JSON")
+
+    manager = InvalidInfoManager()
+    lifecycle = EmulatorLifecycle(device, manager=manager, adb_factory=adb.factory)
+
+    with pytest.raises(LifecycleError, match="无效 JSON"):
+        lifecycle.ensure_emulator_ready()
+
+    assert manager.info_calls == 1
+    assert manager.events == []
+
+
+def test_manager_info_timeout_retry_honors_cancellation():
+    device = _device()
+    adb = FakeAdbState()
+
+    class TimeoutManager(FakeManager):
+        def __init__(self):
+            super().__init__(device, adb, running=True)
+            self.info_calls = 0
+
+        def info(self):
+            self.info_calls += 1
+            timeout = subprocess.TimeoutExpired(["MuMuManager", "info"], 10)
+            raise LifecycleError("MuMuManager command timed out: info -v 5") from timeout
+
+    manager = TimeoutManager()
+    clock = FakeClock()
+    lifecycle = EmulatorLifecycle(
+        device,
+        manager=manager,
+        adb_factory=adb.factory,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        options=LifecycleOptions(poll_interval=0.1),
+    )
+    checks = iter([False, False, True])
+
+    with pytest.raises(LifecycleCancelled):
+        lifecycle.ensure_emulator_ready(lambda: next(checks))
+
+    assert manager.info_calls == 1
+    assert clock.now == 0
+    assert manager.events == []
+
+
 def test_running_v5_waits_for_android_boot_without_auto_launch():
     device = _device()
     adb = FakeAdbState()
