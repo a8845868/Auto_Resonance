@@ -63,6 +63,20 @@ def test_structured_log_coalesces_scroll_requests_on_one_owned_timer():
     assert widget._scrollTimer.isActive()
 
 
+def test_structured_log_wraps_messages_and_copies_selected_rows():
+    app = _app()
+    widget = StructuredLogWidget()
+    widget.appendLog("WARNING\x1f12:00:00.001\x1fa long warning message")
+    widget.selectRow(0)
+
+    widget.copySelection()
+
+    assert widget.wordWrap() is True
+    assert app.clipboard().text() == (
+        "WARNING\t12:00:00.001\ta long warning message"
+    )
+
+
 def test_structured_log_repeated_native_lifecycle_exits_cleanly():
     code = """
 from PySide6.QtWidgets import QApplication

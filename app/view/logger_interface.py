@@ -8,9 +8,10 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 import re
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QHeaderView,
     QLabel,
     QTableWidget,
@@ -77,7 +78,8 @@ class StructuredLogWidget(QTableWidget):
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setShowGrid(False)
-        self.setWordWrap(False)
+        self.setWordWrap(True)
+        self.setTextElideMode(Qt.TextElideMode.ElideNone)
         self.setAlternatingRowColors(True)
         self.setColumnWidth(0, 82)
         self.setColumnWidth(1, 112)
@@ -85,6 +87,9 @@ class StructuredLogWidget(QTableWidget):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.verticalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
         self.setStyleSheet(
             "QTableWidget { border: 1px solid rgba(128,128,128,0.28); "
             "border-radius: 6px; background: rgba(20,20,20,0.12); }"
@@ -132,6 +137,27 @@ class StructuredLogWidget(QTableWidget):
         # Restarting one owned timer coalesces history and live bursts into a
         # single scroll operation.  Qt also stops it automatically on destroy.
         self._scrollTimer.start()
+
+    def copySelection(self):
+        rows = sorted({index.row() for index in self.selectedIndexes()})
+        if not rows:
+            return
+        lines = []
+        for row in rows:
+            lines.append(
+                "\t".join(
+                    self.item(row, column).text() if self.item(row, column) else ""
+                    for column in range(self.columnCount())
+                )
+            )
+        QApplication.clipboard().setText("\n".join(lines))
+
+    def keyPressEvent(self, event):
+        if event.matches(QKeySequence.StandardKey.Copy):
+            self.copySelection()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class LoggerInterface(ScrollArea):
