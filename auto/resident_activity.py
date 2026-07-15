@@ -59,7 +59,9 @@ DETAIL_SWEEP_ROI = (780, 455, 970, 540)
 DETAIL_MARKER_ROI = (55, 645, 170, 705)
 TEAM_TITLE_ROI = (540, 130, 735, 200)
 TEAM_START_ROI = (635, 485, 930, 565)
-REWARD_TITLE_ROI = (500, 70, 820, 270)
+REWARD_TITLE_ROI = (500, 20, 820, 100)
+REWARD_ITEMS_ROI = (300, 140, 950, 640)
+REWARD_DISMISS_ROI = (500, 640, 800, 710)
 
 
 def _center(item: dict) -> tuple[int, int]:
@@ -86,6 +88,29 @@ def _matches(actual: str, expected: str, *, exact: bool = False) -> bool:
     if exact:
         return normalized == expected
     return normalized == expected or expected in normalized
+
+
+@dataclass(frozen=True)
+class RewardEntry:
+    text: str
+    x: int
+    y: int
+    amount: int | None = None
+
+
+@dataclass(frozen=True)
+class RewardObservation:
+    has_title: bool
+    has_dismiss: bool
+    entries: tuple[RewardEntry, ...]
+
+    @property
+    def signature(self) -> tuple[tuple[str, int, int], ...]:
+        # OCR boxes can drift by a few pixels while the reward animation settles.
+        return tuple(
+            (entry.text, round(entry.x / 10), round(entry.y / 10))
+            for entry in self.entries
+        )
 
 
 @dataclass
@@ -200,6 +225,7 @@ class ScreenDriver:
 class ResidentActivityAutomation:
     def __init__(self, driver: Optional[ScreenDriver] = None):
         self.driver = driver or ScreenDriver()
+        self.reward_history: list[RewardObservation] = []
 
     def open_action_summary(self) -> bool:
         if not self.driver.go_home():
@@ -269,7 +295,79 @@ class ResidentActivityAutomation:
             self.driver.sleep(delay)
         return False
 
-    def sweep_current_activity(self, max_attempts: int) -> int:
+    def reward_observation(self, items: list[dict]) -> RewardObservation | None:
+        """Describe a confirmed reward page without dismissing its animation."""
+        has_title = self.text_in_roi(
+            items, "获得物品", REWARD_TITLE_ROI, exact=False
+        )
+        has_dismiss = self.text_in_roi(
+            items, "触碰空白区域退出", REWARD_DISMISS_ROI, exact=False
+        )
+        entries = []
+        x1, y1, x2, y2 = REWARD_ITEMS_ROI
+        for item in items:
+            text = _normalize_text(item["text"])
+            x, y = _center(item)
+            if not (x1 <= x <= x2 and y1 <= y <= y2):
+                continue
+            amount_match = re.fullmatch(r"(?:[x×]\s*)?([\d,]+)", text)
+            amount = (
+                int(amount_match.group(1).replace(",", ""))
+                if amount_match
+                else None
+            )
+            entries.append(RewardEntry(text=text, x=x, y=y, amount=amount))
+        if not has_title and not (has_dismiss and entries):
+            return None
+        return RewardObservation(
+            has_title=has_title,
+            has_dismiss=has_dismiss,
+            entries=tuple(entries),
+        )
+
+    def wait_for_reward_result(
+        self,
+        *,
+        attempts: int = 20,
+        stable_frames: int = 2,
+        minimum_confirmed_frames: int = 6,
+        expected_reward: str | None = None,
+    ) -> RewardObservation | None:
+        """Wait until the animated reward list is stable before closing it."""
+        previous_signature = None
+        stable_count = 0
+        confirmed_count = 0
+        for _ in range(attempts):
+            observation = self.reward_observation(self.driver.texts())
+            if observation is None:
+                previous_signature = None
+                stable_count = 0
+                confirmed_count = 0
+            else:
+                confirmed_count += 1
+                signature = observation.signature
+                if signature == previous_signature:
+                    stable_count += 1
+                else:
+                    previous_signature = signature
+                    stable_count = 1
+                if (
+                    confirmed_count >= minimum_confirmed_frames
+                    and stable_count >= stable_frames
+                ):
+                    self.reward_history.append(observation)
+                    visible = ", ".join(
+                        entry.text for entry in observation.entries
+                    ) or "未识别到数量文字"
+                    target = f"；目标掉落：{expected_reward}" if expected_reward else ""
+                    logger.info(f"奖励页已稳定{target}；可见奖励条目：{visible}")
+                    return observation
+            self.driver.sleep(0.5)
+        return None
+
+    def sweep_current_activity(
+        self, max_attempts: int, *, expected_reward: str | None = None
+    ) -> int:
         completed = 0
         for _ in range(max_attempts):
             # Strict state machine: detail -> team selection -> reward result.
@@ -292,10 +390,10 @@ class ResidentActivityAutomation:
 
             self.driver.tap(START_SWEEP_BUTTON_CENTER)
             self.driver.sleep(0.8)
-            if not self.wait_for_screen(
-                (("获得物品", REWARD_TITLE_ROI),), attempts=14
-            ):
-                logger.warning("点击“开始扫荡”后未出现“获得物品”，本次不计入完成")
+            if not self.wait_for_reward_result(expected_reward=expected_reward):
+                logger.warning(
+                    "点击“开始扫荡”后未稳定识别奖励页，本次不计入完成"
+                )
                 break
 
             self.driver.dismiss_result()
@@ -318,7 +416,13 @@ class ResidentActivityAutomation:
         if not self.driver.click_text("进入挑战", attempts=3):
             logger.warning(f"{name}没有可进入的挑战")
             return 0
-        completed = self.sweep_current_activity(attempts)
+        expected_reward = next(
+            (label for label, stage_name in FULL_REALM_REWARDS.items() if stage_name == stage),
+            stage,
+        )
+        completed = self.sweep_current_activity(
+            attempts, expected_reward=expected_reward
+        )
         logger.info(f"{name}完成 {completed}/{attempts} 次")
         return completed
 
@@ -347,7 +451,9 @@ class ResidentActivityAutomation:
         if not self.select_siege_task(task):
             return 0
 
-        completed = self.sweep_current_activity(safety_limit)
+        completed = self.sweep_current_activity(
+            safety_limit, expected_reward=SIEGE_REWARDS[task][0]
+        )
         if completed < safety_limit:
             logger.info("澄清度不足、扫荡不可用或扫荡确认失败，停止利刃围剿")
         logger.info(f"{task}完成 {completed} 次")
@@ -381,7 +487,9 @@ class ResidentActivityAutomation:
             return {task: 0}
         if not self.select_siege_task(task):
             return {task: 0}
-        completed = self.sweep_current_activity(1)
+        completed = self.sweep_current_activity(
+            1, expected_reward=SIEGE_REWARDS[task][0]
+        )
         logger.info(f"单次扫荡验证完成：{task} {completed}/1 次")
         return {task: completed}
 
