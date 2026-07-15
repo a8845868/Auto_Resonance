@@ -70,22 +70,41 @@ WORLD_MAP_OPEN_POS = (1201, 666)
 WORLD_MAP_BACK_POS = (84, 40)
 WORLD_MAP_DEFAULT_ZOOM_POS = (1151, 465)
 WORLD_MAP_GESTURE_CENTER = (640.0, 360.0)
-WORLD_MAP_MAX_PAN_STEP_X = 700.0
-WORLD_MAP_MAX_PAN_STEP_Y = 500.0
-WORLD_MAP_MAX_PAN_ATTEMPTS = 10
+WORLD_MAP_MAX_PAN_STEP_X = 400.0
+WORLD_MAP_MAX_PAN_STEP_Y = 300.0
+WORLD_MAP_MAX_PAN_ATTEMPTS = 18
 WORLD_MAP_LABEL_MIN_SCORE = 0.9
+WORLD_MAP_PARTIAL_LABEL_MIN_SCORE = 0.97
 WORLD_MAP_LABEL_Y_RANGE = (100.0, 620.0)
+WORLD_MAP_EDGE_X = (8.0, 1272.0)
+WORLD_MAP_DEFAULT_GESTURE_GAIN = 1.3
+WORLD_MAP_GAIN_RANGE = (0.7, 2.0)
 
 
-def _station_label_center(map_ocr, station_names):
+def _station_label_center(map_ocr, station_names, *, allow_edge_partial=False):
     """Return the most central trustworthy station label in one map frame."""
     candidates = []
+    station_names = tuple(station_names)
     for item in map_ocr:
         text = item.get("text", "").strip()
-        if text not in station_names or item.get("score", 1.0) < WORLD_MAP_LABEL_MIN_SCORE:
-            continue
         position = item.get("position")
         if not position or len(position) < 3:
+            continue
+        score = item.get("score", 1.0)
+        exact = text in station_names and score >= WORLD_MAP_LABEL_MIN_SCORE
+        matched_station = text if exact else None
+        if not exact and allow_edge_partial and score >= WORLD_MAP_PARTIAL_LABEL_MIN_SCORE:
+            left = min(point[0] for point in position)
+            right = max(point[0] for point in position)
+            partial_matches = []
+            if len(text) >= 3 and right >= WORLD_MAP_EDGE_X[1]:
+                partial_matches.extend(name for name in station_names if name.startswith(text))
+            if len(text) >= 3 and left <= WORLD_MAP_EDGE_X[0]:
+                partial_matches.extend(name for name in station_names if name.endswith(text))
+            partial_matches = list(dict.fromkeys(partial_matches))
+            if len(partial_matches) == 1:
+                matched_station = partial_matches[0]
+        if matched_station is None:
             continue
         center_x = (position[0][0] + position[2][0]) / 2
         center_y = (position[0][1] + position[2][1]) / 2
@@ -95,19 +114,31 @@ def _station_label_center(map_ocr, station_names):
             abs(center_x - WORLD_MAP_GESTURE_CENTER[0])
             + abs(center_y - WORLD_MAP_GESTURE_CENTER[1])
         )
-        candidates.append((distance, text, center_x, center_y))
+        candidates.append((not exact, distance, matched_station, center_x, center_y))
     if not candidates:
         return None
-    _, station, center_x, center_y = min(candidates)
+    _, _, station, center_x, center_y = min(candidates)
     return station, center_x, center_y
 
 
-def _world_map_pan_vector(source_station, target_station):
+def _world_map_pan_vector(
+    source_station,
+    target_station,
+    source_x=WORLD_MAP_GESTURE_CENTER[0],
+    source_y=WORLD_MAP_GESTURE_CENTER[1],
+    gesture_gain=WORLD_MAP_DEFAULT_GESTURE_GAIN,
+):
     """Calculate the calibrated gesture needed from one map landmark."""
     city_differences = STATION_DIFFERENCES.get((source_station, target_station))
     if not city_differences:
         return None
-    return -city_differences[0] / 2.5, -city_differences[1] / 2.5
+    gain = max(WORLD_MAP_GAIN_RANGE[0], min(float(gesture_gain), WORLD_MAP_GAIN_RANGE[1]))
+    return (
+        -city_differences[0] / 2.5
+        + (WORLD_MAP_GESTURE_CENTER[0] - source_x) / gain,
+        -city_differences[1] / 2.5
+        + (WORLD_MAP_GESTURE_CENTER[1] - source_y) / gain,
+    )
 
 
 def _world_map_step(move_x, move_y):
@@ -118,6 +149,25 @@ def _world_map_step(move_x, move_y):
         WORLD_MAP_MAX_PAN_STEP_Y / abs(move_y) if move_y else 1.0,
     )
     return move_x * scale, move_y * scale
+
+
+def _updated_gesture_gain(previous_anchor, current_anchor, last_step, current_gain):
+    """Update pan gain only when the same reliable landmark survived a swipe."""
+    if not previous_anchor or not current_anchor or not last_step:
+        return current_gain
+    if previous_anchor[0] != current_anchor[0]:
+        return current_gain
+    observed = (
+        current_anchor[1] - previous_anchor[1],
+        current_anchor[2] - previous_anchor[2],
+    )
+    dominant = 0 if abs(last_step[0]) >= abs(last_step[1]) else 1
+    commanded = last_step[dominant]
+    if abs(commanded) < 20 or observed[dominant] * commanded <= 0:
+        return current_gain
+    measured = abs(observed[dominant] / commanded)
+    measured = max(WORLD_MAP_GAIN_RANGE[0], min(measured, WORLD_MAP_GAIN_RANGE[1]))
+    return (current_gain + measured) / 2
 
 
 def _wait_for_departure(timeout: float = 12.0) -> bool:
@@ -197,12 +247,18 @@ def click_station(name: str, cur_station: Optional[str] = None):
         if anchor:
             _, source_x, source_y = anchor
             logger.info(f"地图当前站点锚点: {station} ({source_x:.0f}, {source_y:.0f})")
-        move = _world_map_pan_vector(station, name)
+        gesture_gain = WORLD_MAP_DEFAULT_GESTURE_GAIN
+        move = _world_map_pan_vector(
+            station, name, source_x, source_y, gesture_gain
+        )
         if move is None:
             logger.error("没有该站点的坐标信息")
             return STATION(False)
         move_x, move_y = move
-        best_distance = max(abs(move_x), abs(move_y))
+        base_move = _world_map_pan_vector(station, name)
+        best_anchor_distance = max(abs(base_move[0]), abs(base_move[1]))
+        last_anchor = anchor
+        last_step = None
         logger.info(f"地图分段拖动: 总位移({move_x:.0f}, {move_y:.0f})")
         result = None
         target_anchor = None
@@ -221,20 +277,37 @@ def click_station(name: str, cur_station: Optional[str] = None):
                 )
                 break
 
-            anchor = _station_label_center(probe_ocr, known_stations)
+            anchor = _station_label_center(
+                probe_ocr, known_stations, allow_edge_partial=True
+            )
             if anchor:
                 station, source_x, source_y = anchor
-                move = _world_map_pan_vector(station, name)
-                if move is not None:
-                    corrected_distance = max(abs(move[0]), abs(move[1]))
-                    if corrected_distance + 8 < best_distance:
+                updated_gain = _updated_gesture_gain(
+                    last_anchor, anchor, last_step, gesture_gain
+                )
+                if updated_gain != gesture_gain:
+                    gesture_gain = updated_gain
+                    logger.info(f"地图手势增益校正为 {gesture_gain:.2f}")
+
+                base_move = _world_map_pan_vector(station, name)
+                anchor_distance = max(abs(base_move[0]), abs(base_move[1]))
+                if (
+                    last_anchor and last_anchor[0] == station
+                ) or anchor_distance + 8 < best_anchor_distance:
+                    move = _world_map_pan_vector(
+                        station, name, source_x, source_y, gesture_gain
+                    )
+                    if move is not None:
                         move_x, move_y = move
-                        best_distance = corrected_distance
+                        best_anchor_distance = min(
+                            best_anchor_distance, anchor_distance
+                        )
                         logger.info(
                             f"地图重新锚定站点: {station} "
                             f"({source_x:.0f}, {source_y:.0f}), "
                             f"校正位移({move_x:.0f}, {move_y:.0f})"
                         )
+                last_anchor = anchor
 
             if max(abs(move_x), abs(move_y)) < 8:
                 break
@@ -244,9 +317,9 @@ def click_station(name: str, cur_station: Optional[str] = None):
             end = (gesture_cx + step_x / 2, gesture_cy + step_y / 2)
             input_swipe(start, end, swipe_time=450)
             time.sleep(0.45)
+            last_step = (step_x, step_y)
             move_x -= step_x
             move_y -= step_y
-            best_distance = min(best_distance, max(abs(move_x), abs(move_y)))
         # 向回拖动避免画面长时间移动
         input_swipe(
             WORLD_MAP_GESTURE_CENTER,

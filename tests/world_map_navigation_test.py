@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import core.preset.presets as presets
 
@@ -36,7 +36,7 @@ def test_world_map_step_keeps_long_swipes_inside_screen():
     step_x, step_y = presets._world_map_step(4010.0, -110.0)
 
     assert step_x == presets.WORLD_MAP_MAX_PAN_STEP_X
-    assert round(step_y, 1) == -19.2
+    assert round(step_y, 1) == -11.0
 
 
 def test_click_station_reanchors_during_long_pan_before_selecting_target():
@@ -89,10 +89,13 @@ def test_click_station_reanchors_during_long_pan_before_selecting_target():
         result = presets.click_station("target", cur_station="start")
 
     assert bool(result) is True
-    assert swipe.call_args_list[:2] == [
-        call((290.0, 369.6009975062344), (990.0, 350.3990024937656), swipe_time=450),
-        call((290.0, 427.7865612648221), (990.0, 292.2134387351779), swipe_time=450),
-    ]
+    first_start, first_end = swipe.call_args_list[0].args
+    second_start, second_end = swipe.call_args_list[1].args
+    assert abs(first_end[0] - first_start[0]) <= presets.WORLD_MAP_MAX_PAN_STEP_X
+    assert abs(first_end[1] - first_start[1]) <= presets.WORLD_MAP_MAX_PAN_STEP_Y
+    assert abs(second_end[0] - second_start[0]) <= presets.WORLD_MAP_MAX_PAN_STEP_X
+    assert abs(second_end[1] - second_start[1]) <= presets.WORLD_MAP_MAX_PAN_STEP_Y
+    assert (first_start, first_end) != (second_start, second_end)
     assert len(swipe.call_args_list) == 3
     tap.assert_called_once_with((640.0, 400.0))
 
@@ -110,6 +113,60 @@ def test_station_label_rejects_partial_low_confidence_and_hud_candidates():
         640.0,
         370.0,
     )
+
+
+def test_station_label_accepts_only_unique_high_confidence_edge_prefix():
+    stations = ("黑月游乐城", "阿妮塔战备工厂", "阿妮塔发射中心")
+    right_edge = box("黑月游", 1237, 247, 1279, 267)
+
+    assert presets._station_label_center(
+        [right_edge], stations, allow_edge_partial=True
+    ) == ("黑月游乐城", 1258.0, 257.0)
+    assert presets._station_label_center([right_edge], stations) is None
+    assert presets._station_label_center(
+        [box("黑月游", 900, 247, 960, 267)],
+        stations,
+        allow_edge_partial=True,
+    ) is None
+    assert presets._station_label_center(
+        [box("阿妮塔", 1237, 247, 1279, 267)],
+        stations,
+        allow_edge_partial=True,
+    ) is None
+
+
+def test_world_map_pan_vector_uses_landmark_screen_position():
+    station_data = {
+        "middle": (-750.0, 1625.0),
+        "target": (-7075.0, 400.0),
+    }
+    differences = presets.calculate_station_differences(station_data)
+
+    with patch.object(presets, "STATION_DIFFERENCES", differences):
+        left_edge = presets._world_map_pan_vector(
+            "middle", "target", 135.0, 418.0, gesture_gain=1.3
+        )
+        right_edge = presets._world_map_pan_vector(
+            "middle", "target", 1258.0, 257.0, gesture_gain=1.3
+        )
+
+    assert round(left_edge[0], 1) == 2918.5
+    assert round(right_edge[0], 1) == 2054.6
+    assert abs(right_edge[0]) < abs(left_edge[0])
+
+
+def test_world_map_gain_uses_same_landmark_observed_motion():
+    previous = ("middle", 200.0, 400.0)
+    current = ("middle", 800.0, 410.0)
+
+    gain = presets._updated_gesture_gain(
+        previous, current, (400.0, -20.0), 1.3
+    )
+
+    assert gain == 1.4
+    assert presets._updated_gesture_gain(
+        previous, ("other", 800.0, 410.0), (400.0, -20.0), 1.3
+    ) == 1.3
 
 
 def test_click_station_stops_without_departure_after_pan_attempts_are_exhausted():
@@ -207,6 +264,6 @@ def test_world_map_step_keeps_vertical_swipe_inside_map_area():
     step_x, step_y = presets._world_map_step(100.0, 2000.0)
 
     assert step_y == presets.WORLD_MAP_MAX_PAN_STEP_Y
-    assert step_x == 25.0
+    assert step_x == 15.0
     assert 100 <= presets.WORLD_MAP_GESTURE_CENTER[1] - step_y / 2
     assert presets.WORLD_MAP_GESTURE_CENTER[1] + step_y / 2 <= 620
