@@ -1,4 +1,9 @@
+import os
 from types import SimpleNamespace
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication
 
 from app.common.config import cfg
 import app.view.dashboard_interface as dashboard_module
@@ -50,6 +55,26 @@ class _Worker:
 
     def deleteLater(self):
         self.deleted = True
+
+
+def test_scheduler_starts_due_tasks_without_a_manual_button_click(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(cfg.enableCodexSelfHealing, "value", False)
+    monkeypatch.setattr(dashboard_module, "is_task_due", lambda _key: True)
+    dashboard = DashboardInterface()
+    dashboard.scheduleTimer.stop()
+    starts = []
+    dashboard._allEnabledTasks = lambda: [SimpleNamespace(key="scheduled_task")]
+    dashboard.startTaskQueue = lambda: starts.append("started")
+
+    DashboardInterface._runDueTasks(dashboard)
+
+    assert dashboard.schedulerArmed is True
+    assert dashboard.controlButton.text() == "停止全部任务"
+    assert starts == ["started"]
+    assert dashboard.shutdown() is True
+    dashboard.deleteLater()
+    app.processEvents()
 
 
 def test_queue_failure_disarms_scheduler_before_timer_can_restart_tasks():

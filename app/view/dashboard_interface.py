@@ -86,7 +86,9 @@ class DashboardInterface(ScrollArea):
         self.businessTaskProvider = lambda: None
         self.priorityTaskProviders = []
         self.additionalTaskProviders = []
-        self.schedulerArmed = False
+        # Keep the scheduler listening from application startup so reaching a
+        # configured next-run time does not require a manual button click.
+        self.schedulerArmed = True
         self.scheduleTimer = QTimer(self)
         self.scheduleTimer.setInterval(30_000)
         self.scheduleTimer.timeout.connect(self._runDueTasks)
@@ -104,6 +106,7 @@ class DashboardInterface(ScrollArea):
         self.mainLayout.setSpacing(14)
         StyleSheet.HOME_INTERFACE.apply(self)
         self._buildUi()
+        self._setControlRunning(self.schedulerArmed)
 
     def _buildUi(self):
         title = QLabel("自动任务", self.scrollWidget)
