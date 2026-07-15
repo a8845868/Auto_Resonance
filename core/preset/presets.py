@@ -21,6 +21,7 @@ from core.module.bgr import BGR
 from core.image.ocr import predict
 from core.preset import blurry_ocr_click, go_home
 from core.services.screen_state import is_train_in_transit
+from core.services.station_availability import station_unavailable_reason
 from core.utils.utils import RESOURCES_PATH, read_json
 
 from .control import click_image
@@ -229,6 +230,13 @@ def click_station(name: str, cur_station: Optional[str] = None):
     :param cur_station: 当前站点
     """
     logger.info(f"点击站点 => {name}")
+    if cur_station == name:
+        logger.info("已在目标站点")
+        return STATION(True, is_destine=True)
+    unavailable_reason = station_unavailable_reason(name)
+    if unavailable_reason:
+        logger.warning(f"拒绝前往未开放站点: {unavailable_reason}")
+        return STATION(False)
     if screenshot().match_template(RESOURCES_PATH / "main_map.png", 0.95) == False:
         logger.info("未检测到主地图界面，返回主地图")
         go_home()

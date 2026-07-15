@@ -15,6 +15,8 @@ def test_weekly_run_yields_after_one_complete_round_trip():
     ), patch.object(business, "RouteModel", side_effect=lambda **kwargs: kwargs), patch.object(
         business, "RoutesModel", side_effect=lambda **kwargs: kwargs
     ), patch.object(business, "run_with_recovery", return_value=True) as run, patch.object(
+        business, "_route_availability_deferral", return_value=None
+    ), patch.object(
         business, "is_stopped", return_value=False
     ), patch("core.services.record_completed_run") as record:
         result = business.two_city_weekly_run(

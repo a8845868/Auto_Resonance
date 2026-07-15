@@ -185,6 +185,33 @@ def test_station_label_accepts_unique_high_confidence_side_near_suffix():
     ) is None
 
 
+def test_click_station_rejects_unavailable_target_before_opening_map():
+    with patch.object(
+        presets,
+        "station_unavailable_reason",
+        return_value="武林源当前未开放，下一次开放时间未定",
+    ), patch.object(presets, "screenshot") as screenshot, patch.object(
+        presets, "_open_world_map_at_default_zoom"
+    ) as open_map, patch.object(presets, "input_swipe") as swipe:
+        result = presets.click_station("武林源", cur_station="岚心城")
+
+    assert bool(result) is False
+    screenshot.assert_not_called()
+    open_map.assert_not_called()
+    swipe.assert_not_called()
+
+
+def test_click_station_keeps_already_at_target_idempotent_when_window_closes():
+    with patch.object(
+        presets, "station_unavailable_reason"
+    ) as availability, patch.object(presets, "screenshot") as screenshot:
+        result = presets.click_station("武林源", cur_station="武林源")
+
+    assert bool(result) is True
+    availability.assert_not_called()
+    screenshot.assert_not_called()
+
+
 def test_world_map_gain_uses_same_landmark_observed_motion():
     previous = ("middle", 200.0, 400.0)
     current = ("middle", 800.0, 410.0)
