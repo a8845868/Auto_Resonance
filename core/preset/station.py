@@ -5,9 +5,7 @@ LastEditTime: 2025-02-11 22:14:21
 LastEditors: Night-stars-1 nujj1042633805@gmail.com
 """
 
-import re
 import time
-from collections import deque
 from datetime import datetime, timedelta
 
 from loguru import logger
@@ -16,6 +14,11 @@ from core.control.control import input_tap, screenshot
 from core.model.config import config
 from core.module.bgr import BGR
 from core.preset.control import go_home
+from core.services.train_eta import (
+    TrainArrivalEstimator,
+    parse_remaining_distance,
+    polling_interval,
+)
 from core.utils.utils import RESOURCES_PATH
 
 FIGHT_TIME = 300
@@ -23,20 +26,7 @@ MAP_WAIT_TIME = 3000
 SPEED_BOOST_COLOR = (251, 253, 253)
 SPEED_BOOST_EXCLUDED_LOW = (235, 235, 250)
 SPEED_BOOST_EXCLUDED_HIGH = (240, 240, 255)
-ETA_SAMPLE_INTERVAL = 10.0
-ETA_LOG_INTERVAL = 30.0
-
-
-def parse_remaining_distance(texts: list[str]) -> int | None:
-    """Read `剩余行程：1234km` from the driving HUD OCR."""
-    for text in texts:
-        compact = str(text).replace(" ", "").replace(",", "")
-        if "剩余行程" not in compact:
-            continue
-        match = re.search(r"剩余行程[^0-9]*(\d+)\s*km", compact, re.IGNORECASE)
-        if match:
-            return int(match.group(1))
-    return None
+DISTANCE_OCR_INTERVAL = 15.0
 
 
 def _format_eta_duration(seconds: float) -> str:
@@ -49,16 +39,12 @@ def _format_eta_duration(seconds: float) -> str:
 
 
 class TravelEtaTracker:
-    """Estimate real remaining time from observed in-game distance decay."""
+    """Compatibility logger backed by the rolling ETA estimator."""
 
-    def __init__(
-        self,
-        sample_interval: float = ETA_SAMPLE_INTERVAL,
-        log_interval: float = ETA_LOG_INTERVAL,
-    ) -> None:
+    def __init__(self, sample_interval: float = 10.0, log_interval: float = 30.0) -> None:
         self.sample_interval = sample_interval
         self.log_interval = log_interval
-        self.samples = deque(maxlen=6)
+        self.estimator = TrainArrivalEstimator(max_samples=6)
         self.last_sample_at: float | None = None
         self.last_eta_log_at: float | None = None
         self.initial_logged = False
@@ -78,35 +64,20 @@ class TravelEtaTracker:
         if distance is None:
             return None
 
-        if self.samples and distance > self.samples[-1][1]:
-            self.samples.clear()
-            self.last_eta_log_at = None
-        self.samples.append((now, distance))
-
+        eta_seconds = self.estimator.observe(distance, now)
         if not self.initial_logged:
             self.initial_logged = True
-            return f"行车 ETA：剩余 {distance} km，正在采样实际行驶速度"
-        if len(self.samples) < 2:
+            return f"行车 ETA：剩余 {distance:g} km，正在采样实际行驶速度"
+        if eta_seconds is None:
+            return None
+        if self.last_eta_log_at is not None and now - self.last_eta_log_at < self.log_interval:
             return None
 
-        start_time, start_distance = self.samples[0]
-        elapsed = now - start_time
-        travelled = start_distance - distance
-        if elapsed <= 0 or travelled <= 0:
-            return None
-        km_per_second = travelled / elapsed
-        eta_seconds = distance / km_per_second
-        if eta_seconds <= 0 or eta_seconds > 24 * 3600:
-            return None
-
-        first_estimate = self.last_eta_log_at is None
-        if not first_estimate and now - self.last_eta_log_at < self.log_interval:
-            return None
         self.last_eta_log_at = now
         wall_now = wall_now or datetime.now()
         arrival = wall_now + timedelta(seconds=eta_seconds)
         return (
-            f"行车 ETA：剩余 {distance} km，实测 {km_per_second * 60:.1f} km/分钟，"
+            f"行车 ETA：剩余 {distance:g} km，实测 {self.estimator.speed * 60:.1f} km/分钟，"
             f"预计 {_format_eta_duration(eta_seconds)} 后到达（{arrival:%H:%M:%S}）"
         )
 
@@ -151,17 +122,12 @@ class STATION:
             return True
         logger.info("进入行车监听")
         start = time.perf_counter()
-        eta_tracker = TravelEtaTracker()
+        estimator = TrainArrivalEstimator()
+        eta_seconds = None
+        last_distance_ocr = float("-inf")
         while time.perf_counter() - start < MAP_WAIT_TIME:
-            image = screenshot()
             now = time.perf_counter()
-            if eta_tracker.should_sample(now):
-                eta_message = eta_tracker.observe(
-                    [item["text"] for item in image.ocr()],
-                    now=now,
-                )
-                if eta_message:
-                    logger.info(eta_message)
+            image = screenshot()
             # 0-2攻击检测，3-4拦截检测
             attack_bgrs = image.get_bgrs(
                 [(944, 247), (967, 229), (1056, 229), (1120, 312)]
@@ -173,6 +139,19 @@ class STATION:
             logger.debug(f"行车攻击检测: {attack_bgrs}")
             logger.debug(f"行车检测: {reach_bgrs}")
             logger.debug(f"是否进站检测: {run_bgr}")
+            if now - last_distance_ocr >= DISTANCE_OCR_INTERVAL:
+                last_distance_ocr = now
+                distance = parse_remaining_distance(image.ocr())
+                if distance is not None:
+                    eta_seconds = estimator.observe(distance, now)
+                    if eta_seconds is None:
+                        logger.info(f"剩余行程 {distance:.1f}km，正在采集速度样本")
+                    else:
+                        logger.info(
+                            f"剩余行程 {distance:.1f}km，平均速度 "
+                            f"{estimator.speed * 3600:.1f}km/h，预计 "
+                            f"{eta_seconds:.0f} 秒到站"
+                        )
             if (
                 BGR(8, 168, 234) <= attack_bgrs[0] <= BGR(10, 171, 245)
                 and BGR(8, 168, 234) <= attack_bgrs[1] <= BGR(10, 171, 245)
@@ -204,7 +183,11 @@ class STATION:
                 time.sleep(0.5)
             if config.global_config.is_auto_pick:
                 input_tap((781, 484))  # 捡垃圾
-            time.sleep(0.3)
+            time.sleep(
+                polling_interval(
+                    eta_seconds, auto_pick=config.global_config.is_auto_pick
+                )
+            )
         logger.error("站点超时")
         return False
 
