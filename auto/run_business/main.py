@@ -272,11 +272,18 @@ def run(routes: RoutesModel, recovery_attempts: int = 2):
         return False
     expected_cities = _route_city_names(routes)
     if city_name not in expected_cities:
-        logger.error(
+        first_buy_city = routes.city_data[0].buy_city_name
+        logger.warning(
             f"安全门禁：识别到非路线城市 {city_name!r}，预期为 {sorted(expected_cities)}；"
-            "拒绝进入清仓和交易所流程"
+            f"先前往计划买货城市 {first_buy_city!r}，到站后再执行清仓预检"
         )
-        return False
+        if is_train_in_transit(screenshot().ocr()):
+            logger.error("安全门禁：城市识别后仍检测到行驶状态，拒绝重新规划路线")
+            return False
+        if not click_station(first_buy_city, cur_station=city_name).wait():
+            logger.error(f"无法从路线外城市到达买货城市 {first_buy_city}，停止本次跑商")
+            return False
+        city_name = first_buy_city
     if is_train_in_transit(screenshot().ocr()):
         logger.error("安全门禁：城市识别后仍检测到行驶状态，拒绝执行清仓预检")
         return False

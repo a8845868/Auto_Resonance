@@ -60,6 +60,152 @@ def test_run_propagates_residual_deferral_before_any_new_route_action():
     click_station.assert_not_called()
 
 
+def test_run_from_off_route_station_repositions_before_cleanup_and_route_actions():
+    routes = RoutesModel(
+        city_data=[
+            RouteModel(
+                buy_city_name="A",
+                sell_city_name="B",
+                goods_data={"good-a": {}},
+            ),
+            RouteModel(
+                buy_city_name="B",
+                sell_city_name="A",
+                goods_data={"good-b": {}},
+            ),
+        ]
+    )
+    image = MagicMock()
+    image.ocr.return_value = []
+    travel = MagicMock()
+    travel.wait.return_value = True
+    events = []
+
+    def navigate(name, cur_station=None):
+        events.append(("navigate", name, cur_station))
+        return travel
+
+    def enter_business(mode):
+        events.append(("business", mode))
+        return True
+
+    def clear_residual(goods):
+        events.append(("clear", tuple(goods)))
+        return True
+
+    def buy(*args, **kwargs):
+        events.append(("buy",))
+
+    with patch.object(business, "connect", return_value=True), patch.object(
+        business, "is_game_running", return_value=True
+    ), patch.object(business, "is_sell_page", return_value=False), patch.object(
+        business, "_normalize_trade_startup_screen", return_value=True
+    ), patch.object(business, "get_station", return_value="C"), patch.object(
+        business, "screenshot", return_value=image
+    ), patch.object(
+        business, "is_train_in_transit", return_value=False
+    ), patch.object(
+        business, "_clear_residual_cargo", side_effect=clear_residual
+    ) as clear, patch.object(
+        business, "go_business", side_effect=enter_business
+    ) as go_business, patch.object(
+        business, "click_station", side_effect=navigate
+    ) as click_station, patch.object(
+        business, "prepare_negotiation", return_value=2
+    ), patch.object(
+        business, "buy_business", side_effect=buy
+    ), patch.object(
+        business, "_prepare_max_sell_haggle", return_value=2
+    ), patch.object(
+        business, "sell_business", return_value=True
+    ):
+        result = business.run(routes)
+
+    assert result is True
+    assert click_station.call_args_list[0].args == ("A",)
+    assert click_station.call_args_list[0].kwargs == {"cur_station": "C"}
+    clear.assert_called_once_with(["good-b"])
+    assert go_business.call_args_list[0].args == ("sell",)
+    assert click_station.call_args_list[1].kwargs == {"cur_station": "A"}
+    assert click_station.call_args_list[2].args == ("B",)
+    assert click_station.call_args_list[2].kwargs == {"cur_station": "A"}
+    assert [
+        (call.args[0], call.kwargs["cur_station"])
+        for call in click_station.call_args_list
+    ] == [("A", "C"), ("A", "A"), ("B", "A"), ("B", "B"), ("A", "B")]
+    assert events[:5] == [
+        ("navigate", "A", "C"),
+        ("business", "sell"),
+        ("clear", ("good-b",)),
+        ("navigate", "A", "A"),
+        ("business", "buy"),
+    ]
+
+
+def test_run_from_off_route_station_stops_when_repositioning_fails():
+    routes = RoutesModel(
+        city_data=[
+            RouteModel(buy_city_name="A", sell_city_name="B"),
+            RouteModel(buy_city_name="B", sell_city_name="A"),
+        ]
+    )
+    image = MagicMock()
+    image.ocr.return_value = []
+    travel = MagicMock()
+    travel.wait.return_value = False
+
+    with patch.object(business, "connect", return_value=True), patch.object(
+        business, "is_game_running", return_value=True
+    ), patch.object(business, "is_sell_page", return_value=False), patch.object(
+        business, "_normalize_trade_startup_screen", return_value=True
+    ), patch.object(business, "get_station", return_value="C"), patch.object(
+        business, "screenshot", return_value=image
+    ), patch.object(
+        business, "is_train_in_transit", return_value=False
+    ), patch.object(
+        business, "click_station", return_value=travel
+    ), patch.object(
+        business, "go_business"
+    ) as go_business, patch.object(
+        business, "_clear_residual_cargo"
+    ) as clear:
+        result = business.run(routes)
+
+    assert result is False
+    go_business.assert_not_called()
+    clear.assert_not_called()
+
+
+def test_run_from_off_route_station_refuses_to_reposition_while_in_transit():
+    routes = RoutesModel(
+        city_data=[
+            RouteModel(buy_city_name="A", sell_city_name="B"),
+            RouteModel(buy_city_name="B", sell_city_name="A"),
+        ]
+    )
+    image = MagicMock()
+    image.ocr.return_value = [{"text": "自动巡航中"}]
+
+    with patch.object(business, "connect", return_value=True), patch.object(
+        business, "is_game_running", return_value=True
+    ), patch.object(business, "is_sell_page", return_value=False), patch.object(
+        business, "_normalize_trade_startup_screen", return_value=True
+    ), patch.object(business, "get_station", return_value="C"), patch.object(
+        business, "screenshot", return_value=image
+    ), patch.object(
+        business, "is_train_in_transit", return_value=True
+    ), patch.object(
+        business, "click_station"
+    ) as click_station, patch.object(
+        business, "go_business"
+    ) as go_business:
+        result = business.run(routes)
+
+    assert result is False
+    click_station.assert_not_called()
+    go_business.assert_not_called()
+
+
 def test_weekly_run_propagates_deferral_without_recording_completion():
     deferred = {
         "success": True,
