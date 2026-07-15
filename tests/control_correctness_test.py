@@ -46,7 +46,7 @@ def _patch_mumu_backends(monkeypatch, nemu, adb, events):
         control_module.app.Global, "device", SimpleNamespace(is_mumu=True)
     )
 
-    def create_nemu():
+    def create_nemu(_device=None):
         events.append("nemu.init")
         if isinstance(nemu, Exception):
             raise nemu

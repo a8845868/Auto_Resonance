@@ -4,8 +4,6 @@ from unittest.mock import Mock, patch
 from auto.resident_activity import (
     ENTER_CHALLENGE_Y,
     FULL_REALM_REWARDS,
-    REWARD_DISMISS_ROI,
-    REWARD_ITEMS_ROI,
     REWARD_TITLE_ROI,
     ResidentActivityAutomation,
     SIEGE_TASKS,

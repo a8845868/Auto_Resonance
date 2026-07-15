@@ -64,6 +64,10 @@ def get_runtime_auto_start_emulator() -> bool:
 
 def get_runtime_device() -> EmulatorInfo:
     device = _runtime_device or app.Global.device
+    # Tests and legacy callers may provide a lightweight device-like object.
+    # Preserve it instead of requiring the newer serialisation API.
+    if not hasattr(device, "to_dict"):
+        return device
     return EmulatorInfo.from_dict(device.to_dict())
 
 

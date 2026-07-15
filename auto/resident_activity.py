@@ -503,23 +503,6 @@ class ResidentActivityAutomation:
                 logger.warning("点击“开始扫荡”后未出现“获得物品”，本次不计入完成")
                 break
 
-            self.driver.tap(SWEEP_BUTTON_CENTER)
-            self.driver.sleep(0.8)
-            if not self.wait_for_screen(
-                (("选择队伍", TEAM_TITLE_ROI), ("开始扫荡", TEAM_START_ROI)),
-                attempts=8,
-            ):
-                logger.warning("点击“扫荡”后未进入队伍选择页，本次不计入完成")
-                break
-
-            self.driver.tap(START_SWEEP_BUTTON_CENTER)
-            self.driver.sleep(0.8)
-            if not self.wait_for_reward_result(expected_reward=expected_reward):
-                logger.warning(
-                    "点击“开始扫荡”后未稳定识别奖励页，本次不计入完成"
-                )
-                break
-
             self.driver.dismiss_result()
             completed += 1
         return completed
