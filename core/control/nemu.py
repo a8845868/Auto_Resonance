@@ -35,6 +35,7 @@ def swipe_path(p0, p3, time):
 
 class NEMU(IADB):
     def __init__(self) -> None:
+        self.connect_id = None
         self.device = app.Global.device
         self.path = self.device.path
         if self.device.type == EmulatorType.MUMUV5:
@@ -47,22 +48,50 @@ class NEMU(IADB):
 
     def connect(self, adb_port: Optional[int] = None) -> bool:
         logger.info("使用NEMUIPC连接")
-        self.connect_id = self.nemu.nemu_connect(self.path, self.device.index)
-        self.display_id = self.nemu.nemu_get_display_id(self.connect_id, b"com.hermes.goda", 0)
+        try:
+            self.connect_id = self.nemu.nemu_connect(self.path, self.device.index)
+            self.display_id = self.nemu.nemu_get_display_id(
+                self.connect_id, b"com.hermes.goda", 0
+            )
 
-        # 获取尺寸
-        self.width_ptr = ctypes.pointer(ctypes.c_int(0))
-        self.height_ptr = ctypes.pointer(ctypes.c_int(0))
-        nullptr = ctypes.POINTER(ctypes.c_ubyte)()
-        self.nemu.nemu_capture_display(self.connect_id, self.display_id, 0, self.width_ptr, self.height_ptr, nullptr)
+            # 获取尺寸
+            self.width_ptr = ctypes.pointer(ctypes.c_int(0))
+            self.height_ptr = ctypes.pointer(ctypes.c_int(0))
+            nullptr = ctypes.POINTER(ctypes.c_ubyte)()
+            self.nemu.nemu_capture_display(
+                self.connect_id,
+                self.display_id,
+                0,
+                self.width_ptr,
+                self.height_ptr,
+                nullptr,
+            )
 
-        self.width = self.width_ptr.contents.value
-        self.height = self.height_ptr.contents.value
+            self.width = self.width_ptr.contents.value
+            self.height = self.height_ptr.contents.value
 
-        self.length = self.width * self.height * 4
-        self.pixels_array = (ctypes.c_ubyte * self.length)()
-        self.pixels_pointer = ctypes.pointer(self.pixels_array)
-        return self.check_resolution_ratio(self.width, self.height)
+            self.length = self.width * self.height * 4
+            self.pixels_array = (ctypes.c_ubyte * self.length)()
+            self.pixels_pointer = ctypes.pointer(self.pixels_array)
+            if not self.check_resolution_ratio(self.width, self.height):
+                self.kill()
+                return False
+
+            # Match ADB.connect(): do not publish a backend that cannot capture.
+            screenshot = self.screenshot()
+            expected_shape = (self.height, self.width, 3)
+            if not isinstance(screenshot, np.ndarray) or screenshot.shape != expected_shape:
+                actual_shape = getattr(screenshot, "shape", None)
+                raise RuntimeError(
+                    f"NEMUIPC截图无效: 期望 {expected_shape}, 实际 {actual_shape}"
+                )
+            return True
+        except Exception:
+            try:
+                self.kill()
+            except Exception:
+                logger.exception("NEMUIPC连接失败后的资源清理也失败")
+            raise
 
     def input_swipe(self, x1: int, y1: int, x2: int, y2: int, millisecond: int = 100) -> None:
         points = swipe_path((x1, y1), (x2, y2), millisecond)
@@ -82,9 +111,13 @@ class NEMU(IADB):
         self.nemu.nemu_capture_display(self.connect_id, self.display_id, self.length, self.width_ptr, self.height_ptr, self.pixels_pointer)
         image = np.frombuffer(self.pixels_array, dtype=np.uint8).reshape((self.height, self.width, 4))
 
-        image = cv.cvtColor(image, cv.COLOR_BGRA2RGB)
+        image = cv.cvtColor(image, cv.COLOR_BGRA2BGR)
         image = cv.flip(image, 0)
         return image
     
     def kill(self):
-        pass
+        connect_id = getattr(self, "connect_id", None)
+        if connect_id is None:
+            return
+        self.connect_id = None
+        self.nemu.nemu_disconnect(connect_id)

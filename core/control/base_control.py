@@ -26,6 +26,7 @@ class IADB(ABC):
 
     @abstractmethod
     def screenshot(self) -> cv.typing.MatLike:
+        """Return a screenshot in OpenCV BGR channel order."""
         pass
     
     @abstractmethod

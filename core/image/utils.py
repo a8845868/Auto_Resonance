@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Tuple, Union
+from typing import List, Tuple, Union
 
 import cv2 as cv
 import numpy as np
@@ -100,6 +100,9 @@ def get_bgr(
     if (cropped_pos1 != (0, 0) or cropped_pos2 != (0, 0)) and not no_crop:
         image = crop_image(image, cropped_pos1, cropped_pos2)
     pos = (pos[0] - cropped_pos1[0], pos[1] - cropped_pos1[1])
+    height, width = image.shape[:2]
+    if not (0 <= pos[0] < width and 0 <= pos[1] < height):
+        raise IndexError(f"image position out of bounds: {pos}")
     color = image[pos[1], pos[0]]
     return BGR(*color, offset=offset)
 
@@ -119,7 +122,7 @@ def get_hsv(
     """
     if (cropped_pos1 != (0, 0) or cropped_pos2 != (0, 0)) and not no_crop:
         image = crop_image(image, cropped_pos1, cropped_pos2)
-    image_hsv = cv.cvtColor(image, cv.COLOR_RGB2HSV)
+    image_hsv = cv.cvtColor(image, cv.COLOR_BGR2HSV)
 
     pos = (pos[0] - cropped_pos1[0], pos[1] - cropped_pos1[1])
     color = image_hsv[int(pos[1]), int(pos[0])]
@@ -141,13 +144,19 @@ def get_bgrs(
     """
     if (cropped_pos1 != (0, 0) or cropped_pos2 != (0, 0)) and not no_crop:
         image = crop_image(image, cropped_pos1, cropped_pos2)
-    new_positions = [
-        (position[0] - cropped_pos1[0], position[1] - cropped_pos1[1])
+    if not positions:
+        return []
+    relative_positions = [
+        (position[1] - cropped_pos1[1], position[0] - cropped_pos1[0])
         for position in positions
     ]
-    new_positions: Any = [(position[1], position[0]) for position in positions]
-    new_positions = np.array(new_positions)
-    colors = image[new_positions[:, 0], new_positions[:, 1]]
+    indices = np.asarray(relative_positions, dtype=np.intp)
+    height, width = image.shape[:2]
+    if np.any(indices[:, 0] < 0) or np.any(indices[:, 0] >= height):
+        raise IndexError("image row position out of bounds")
+    if np.any(indices[:, 1] < 0) or np.any(indices[:, 1] >= width):
+        raise IndexError("image column position out of bounds")
+    colors = image[indices[:, 0], indices[:, 1]]
     return [BGR(*color, offset=0) for color in colors]
 
 

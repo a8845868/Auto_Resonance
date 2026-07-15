@@ -24,8 +24,24 @@ from core.model import app
 EXCURSIONX = [-10, 10]
 EXCURSIONY = [-10, 10]
 STOP = False
+MAX_SWIPE_SEGMENTS = 100
 
 control: IADB = ADB()
+
+
+def _close_backend(candidate: IADB, name: str) -> None:
+    try:
+        candidate.kill()
+    except Exception:
+        logger.exception(f"{name}连接资源清理失败")
+
+
+def _activate_backend(candidate: IADB) -> None:
+    global control
+    previous = control
+    control = candidate
+    if previous is not candidate:
+        _close_backend(previous, "旧控制后端")
 
 
 def connect(adb_port: Optional[int] = None):
@@ -37,14 +53,30 @@ def connect(adb_port: Optional[int] = None):
     global control
     device = app.Global.device
     if device.is_mumu:
-        control = NEMU()
-        status = control.connect(adb_port)
+        nemu_candidate = None
+        try:
+            nemu_candidate = NEMU()
+            status = nemu_candidate.connect(adb_port)
+        except Exception:
+            logger.exception("MUMUIPC连接异常，尝试使用ADB连接")
+            status = False
         if status:
-            return status
-        else:
-            logger.warning("MUMUIPC连接失败，尝试使用ADB连接")
-    control = ADB()
-    status = control.connect(adb_port)
+            _activate_backend(nemu_candidate)
+            return True
+        if nemu_candidate is not None:
+            _close_backend(nemu_candidate, "NEMUIPC")
+        logger.warning("MUMUIPC连接失败，尝试使用ADB连接")
+
+    adb_candidate = ADB()
+    try:
+        status = adb_candidate.connect(adb_port)
+    except Exception:
+        _close_backend(adb_candidate, "ADB")
+        raise
+    if status:
+        _activate_backend(adb_candidate)
+    else:
+        _close_backend(adb_candidate, "ADB")
     return status
 
 
@@ -80,7 +112,6 @@ def input_swipe(pos1=(919, 617), pos2=(919, 908), swipe_time: int = 100):
     """
     if STOP:
         raise StopExecution()
-    num = 0
     # 添加随机值
     pos_x1 = control.ratio * pos1[0] + random.randint(*EXCURSIONX)
     pos_y1 = control.ratio * pos1[1] + random.randint(*EXCURSIONY)
@@ -88,15 +119,91 @@ def input_swipe(pos1=(919, 617), pos2=(919, 908), swipe_time: int = 100):
     pos_y2 = control.ratio * pos2[1] + random.randint(*EXCURSIONY)
 
     logger.debug(f"滑动 ({pos_x1}, {pos_y1}) -> ({pos_x2}, {pos_y2})")
-    while abs(pos_x2 - pos_x1) > 10 or abs(pos_y2 - pos_y1) > 10:
+    remaining_x = pos_x2 - pos_x1
+    remaining_y = pos_y2 - pos_y1
+    safe_x1, safe_y1, safe_x2, safe_y2 = control.safe_area
+    preferred_start = (
+        max(safe_x1, min(pos_x1, safe_x2)),
+        max(safe_y1, min(pos_y1, safe_y2)),
+    )
+
+    for segment in range(MAX_SWIPE_SEGMENTS):
+        if abs(remaining_x) <= 10 and abs(remaining_y) <= 10:
+            return
         if STOP:
             raise StopExecution()
-        if num >= 1:
+        if segment >= 1:
             time.sleep(0.5)
-        limit_pos_x1 = max(control.safe_area[0], min(pos_x1, control.safe_area[2]))
-        limit_pos_y1 = max(control.safe_area[1], min(pos_y1, control.safe_area[3]))
-        limit_pos_x2 = max(control.safe_area[0], min(pos_x2, control.safe_area[2]))
-        limit_pos_y2 = max(control.safe_area[1], min(pos_y2, control.safe_area[3]))
+            if STOP:
+                raise StopExecution()
+
+        if segment == 0:
+            start_x, start_y = preferred_start
+        else:
+            start_x = (
+                safe_x1
+                if remaining_x > 0
+                else safe_x2
+                if remaining_x < 0
+                else preferred_start[0]
+            )
+            start_y = (
+                safe_y1
+                if remaining_y > 0
+                else safe_y2
+                if remaining_y < 0
+                else preferred_start[1]
+            )
+
+        def progress_ratio(x, y):
+            ratios = [1.0]
+            if remaining_x > 0:
+                ratios.append((safe_x2 - x) / remaining_x)
+            elif remaining_x < 0:
+                ratios.append((x - safe_x1) / -remaining_x)
+            if remaining_y > 0:
+                ratios.append((safe_y2 - y) / remaining_y)
+            elif remaining_y < 0:
+                ratios.append((y - safe_y1) / -remaining_y)
+            return max(0.0, min(ratios))
+
+        ratio = progress_ratio(start_x, start_y)
+        limit_pos_x1 = int(round(start_x))
+        limit_pos_y1 = int(round(start_y))
+        limit_pos_x2 = int(round(start_x + remaining_x * ratio))
+        limit_pos_y2 = int(round(start_y + remaining_y * ratio))
+        actual_x = limit_pos_x2 - limit_pos_x1
+        actual_y = limit_pos_y2 - limit_pos_y1
+
+        if actual_x == 0 and actual_y == 0 and segment == 0:
+            start_x = (
+                safe_x1
+                if remaining_x > 0
+                else safe_x2
+                if remaining_x < 0
+                else preferred_start[0]
+            )
+            start_y = (
+                safe_y1
+                if remaining_y > 0
+                else safe_y2
+                if remaining_y < 0
+                else preferred_start[1]
+            )
+            ratio = progress_ratio(start_x, start_y)
+            limit_pos_x1 = int(round(start_x))
+            limit_pos_y1 = int(round(start_y))
+            limit_pos_x2 = int(round(start_x + remaining_x * ratio))
+            limit_pos_y2 = int(round(start_y + remaining_y * ratio))
+            actual_x = limit_pos_x2 - limit_pos_x1
+            actual_y = limit_pos_y2 - limit_pos_y1
+
+        if actual_x == 0 and actual_y == 0:
+            raise RuntimeError(
+                f"滑动无法推进：剩余位移 ({remaining_x}, {remaining_y})，"
+                f"安全区域 {control.safe_area}"
+            )
+
         logger.debug(
             f"多次滑动 ({limit_pos_x1}, {limit_pos_y1}) -> ({limit_pos_x2}, {limit_pos_y2})"
         )
@@ -105,10 +212,20 @@ def input_swipe(pos1=(919, 617), pos2=(919, 908), swipe_time: int = 100):
             limit_pos_x1, limit_pos_y1, limit_pos_x2, limit_pos_y2, swipe_time
         )
 
-        # 减去当前执行的距离
-        pos_x1 -= limit_pos_x1 - limit_pos_x2
-        pos_y1 -= limit_pos_y1 - limit_pos_y2
-        num += 1
+        previous_distance = abs(remaining_x) + abs(remaining_y)
+        remaining_x -= actual_x
+        remaining_y -= actual_y
+        if abs(remaining_x) + abs(remaining_y) >= previous_distance:
+            raise RuntimeError(
+                f"滑动无法推进：分段位移 ({actual_x}, {actual_y}) 未减少剩余距离"
+            )
+        if abs(remaining_x) <= 10 and abs(remaining_y) <= 10:
+            return
+
+    raise RuntimeError(
+        f"滑动超过最大分段次数 {MAX_SWIPE_SEGMENTS}，"
+        f"仍剩余位移 ({remaining_x}, {remaining_y})"
+    )
 
 
 def input_tap(pos: Tuple[int, int] = (880, 362)):
