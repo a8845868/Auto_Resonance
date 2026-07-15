@@ -36,6 +36,7 @@ from core.services.task_schedule_state import (
 )
 from core.utils.utils import read_json, RESOURCES_PATH
 from core.services.game_recovery import is_game_running, recover_game
+from core.services.station_availability import unavailable_stations
 
 _city_sell_data: Any = read_json(RESOURCES_PATH / "goods/CityGoodsSellData.json")
 _city_tired_data: Dict[str, int] = read_json(RESOURCES_PATH / "goods/CityTiredData.json")
@@ -84,6 +85,22 @@ def _fatigue_deferral(reason: str, required_available: int):
         "maximum": maximum,
         "available": available,
         "required_available": max(0, int(required_available)),
+    }
+
+
+def _route_availability_deferral(*cities: str):
+    unavailable = unavailable_stations(cities)
+    if not unavailable:
+        return None
+    logger.warning(
+        f"跑商路线包含当前未开放站点: {', '.join(unavailable)}；"
+        "停止地图操作并等待路线重新规划"
+    )
+    return {
+        "success": True,
+        "deferred": True,
+        "reason": "route_station_unavailable",
+        "stations": unavailable,
     }
 
 
@@ -390,6 +407,9 @@ def run_with_recovery(routes: RoutesModel, recovery_attempts: int = 2):
 def two_city_run(buy_city_name: str, sell_city_name: str):
     global STOP
     STOP = False
+    unavailable = _route_availability_deferral(buy_city_name, sell_city_name)
+    if unavailable:
+        return unavailable
     count = app.RunBuy.BuyCount
     buy_haggle_num = app.CityHaggle[buy_city_name]
     sell_haggle_num = app.CityHaggle[sell_city_name]
@@ -441,6 +461,9 @@ def two_city_weekly_run(
 
     global STOP
     STOP = False
+    unavailable = _route_availability_deferral(buy_city_name, sell_city_name)
+    if unavailable:
+        return unavailable
     buy_haggle_num = app.CityHaggle[buy_city_name]
     sell_haggle_num = app.CityHaggle[sell_city_name]
     total_runs = sum(int(batch["runs"]) for batch in execution_batches)
@@ -517,8 +540,15 @@ def adaptive_weekly_run():
     if not state or not summary or summary["finished"]:
         logger.info("没有待执行的本周跑商计划")
         return bool(state and summary and summary["finished"])
+    unavailable_cycle = unavailable_stations(state["cycle"])
     fallback = int(cfg.InventoryBooks.value)
     sell_resume = is_sell_page()
+    if unavailable_cycle and sell_resume:
+        logger.warning(
+            "当前处于卖货中间态且原计划包含未开放站点，"
+            "为保留现有货物与议价状态，本次暂停并等待人工复核"
+        )
+        return _route_availability_deferral(*state["cycle"])
     if sell_resume:
         logger.info("当前处于卖货中间态，跳过进货书背包扫描以保留议价幅度")
         actual = None
@@ -535,17 +565,25 @@ def adaptive_weekly_run():
         from qfluentwidgets import qconfig
         qconfig.set(cfg.InventoryBooks, actual)
     required = int(summary["remaining_books"])
-    needs_reoptimization = bool(state.get("needs_reoptimization")) and not sell_resume
+    needs_reoptimization = (
+        bool(state.get("needs_reoptimization")) or bool(unavailable_cycle)
+    ) and not sell_resume
     if available >= required and not needs_reoptimization:
         logger.info(f"进货书库存 {available} 本，足够完成剩余计划（需要 {required} 本）")
         cycle = state["cycle"]
         return two_city_weekly_run(cycle[0], cycle[1], remaining_batches(state), max_runs=1)
 
     if needs_reoptimization:
-        logger.info(
-            f"新周进货书库存已确认：{available} 本；"
-            "正在按真实库存重新计算剩余计划"
-        )
+        if unavailable_cycle:
+            logger.warning(
+                f"原周计划包含未开放站点 {unavailable_cycle}；"
+                f"按当前 {available} 本进货书强制计算替代路线"
+            )
+        else:
+            logger.info(
+                f"新周进货书库存已确认：{available} 本；"
+                "正在按真实库存重新计算剩余计划"
+            )
     else:
         logger.warning(
             f"进货书库存仅 {available} 本，少于剩余计划需要的 {required} 本，"
@@ -563,6 +601,12 @@ def adaptive_weekly_run():
     except StopExecution:
         raise
     except Exception:
+        if unavailable_cycle:
+            logger.exception(
+                "未能为含关闭站点的周计划生成替代路线；"
+                "禁止回退原路线，留待下次复核"
+            )
+            return _route_availability_deferral(*state["cycle"])
         logger.exception("科伦巴实时替代路线计算失败，降级为原路线不使用进货书")
         safe_batches = [{"runs": summary["remaining_runs"], "books": {city: 0 for city in state["cycle"]}}]
         return two_city_weekly_run(

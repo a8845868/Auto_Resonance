@@ -220,6 +220,8 @@ def test_weekly_run_propagates_deferral_without_recording_completion():
     ), patch.object(
         business, "run_with_recovery", return_value=deferred
     ), patch.object(
+        business, "_route_availability_deferral", return_value=None
+    ), patch.object(
         business, "is_stopped", return_value=False
     ), patch("core.services.record_completed_run") as record:
         result = business.two_city_weekly_run("岚心城", "武林源", batches)

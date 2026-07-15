@@ -12,6 +12,7 @@ from loguru import logger
 
 from core.utils.utils import RESOURCES_PATH, read_json
 from core.services.passenger_planner import PassengerPlanConfig, estimate_passenger_plan
+from core.services.station_availability import available_stations
 
 
 PRICE_API = "https://www.resonance-columba.com/api/get-prices"
@@ -174,8 +175,13 @@ def _distribute_books(gains: list[list[int]], total_books: int) -> tuple[int, li
     return dp[best_books], paths[best_books]
 
 
-def optimize_live_routes(config: OptimizationConfig = OptimizationConfig()) -> dict:
+def optimize_live_routes(
+    config: OptimizationConfig = OptimizationConfig(),
+    *,
+    at: datetime | None = None,
+) -> dict:
     products, upstream_cities, cities, fatigue, belongs_to = _load_metadata()
+    cities = available_stations(cities, at)
     prices, latest_timestamp = _fetch_prices(products, upstream_cities)
     passenger_fatigue = max(0, config.passenger_trips_per_week) * max(0, config.passenger_fatigue_per_trip)
     freight_fatigue_budget = max(0, config.weekly_fatigue - passenger_fatigue)
