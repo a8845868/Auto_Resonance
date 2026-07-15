@@ -365,22 +365,48 @@ def click_station(name: str, cur_station: Optional[str] = None):
         else:
             logger.error(f"未找到站点: {name}")
             return STATION(False)
-        time.sleep(0.5)
-        # 点击前往目的地按钮
-        logger.info("点击前往目的地按钮")
-        if click_image(
-            RESOURCES_PATH / "map/go_station.png",
-            cropped_pos1=(937, 605),
-            cropped_pos2=(1218, 679),
-            trynum=5,
-        ):
-            time.sleep(1.0)
-            if _wait_for_departure():
-                return STATION(True)
-            logger.error("站台过渡超时，未确认进入自动巡航")
-            return STATION(False)
-        else:
-            logger.error(f"未找到前往目的地按钮: {name}")
+        # Clicking a station label can first recenter the map and place the red
+        # destination pin without opening the action panel. Reacquire the
+        # target in the new frame and retry the station click before failing.
+        for selection_attempt in range(3):
+            time.sleep(0.5)
+            logger.info("点击前往目的地按钮")
+            if click_image(
+                RESOURCES_PATH / "map/go_station.png",
+                cropped_pos1=(937, 605),
+                cropped_pos2=(1218, 679),
+                trynum=1,
+                check_err=False,
+            ):
+                time.sleep(1.0)
+                if _wait_for_departure():
+                    return STATION(True)
+                logger.error("站台过渡超时，未确认进入自动巡航")
+                return STATION(False)
+            if selection_attempt == 2:
+                break
+
+            retry_image = screenshot()
+            retry_image.crop_image((0, 0), (1280, 654))
+            retry_result = retry_image.match_template(
+                RESOURCES_PATH / "stations" / STATION_NAME2PNG[name], 0.95
+            )
+            retry_anchor = _station_label_center(retry_image.ocr(), (name,))
+            if retry_result:
+                retry_pos = retry_result.loc
+            elif retry_anchor:
+                retry_pos = (retry_anchor[1], retry_anchor[2])
+            else:
+                logger.warning(
+                    f"前往按钮尚未出现，且无法重新定位目标站点: {name}"
+                )
+                break
+            logger.info(
+                f"前往按钮尚未出现，重新点击目标站点 "
+                f"({selection_attempt + 2}/3): {name} {retry_pos}"
+            )
+            input_tap(retry_pos)
+        logger.error(f"未找到前往目的地按钮: {name}")
     else:
         logger.error("没有该站点的坐标信息")
     return STATION(False)

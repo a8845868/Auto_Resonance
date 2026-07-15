@@ -95,6 +95,7 @@ def test_run_from_off_route_station_repositions_before_cleanup_and_route_actions
 
     def buy(*args, **kwargs):
         events.append(("buy",))
+        return True
 
     with patch.object(business, "connect", return_value=True), patch.object(
         business, "is_game_running", return_value=True
@@ -174,6 +175,51 @@ def test_run_from_off_route_station_stops_when_repositioning_fails():
     assert result is False
     go_business.assert_not_called()
     clear.assert_not_called()
+
+
+def test_run_stops_when_buy_step_explicitly_fails():
+    routes = RoutesModel(
+        city_data=[
+            RouteModel(
+                buy_city_name="A",
+                sell_city_name="B",
+                goods_data={"good-a": {}},
+            ),
+            RouteModel(
+                buy_city_name="B",
+                sell_city_name="A",
+                goods_data={"good-b": {}},
+            ),
+        ]
+    )
+    image = MagicMock()
+    image.ocr.return_value = []
+    travel = MagicMock()
+    travel.wait.return_value = True
+
+    with patch.object(business, "connect", return_value=True), patch.object(
+        business, "is_game_running", return_value=True
+    ), patch.object(business, "is_sell_page", return_value=False), patch.object(
+        business, "_normalize_trade_startup_screen", return_value=True
+    ), patch.object(business, "get_station", return_value="A"), patch.object(
+        business, "screenshot", return_value=image
+    ), patch.object(
+        business, "is_train_in_transit", return_value=False
+    ), patch.object(
+        business, "_clear_residual_cargo", return_value=True
+    ), patch.object(
+        business, "go_business", return_value=True
+    ), patch.object(
+        business, "click_station", return_value=travel
+    ) as click_station, patch.object(
+        business, "prepare_negotiation", return_value=2
+    ), patch.object(
+        business, "buy_business", return_value=False
+    ):
+        result = business.run(routes)
+
+    assert result is False
+    assert [call.args[0] for call in click_station.call_args_list] == ["A"]
 
 
 def test_run_from_off_route_station_refuses_to_reposition_while_in_transit():
