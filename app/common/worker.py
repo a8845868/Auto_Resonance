@@ -7,13 +7,13 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 import inspect
 
 from loguru import logger
-from PyQt5.QtCore import QThread, pyqtSignal
+from PySide6.QtCore import QThread, Signal
 
 from core.utils.update.base_update_utils import BaseUpdateUtils
 
 
 class Worker(QThread):
-    result = pyqtSignal(object)
+    result = Signal(object)
 
     def __init__(self, func, stop = lambda : None, **kwargs):
         super(Worker, self).__init__()
@@ -34,8 +34,8 @@ class Worker(QThread):
         self.stop_func()
 
 class UpdateWorker(QThread):
-    progress_changed = pyqtSignal(int)
-    update_finished = pyqtSignal(bool)
+    progress_changed = Signal(int)
+    update_finished = Signal(bool)
 
     def __init__(self, func, **kwargs):
         super(UpdateWorker, self).__init__()

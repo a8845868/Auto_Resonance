@@ -10,9 +10,8 @@ import json
 import os
 import sys
 
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QIcon
-from PyQt5.QtWidgets import QApplication, QMainWindow
+from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import QApplication, QMainWindow
 
 import core.utils.logger  # noqa: F401
 from app.components.update_message_box import UpdateMessageBox
@@ -39,17 +38,8 @@ update_data = None
 if args.update_data:
     update_data = LatestInfoResponse.model_validate_json(args.update_data)
 
-# enable dpi scale
-QApplication.setHighDpiScaleFactorRoundingPolicy(
-    Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-)
-QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
-
-QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
-
 # create application
 app = QApplication(sys.argv)
-app.setAttribute(Qt.AA_DontCreateNativeWidgetSiblings)
 
 # create main window
 main_window = QMainWindow()
@@ -61,4 +51,4 @@ w = UpdateMessageBox(parent=main_window)
 w.cancelButton.clicked.connect(sys.exit)
 w.show(args.mirror_cdk, update_data)
 
-app.exec_()
+app.exec()

@@ -3,9 +3,9 @@ Author: Night-stars-1 nujj1042633805@gmail.com
 Date: 2023-05-15 21:45:43
 LastEditors: Night-stars-1 nujj1042633805@gmail.com
 LastEditTime: 2024-04-29 13:02:23
-Description: 
+Description:
 
-Copyright (c) 2023 by Night-stars-1, All Rights Reserved. 
+Copyright (c) 2023 by Night-stars-1, All Rights Reserved.
 """
 
 import os.path

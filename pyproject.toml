@@ -1,28 +1,46 @@
 [project]
-name = "Auto_Resonance_Updater"
+name = "Auto_Resonance"
 version = "0.1.0"
 description = "Default template for PDM package"
 authors = [
     {name = "Night-stars-1", email = "nujj1042633805@gmail.com"},
 ]
 dependencies = [
-    "pyqt5-qt5==5.15.2",
-    "PyQt-Fluent-Widgets==1.5.4", 
-    "loguru>=0.7.3", 
-    "requests>=2.32.4", 
-    "pydantic>=2.11.5"
+    "Pillow==10.3.0",
+    "loguru==0.7.2",
+    "numpy==1.26.4",
+    "opencv-python==4.9.0.80",
+    "orjson>=3.10.0",
+    "pydantic>=2.6.4",
+    "watchdog>=4.0.0",
+    "adb-shell>=0.4.4",
+    "onnxocr-ppocrv4>=0.0.5",
+    "requests>=2.32.4",
+    "psutil>=7.0.0",
+    "PySide6-Fluent-Widgets[full]>=1.8.3",
+    "onnxruntime>=1.22.1"
 ]
 requires-python = "<3.13,>=3.11"
 readme = "README.md"
 license = {text = "MIT"}
 
-[tool.pdm.scripts]
-build-updater  = "pdm run pyinstaller -F --distpath ./dist/updater -i app/resource/images/logo.ico -n 'HeiYue Updater' updater.py -y"
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
 
 [tool.pdm]
-distribution = false
+distribution = true
 
-[dependency-groups]
+[tool.pdm.scripts]
+build-updater = "pdm run pyinstaller -F --distpath ./dist/updater -i app/resource/images/logo.ico -n 'HeiYue Updater' updater.py -y"
+
+[tool.pdm.dev-dependencies]
 dev = [
-    "pyinstaller>=6.14.1",
+    "pytest>=8.1.1",
+    "pyinstaller==6.13.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["_worktrees", ".git", ".venv"]
+addopts = ["--ignore=tests/tests"]
