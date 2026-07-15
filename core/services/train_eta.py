@@ -15,12 +15,9 @@ _DISTANCE_RE = re.compile(
 )
 
 
-def parse_remaining_distance(items: Iterable[dict | str]) -> Optional[float]:
+def parse_remaining_distance(items: Iterable[dict]) -> Optional[float]:
     """Return the remaining distance in kilometres from OCR output."""
-    texts = [
-        str(item.get("text", "") if isinstance(item, dict) else item).replace("，", ",")
-        for item in items
-    ]
+    texts = [str(item.get("text", "")).replace("，", ",") for item in items]
     # PaddleOCR may return the label and number as one box or as adjacent boxes.
     for text in [*texts, "".join(texts)]:
         match = _DISTANCE_RE.search(text)

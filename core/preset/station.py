@@ -6,7 +6,6 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 """
 
 import time
-from datetime import datetime, timedelta
 
 from loguru import logger
 
@@ -27,59 +26,6 @@ SPEED_BOOST_COLOR = (251, 253, 253)
 SPEED_BOOST_EXCLUDED_LOW = (235, 235, 250)
 SPEED_BOOST_EXCLUDED_HIGH = (240, 240, 255)
 DISTANCE_OCR_INTERVAL = 15.0
-
-
-def _format_eta_duration(seconds: float) -> str:
-    total = max(0, int(round(seconds)))
-    hours, remainder = divmod(total, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    if hours:
-        return f"{hours}:{minutes:02d}:{seconds:02d}"
-    return f"{minutes:02d}:{seconds:02d}"
-
-
-class TravelEtaTracker:
-    """Compatibility logger backed by the rolling ETA estimator."""
-
-    def __init__(self, sample_interval: float = 10.0, log_interval: float = 30.0) -> None:
-        self.sample_interval = sample_interval
-        self.log_interval = log_interval
-        self.estimator = TrainArrivalEstimator(max_samples=6)
-        self.last_sample_at: float | None = None
-        self.last_eta_log_at: float | None = None
-        self.initial_logged = False
-
-    def should_sample(self, now: float) -> bool:
-        return self.last_sample_at is None or now - self.last_sample_at >= self.sample_interval
-
-    def observe(
-        self,
-        texts: list[str],
-        *,
-        now: float,
-        wall_now: datetime | None = None,
-    ) -> str | None:
-        distance = parse_remaining_distance(texts)
-        self.last_sample_at = now
-        if distance is None:
-            return None
-
-        eta_seconds = self.estimator.observe(distance, now)
-        if not self.initial_logged:
-            self.initial_logged = True
-            return f"行车 ETA：剩余 {distance:g} km，正在采样实际行驶速度"
-        if eta_seconds is None:
-            return None
-        if self.last_eta_log_at is not None and now - self.last_eta_log_at < self.log_interval:
-            return None
-
-        self.last_eta_log_at = now
-        wall_now = wall_now or datetime.now()
-        arrival = wall_now + timedelta(seconds=eta_seconds)
-        return (
-            f"行车 ETA：剩余 {distance:g} km，实测 {self.estimator.speed * 60:.1f} km/分钟，"
-            f"预计 {_format_eta_duration(eta_seconds)} 后到达（{arrival:%H:%M:%S}）"
-        )
 
 # pick_mask = cv.imread("resources/mask/pick_mask.png", cv.IMREAD_GRAYSCALE)
 # _, pick_mask = cv.threshold(pick_mask, 128, 255, cv.THRESH_BINARY)
