@@ -5,6 +5,8 @@ from auto.resident_activity import (
     DETAIL_MARKER_ROI,
     DETAIL_SWEEP_ROI,
     FULL_REALM_REWARDS,
+    REWARD_DISMISS_ROI,
+    REWARD_ITEMS_ROI,
     REWARD_TITLE_ROI,
     ResidentActivityAutomation,
     SIEGE_TASKS,
@@ -83,7 +85,13 @@ class SweepFlowDriver(FakeDriver):
                 else []
             ),
             "reward": (
-                [item("获得物品", 675, 185)] if self.reward_available else []
+                [
+                    item("获得物品", 675, 54),
+                    item("200", 413, 205),
+                    item("触碰空白区域退出", 657, 683),
+                ]
+                if self.reward_available
+                else []
             ),
         }
         return labels[self.state]
@@ -193,7 +201,9 @@ class ResidentActivityTests(unittest.TestCase):
             item("扫荡", 300, 200),
             item("难度选择", 110, 677),
             item("开始扫荡", 772, 526),
-            item("获得物品", 675, 185),
+            item("获得物品", 675, 54),
+            item("200", 413, 205),
+            item("触碰空白区域退出", 657, 683),
         ]])
         self.assertEqual(ResidentActivityAutomation(driver).sweep_current_activity(1), 0)
         self.assertEqual(driver.taps, [])
@@ -213,10 +223,62 @@ class ResidentActivityTests(unittest.TestCase):
             ("难度选择", 110, 677, DETAIL_MARKER_ROI),
             ("选择队伍", 640, 166, TEAM_TITLE_ROI),
             ("开始扫荡", 772, 526, TEAM_START_ROI),
-            ("获得物品", 675, 185, REWARD_TITLE_ROI),
+            ("获得物品", 675, 54, REWARD_TITLE_ROI),
+            ("200", 413, 205, REWARD_ITEMS_ROI),
+            ("触碰空白区域退出", 657, 683, REWARD_DISMISS_ROI),
         )
         for text, x, y, roi in fixtures:
             self.assertTrue(automation.text_in_roi([item(text, x, y)], text, roi))
+
+    def test_reward_page_waits_for_stable_items_before_dismissal(self):
+        class AnimatedRewardDriver(SweepFlowDriver):
+            def __init__(self):
+                super().__init__()
+                self.reward_frame = 0
+
+            def texts(self):
+                if self.state != "reward":
+                    return super().texts()
+                frames = [
+                    [
+                        item("获得物品", 675, 54),
+                        item("200", 413, 205),
+                        item("触碰空白区域退出", 657, 683),
+                    ],
+                    [
+                        item("获得物品", 675, 54),
+                        item("200", 413, 205),
+                        item("10", 821, 338),
+                        item("触碰空白区域退出", 657, 683),
+                    ],
+                ]
+                frame = frames[min(self.reward_frame, len(frames) - 1)]
+                self.reward_frame += 1
+                return frame
+
+        driver = AnimatedRewardDriver()
+        automation = ResidentActivityAutomation(driver)
+
+        self.assertEqual(
+            automation.sweep_current_activity(1, expected_reward="照夜双刃 / 噪音激酶"),
+            1,
+        )
+        self.assertGreaterEqual(driver.reward_frame, 6)
+        self.assertEqual(
+            [entry.amount for entry in automation.reward_history[0].entries],
+            [200, 10],
+        )
+
+    def test_real_reward_title_position_is_inside_reward_roi(self):
+        automation = ResidentActivityAutomation(FakeDriver([[]]))
+        actual = {
+            "text": "获得物品",
+            "position": [[593.0, 29.0], [759.0, 32.0], [758.0, 78.0], [592.0, 75.0]],
+        }
+
+        self.assertTrue(
+            automation.text_in_roi([actual], "获得物品", REWARD_TITLE_ROI)
+        )
 
     def test_run_siege_uses_verified_sweep_flow(self):
         driver = SweepFlowDriver(max_sweeps=1)
@@ -238,7 +300,9 @@ class ResidentActivityTests(unittest.TestCase):
             item("难度选择", 110, 677),
             item("选择队伍", 640, 166),
             item("开始扫荡", 772, 526),
-            item("获得物品", 675, 185),
+            item("获得物品", 675, 54),
+            item("200", 413, 205),
+            item("触碰空白区域退出", 657, 683),
         ]])
         completed = ResidentActivityAutomation(driver).run_limited_activity(
             "全境特供", stage=FULL_REALM_REWARDS["学会装备箱"]
