@@ -118,6 +118,9 @@ class Config(RunningBusinessConfig):
     autoStartEmulator = ConfigItem(
         "EmulatorLifecycle", "AutoStartEmulator", True, None
     )
+    closeGameWhenIdle = ConfigItem(
+        "EmulatorLifecycle", "CloseGameWhenIdle", True, None
+    )
     closeEmulatorWhenIdle = ConfigItem(
         "EmulatorLifecycle", "CloseEmulatorWhenIdle", False, None
     )

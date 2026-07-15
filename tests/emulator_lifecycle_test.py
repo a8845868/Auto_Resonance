@@ -711,6 +711,36 @@ def test_queue_lifecycle_activates_snapshot_and_cleans_in_safe_order():
         app.Global.device = previous
 
 
+def test_queue_lifecycle_can_keep_game_running_after_queue_finishes():
+    events = []
+
+    class Session:
+        def ensure_game_ready(self, _cancelled):
+            events.append("ensure")
+            return _device(index=5, port=16544)
+
+        def stop_game(self, _timeout, **_kwargs):
+            events.append("stop_game")
+
+        def stop_emulator(self, _timeout):
+            events.append("stop_emulator")
+
+    queue_lifecycle = EmulatorQueueLifecycle(
+        _device(index=5, port=16544),
+        lifecycle=Session(),
+        options=LifecycleOptions(
+            close_game_when_idle=False,
+            close_emulator_when_idle=False,
+        ),
+        release_controller=lambda: events.append("release_controller"),
+    )
+
+    queue_lifecycle.prepare()
+    queue_lifecycle.cleanup()
+
+    assert events == ["ensure", "release_controller"]
+
+
 def test_failed_prepare_compensates_for_emulator_started_by_queue():
     events = []
 

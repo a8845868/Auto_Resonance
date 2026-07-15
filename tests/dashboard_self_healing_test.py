@@ -1,6 +1,8 @@
 import os
 from types import SimpleNamespace
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
@@ -263,3 +265,64 @@ def test_queue_captures_one_self_healing_policy_snapshot(monkeypatch):
             {"dispatch": True, "allow_repair": False},
         )
     ]
+
+
+@pytest.mark.parametrize("close_game_when_idle", [False, True])
+def test_queue_captures_close_game_preference(monkeypatch, close_game_when_idle):
+    captured = {}
+
+    class CapturingLifecycle:
+        def __init__(self, device, *, options):
+            captured["device"] = device
+            captured["options"] = options
+
+    class CapturingWorker:
+        def __init__(self, _tasks, _parent, **kwargs):
+            captured["lifecycle"] = kwargs["lifecycle"]
+            self.taskStarted = _Signal()
+            self.taskFinished = _Signal()
+            self.taskResult = _Signal()
+            self.taskCompleted = _Signal()
+            self.queueChanged = _Signal()
+            self.error = _Signal()
+            self.finished = _Signal()
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(
+        dashboard_module, "EmulatorQueueLifecycle", CapturingLifecycle
+    )
+    monkeypatch.setattr(dashboard_module, "TaskQueueWorker", CapturingWorker)
+    monkeypatch.setattr(cfg.enableCodexSelfHealing, "value", False)
+    monkeypatch.setattr(cfg.allowCodexIsolatedRepair, "value", False)
+    monkeypatch.setattr(cfg.enableAutoGameLifecycle, "value", True)
+    monkeypatch.setattr(cfg.autoStartEmulator, "value", True)
+    monkeypatch.setattr(
+        cfg.closeGameWhenIdle, "value", close_game_when_idle
+    )
+    monkeypatch.setattr(cfg.closeEmulatorWhenIdle, "value", False)
+    monkeypatch.setattr(cfg.device, "value", "127.0.0.1:16544")
+    dashboard = SimpleNamespace(
+        queueWorker=None,
+        schedulerArmed=False,
+        _enabledTasks=lambda: [SimpleNamespace(name="task")],
+        _taskStarted=lambda *_args: None,
+        _taskFinished=lambda *_args: None,
+        _taskResult=lambda *_args: None,
+        _taskCompleted=lambda *_args: None,
+        pendingPanel=_Panel(),
+        controlButton=_Button(),
+    )
+    dashboard._setControlRunning = lambda running: DashboardInterface._setControlRunning(
+        dashboard, running
+    )
+
+    DashboardInterface.startTaskQueue(dashboard)
+
+    assert captured["device"] == "127.0.0.1:16544"
+    assert captured["lifecycle"] is not None
+    assert (
+        captured["options"].close_game_when_idle
+        is close_game_when_idle
+    )

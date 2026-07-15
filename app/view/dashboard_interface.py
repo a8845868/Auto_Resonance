@@ -271,7 +271,7 @@ class DashboardInterface(ScrollArea):
                 cfg.device.value,
                 options=LifecycleOptions(
                     auto_start_emulator=bool(cfg.autoStartEmulator.value),
-                    close_game_when_idle=True,
+                    close_game_when_idle=bool(cfg.closeGameWhenIdle.value),
                     close_emulator_when_idle=bool(
                         cfg.closeEmulatorWhenIdle.value
                     ),

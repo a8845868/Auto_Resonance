@@ -83,7 +83,7 @@ class SettingInterface(ScrollArea):
         self.autoGameLifecycleCard = SwitchSettingCard(
             FIF.PLAY,
             "任务自动管理游戏进程",
-            "队列有任务时启动当前 MuMu 多开实例和游戏；整批结束后关闭游戏进程",
+            "队列有任务时启动并管理当前 MuMu 多开实例和游戏",
             configItem=cfg.enableAutoGameLifecycle,
             parent=self.lifecycleGroup,
         )
@@ -94,10 +94,17 @@ class SettingInterface(ScrollArea):
             configItem=cfg.autoStartEmulator,
             parent=self.lifecycleGroup,
         )
+        self.closeGameWhenIdleCard = SwitchSettingCard(
+            FIF.POWER_BUTTON,
+            "队列结束后关闭游戏",
+            "关闭后会保留游戏；若同时关闭模拟器，游戏仍会随模拟器结束",
+            configItem=cfg.closeGameWhenIdle,
+            parent=self.lifecycleGroup,
+        )
         self.closeEmulatorWhenIdleCard = SwitchSettingCard(
             FIF.POWER_BUTTON,
             "队列结束后同时关闭模拟器",
-            "默认仅关闭游戏以便节约资源；开启后还会关闭对应 MuMu 多开实例",
+            "开启后，队列结束时还会关闭对应 MuMu 多开实例",
             configItem=cfg.closeEmulatorWhenIdle,
             parent=self.lifecycleGroup,
         )
@@ -155,6 +162,7 @@ class SettingInterface(ScrollArea):
         self.musicInThisPCGroup.addSettingCard(self.adbOrderCard)
         self.lifecycleGroup.addSettingCard(self.autoGameLifecycleCard)
         self.lifecycleGroup.addSettingCard(self.autoStartEmulatorCard)
+        self.lifecycleGroup.addSettingCard(self.closeGameWhenIdleCard)
         self.lifecycleGroup.addSettingCard(self.closeEmulatorWhenIdleCard)
         self.selfHealingGroup.addSettingCard(self.codexSelfHealingCard)
         self.selfHealingGroup.addSettingCard(self.codexIsolatedRepairCard)
