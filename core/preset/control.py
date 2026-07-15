@@ -17,6 +17,7 @@ from core.module.bgr import BGR
 from core.control.control import input_tap, screenshot
 from core.exception.exception_handling import get_excption
 from core.services.screen_state import (
+    clarity_replenish_cancel_position,
     RESOURCE_DOWNLOAD_CONFIRM_TAP,
     RESOURCE_DOWNLOAD_WAIT_ATTEMPTS,
     is_inventory_item_detail,
@@ -243,6 +244,13 @@ def go_home():
             logger.info("已返回主界面")
             return True
         visible = image.ocr()
+        clarity_cancel = clarity_replenish_cancel_position(visible)
+        if clarity_cancel is not None:
+            logger.info("检测到澄明度补充提示，取消后继续返回主界面")
+            input_tap(clarity_cancel)
+            startup_recovery = False
+            time.sleep(1)
+            continue
         if is_inventory_item_detail(visible):
             logger.info("识别到背包物品详情页，关闭详情后继续返回主界面")
             input_tap((100, 650))

@@ -13,6 +13,7 @@ from core.control.control import connect, input_swipe, input_tap, screenshot
 from core.services.screen_state import (
     RESOURCE_DOWNLOAD_CONFIRM_TAP,
     RESOURCE_DOWNLOAD_WAIT_ATTEMPTS,
+    clarity_replenish_cancel_position,
     startup_screen_action,
 )
 
@@ -145,6 +146,12 @@ class ScreenDriver:
                 for marker in ("作战终端", "访问城市", "启程")
             ):
                 return True
+            clarity_cancel = clarity_replenish_cancel_position(texts)
+            if clarity_cancel is not None:
+                logger.info("检测到澄明度补充提示，取消后继续返回主界面")
+                self.tap(clarity_cancel)
+                self.sleep(1)
+                continue
             action = startup_screen_action(texts)
             if action == "cancel_resource_repair":
                 logger.warning("检测到资源完整性修复提示，取消修复")

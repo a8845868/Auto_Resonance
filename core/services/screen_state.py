@@ -8,10 +8,37 @@ RESOURCE_DOWNLOAD_CONFIRM_TAP = (640, 506)
 # Ordinary navigation keeps its existing 45-attempt limit.  Only after this
 # prompt is observed do callers grant roughly five minutes for downloading.
 RESOURCE_DOWNLOAD_WAIT_ATTEMPTS = 150
+CLARITY_REPLENISH_CANCEL_TAP = (350, 509)
 
 
 def _texts(items: list[dict]) -> list[str]:
     return [str(item.get("text", "")).replace(" ", "") for item in items]
+
+
+def _center(item: dict) -> tuple[int, int] | None:
+    points = item.get("position") or []
+    if len(points) < 3:
+        return None
+    return (
+        int((points[0][0] + points[2][0]) / 2),
+        int((points[0][1] + points[2][1]) / 2),
+    )
+
+
+def clarity_replenish_cancel_position(
+    items: list[dict],
+) -> tuple[int, int] | None:
+    """Return a guarded cancel position for the clarity replenish prompt."""
+    texts = _texts(items)
+    if not any(
+        "澄明度不足" in text or "是否补充澄明度" in text for text in texts
+    ):
+        return None
+    for item, text in zip(items, texts):
+        if text == "取消":
+            return _center(item) or CLARITY_REPLENISH_CANCEL_TAP
+    # Normalized 1280x720 fallback, permitted only after the prompt guard.
+    return CLARITY_REPLENISH_CANCEL_TAP
 
 
 def is_train_in_transit(items: list[dict]) -> bool:

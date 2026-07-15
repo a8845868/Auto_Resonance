@@ -120,6 +120,35 @@ class ResidentActivityTests(unittest.TestCase):
             [(640, 506)],
         )
 
+    def test_go_home_cancels_clarity_replenish_prompt_before_retrying(self):
+        driver = ScreenDriver(sleep=lambda _seconds: None)
+        driver.texts = Mock(side_effect=[
+            [
+                item("您当前的澄明度不足，是否补充澄明度？", 684, 362),
+                item("取消", 333, 512),
+                item("确认", 986, 508),
+            ],
+            [item("访问城市")],
+        ])
+        driver.tap = Mock()
+
+        self.assertTrue(driver.go_home())
+        self.assertEqual(driver.tap.call_args_list[0].args[0], (333, 512))
+
+    def test_go_home_uses_guarded_clarity_cancel_fallback(self):
+        driver = ScreenDriver(sleep=lambda _seconds: None)
+        driver.texts = Mock(side_effect=[
+            [
+                item("您当前的澄明度不足，是否补充澄明度？", 684, 362),
+                item("确认", 986, 508),
+            ],
+            [item("访问城市")],
+        ])
+        driver.tap = Mock()
+
+        self.assertTrue(driver.go_home())
+        self.assertEqual(driver.tap.call_args_list[0].args[0], (350, 509))
+
     def test_all_siege_tasks_are_in_required_order(self):
         self.assertEqual(SIEGE_TASKS, (
             "特殊订单", "利刃行动", "挑灯看剑", "武器材质分析", "骑士小说",

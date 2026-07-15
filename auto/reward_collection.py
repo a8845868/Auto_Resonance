@@ -23,12 +23,12 @@ from core.control.control import connect, input_tap, screenshot
 from core.services.screen_state import (
     RESOURCE_DOWNLOAD_CONFIRM_TAP,
     RESOURCE_DOWNLOAD_WAIT_ATTEMPTS,
+    clarity_replenish_cancel_position,
     startup_screen_action,
 )
 
 
 STATE_PATH = Path("config") / "reward_state.json"
-CLARITY_REPLENISH_CANCEL_TAP = (350, 509)
 
 
 def _load_state() -> dict:
@@ -85,23 +85,6 @@ def _daily_activity_value(items: list[dict]) -> int | None:
     return activity
 
 
-def _clarity_replenish_cancel(items: list[dict]) -> tuple[int, int] | None:
-    """Return the safe cancel action for the clarity replenish prompt."""
-    has_prompt = any(
-        "澄明度不足" in str(item.get("text", ""))
-        or "是否补充澄明度" in str(item.get("text", ""))
-        for item in items
-    )
-    if not has_prompt:
-        return None
-    for item in items:
-        if str(item.get("text", "")).replace(" ", "") == "取消":
-            return _center(item)
-    # The control layer normalizes frames to 1280x720.  This fallback is only
-    # allowed after the prompt text guard, so it cannot hit an unrelated page.
-    return CLARITY_REPLENISH_CANCEL_TAP
-
-
 def _is_daily_activity_page(items: list[dict]) -> bool:
     texts = [str(item.get("text", "")) for item in items]
     return any(_matches(text, "每日活跃") for text in texts) or (
@@ -146,7 +129,7 @@ class RewardDriver:
             texts = self.texts()
             if any(_matches(i["text"], marker) for i in texts for marker in ("访问城市", "启程", "作战终端")):
                 return True
-            clarity_cancel = _clarity_replenish_cancel(texts)
+            clarity_cancel = clarity_replenish_cancel_position(texts)
             if clarity_cancel is not None:
                 logger.info("检测到澄明度补充提示，取消后继续返回主界面")
                 self.tap(clarity_cancel)

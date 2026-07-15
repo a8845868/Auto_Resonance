@@ -4,6 +4,8 @@ import auto.run_business.main as business
 import core.preset.control as preset_control
 from core.module.bgr import BGR
 from core.services.screen_state import (
+    CLARITY_REPLENISH_CANCEL_TAP,
+    clarity_replenish_cancel_position,
     is_inventory_item_detail,
     is_inventory_screen,
     is_top_level_hud,
@@ -72,6 +74,47 @@ def test_startup_screen_actions_keep_go_home_away_from_resource_repair():
     assert startup_screen_action(_items("点击屏幕进入游戏")) == "enter_game"
     assert startup_screen_action(_items("81%")) == "wait_for_game"
     assert startup_screen_action(_items("触碰空白区域退出")) == "dismiss_startup_overlay"
+
+
+def test_clarity_replenish_cancel_requires_prompt_and_prefers_ocr_position():
+    prompt = [
+        {
+            "text": "您当前的澄明度不足，是否补充澄明度？",
+            "position": ((480, 348), (888, 348), (888, 375), (480, 375)),
+        },
+        {
+            "text": "取消",
+            "position": ((308, 497), (358, 497), (358, 527), (308, 527)),
+        },
+        {"text": "确认"},
+    ]
+
+    assert clarity_replenish_cancel_position(prompt) == (333, 512)
+    assert clarity_replenish_cancel_position(_items("普通页面", "取消")) is None
+
+
+def test_clarity_replenish_cancel_uses_guarded_normalized_fallback():
+    assert clarity_replenish_cancel_position(
+        _items("您当前的澄明度不足，是否补充澄明度？", "确认")
+    ) == CLARITY_REPLENISH_CANCEL_TAP
+
+
+def test_core_go_home_cancels_clarity_prompt_without_touching_confirm():
+    clarity_prompt = FakeStartupImage(
+        ["您当前的澄明度不足，是否补充澄明度？", "确认"]
+    )
+    station_home = FakeStationHomeImage(["资产", "车厢内", "副官室"])
+    with patch.object(
+        preset_control, "screenshot", side_effect=[clarity_prompt, station_home]
+    ), patch.object(preset_control, "click_image") as click_image, patch.object(
+        preset_control, "input_tap"
+    ) as tap, patch.object(preset_control.time, "sleep"):
+        assert preset_control.go_home()
+
+    assert [call.args[0] for call in tap.call_args_list] == [
+        CLARITY_REPLENISH_CANCEL_TAP
+    ]
+    click_image.assert_not_called()
 
 
 def test_go_home_confirms_prelogin_resource_pack_then_waits_for_login():
