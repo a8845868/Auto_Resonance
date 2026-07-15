@@ -347,12 +347,14 @@ def run(routes: RoutesModel, recovery_attempts: int = 2):
                 required_available=travel_cost,
             ) or False
         goods_data = list(city.goods_data.keys())
-        buy_business(
+        buy_result = buy_business(
             goods_data[:1],
             goods_data[1:],
             buy_haggle,
             max_book=city.book,
         )
+        if not buy_result:
+            return False
         if not click_station(city.sell_city_name, cur_station=city_name).wait():
             logger.error(f"无法到达卖货城市 {city.sell_city_name}，停止本次跑商")
             return False

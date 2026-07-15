@@ -317,6 +317,56 @@ def test_click_station_stops_long_pan_when_target_template_is_visible():
     tap.assert_called_once_with((777, 333))
 
 
+def test_click_station_reclicks_recentered_target_when_departure_button_is_absent():
+    initial = MagicMock()
+    initial.match_template.return_value = True
+    start_map = MagicMock()
+    start_map.ocr.return_value = [box("start", 610, 350, 670, 390)]
+    target_map = MagicMock()
+    target_map.match_template.return_value = None
+    target_map.ocr.return_value = [box("target", 385, 516, 425, 531)]
+    recentered_map = MagicMock()
+    recentered_map.match_template.return_value = None
+    recentered_map.ocr.return_value = [box("target", 743, 318, 783, 338)]
+
+    station_data = {"start": (0, 0), "target": (5000, 0)}
+    with patch.object(presets, "STATION_POS_DATA", station_data), patch.object(
+        presets,
+        "STATION_DIFFERENCES",
+        presets.calculate_station_differences(station_data),
+    ), patch.object(
+        presets, "STATION_NAME2PNG", {"target": "target.png"}
+    ), patch.object(
+        presets,
+        "screenshot",
+        side_effect=[initial, start_map, target_map, recentered_map],
+    ), patch.object(
+        presets, "_open_world_map_at_default_zoom"
+    ), patch.object(
+        presets, "go_home"
+    ), patch.object(
+        presets, "input_swipe"
+    ), patch.object(
+        presets, "input_tap"
+    ) as tap, patch.object(
+        presets, "wait_stopped"
+    ), patch.object(
+        presets, "click_image", side_effect=[False, True]
+    ) as click_departure, patch.object(
+        presets, "_wait_for_departure", return_value=True
+    ), patch.object(
+        presets.time, "sleep"
+    ):
+        result = presets.click_station("target", cur_station="start")
+
+    assert bool(result) is True
+    assert [call.args[0] for call in tap.call_args_list] == [
+        (405.0, 523.5),
+        (763.0, 328.0),
+    ]
+    assert click_departure.call_count == 2
+
+
 def test_world_map_step_keeps_vertical_swipe_inside_map_area():
     step_x, step_y = presets._world_map_step(100.0, 2000.0)
 
