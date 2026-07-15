@@ -277,7 +277,7 @@ def input_swipe(pos1=(919, 617), pos2=(919, 908), swipe_time: int = 100):
     )
 
 
-def input_tap(pos: Tuple[int, int] = (880, 362)):
+def input_tap(pos: Tuple[int, int] = (880, 362), random_offset: bool = True):
     """
     点击坐标
 
@@ -286,8 +286,11 @@ def input_tap(pos: Tuple[int, int] = (880, 362)):
     ensure_automation_allowed("点击游戏界面")
     if STOP:
         raise StopExecution()
+    offset_x = random.randint(*EXCURSIONX) if random_offset else 0
+    offset_y = random.randint(*EXCURSIONY) if random_offset else 0
     control.input_tap(
-        int(control.ratio * pos[0] + random.randint(*EXCURSIONX)), int(control.ratio * pos[1] + random.randint(*EXCURSIONY))
+        int(control.ratio * pos[0] + offset_x),
+        int(control.ratio * pos[1] + offset_y),
     )
 
 

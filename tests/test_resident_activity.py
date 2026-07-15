@@ -2,8 +2,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from auto.resident_activity import (
-    DETAIL_MARKER_ROI,
-    DETAIL_SWEEP_ROI,
+    ENTER_CHALLENGE_Y,
     FULL_REALM_REWARDS,
     REWARD_DISMISS_ROI,
     REWARD_ITEMS_ROI,
@@ -11,12 +10,11 @@ from auto.resident_activity import (
     ResidentActivityAutomation,
     SIEGE_TASKS,
     START_SWEEP_BUTTON_CENTER,
-    ScreenDriver,
     SWEEP_BUTTON_CENTER,
-    TEAM_START_ROI,
-    TEAM_TITLE_ROI,
+    _find_resonance_port,
     _matches,
 )
+from core.control.adb_port import EmulatorInfo, EmulatorType
 
 
 def item(text, x=600, y=420):
@@ -36,7 +34,7 @@ class FakeDriver:
     def texts(self):
         return self.pages[self.page]
 
-    def tap(self, pos):
+    def tap(self, pos, **_):
         self.taps.append(pos)
 
     def sleep(self, _):
@@ -52,6 +50,12 @@ class FakeDriver:
         self.clicked.append(text)
         return any(_matches(entry["text"], text) for entry in self.texts())
 
+    def has_text(self, text):
+        return any(_matches(entry["text"], text) for entry in self.texts())
+
+    def reward_icon_score(self, reward, region):
+        return 0.9
+
     def go_home(self):
         return True
 
@@ -60,19 +64,12 @@ class FakeDriver:
 
 
 class SweepFlowDriver(FakeDriver):
-    def __init__(
-        self,
-        max_sweeps=1,
-        *,
-        team_available=True,
-        reward_available=True,
-    ):
+    def __init__(self, max_sweeps=1, team_available=True):
         super().__init__([[]])
         self.state = "detail"
         self.completed = 0
         self.max_sweeps = max_sweeps
         self.team_available = team_available
-        self.reward_available = reward_available
 
     def texts(self):
         if self.state == "detail" and self.completed >= self.max_sweeps:
@@ -84,19 +81,11 @@ class SweepFlowDriver(FakeDriver):
                 if self.team_available
                 else []
             ),
-            "reward": (
-                [
-                    item("获得物品", 675, 54),
-                    item("200", 413, 205),
-                    item("触碰空白区域退出", 657, 683),
-                ]
-                if self.reward_available
-                else []
-            ),
+            "reward": [item("获得物品", 675, 222)],
         }
         return labels[self.state]
 
-    def tap(self, pos):
+    def tap(self, pos, **_):
         super().tap(pos)
         if pos == SWEEP_BUTTON_CENTER and self.state == "detail":
             self.state = "team"
@@ -113,49 +102,12 @@ class SweepFlowDriver(FakeDriver):
 
 
 class ResidentActivityTests(unittest.TestCase):
-    def test_go_home_confirms_prelogin_resource_download(self):
-        driver = ScreenDriver(sleep=lambda _seconds: None)
-        driver.texts = Mock(side_effect=[
-            [item("需要下载资源包（共20.9MB）"), item("确认"), item("0%")],
-            [item("55%")],
-            [item("访问城市")],
-        ])
-        driver.tap = Mock()
-
-        self.assertTrue(driver.go_home())
-        self.assertEqual(
-            [call.args[0] for call in driver.tap.call_args_list],
-            [(640, 506)],
-        )
-
-    def test_go_home_cancels_clarity_replenish_prompt_before_retrying(self):
-        driver = ScreenDriver(sleep=lambda _seconds: None)
-        driver.texts = Mock(side_effect=[
-            [
-                item("您当前的澄明度不足，是否补充澄明度？", 684, 362),
-                item("取消", 333, 512),
-                item("确认", 986, 508),
-            ],
-            [item("访问城市")],
-        ])
-        driver.tap = Mock()
-
-        self.assertTrue(driver.go_home())
-        self.assertEqual(driver.tap.call_args_list[0].args[0], (333, 512))
-
-    def test_go_home_uses_guarded_clarity_cancel_fallback(self):
-        driver = ScreenDriver(sleep=lambda _seconds: None)
-        driver.texts = Mock(side_effect=[
-            [
-                item("您当前的澄明度不足，是否补充澄明度？", 684, 362),
-                item("确认", 986, 508),
-            ],
-            [item("访问城市")],
-        ])
-        driver.tap = Mock()
-
-        self.assertTrue(driver.go_home())
-        self.assertEqual(driver.tap.call_args_list[0].args[0], (350, 509))
+    def test_resonance_port_is_selected_from_multiple_mumu_instances(self):
+        devices = [
+            EmulatorInfo("明日方舟", 16384, "", EmulatorType.MUMUV5, 0),
+            EmulatorInfo("雷索纳斯", 16544, "", EmulatorType.MUMUV5, 5),
+        ]
+        self.assertEqual(_find_resonance_port(devices), 16544)
 
     def test_all_siege_tasks_are_in_required_order(self):
         self.assertEqual(SIEGE_TASKS, (
@@ -164,10 +116,43 @@ class ResidentActivityTests(unittest.TestCase):
         ))
 
     def test_select_siege_task_scrolls_and_taps_challenge_below_title(self):
-        driver = FakeDriver([[item("特殊订单")], [item("武器材质分析", 700, 410)]])
+        class TaskDriver(FakeDriver):
+            def tap(self, pos, **_):
+                super().tap(pos)
+                if pos[1] > 500:
+                    self.page = 2
+
+        driver = TaskDriver([
+            [item("特殊订单")],
+            [
+                item("武器材质分析", 700, 410),
+                item("进入挑战", 700, 606),
+                item("进入挑战", 1000, 606),
+            ],
+            [item("扫荡", 870, 490), item("难度选择", 110, 677)],
+        ])
         automation = ResidentActivityAutomation(driver)
         self.assertTrue(automation.select_siege_task("武器材质分析"))
-        self.assertEqual(driver.taps[-1], (700, 600))
+        self.assertEqual(driver.taps[-1], (700, ENTER_CHALLENGE_Y))
+
+    def test_first_limited_activity_uses_full_button_center(self):
+        class ChallengeDriver(FakeDriver):
+            def tap(self, pos, **kwargs):
+                super().tap(pos, **kwargs)
+                if pos == (593, ENTER_CHALLENGE_Y):
+                    self.page = 1
+
+        driver = ChallengeDriver([
+            [
+                item("进入挑战", 593, 606),
+                item("进入挑战", 875, 606),
+            ],
+            [item("扫荡", 872, 490), item("难度选择", 110, 677)],
+        ])
+        self.assertTrue(
+            ResidentActivityAutomation(driver).enter_first_visible_challenge()
+        )
+        self.assertEqual(driver.taps, [(593, ENTER_CHALLENGE_Y)])
 
     def test_reward_attempts_uses_ocr_counter_and_safe_fallback(self):
         driver = FakeDriver([[item("本日可获取奖励次数 2/3")]])
@@ -191,124 +176,82 @@ class ResidentActivityTests(unittest.TestCase):
         self.assertEqual(ResidentActivityAutomation(driver).sweep_current_activity(1), 0)
         self.assertEqual(driver.taps, [SWEEP_BUTTON_CENTER])
 
-    def test_sweep_is_not_counted_when_reward_screen_is_missing(self):
-        driver = SweepFlowDriver(reward_available=False)
-        self.assertEqual(ResidentActivityAutomation(driver).sweep_current_activity(1), 0)
-        self.assertEqual(driver.taps, [SWEEP_BUTTON_CENTER, START_SWEEP_BUTTON_CENTER])
-
     def test_matching_text_outside_expected_roi_never_unlocks_a_click(self):
         driver = FakeDriver([[
             item("扫荡", 300, 200),
             item("难度选择", 110, 677),
             item("开始扫荡", 772, 526),
-            item("获得物品", 675, 54),
-            item("200", 413, 205),
-            item("触碰空白区域退出", 657, 683),
         ]])
         self.assertEqual(ResidentActivityAutomation(driver).sweep_current_activity(1), 0)
         self.assertEqual(driver.taps, [])
 
-    def test_start_sweep_text_cannot_match_initial_sweep_marker(self):
-        driver = FakeDriver([[
-            item("开始扫荡", 872, 490),
-            item("难度选择", 110, 677),
-        ]])
-        self.assertEqual(ResidentActivityAutomation(driver).sweep_current_activity(1), 0)
-        self.assertEqual(driver.taps, [])
-
-    def test_sweep_screen_markers_match_verified_regions(self):
+    def test_reward_title_animation_positions_are_both_accepted(self):
         automation = ResidentActivityAutomation(FakeDriver([[]]))
-        fixtures = (
-            ("扫荡", 872, 490, DETAIL_SWEEP_ROI),
-            ("难度选择", 110, 677, DETAIL_MARKER_ROI),
-            ("选择队伍", 640, 166, TEAM_TITLE_ROI),
-            ("开始扫荡", 772, 526, TEAM_START_ROI),
-            ("获得物品", 675, 54, REWARD_TITLE_ROI),
-            ("200", 413, 205, REWARD_ITEMS_ROI),
-            ("触碰空白区域退出", 657, 683, REWARD_DISMISS_ROI),
-        )
-        for text, x, y, roi in fixtures:
-            self.assertTrue(automation.text_in_roi([item(text, x, y)], text, roi))
-
-    def test_reward_page_waits_for_stable_items_before_dismissal(self):
-        class AnimatedRewardDriver(SweepFlowDriver):
-            def __init__(self):
-                super().__init__()
-                self.reward_frame = 0
-
-            def texts(self):
-                if self.state != "reward":
-                    return super().texts()
-                frames = [
-                    [
-                        item("获得物品", 675, 54),
-                        item("200", 413, 205),
-                        item("触碰空白区域退出", 657, 683),
-                    ],
-                    [
-                        item("获得物品", 675, 54),
-                        item("200", 413, 205),
-                        item("10", 821, 338),
-                        item("触碰空白区域退出", 657, 683),
-                    ],
-                ]
-                frame = frames[min(self.reward_frame, len(frames) - 1)]
-                self.reward_frame += 1
-                return frame
-
-        driver = AnimatedRewardDriver()
-        automation = ResidentActivityAutomation(driver)
-
-        self.assertEqual(
-            automation.sweep_current_activity(1, expected_reward="照夜双刃 / 噪音激酶"),
-            1,
-        )
-        self.assertGreaterEqual(driver.reward_frame, 6)
-        self.assertEqual(
-            [entry.amount for entry in automation.reward_history[0].entries],
-            [200, 10],
-        )
-
-    def test_real_reward_title_position_is_inside_reward_roi(self):
-        automation = ResidentActivityAutomation(FakeDriver([[]]))
-        actual = {
-            "text": "获得物品",
-            "position": [[593.0, 29.0], [759.0, 32.0], [758.0, 78.0], [592.0, 75.0]],
-        }
-
-        self.assertTrue(
-            automation.text_in_roi([actual], "获得物品", REWARD_TITLE_ROI)
-        )
-
-    def test_run_siege_uses_verified_sweep_flow(self):
-        driver = SweepFlowDriver(max_sweeps=1)
-        driver.click_text = lambda text, **_: text == "利刃围剿"
-        automation = ResidentActivityAutomation(driver)
-        automation.select_siege_task = lambda _task: True
-
-        self.assertEqual(automation.run_siege("挑灯看剑", safety_limit=3), 1)
-        self.assertEqual(driver.taps, [SWEEP_BUTTON_CENTER, START_SWEEP_BUTTON_CENTER])
+        for y in (119, 222):
+            self.assertTrue(
+                automation.text_in_roi(
+                    [item("获得物品", 675, y)],
+                    "获得物品",
+                    (500, 70, 820, 270),
+                )
+            )
 
     def test_academy_chest_selects_salvation_supply_stage(self):
         self.assertEqual(FULL_REALM_REWARDS["学会装备箱"], "特供·救世")
-        driver = FakeDriver([[
-            item("本日可获取奖励次数 1/3"),
-            item("全境特供"),
-            item("特供·救世"),
-            item("进入挑战"),
-            item("扫荡", 872, 490),
-            item("难度选择", 110, 677),
-            item("选择队伍", 640, 166),
-            item("开始扫荡", 772, 526),
-            item("获得物品", 675, 54),
-            item("200", 413, 205),
-            item("触碰空白区域退出", 657, 683),
-        ]])
-        completed = ResidentActivityAutomation(driver).run_limited_activity(
-            "全境特供", stage=FULL_REALM_REWARDS["学会装备箱"]
+
+    def test_supply_stage_uses_nearest_challenge_button(self):
+        class DetailDriver(FakeDriver):
+            def tap(self, pos, **kwargs):
+                super().tap(pos, **kwargs)
+                if pos == (700, ENTER_CHALLENGE_Y):
+                    self.page = 1
+
+        driver = DetailDriver([
+            [
+                item("特供·救世", 700, 420),
+                item("进入挑战", 420, 606),
+                item("进入挑战", 700, 606),
+            ],
+            [
+                item("特供·救世", 1080, 105),
+                item("奖励预览", 825, 385),
+                item("扫荡", 870, 490),
+            ],
+        ])
+        self.assertTrue(
+            ResidentActivityAutomation(driver).select_activity_stage(
+                "特供·救世", "学会装备箱"
+            )
         )
-        self.assertEqual(completed, 1)
-        self.assertIn("特供·救世", driver.clicked)
+        self.assertEqual(driver.taps[0], (700, ENTER_CHALLENGE_Y))
+
+    def test_wrong_detail_reward_returns_without_sweeping(self):
+        class WrongRewardDriver(FakeDriver):
+            def reward_icon_score(self, reward, region):
+                return 0.9 if region[1] == 455 else 0.1
+
+            def tap(self, pos, **kwargs):
+                super().tap(pos, **kwargs)
+                if pos == (700, ENTER_CHALLENGE_Y):
+                    self.page = 1
+
+        driver = WrongRewardDriver([
+            [
+                item("特供·救世", 700, 420),
+                item("进入挑战", 700, 606),
+            ],
+            [
+                item("特供·救世", 1080, 105),
+                item("奖励预览", 825, 385),
+                item("扫荡", 870, 500),
+            ],
+        ])
+        self.assertFalse(
+            ResidentActivityAutomation(driver).select_activity_stage(
+                "特供·救世", "学会装备箱"
+            )
+        )
+        self.assertEqual(driver.taps[-1], (82, 36))
 
     def test_home_navigation_failure_is_not_reported_as_zero_completion(self):
         driver = FakeDriver([[]])

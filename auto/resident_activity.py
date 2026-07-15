@@ -5,17 +5,14 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
 
+import cv2 as cv
 from loguru import logger
 
 from core.control.control import connect, input_swipe, input_tap, screenshot
-from core.services.screen_state import (
-    RESOURCE_DOWNLOAD_CONFIRM_TAP,
-    RESOURCE_DOWNLOAD_WAIT_ATTEMPTS,
-    clarity_replenish_cancel_position,
-    startup_screen_action,
-)
+from core.control.adb_port import EmulatorInfo, get_adb_port
 
 
 SIEGE_TASKS = (
@@ -50,18 +47,48 @@ SIEGE_REWARDS = {
     "总体围剿": ("深眠木 / 游星之眼", "deep_sleep_wood.png"),
 }
 
-# The emulator image is normalized to 1280 x 720. Only advance the sweep
-# state machine when the expected labels are present in their real screen
-# regions; matching the same word in a background layer is not sufficient.
+FULL_REALM_REWARD_ICONS = {
+    "学会装备箱": "academy_lost_chest.png",
+    "黑月装备箱": "blackmoon_lost_chest.png",
+    "帝国装备箱": "empire_lost_chest.png",
+}
+REWARD_ICON_DIR = Path(__file__).resolve().parents[1] / "resources" / "rewards"
+
+# The emulator image is normalized to 1280 x 720.  Click the safe centre of
+# each complete button (measured from real ADB screenshots), never the centre
+# of an OCR text box.
+ENTER_CHALLENGE_Y = 610
 SWEEP_BUTTON_CENTER = (872, 501)
 START_SWEEP_BUTTON_CENTER = (772, 526)
+
 DETAIL_SWEEP_ROI = (780, 455, 970, 540)
 DETAIL_MARKER_ROI = (55, 645, 170, 705)
 TEAM_TITLE_ROI = (540, 130, 735, 200)
 TEAM_START_ROI = (635, 485, 930, 565)
-REWARD_TITLE_ROI = (500, 20, 820, 100)
-REWARD_ITEMS_ROI = (300, 140, 950, 640)
-REWARD_DISMISS_ROI = (500, 640, 800, 710)
+# The reward title animates between y≈119 and y≈222 on different frames.
+REWARD_TITLE_ROI = (500, 70, 820, 270)
+
+
+def _find_resonance_port(devices: list[EmulatorInfo]) -> Optional[int]:
+    """Return the live MuMu instance explicitly named for Resonance."""
+    for device in devices:
+        if device.port and "雷索纳斯" in device.name:
+            return int(device.port)
+    return None
+
+
+def connect_resonance() -> bool:
+    """Connect to Resonance instead of accepting any reachable emulator."""
+    try:
+        port = _find_resonance_port(get_adb_port())
+    except Exception:
+        logger.exception("自动识别雷索纳斯模拟器失败，回退到已配置端口")
+        port = None
+    if port:
+        logger.info(f"自动选择雷索纳斯模拟器 ADB 端口：{port}")
+        return bool(connect(port))
+    logger.warning("未发现名为“雷索纳斯”的 MuMu 实例，回退到已配置端口")
+    return bool(connect())
 
 
 def _center(item: dict) -> tuple[int, int]:
@@ -85,9 +112,7 @@ def _normalize_text(text: str) -> str:
 def _matches(actual: str, expected: str, *, exact: bool = False) -> bool:
     normalized = _normalize_text(actual)
     expected = _normalize_text(expected)
-    if exact:
-        return normalized == expected
-    return normalized == expected or expected in normalized
+    return normalized == expected if exact else normalized == expected or expected in normalized
 
 
 @dataclass(frozen=True)
@@ -122,8 +147,8 @@ class ScreenDriver:
     def texts(self) -> list[dict]:
         return screenshot().ocr()
 
-    def tap(self, pos: tuple[int, int]) -> None:
-        input_tap(pos)
+    def tap(self, pos: tuple[int, int], *, precise: bool = False) -> None:
+        input_tap(pos, random_offset=not precise)
 
     def swipe_left(self) -> None:
         input_swipe((1100, 450), (500, 450), swipe_time=650)
@@ -140,12 +165,13 @@ class ScreenDriver:
         offset: tuple[int, int] = (0, 0),
         attempts: int = 5,
         exact: bool = False,
+        precise: bool = False,
     ) -> bool:
         for _ in range(attempts):
             for item in self.texts():
                 if _matches(item["text"], text, exact=exact):
                     x, y = _center(item)
-                    self.tap((x + offset[0], y + offset[1]))
+                    self.tap((x + offset[0], y + offset[1]), precise=precise)
                     self.sleep(1)
                     return True
             self.sleep(0.5)
@@ -155,6 +181,42 @@ class ScreenDriver:
         return any(
             _matches(item["text"], text, exact=exact) for item in self.texts()
         )
+
+    def reward_icon_score(
+        self, reward: str, region: tuple[int, int, int, int]
+    ) -> float:
+        """Match a reward icon inside a card/detail reward-preview region."""
+        icon_name = FULL_REALM_REWARD_ICONS.get(reward)
+        if not icon_name:
+            return 0.0
+        source = cv.imread(str(REWARD_ICON_DIR / icon_name), cv.IMREAD_UNCHANGED)
+        if source is None:
+            return 0.0
+        if source.shape[2] == 4:
+            alpha = source[:, :, 3]
+            points = cv.findNonZero(alpha)
+            if points is None:
+                return 0.0
+            x, y, w, h = cv.boundingRect(points)
+            source = source[y : y + h, x : x + w, :3]
+
+        x1, y1, x2, y2 = region
+        haystack = screenshot().image[y1:y2, x1:x2]
+        if haystack.size == 0:
+            return 0.0
+        haystack = cv.cvtColor(haystack, cv.COLOR_BGR2GRAY)
+        source = cv.cvtColor(source, cv.COLOR_BGR2GRAY)
+        best = 0.0
+        for scale in (0.10, 0.12, 0.14, 0.16, 0.18, 0.20):
+            template = cv.resize(source, None, fx=scale, fy=scale)
+            if (
+                template.shape[0] >= haystack.shape[0]
+                or template.shape[1] >= haystack.shape[1]
+            ):
+                continue
+            result = cv.matchTemplate(haystack, template, cv.TM_CCOEFF_NORMED)
+            best = max(best, float(cv.minMaxLoc(result)[1]))
+        return best
 
     def go_home(self) -> bool:
         """Return to the station home without depending on a versioned screenshot."""
@@ -263,6 +325,15 @@ class ResidentActivityAutomation:
                 return int(match.group(1))
         return fallback
 
+    def wait_for_text(
+        self, text: str, *, attempts: int = 10, delay: float = 0.5
+    ) -> bool:
+        for _ in range(attempts):
+            if self.driver.has_text(text):
+                return True
+            self.driver.sleep(delay)
+        return False
+
     @staticmethod
     def text_in_roi(
         items: list[dict],
@@ -287,7 +358,7 @@ class ResidentActivityAutomation:
         attempts: int,
         delay: float = 0.5,
     ) -> bool:
-        """Confirm a screen using all region-locked OCR markers."""
+        """Confirm a screen using all of its region-locked OCR markers."""
         for _ in range(attempts):
             items = self.driver.texts()
             if all(self.text_in_roi(items, text, roi) for text, roi in markers):
@@ -295,88 +366,141 @@ class ResidentActivityAutomation:
             self.driver.sleep(delay)
         return False
 
-    def reward_observation(self, items: list[dict]) -> RewardObservation | None:
-        """Describe a confirmed reward page without dismissing its animation."""
-        has_title = self.text_in_roi(
-            items, "获得物品", REWARD_TITLE_ROI, exact=False
-        )
-        has_dismiss = self.text_in_roi(
-            items, "触碰空白区域退出", REWARD_DISMISS_ROI, exact=False
-        )
-        entries = []
-        x1, y1, x2, y2 = REWARD_ITEMS_ROI
-        for item in items:
-            text = _normalize_text(item["text"])
-            x, y = _center(item)
-            if not (x1 <= x <= x2 and y1 <= y <= y2):
-                continue
-            amount_match = re.fullmatch(r"(?:[x×]\s*)?([\d,]+)", text)
-            amount = (
-                int(amount_match.group(1).replace(",", ""))
-                if amount_match
-                else None
-            )
-            entries.append(RewardEntry(text=text, x=x, y=y, amount=amount))
-        if not has_title and not (has_dismiss and entries):
-            return None
-        return RewardObservation(
-            has_title=has_title,
-            has_dismiss=has_dismiss,
-            entries=tuple(entries),
-        )
-
-    def wait_for_reward_result(
-        self,
-        *,
-        attempts: int = 20,
-        stable_frames: int = 2,
-        minimum_confirmed_frames: int = 6,
-        expected_reward: str | None = None,
-    ) -> RewardObservation | None:
-        """Wait until the animated reward list is stable before closing it."""
-        previous_signature = None
-        stable_count = 0
-        confirmed_count = 0
-        for _ in range(attempts):
-            observation = self.reward_observation(self.driver.texts())
-            if observation is None:
-                previous_signature = None
-                stable_count = 0
-                confirmed_count = 0
-            else:
-                confirmed_count += 1
-                signature = observation.signature
-                if signature == previous_signature:
-                    stable_count += 1
-                else:
-                    previous_signature = signature
-                    stable_count = 1
-                if (
-                    confirmed_count >= minimum_confirmed_frames
-                    and stable_count >= stable_frames
-                ):
-                    self.reward_history.append(observation)
-                    visible = ", ".join(
-                        entry.text for entry in observation.entries
-                    ) or "未识别到数量文字"
-                    target = f"；目标掉落：{expected_reward}" if expected_reward else ""
-                    logger.info(f"奖励页已稳定{target}；可见奖励条目：{visible}")
-                    return observation
+    def enter_first_visible_challenge(self) -> bool:
+        """Enter the leftmost visible card through its full blue button."""
+        for _ in range(3):
+            items = self.driver.texts()
+            candidates = [
+                item
+                for item in items
+                if _matches(item["text"], "进入挑战")
+                and 400 <= _center(item)[0] <= 1240
+                and 570 <= _center(item)[1] <= 635
+            ]
+            if candidates:
+                x = min(_center(item)[0] for item in candidates)
+                self.driver.tap((x, ENTER_CHALLENGE_Y), precise=True)
+                self.driver.sleep(1.2)
+                return self.wait_for_screen(
+                    (("扫荡", DETAIL_SWEEP_ROI), ("难度选择", DETAIL_MARKER_ROI)),
+                    attempts=6,
+                )
             self.driver.sleep(0.5)
-        return None
+        return False
 
-    def sweep_current_activity(
-        self, max_attempts: int, *, expected_reward: str | None = None
-    ) -> int:
+    def click_activity_tab(self, name: str) -> bool:
+        """Click the left navigation tab, not the duplicate page heading."""
+        matches = [
+            item
+            for item in self.driver.texts()
+            if _matches(item["text"], name, exact=True)
+        ]
+        if not matches:
+            return False
+        target = min(matches, key=lambda item: _center(item)[0])
+        self.driver.tap(_center(target), precise=True)
+        self.driver.sleep(1)
+        return True
+
+    def reward_matches(
+        self, reward: str, region: tuple[int, int, int, int]
+    ) -> tuple[bool, float, dict[str, float]]:
+        """Require the expected chest to be the best of all known chest icons."""
+        scores = {
+            candidate: self.driver.reward_icon_score(candidate, region)
+            for candidate in FULL_REALM_REWARD_ICONS
+        }
+        expected = scores.get(reward, 0.0)
+        best = max(scores.values(), default=0.0)
+        return expected >= 0.58 and expected >= best - 0.01, expected, scores
+
+    def verify_activity_detail(self, stage: str, reward: str) -> bool:
+        """Verify both the detail title and its expected reward preview."""
+        items = self.driver.texts()
+        title_ok = any(
+            _matches(item["text"], stage, exact=True)
+            and _center(item)[0] > 900
+            and _center(item)[1] < 180
+            for item in items
+        )
+        preview_ok = any(_matches(item["text"], "奖励预览") for item in items)
+        sweep_ok = self.text_in_roi(items, "扫荡", DETAIL_SWEEP_ROI)
+        reward_ok, reward_score, scores = self.reward_matches(
+            reward, (860, 320, 1210, 450)
+        )
+        if title_ok and preview_ok and reward_ok and sweep_ok:
+            return True
+        logger.warning(
+            f"关卡详情校验失败：关卡名={title_ok}，奖励预览={preview_ok}，"
+            f"扫荡按钮={sweep_ok}，{reward}图标={reward_ok}({reward_score:.3f})，"
+            f"候选={scores}"
+        )
+        self.driver.tap((82, 36), precise=True)
+        self.driver.sleep(1)
+        return False
+
+    def select_activity_stage(self, stage: str, reward: str) -> bool:
+        """Locate a card by OCR title plus reward icon, then verify its detail."""
+        for _ in range(7):
+            items = self.driver.texts()
+            stage_items = [
+                item for item in items if _matches(item["text"], stage, exact=True)
+            ]
+            if stage_items:
+                stage_x, _ = _center(stage_items[0])
+                reward_ok, reward_score, scores = self.reward_matches(
+                    reward, (max(420, stage_x - 125), 455, min(1245, stage_x + 125), 570)
+                )
+                if not reward_ok:
+                    logger.warning(
+                        f"列表卡片奖励校验失败：{stage} 未匹配到 {reward} "
+                        f"({reward_score:.3f})，候选={scores}"
+                    )
+                    return False
+                challenge_items = [
+                    item
+                    for item in items
+                    if _matches(item["text"], "进入挑战")
+                    and 570 <= _center(item)[1] <= 635
+                    and abs(_center(item)[0] - stage_x) <= 140
+                ]
+                if not challenge_items:
+                    logger.warning(f"{stage} 卡片下方未识别到对应的进入挑战按钮")
+                    return False
+                self.driver.tap((stage_x, ENTER_CHALLENGE_Y), precise=True)
+                self.driver.sleep(1.2)
+                return self.verify_activity_detail(stage, reward)
+            self.driver.swipe_left()
+        return False
+
+    def sweep_current_activity(self, max_attempts: int) -> int:
         completed = 0
         for _ in range(max_attempts):
-            # Strict state machine: detail -> team selection -> reward result.
-            # A sweep is counted only after the reward screen is observed.
+            # Strict region-locked state machine:
+            # detail -> team selection -> reward result.  A matching word in a
+            # background layer cannot unlock a click for another screen.
             if not self.wait_for_screen(
                 (("扫荡", DETAIL_SWEEP_ROI), ("难度选择", DETAIL_MARKER_ROI)),
                 attempts=4,
             ):
                 logger.info("未确认处于关卡详情页，停止扫荡")
+                break
+
+            self.driver.tap(SWEEP_BUTTON_CENTER, precise=True)
+            self.driver.sleep(0.8)
+            if not self.wait_for_screen(
+                (("选择队伍", TEAM_TITLE_ROI), ("开始扫荡", TEAM_START_ROI)),
+                attempts=8,
+            ):
+                logger.warning("点击“扫荡”后未进入队伍选择页，本次不计入完成")
+                break
+
+            self.driver.tap(START_SWEEP_BUTTON_CENTER, precise=True)
+            self.driver.sleep(0.8)
+            if not self.wait_for_screen(
+                (("获得物品", REWARD_TITLE_ROI),), attempts=14
+            ):
+                logger.warning("点击“开始扫荡”后未出现“获得物品”，本次不计入完成")
                 break
 
             self.driver.tap(SWEEP_BUTTON_CENTER)
@@ -400,20 +524,21 @@ class ResidentActivityAutomation:
             completed += 1
         return completed
 
-    def run_limited_activity(self, name: str, stage: Optional[str] = None) -> int:
-        if not self.driver.click_text(name):
+    def run_limited_activity(
+        self, name: str, stage: Optional[str] = None, reward: Optional[str] = None
+    ) -> int:
+        if not self.click_activity_tab(name):
             logger.warning(f"未找到活动：{name}")
             return 0
         attempts = self._reward_attempts()
         if attempts == 0:
             logger.info(f"{name}次数已用完")
             return 0
-        if stage and not self.driver.click_text(stage, attempts=3):
-            logger.warning(f"{name}未找到目标奖励关卡：{stage}")
-            return 0
-        # The selected limited activity opens its stage list. Enter the visible
-        # challenge and then use the sweep button on the detail screen.
-        if not self.driver.click_text("进入挑战", attempts=3):
+        if stage:
+            entered = bool(reward) and self.select_activity_stage(stage, reward)
+        else:
+            entered = self.enter_first_visible_challenge()
+        if not entered:
             logger.warning(f"{name}没有可进入的挑战")
             return 0
         expected_reward = next(
@@ -434,33 +559,57 @@ class ResidentActivityAutomation:
         for _ in range(4):
             self.driver.swipe_right()
         for _ in range(7):
-            for item in self.driver.texts():
+            items = self.driver.texts()
+            if any(
+                _matches(item["text"], "挑战次数已用完") for item in items
+            ):
+                logger.info("利刃围剿今日挑战次数已用完")
+                return False
+            for item in items:
                 if _matches(item["text"], task):
                     x, y = _center(item)
-                    # The challenge button is directly below the task title.
-                    self.driver.tap((x, min(y + 190, 620)))
-                    self.driver.sleep(1)
-                    return True
+                    challenge_items = [
+                        candidate
+                        for candidate in items
+                        if _matches(candidate["text"], "进入挑战", exact=True)
+                    ]
+                    if challenge_items:
+                        challenge = min(
+                            challenge_items,
+                            key=lambda candidate: abs(_center(candidate)[0] - x),
+                        )
+                        target = (_center(challenge)[0], ENTER_CHALLENGE_Y)
+                    else:
+                        target = (x, ENTER_CHALLENGE_Y)
+                    for _ in range(2):
+                        self.driver.tap(target, precise=True)
+                        self.driver.sleep(1.2)
+                        if self.wait_for_screen(
+                            (
+                                ("扫荡", DETAIL_SWEEP_ROI),
+                                ("难度选择", DETAIL_MARKER_ROI),
+                            ),
+                            attempts=3,
+                        ):
+                            return True
+                    logger.warning(f"已点击{task}的进入挑战，但未进入任务详情")
+                    return False
             self.driver.swipe_left()
         logger.error(f"未找到利刃围剿任务：{task}")
         return False
 
     def run_siege(self, task: str, safety_limit: int = 100) -> int:
-        if not self.driver.click_text("利刃围剿"):
-            return 0
         if not self.select_siege_task(task):
             return 0
 
-        completed = self.sweep_current_activity(
-            safety_limit, expected_reward=SIEGE_REWARDS[task][0]
-        )
+        completed = self.sweep_current_activity(safety_limit)
         if completed < safety_limit:
-            logger.info("澄清度不足、扫荡不可用或扫荡确认失败，停止利刃围剿")
+            logger.info("澄清度不足、扫荡不可用或队伍确认失败，停止利刃围剿")
         logger.info(f"{task}完成 {completed} 次")
         return completed
 
     def run(self, task: str, full_realm_reward: str = "学会装备箱") -> dict[str, int]:
-        if not connect():
+        if not connect_resonance():
             raise RuntimeError("ADB连接失败")
         if not self.open_action_summary():
             raise RuntimeError("无法打开活动总览，未执行扫荡与全域整备")
@@ -471,7 +620,9 @@ class ResidentActivityAutomation:
         if not self.open_action_summary():
             raise RuntimeError("无法重新打开活动总览，未完成全境特供")
         stage = FULL_REALM_REWARDS.get(full_realm_reward)
-        results["全境特供"] = self.run_limited_activity("全境特供", stage=stage)
+        results["全境特供"] = self.run_limited_activity(
+            "全境特供", stage=stage, reward=full_realm_reward
+        )
         if not self.open_action_summary():
             raise RuntimeError(f"无法重新打开活动总览，未完成{task}")
         results[task] = self.run_siege(task)
@@ -479,11 +630,9 @@ class ResidentActivityAutomation:
 
     def run_once(self, task: str) -> dict[str, int]:
         """Run exactly one selected siege sweep for end-to-end verification."""
-        if not connect():
+        if not connect_resonance():
             raise RuntimeError("ADB连接失败")
         if not self.open_action_summary():
-            return {task: 0}
-        if not self.driver.click_text("利刃围剿"):
             return {task: 0}
         if not self.select_siege_task(task):
             return {task: 0}
