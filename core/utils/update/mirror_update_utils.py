@@ -1,10 +1,11 @@
 from typing import Callable
+
 import requests
-from core import logger
+from loguru import logger
+
 from core.utils.download_utils import download_file
 from core.utils.update.base_update_utils import BaseUpdateUtils, LatestInfoResponse
 from version import __version__
-
 
 RES_ID = "Auto_Resonance"
 LATEST_URL = f"https://mirrorchyan.com/api/resources/{RES_ID}/latest"

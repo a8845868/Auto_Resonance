@@ -105,14 +105,12 @@ venv.bak/
 
 # add
 .idea/
-.codex/
-_worktrees/
 
 # custom 
 logs/
 gui/
 examples/
-test*.py
+test.*
 config*
 !config.py
 temp/
@@ -121,5 +119,3 @@ temp/
 diff.zip
 hash.json
 .pdm-python
-commit_templates.json
-resources/interface.json
