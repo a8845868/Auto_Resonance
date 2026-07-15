@@ -77,6 +77,7 @@ WORLD_MAP_LABEL_MIN_SCORE = 0.9
 WORLD_MAP_PARTIAL_LABEL_MIN_SCORE = 0.97
 WORLD_MAP_LABEL_Y_RANGE = (100.0, 620.0)
 WORLD_MAP_EDGE_X = (8.0, 1272.0)
+WORLD_MAP_RIGHT_SIDE_SUFFIX_MIN_X = 1100.0
 WORLD_MAP_DEFAULT_GESTURE_GAIN = 1.3
 WORLD_MAP_GAIN_RANGE = (0.7, 2.0)
 
@@ -101,6 +102,17 @@ def _station_label_center(map_ocr, station_names, *, allow_edge_partial=False):
                 partial_matches.extend(name for name in station_names if name.startswith(text))
             if len(text) >= 3 and left <= WORLD_MAP_EDGE_X[0]:
                 partial_matches.extend(name for name in station_names if name.endswith(text))
+            # In the incident frame the right-side label was fully on-screen,
+            # but OCR dropped its first character ("月游乐城" for
+            # "黑月游乐城"). Accept that observed suffix only in the same
+            # right-side region; do not broaden both prefix directions across
+            # both sides of the map.
+            if len(text) >= 3 and left >= WORLD_MAP_RIGHT_SIDE_SUFFIX_MIN_X:
+                partial_matches.extend(
+                    name
+                    for name in station_names
+                    if len(name) == len(text) + 1 and name.endswith(text)
+                )
             partial_matches = list(dict.fromkeys(partial_matches))
             if len(partial_matches) == 1:
                 matched_station = partial_matches[0]

@@ -155,6 +155,36 @@ def test_world_map_pan_vector_uses_landmark_screen_position():
     assert abs(right_edge[0]) < abs(left_edge[0])
 
 
+def test_station_label_accepts_unique_high_confidence_side_near_suffix():
+    stations = ("黑月游乐城", "阿妮塔战备工厂", "阿妮塔发射中心")
+
+    assert presets._station_label_center(
+        [box("月游乐城", 1140, 327, 1221, 355)],
+        stations,
+        allow_edge_partial=True,
+    ) == ("黑月游乐城", 1180.5, 341.0)
+    assert presets._station_label_center(
+        [box("月游乐城", 760, 327, 841, 355)],
+        stations,
+        allow_edge_partial=True,
+    ) is None
+    assert presets._station_label_center(
+        [box("黑月游", 1140, 327, 1221, 355)],
+        stations,
+        allow_edge_partial=True,
+    ) is None
+    assert presets._station_label_center(
+        [box("游乐城", 1140, 327, 1221, 355)],
+        stations,
+        allow_edge_partial=True,
+    ) is None
+    assert presets._station_label_center(
+        [box("游乐城", 1140, 327, 1221, 355)],
+        ("甲游乐城", "乙游乐城"),
+        allow_edge_partial=True,
+    ) is None
+
+
 def test_world_map_gain_uses_same_landmark_observed_motion():
     previous = ("middle", 200.0, 400.0)
     current = ("middle", 800.0, 410.0)
