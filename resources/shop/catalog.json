@@ -1,0 +1,267 @@
+{
+  "version": 1,
+  "currencies": {
+    "iron_coin": {
+      "name": "铁盟币",
+      "icon": "resources/currency/铁盟币.png"
+    },
+    "resume_intelligence": {
+      "name": "履历情报",
+      "icon": "resources/currency/履历情报.png"
+    },
+    "birch_stone": {
+      "name": "桦石",
+      "icon": "resources/currency/桦石.png"
+    }
+  },
+  "shops": [
+    {
+      "id": "headquarters_black_moon",
+      "name": "总部商店 · 黑月商店",
+      "short_name": "黑月商店",
+      "adapter": "headquarters_black_moon",
+      "automation_supported": true,
+      "description": "已按实机完整滚动采集。默认逐件打开数量弹窗购买，可选择买 1 次或买到本期上限。",
+      "accent": "#d5a04d",
+      "items": [
+        {
+          "id": "laplace_weekly_iron",
+          "name": "拉普拉斯协议",
+          "period": "weekly",
+          "max_limit": 3,
+          "price": 100000,
+          "currency": "iron_coin",
+          "icon": "resources/shop/headquarters_black_moon/laplace_weekly.png"
+        },
+        {
+          "id": "self_observation_daily_iron",
+          "name": "自观测胶卷",
+          "period": "daily",
+          "max_limit": 5,
+          "price": 100000,
+          "currency": "iron_coin",
+          "icon": "resources/shop/headquarters_black_moon/self_observation.png"
+        },
+        {
+          "id": "nebula_4_daily_iron",
+          "name": "星云物质（4钛）",
+          "period": "daily",
+          "max_limit": 36,
+          "price": 30000,
+          "currency": "iron_coin",
+          "icon": "resources/shop/headquarters_black_moon/nebula_4.png"
+        },
+        {
+          "id": "blank_tape_daily_iron",
+          "name": "空白录像带",
+          "period": "daily",
+          "max_limit": 10,
+          "price": 20000,
+          "currency": "iron_coin",
+          "icon": "resources/shop/headquarters_black_moon/blank_tape.png"
+        },
+        {
+          "id": "cactus_energy_weekly_iron",
+          "name": "仙人掌能量棒棒糖",
+          "period": "weekly",
+          "max_limit": 8,
+          "price": 10000,
+          "currency": "iron_coin",
+          "icon": "resources/shop/headquarters_black_moon/cactus_energy.png"
+        },
+        {
+          "id": "energy_candy_weekly_iron",
+          "name": "提神棒棒糖",
+          "period": "weekly",
+          "max_limit": 8,
+          "price": 10000,
+          "currency": "iron_coin",
+          "icon": "resources/shop/headquarters_black_moon/energy_candy.png"
+        },
+        {
+          "id": "bait_balloon_weekly_iron",
+          "name": "诱饵气球",
+          "period": "weekly",
+          "max_limit": 30,
+          "price": 5000,
+          "currency": "iron_coin",
+          "icon": "resources/shop/headquarters_black_moon/bait_balloon.png"
+        },
+        {
+          "id": "purchase_book_weekly_iron",
+          "name": "进货采买书",
+          "period": "weekly",
+          "max_limit": 5,
+          "price": 15000,
+          "currency": "iron_coin",
+          "icon": "resources/shop/headquarters_black_moon/purchase_book.png"
+        },
+        {
+          "id": "renegotiation_weekly_iron",
+          "name": "再交涉请求书",
+          "period": "weekly",
+          "max_limit": 5,
+          "price": 10000,
+          "currency": "iron_coin",
+          "icon": "resources/shop/headquarters_black_moon/renegotiation.png"
+        },
+        {
+          "id": "advertising_weekly_iron",
+          "name": "广告投放券",
+          "period": "weekly",
+          "max_limit": 3,
+          "price": 15000,
+          "currency": "iron_coin",
+          "icon": "resources/shop/headquarters_black_moon/advertising.png"
+        },
+        {
+          "id": "solo_string_monthly_resume",
+          "name": "独奏之弦",
+          "period": "monthly",
+          "max_limit": 2,
+          "price": 30,
+          "currency": "resume_intelligence",
+          "icon": "resources/shop/headquarters_black_moon/solo_string.png"
+        },
+        {
+          "id": "echo_string_monthly_resume",
+          "name": "回响之弦",
+          "period": "monthly",
+          "max_limit": 1,
+          "price": 30,
+          "currency": "resume_intelligence",
+          "icon": "resources/shop/headquarters_black_moon/echo_string.png"
+        },
+        {
+          "id": "source_string_monthly_resume",
+          "name": "本源之弦",
+          "period": "monthly",
+          "max_limit": 1,
+          "price": 60,
+          "currency": "resume_intelligence",
+          "icon": "resources/shop/headquarters_black_moon/source_string.png"
+        },
+        {
+          "id": "source_string_monthly_iron",
+          "name": "本源之弦",
+          "period": "monthly",
+          "max_limit": 4,
+          "price": 5000000,
+          "currency": "iron_coin",
+          "icon": "resources/shop/headquarters_black_moon/source_string.png"
+        },
+        {
+          "id": "solitary_shard_monthly_resume",
+          "name": "独石碎片",
+          "period": "monthly",
+          "max_limit": 42,
+          "price": 2,
+          "currency": "resume_intelligence",
+          "icon": "resources/shop/headquarters_black_moon/solitary_shard.png"
+        },
+        {
+          "id": "nebula_8_monthly_resume",
+          "name": "星云物质（8钛）",
+          "period": "monthly",
+          "max_limit": 500,
+          "price": 4,
+          "currency": "resume_intelligence",
+          "icon": "resources/shop/headquarters_black_moon/nebula_8.png"
+        },
+        {
+          "id": "black_moon_ticket_weekly_birch",
+          "name": "黑月采购券",
+          "period": "weekly",
+          "max_limit": 5,
+          "price": 100,
+          "currency": "birch_stone",
+          "icon": "resources/shop/headquarters_black_moon/black_moon_ticket.png"
+        },
+        {
+          "id": "purchase_book_daily_birch",
+          "name": "进货采买书",
+          "period": "daily",
+          "max_limit": 10,
+          "price": 10,
+          "currency": "birch_stone",
+          "icon": "resources/shop/headquarters_black_moon/purchase_book.png"
+        },
+        {
+          "id": "blank_tape_daily_birch",
+          "name": "空白录像带",
+          "period": "daily",
+          "max_limit": 10,
+          "price": 10,
+          "currency": "birch_stone",
+          "icon": "resources/shop/headquarters_black_moon/blank_tape.png"
+        },
+        {
+          "id": "self_observation_daily_birch",
+          "name": "自观测胶卷",
+          "period": "daily",
+          "max_limit": 100,
+          "price": 20,
+          "currency": "birch_stone",
+          "icon": "resources/shop/headquarters_black_moon/self_observation.png"
+        },
+        {
+          "id": "laplace_monthly_iron",
+          "name": "拉普拉斯协议",
+          "period": "monthly",
+          "max_limit": 10,
+          "price": 500000,
+          "currency": "iron_coin",
+          "icon": "resources/shop/headquarters_black_moon/laplace_weekly.png"
+        },
+        {
+          "id": "extra_funding_monthly_iron",
+          "name": "追加注资申请书",
+          "period": "monthly",
+          "max_limit": 1,
+          "price": 500000,
+          "currency": "iron_coin",
+          "icon": "resources/shop/headquarters_black_moon/extra_funding.png"
+        },
+        {
+          "id": "laplace_monthly_resume",
+          "name": "拉普拉斯协议",
+          "period": "monthly",
+          "max_limit": 10,
+          "price": 20,
+          "currency": "resume_intelligence",
+          "icon": "resources/shop/headquarters_black_moon/laplace_weekly.png"
+        }
+      ]
+    },
+    {
+      "id": "bureau_exchange",
+      "name": "赴命商店",
+      "short_name": "赴命商店",
+      "adapter": "bureau_exchange",
+      "automation_supported": false,
+      "description": "已完成 6 个有效滚动位置的实机与 OCR 采集。兑换配方为多材料结构，待独立适配器接入。",
+      "accent": "#3989ff",
+      "items": []
+    },
+    {
+      "id": "furniture_shop",
+      "name": "家具商店",
+      "short_name": "家具商店",
+      "adapter": "furniture_shop",
+      "automation_supported": false,
+      "description": "已预留店铺适配器与目录入口，后续实机采集后无需修改 GUI 架构。",
+      "accent": "#8f75db",
+      "items": []
+    },
+    {
+      "id": "aquarium_shop",
+      "name": "水族馆",
+      "short_name": "水族馆",
+      "adapter": "aquarium_shop",
+      "automation_supported": false,
+      "description": "已预留店铺适配器与目录入口，后续实机采集后无需修改 GUI 架构。",
+      "accent": "#3dbfc4",
+      "items": []
+    }
+  ]
+}

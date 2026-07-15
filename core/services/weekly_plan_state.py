@@ -46,6 +46,33 @@ def load_weekly_plan(include_expired: bool = False) -> dict[str, Any] | None:
     return state
 
 
+def roll_weekly_plan_forward() -> dict[str, Any] | None:
+    """Start a new week from the most recent configured plan.
+
+    A Monday reset must clear progress, not make an enabled trading task look
+    successfully finished.  The saved cycle and execution batches remain the
+    user's active plan until they explicitly apply a replacement.
+    """
+    current = load_weekly_plan()
+    if current:
+        return current
+    previous = load_weekly_plan(include_expired=True)
+    if not previous or previous.get("week_start", "") > current_week_start():
+        return None
+    state = dict(previous)
+    state["week_start"] = current_week_start()
+    state["completed_runs"] = 0
+    state["completed_books"] = 0
+    # A new week can have a different restock-book inventory.  Keep the route
+    # as the safe default, but force the live runner to verify inventory and
+    # rebuild the execution batches before treating last week's book allocation
+    # as current.
+    state["needs_reoptimization"] = True
+    state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    _write_state(state)
+    return state
+
+
 def save_weekly_plan(result: dict) -> dict[str, Any]:
     runs = _flatten_batches(result["execution_batches"])
     existing = load_weekly_plan()

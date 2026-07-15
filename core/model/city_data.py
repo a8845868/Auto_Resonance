@@ -9,7 +9,7 @@ from typing import Dict
 
 from pydantic import BaseModel, RootModel
 
-from core.utils import read_json, RESOURCES_PATH
+from core.utils.utils import RESOURCES_PATH, read_json
 
 GOODSDATA_PATH = RESOURCES_PATH / "goods" / "CityGoodsData.json"
 """自动程序配置文件路径"""

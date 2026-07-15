@@ -6,6 +6,7 @@ from .weekly_plan_state import (
     progress_summary,
     record_completed_run,
     remaining_batches,
+    roll_weekly_plan_forward,
     save_weekly_plan,
 )
 from .book_budget import BOOK_SOURCES, calculate_book_budget

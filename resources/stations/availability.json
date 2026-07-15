@@ -1,0 +1,14 @@
+{
+  "武林源": {
+    "limited": true,
+    "windows": [
+      {
+        "start": "2026-05-13T00:00:00+08:00",
+        "end_exclusive": "2026-07-15T15:57:00+08:00"
+      }
+    ],
+    "source": "https://www.taptap.cn/moment/803458290884283553",
+    "precision": "官方公告确认开放日期为 5 月 13 日至 7 月 15 日；运行现场于 7 月 15 日 15:57 确认站点已不可达",
+    "next_open": null
+  }
+}

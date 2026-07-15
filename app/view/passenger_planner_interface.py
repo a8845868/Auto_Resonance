@@ -46,6 +46,19 @@ class FurnitureInventoryWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class PassengerBuildInventoryWorker(QThread):
+    succeeded = Signal(dict)
+    failed = Signal(str)
+
+    def run(self):
+        try:
+            from auto.passenger_carriage_build import scan_passenger_build_inventory
+
+            self.succeeded.emit(scan_passenger_build_inventory())
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class PassengerPlannerInterface(ScrollArea):
     """Passenger construction, readiness and operation planner."""
 
@@ -56,6 +69,7 @@ class PassengerPlannerInterface(ScrollArea):
         self._refreshingFurnitureTable = False
         self.lastSelectedFurnitureSlot = ""
         self.furnitureWorker = None
+        self.passengerInventoryWorker = None
         self.furnitureRefreshTimer = QTimer(self)
         self.furnitureRefreshTimer.setSingleShot(True)
         self.furnitureRefreshTimer.timeout.connect(self._refreshFurnitureLayout)
@@ -113,10 +127,15 @@ class PassengerPlannerInterface(ScrollArea):
             FluentIcon.CALENDAR, "按当前数量创建/重置计划", monitor
         )
         self.createBuildPlanButton.clicked.connect(self._createBuildMonitorPlan)
+        self.syncBuildInventoryButton = PrimaryPushButton(
+            FluentIcon.SYNC, "从游戏同步实际数量", monitor
+        )
+        self.syncBuildInventoryButton.clicked.connect(self._startBuildInventorySync)
         self.buildMonitorStatus = QLabel(monitor)
         self.buildMonitorStatus.setWordWrap(True)
         self.buildMonitorStatus.setStyleSheet("font-size:16px; color:#35d7e8; padding-top:8px;")
-        monitor_grid.addWidget(self.buildMonitorEnabled, 1, 0, 1, 2)
+        monitor_grid.addWidget(self.buildMonitorEnabled, 1, 0)
+        monitor_grid.addWidget(self.syncBuildInventoryButton, 1, 1)
         monitor_grid.addWidget(self.createBuildPlanButton, 1, 2, 1, 2)
         monitor_grid.addWidget(self.buildMonitorStatus, 2, 0, 1, 4)
         from app.components.task_schedule_card import TaskScheduleCard
@@ -570,6 +589,62 @@ class PassengerPlannerInterface(ScrollArea):
             parent=self,
         )
 
+    def _startBuildInventorySync(self):
+        if self.passengerInventoryWorker and self.passengerInventoryWorker.isRunning():
+            return
+        self.syncBuildInventoryButton.setEnabled(False)
+        self.syncBuildInventoryButton.setText("正在核对…")
+        self.passengerInventoryWorker = PassengerBuildInventoryWorker(self)
+        self.passengerInventoryWorker.succeeded.connect(self._buildInventorySynced)
+        self.passengerInventoryWorker.failed.connect(self._buildInventorySyncFailed)
+        self.passengerInventoryWorker.finished.connect(
+            lambda: self.syncBuildInventoryButton.setEnabled(True)
+        )
+        self.passengerInventoryWorker.finished.connect(
+            lambda: self.syncBuildInventoryButton.setText("从游戏同步实际数量")
+        )
+        self.passengerInventoryWorker.start()
+
+    def _buildInventorySynced(self, result: dict):
+        built = int(result["built_extra_passenger_carriages"])
+        seats = int(result["installed_seat_groups"])
+        for key, value, config_item in (
+            ("built", built, cfg.PassengerBuiltExtraCarriages),
+            ("seats", seats, cfg.PassengerInstalledSeatGroups),
+        ):
+            widget = self.inputs[key]
+            widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(False)
+            qconfig.set(config_item, value)
+        self._syncSeatGroupsFromBuild()
+        save_layout_state(self.layoutState)
+        self._refreshFurnitureLayout()
+        self.recalculate()
+        InfoBar.success(
+            title="已按游戏实况同步",
+            content=(
+                f"1 节初始客厢 + {built} 节额外标准客厢；"
+                f"按每节 16 组同步四座椅组为 {seats}。"
+            ),
+            orient=Qt.Orientation.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP_RIGHT,
+            duration=5000,
+            parent=self,
+        )
+
+    def _buildInventorySyncFailed(self, message: str):
+        InfoBar.error(
+            title="实况同步未通过核对",
+            content=message,
+            orient=Qt.Orientation.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP_RIGHT,
+            duration=6000,
+            parent=self,
+        )
+
     def _refreshBuildMonitorStatus(self):
         if not hasattr(self, "buildMonitorStatus"):
             return
@@ -580,6 +655,7 @@ class PassengerPlannerInterface(ScrollArea):
     def buildQueuedTask(self):
         from app.utils.task_queue import QueuedTask
         from auto.passenger_carriage_build import run_build_monitor, stop
+        from core.services.task_schedule_state import is_force_verify_requested
 
         state = load_build_monitor_plan()
         summary = build_monitor_summary(state)
@@ -599,7 +675,9 @@ class PassengerPlannerInterface(ScrollArea):
 
         return QueuedTask(
             "客厢连续建造监控",
-            run_build_monitor,
+            lambda: run_build_monitor(
+                force_verify=is_force_verify_requested("passenger_build_monitor")
+            ),
             stop,
             key="passenger_build_monitor",
             next_run_factory=next_build_check,

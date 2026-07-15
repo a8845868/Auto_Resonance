@@ -16,6 +16,7 @@ from app.common.config import cfg
 from app.common.style_sheet import StyleSheet
 from app.components.task_schedule_card import TaskScheduleCard
 from auto.resident_activity import FULL_REALM_REWARDS, SIEGE_REWARDS, SIEGE_TASKS
+from core.services.fatigue_planner import fatigue_plan_lines, next_fatigue_refresh
 
 
 REWARD_ICON_DIR = Path(__file__).resolve().parents[2] / "resources" / "rewards"
@@ -121,6 +122,74 @@ class RewardCollectionInterface(TaskSettingsPage):
             cfg.autoCollectTravelManual,
             self.scrollWidget,
         ))
+
+
+class FatiguePlannerInterface(TaskSettingsPage):
+    def __init__(self, parent=None):
+        super().__init__("疲劳规划", "FatiguePlannerInterface", parent)
+        self.layout.addWidget(SwitchSettingCard(
+            FluentIcon.CAFE,
+            "加入任务序列",
+            "每日 05:00 先恢复再跑商；12:00、18:00 复查新发便当",
+            cfg.enableFatiguePlanner,
+            self.scrollWidget,
+        ))
+        self.scheduleCard = TaskScheduleCard("fatigue_recovery", self.scrollWidget)
+        self.layout.addWidget(self.scheduleCard)
+        self.layout.addWidget(SwitchSettingCard(
+            FluentIcon.CAFE,
+            "使用银枝继续喝气泡水",
+            "关闭时只使用免费次数和 500 铁盟币气泡水",
+            cfg.UseSilverBranch,
+            self.scrollWidget,
+        ))
+
+        self.planPanel = QWidget(self.scrollWidget)
+        self.planPanel.setObjectName("fatiguePlanPanel")
+        self.planPanel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.planPanel.setStyleSheet(
+            "QWidget#fatiguePlanPanel { background-color: rgba(30,120,210,0.14); "
+            "border: 1px solid rgba(67,165,255,0.65); border-radius: 12px; }"
+            "QWidget#fatiguePlanPanel QLabel { border: none; background: transparent; }"
+        )
+        panel_layout = QVBoxLayout(self.planPanel)
+        panel_layout.setContentsMargins(18, 14, 18, 14)
+        title = QLabel("每日执行规则", self.planPanel)
+        title.setStyleSheet("font-size: 17px; font-weight: 700;")
+        self.planSummaryLabel = QLabel(self.planPanel)
+        self.planSummaryLabel.setWordWrap(True)
+        self.planSummaryLabel.setStyleSheet("font-size: 13px; line-height: 1.5;")
+        panel_layout.addWidget(title)
+        panel_layout.addWidget(self.planSummaryLabel)
+        self.layout.addWidget(self.planPanel)
+        self.updatePlanSummary()
+
+    def updatePlanSummary(self):
+        self.planSummaryLabel.setText(
+            "\n".join(
+                f"{index}. {line}"
+                for index, line in enumerate(
+                    fatigue_plan_lines(bool(cfg.UseSilverBranch.value)), start=1
+                )
+            )
+        )
+
+    def buildQueuedTask(self):
+        if not bool(cfg.enableFatiguePlanner.value):
+            return None
+        from app.utils.task_queue import QueuedTask
+        from auto.fatigue_recovery import run_daily_fatigue_recovery
+
+        return QueuedTask(
+            "疲劳规划",
+            run_daily_fatigue_recovery,
+            key="fatigue_recovery",
+            next_run_factory=next_fatigue_refresh,
+        )
+
+    def showEvent(self, event):
+        self.updatePlanSummary()
+        super().showEvent(event)
 
 class ResidentActivityInterface(TaskSettingsPage):
     def __init__(self, parent=None):

@@ -19,6 +19,7 @@ class RunningBusinessConfig(QConfig):
 
     BuyCount = ConfigItem("RunBuy", "BuyCount", 0, None)
     UseSilverBranch = ConfigItem("RunBuy", "UseSilverBranch", False, None)
+    UseNegotiationBook = ConfigItem("RunBuy", "UseNegotiationBook", False, None)
     OptimizerCargo = ConfigItem("WeeklyOptimizer", "Cargo", 1121, None)
     OptimizerBooks = ConfigItem("WeeklyOptimizer", "Books", 10, None)
     OptimizerFatigue = ConfigItem("WeeklyOptimizer", "Fatigue", 5292, None)
@@ -43,7 +44,7 @@ class RunningBusinessConfig(QConfig):
     PassengerReferenceRevenueWan = ConfigItem("PassengerPlanner", "ReferenceRevenueWan", 589, None)
     PassengerOccupancy = ConfigItem("PassengerPlanner", "OccupancyPercent", 100, None)
     PassengerFatiguePerTrip = ConfigItem("PassengerPlanner", "FatiguePerTrip", 95, None)
-    PassengerTargetCarriages = ConfigItem("PassengerBuild", "TargetCarriages", 8, None)
+    PassengerTargetCarriages = ConfigItem("PassengerBuild", "TargetCarriages", 7, None)
     PassengerBuiltExtraCarriages = ConfigItem("PassengerBuild", "BuiltExtraCarriages", 0, None)
     PassengerInstalledSeatGroups = ConfigItem("PassengerBuild", "InstalledSeatGroups", 0, None)
     PassengerCurrentIron = ConfigItem("PassengerBuild", "CurrentIron", 0, None)
@@ -109,6 +110,27 @@ class Config(RunningBusinessConfig):
     enableResidentActivityOnce = ConfigItem("TaskQueue", "ResidentActivityOnce", False, None)
     enableRunBusiness = ConfigItem("TaskQueue", "RunBusiness", False, None)
     enablePassengerBuildMonitor = ConfigItem("TaskQueue", "PassengerBuildMonitor", False, None)
+    enableFatiguePlanner = ConfigItem("TaskQueue", "FatiguePlanner", True, None)
+
+    enableAutoGameLifecycle = ConfigItem(
+        "EmulatorLifecycle", "Enabled", True, None
+    )
+    autoStartEmulator = ConfigItem(
+        "EmulatorLifecycle", "AutoStartEmulator", True, None
+    )
+    closeGameWhenIdle = ConfigItem(
+        "EmulatorLifecycle", "CloseGameWhenIdle", True, None
+    )
+    closeEmulatorWhenIdle = ConfigItem(
+        "EmulatorLifecycle", "CloseEmulatorWhenIdle", False, None
+    )
+
+    enableCodexSelfHealing = ConfigItem(
+        "SelfHealing", "Enabled", False, None
+    )
+    allowCodexIsolatedRepair = ConfigItem(
+        "SelfHealing", "AllowIsolatedRepair", False, None
+    )
 
     residentActivityTask = ConfigItem(
         "ResidentActivity",

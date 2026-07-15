@@ -14,12 +14,13 @@ import numpy as np
 from loguru import logger
 
 from core.control.adb import ADB
-from core.control.adb_port import EmulatorType
+from core.control.adb_port import EmulatorInfo, EmulatorType
 from core.control.base_control import IADB
 from core.control.nemu import NEMU
 from core.exception.exceptions import StopExecution
 from core.image.image import Image
 from core.model import app
+from core.services.repair_safety import ensure_automation_allowed
 
 EXCURSIONX = [-10, 10]
 EXCURSIONY = [-10, 10]
@@ -27,6 +28,43 @@ STOP = False
 MAX_SWIPE_SEGMENTS = 100
 
 control: IADB = ADB()
+_runtime_device: EmulatorInfo | None = None
+_runtime_auto_start_emulator: bool | None = None
+
+
+def set_runtime_device(device: EmulatorInfo | None) -> None:
+    """Freeze the target used by an active queue independently of GUI config."""
+
+    global _runtime_device
+    _runtime_device = (
+        EmulatorInfo.from_dict(device.to_dict()) if device is not None else None
+    )
+
+
+def clear_runtime_device() -> None:
+    global _runtime_auto_start_emulator
+    set_runtime_device(None)
+    _runtime_auto_start_emulator = None
+
+
+def has_runtime_device() -> bool:
+    return _runtime_device is not None
+
+
+def set_runtime_auto_start_emulator(enabled: bool) -> None:
+    global _runtime_auto_start_emulator
+    _runtime_auto_start_emulator = bool(enabled)
+
+
+def get_runtime_auto_start_emulator() -> bool:
+    if _runtime_auto_start_emulator is None:
+        return True
+    return _runtime_auto_start_emulator
+
+
+def get_runtime_device() -> EmulatorInfo:
+    device = _runtime_device or app.Global.device
+    return EmulatorInfo.from_dict(device.to_dict())
 
 
 def _close_backend(candidate: IADB, name: str) -> None:
@@ -50,12 +88,13 @@ def connect(adb_port: Optional[int] = None):
 
     :param order: ADB端口
     """
+    ensure_automation_allowed("连接 ADB/NEMU")
     global control
-    device = app.Global.device
+    device = get_runtime_device()
     if device.is_mumu:
         nemu_candidate = None
         try:
-            nemu_candidate = NEMU()
+            nemu_candidate = NEMU(device)
             status = nemu_candidate.connect(adb_port)
         except Exception:
             logger.exception("MUMUIPC连接异常，尝试使用ADB连接")
@@ -69,7 +108,7 @@ def connect(adb_port: Optional[int] = None):
 
     adb_candidate = ADB()
     try:
-        status = adb_candidate.connect(adb_port)
+        status = adb_candidate.connect(adb_port if adb_port is not None else device.port)
     except Exception:
         _close_backend(adb_candidate, "ADB")
         raise
@@ -78,6 +117,15 @@ def connect(adb_port: Optional[int] = None):
     else:
         _close_backend(adb_candidate, "ADB")
     return status
+
+
+def connect_adb(adb_port: Optional[int] = None):
+    """Force the TCP ADB transport for workflows that require shell evidence."""
+    ensure_automation_allowed("连接 ADB")
+    global control
+    device = get_runtime_device()
+    control = ADB()
+    return control.connect(adb_port if adb_port is not None else device.port)
 
 
 def stop():
@@ -110,6 +158,7 @@ def input_swipe(pos1=(919, 617), pos2=(919, 908), swipe_time: int = 100):
     :param pos2: 坐标2
     :param time: 操作时间(毫秒)
     """
+    ensure_automation_allowed("滑动游戏界面")
     if STOP:
         raise StopExecution()
     # 添加随机值
@@ -234,6 +283,7 @@ def input_tap(pos: Tuple[int, int] = (880, 362)):
 
     :param pos: 坐标
     """
+    ensure_automation_allowed("点击游戏界面")
     if STOP:
         raise StopExecution()
     control.input_tap(
@@ -257,6 +307,7 @@ def screenshot_image() -> cv.typing.MatLike:
     """
     截图并返回图片对象
     """
+    ensure_automation_allowed("读取游戏画面")
     if STOP:
         raise StopExecution()
 

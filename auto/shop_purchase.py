@@ -1,0 +1,838 @@
+"""Recurring shop purchases with pluggable shop adapters.
+
+The first adapter targets Headquarters -> Black Moon Shop.  It intentionally
+uses the non-batch purchase flow so every configured item gets an explicit
+quantity dialog and OCR validation before the final confirmation.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Iterable
+
+import cv2 as cv
+import numpy as np
+from loguru import logger
+
+from core.control.control import (
+    connect,
+    connect_adb,
+    input_swipe,
+    input_tap,
+    kill,
+    screenshot,
+)
+from core.exception.exceptions import StopExecution
+from core.preset.control import go_home
+from core.services.shop_catalog import (
+    ConfiguredPurchase,
+    ShopAttemptAlreadyActive,
+    ShopDefinition,
+    ShopItem,
+    active_shop_attempt,
+    configured_purchases,
+    load_shop_catalog,
+    load_shop_plan,
+    record_shop_attempt,
+    update_shop_attempt,
+)
+
+
+SHOP_ENTRY_POS = (260, 30)
+HEADQUARTERS_TAB_POS = (858, 40)
+PRODUCT_REGION = (580, 150, 1260, 660)
+PRODUCT_SCROLL_START = (800, 585)
+PRODUCT_SCROLL_END = (800, 365)
+PRODUCT_REWIND_START = PRODUCT_SCROLL_END
+PRODUCT_REWIND_END = PRODUCT_SCROLL_START
+DIALOG_CANCEL_POS = (320, 535)
+DIALOG_CONFIRM_POS = (960, 535)
+DIALOG_MAX_POS = (892, 380)
+BATCH_TOGGLE_POS = (1230, 117)
+MAX_SCAN_PAGES = 30
+
+
+def _normalize_text(value: object) -> str:
+    text = str(value or "")
+    return re.sub(r"[\s×xX*]+1$", "", re.sub(r"\s+", "", text)).replace(
+        "(", "（"
+    ).replace(")", "）")
+
+
+def _center(item: dict) -> tuple[float, float]:
+    position = item["position"]
+    return (
+        (float(position[0][0]) + float(position[2][0])) / 2,
+        (float(position[0][1]) + float(position[2][1])) / 2,
+    )
+
+
+def parse_limit_text(text: object) -> tuple[str, int, int] | None:
+    match = re.search(r"(每日|每周|每月)限购\s*(\d+)\s*/\s*(\d+)", str(text))
+    if not match:
+        return None
+    period = {"每日": "daily", "每周": "weekly", "每月": "monthly"}[match[1]]
+    return period, int(match[2]), int(match[3])
+
+
+def parse_quantity_text(text: object) -> tuple[int, int] | None:
+    match = re.fullmatch(r"\s*(\d+)\s*/\s*(\d+)\s*", str(text))
+    return (int(match[1]), int(match[2])) if match else None
+
+
+def _numeric_value(text: object) -> int | None:
+    cleaned = str(text).strip().replace(",", "")
+    match = re.fullmatch(r"\D{0,2}(\d+(?:\.\d+)?)([kKmM]?)", cleaned)
+    if not match:
+        return None
+    value = float(match[1])
+    suffix = match[2].lower()
+    if suffix == "k":
+        value *= 1_000
+    elif suffix == "m":
+        value *= 1_000_000
+    return int(round(value))
+
+
+@dataclass(frozen=True)
+class LocatedProduct:
+    item: ShopItem
+    center: tuple[float, float]
+    remaining: int
+    total: int
+    context: tuple[str, ...]
+
+
+def locate_product(ocr_items: Iterable[dict], target: ShopItem) -> LocatedProduct | None:
+    """Locate one catalog product and disambiguate duplicate names by its card."""
+    data = list(ocr_items)
+    expected_name = _normalize_text(target.name)
+    matches = [
+        item
+        for item in data
+        if _normalize_text(item.get("text")) == expected_name
+        and PRODUCT_REGION[1] <= _center(item)[1] <= PRODUCT_REGION[3]
+    ]
+    located: list[LocatedProduct] = []
+    for match in matches:
+        center_x, center_y = _center(match)
+        if center_x < 923:
+            x1, x2 = 580, 915
+        else:
+            x1, x2 = 920, 1260
+        context_items = []
+        for item in data:
+            item_x, item_y = _center(item)
+            if x1 <= item_x <= x2 and center_y - 62 <= item_y <= center_y + 62:
+                context_items.append(item)
+        limits = [
+            parsed
+            for parsed in (parse_limit_text(item.get("text")) for item in context_items)
+            if parsed
+        ]
+        expected_limit = next(
+            (
+                parsed
+                for parsed in limits
+                if parsed[0] == target.period and parsed[2] == target.max_limit
+            ),
+            None,
+        )
+        if not expected_limit:
+            continue
+        numeric_values = {
+            value
+            for value in (_numeric_value(item.get("text")) for item in context_items)
+            if value is not None
+        }
+        # List-price OCR occasionally disappears while the name and exact
+        # period/limit remain readable (observed on 星云物质（8钛）).  Reject a
+        # conflicting observed price, but allow a missing one: the quantity
+        # dialog performs the authoritative price check before confirmation.
+        if numeric_values and target.price not in numeric_values:
+            continue
+        located.append(
+            LocatedProduct(
+                item=target,
+                center=(center_x, center_y),
+                remaining=expected_limit[1],
+                total=expected_limit[2],
+                context=tuple(str(item.get("text", "")) for item in context_items),
+            )
+        )
+    if len(located) > 1:
+        logger.warning(f"商品出现多个候选，采用第一个: {target.id}")
+    return located[0] if located else None
+
+
+def _content_difference(previous: np.ndarray, current: np.ndarray) -> float:
+    x1, y1, x2, y2 = PRODUCT_REGION
+    before = cv.cvtColor(previous[y1:y2, x1:x2], cv.COLOR_BGR2GRAY)
+    after = cv.cvtColor(current[y1:y2, x1:x2], cv.COLOR_BGR2GRAY)
+    return float(np.mean(cv.absdiff(before, after)))
+
+
+def _batch_purchase_enabled(image: object) -> bool:
+    """The enabled toggle has a solid white dot; disabled has a dark center."""
+    matrix = image.image if hasattr(image, "image") else image
+    center_x, center_y = BATCH_TOGGLE_POS
+    patch = matrix[center_y - 7 : center_y + 8, center_x - 7 : center_x + 8]
+    if patch.size == 0:
+        return False
+    white_ratio = float(np.mean(np.all(patch > 200, axis=2)))
+    return white_ratio >= 0.15
+
+
+def _has_quantity_dialog(ocr_items: Iterable[dict]) -> bool:
+    zones = {
+        "最少": (320, 320, 450, 430),
+        "最多": (830, 320, 950, 430),
+        "取消": (180, 480, 500, 590),
+        "确定": (800, 480, 1120, 590),
+    }
+    found: set[str] = set()
+    for item in ocr_items:
+        text = _normalize_text(item.get("text"))
+        zone = zones.get(text)
+        if not zone:
+            continue
+        center_x, center_y = _center(item)
+        if zone[0] <= center_x <= zone[2] and zone[1] <= center_y <= zone[3]:
+            found.add(text)
+    return found == set(zones)
+
+
+def _has_quantity_step_buttons(image: object) -> bool:
+    """Validate the fixed -1/+1 buttons visually when OCR omits symbols."""
+    matrix = image.image if hasattr(image, "image") else image
+    if matrix is None or matrix.shape[0] < 395 or matrix.shape[1] < 847:
+        return False
+    rois = (
+        matrix[365:395, 435:475],  # -1
+        matrix[365:395, 807:847],  # +1
+    )
+    for roi in rois:
+        gray = cv.cvtColor(roi, cv.COLOR_BGR2GRAY)
+        if int(np.count_nonzero(gray > 180)) < 35:
+            return False
+    return True
+
+
+def _has_complete_quantity_dialog(image: object, ocr_items: Iterable[dict]) -> bool:
+    return _has_quantity_dialog(ocr_items) and _has_quantity_step_buttons(image)
+
+
+class ShopEvidenceRecorder:
+    def __init__(self, enabled: bool, label: str):
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.enabled = bool(enabled)
+        self.root = Path("logs") / "shop_purchase" / f"{timestamp}-{label}"
+        self.index = 0
+
+    def capture(
+        self,
+        label: str,
+        image=None,
+        ocr_items: list[dict] | None = None,
+    ) -> list[dict]:
+        if image is None:
+            image = screenshot()
+        if ocr_items is None:
+            ocr_items = image.ocr()
+        if not self.enabled:
+            return ocr_items
+        safe_label = re.sub(r"[^0-9A-Za-z_-]+", "-", label).strip("-") or "step"
+        self.root.mkdir(parents=True, exist_ok=True)
+        stem = f"{self.index:03d}-{safe_label}"
+        self.index += 1
+        cv.imwrite(str(self.root / f"{stem}.png"), image.image)
+        (self.root / f"{stem}.ocr.json").write_text(
+            json.dumps(ocr_items, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return ocr_items
+
+
+def _wait_for_text(
+    expected: Iterable[str],
+    timeout: float = 8.0,
+) -> tuple[object, list[dict]]:
+    expected_normalized = {_normalize_text(text) for text in expected}
+    deadline = time.monotonic() + timeout
+    latest = None
+    latest_ocr: list[dict] = []
+    while time.monotonic() < deadline:
+        latest = screenshot()
+        latest_ocr = latest.ocr()
+        visible = {_normalize_text(item.get("text")) for item in latest_ocr}
+        if expected_normalized.issubset(visible):
+            return latest, latest_ocr
+        time.sleep(0.6)
+    raise RuntimeError(f"等待商店文本超时: {', '.join(expected)}")
+
+
+def _dialog_quantity(ocr_items: Iterable[dict]) -> tuple[int, int] | None:
+    for item in ocr_items:
+        _, center_y = _center(item)
+        quantity = parse_quantity_text(item.get("text"))
+        if quantity and 320 <= center_y <= 420:
+            return quantity
+    return None
+
+
+def _dialog_price(ocr_items: Iterable[dict]) -> int | None:
+    values = []
+    for item in ocr_items:
+        center_x, center_y = _center(item)
+        if center_x >= 600 and 420 <= center_y <= 490:
+            value = _numeric_value(item.get("text"))
+            if value is not None:
+                values.append(value)
+    return values[-1] if values else None
+
+
+def _dialog_has_item(ocr_items: Iterable[dict], item: ShopItem) -> bool:
+    expected = _normalize_text(item.name)
+    return any(_normalize_text(value.get("text")) == expected for value in ocr_items)
+
+
+def _finalize_attempt(result: dict) -> dict:
+    """Best-effort status update; the pre-confirm block must survive failures."""
+    try:
+        update_shop_attempt(str(result["id"]), str(result["status"]), result)
+    except Exception:  # never erase at-most-once protection after confirmation
+        logger.exception(f"无法更新商店执行账本: {result.get('id', '')}")
+    return result
+
+
+class HeadquartersBlackMoonAdapter:
+    key = "headquarters_black_moon"
+
+    def __init__(self, shop: ShopDefinition, recorder: ShopEvidenceRecorder):
+        self.shop = shop
+        self.recorder = recorder
+
+    def open(self) -> None:
+        initial = screenshot()
+        initial_ocr = initial.ocr()
+        initial_texts = {_normalize_text(item.get("text")) for item in initial_ocr}
+        if _has_quantity_dialog(initial_ocr):
+            input_tap(DIALOG_CANCEL_POS)
+            time.sleep(0.8)
+            initial = screenshot()
+            initial_ocr = initial.ocr()
+            initial_texts = {
+                _normalize_text(item.get("text")) for item in initial_ocr
+            }
+        already_in_store = {"总部商店", "赴命商店"}.issubset(initial_texts)
+        if already_in_store:
+            self.recorder.capture("existing-shop", initial, initial_ocr)
+        else:
+            if not go_home():
+                raise RuntimeError("无法返回主界面，未进入商店")
+            self.recorder.capture("home")
+            input_tap(SHOP_ENTRY_POS)
+            image, ocr_items = _wait_for_text(
+                ("总部商店", "黑月商店"), timeout=10
+            )
+            self.recorder.capture("shop-entry", image, ocr_items)
+        input_tap(HEADQUARTERS_TAB_POS)
+        image, ocr_items = _wait_for_text(("总部商店", "黑月商店", "确认购买"))
+        self.recorder.capture("headquarters-top", image, ocr_items)
+        if _batch_purchase_enabled(image):
+            logger.info("检测到批量购买已开启，切换为逐件数量弹窗模式")
+            input_tap(BATCH_TOGGLE_POS)
+            time.sleep(0.8)
+            image = screenshot()
+            ocr_items = image.ocr()
+            self.recorder.capture("batch-disabled", image, ocr_items)
+            if _batch_purchase_enabled(image):
+                raise RuntimeError("无法关闭批量购买，已停止自动购买")
+        self._rewind_to_top()
+
+    def _rewind_to_top(self) -> None:
+        """The game remembers the last scroll position, so never assume page one."""
+        previous = screenshot()
+        stable = 0
+        for index in range(14):
+            input_swipe(PRODUCT_REWIND_START, PRODUCT_REWIND_END, swipe_time=650)
+            time.sleep(0.9)
+            current = screenshot()
+            difference = _content_difference(previous.image, current.image)
+            ocr_items = current.ocr()
+            self.recorder.capture(f"rewind-{index:02d}", current, ocr_items)
+            logger.debug(f"商店回顶第 {index + 1} 次差异: {difference:.3f}")
+            stable = stable + 1 if difference <= 4.0 else 0
+            previous = current
+            if stable >= 2:
+                return
+        raise RuntimeError("商店回顶超过安全滑动次数，已停止继续")
+
+    def _cancel_dialog(self, label: str) -> None:
+        input_tap(DIALOG_CANCEL_POS)
+        time.sleep(0.8)
+        remaining_ocr = self.recorder.capture(label)
+        if _has_quantity_dialog(remaining_ocr):
+            raise RuntimeError("数量弹窗取消后仍未关闭，已停止继续操作")
+
+    def inspect_dialog(
+        self,
+        located: LocatedProduct,
+        quantity_mode: str,
+    ) -> tuple[int, int]:
+        input_tap(located.center)
+        time.sleep(0.9)
+        dialog = screenshot()
+        dialog_ocr = dialog.ocr()
+        self.recorder.capture(f"dialog-{located.item.id}", dialog, dialog_ocr)
+        if not _has_complete_quantity_dialog(dialog, dialog_ocr):
+            self._cancel_dialog(f"cancel-missing-controls-{located.item.id}")
+            raise RuntimeError(
+                f"未识别到完整数量弹窗，拒绝确认购买: {located.item.name}"
+            )
+        if not _dialog_has_item(dialog_ocr, located.item):
+            self._cancel_dialog(f"cancel-unexpected-{located.item.id}")
+            raise RuntimeError(f"商品弹窗名称校验失败: {located.item.name}")
+        observed_price = _dialog_price(dialog_ocr)
+        if observed_price != located.item.price:
+            self._cancel_dialog(f"cancel-price-{located.item.id}")
+            raise RuntimeError(
+                f"商品价格校验失败: {located.item.name}，"
+                f"目录 {located.item.price}，实机 {observed_price}"
+            )
+        observed_total = observed_price
+        quantity = _dialog_quantity(dialog_ocr)
+        if quantity is None:
+            if located.remaining != 1:
+                self._cancel_dialog(f"cancel-quantity-{located.item.id}")
+                raise RuntimeError(f"未识别数量控件: {located.item.name}")
+            quantity = (1, 1)
+        if quantity_mode == "max" and quantity[0] != quantity[1]:
+            input_tap(DIALOG_MAX_POS)
+            time.sleep(0.6)
+            dialog = screenshot()
+            dialog_ocr = dialog.ocr()
+            self.recorder.capture(f"dialog-max-{located.item.id}", dialog, dialog_ocr)
+            quantity = _dialog_quantity(dialog_ocr) or quantity
+            observed_total = _dialog_price(dialog_ocr)
+            if observed_total is None or observed_total < observed_price:
+                self._cancel_dialog(f"cancel-total-{located.item.id}")
+                raise RuntimeError(
+                    f"未能安全识别上限模式实时总价: {located.item.name}"
+                )
+        expected = 1 if quantity_mode == "one" else located.remaining
+        if quantity[0] != expected:
+            self._cancel_dialog(f"cancel-quantity-mismatch-{located.item.id}")
+            raise RuntimeError(
+                f"商品数量校验失败: {located.item.name}，"
+                f"期望 {expected}，实机 {quantity[0]}/{quantity[1]}"
+            )
+        return quantity[0], observed_total
+
+    def purchase(
+        self,
+        located: LocatedProduct,
+        quantity_mode: str,
+        dry_run: bool,
+    ) -> dict:
+        quantity, observed_total = self.inspect_dialog(located, quantity_mode)
+        if dry_run:
+            self._cancel_dialog(f"dry-run-cancel-{located.item.id}")
+            return {
+                "id": located.item.id,
+                "name": located.item.name,
+                "status": "validated",
+                "quantity": quantity,
+                "cost": observed_total,
+                "dry_run": True,
+                "final_action": "cancel",
+            }
+        # At-most-once boundary: persist the item-period lock before the ADB
+        # confirmation tap.  A crash may skip one cycle, but can never repeat it.
+        try:
+            record_shop_attempt(
+                located.item,
+                quantity_mode,
+                quantity=quantity,
+                cost=observed_total,
+                status="prepared",
+            )
+        except ShopAttemptAlreadyActive as error:
+            self._cancel_dialog(f"cancel-period-blocked-{located.item.id}")
+            return {
+                "id": located.item.id,
+                "name": located.item.name,
+                "status": "blocked_by_period",
+                "blocked_until": error.entry.get("blocked_until", ""),
+            }
+        except Exception:
+            # A failed write-ahead record must fail closed: close the dialog and
+            # never send the irreversible confirmation tap.
+            self._cancel_dialog(f"cancel-ledger-error-{located.item.id}")
+            raise
+        try:
+            input_tap(DIALOG_CONFIRM_POS)
+        except StopExecution:
+            _finalize_attempt(
+                {
+                    "id": located.item.id,
+                    "name": located.item.name,
+                    "status": "submitted_unverified",
+                    "quantity": quantity,
+                    "cost": observed_total,
+                    "remaining_before": located.remaining,
+                    "remaining_after": None,
+                    "verification_error": "确认点击阶段收到停止请求",
+                }
+            )
+            raise
+        except Exception as error:
+            # The ADB command may have reached the emulator even if its caller
+            # observed an error.  Preserve the period lock and never tap twice.
+            return _finalize_attempt(
+                {
+                    "id": located.item.id,
+                    "name": located.item.name,
+                    "status": "submitted_unverified",
+                    "quantity": quantity,
+                    "cost": observed_total,
+                    "remaining_before": located.remaining,
+                    "remaining_after": None,
+                    "verification_error": f"确认点击返回异常: {type(error).__name__}: {error}",
+                }
+            )
+        time.sleep(1.5)
+        try:
+            result_image = screenshot()
+            result_ocr = result_image.ocr()
+            self.recorder.capture(
+                f"purchase-result-{located.item.id}", result_image, result_ocr
+            )
+        except StopExecution:
+            _finalize_attempt(
+                {
+                    "id": located.item.id,
+                    "name": located.item.name,
+                    "status": "submitted_unverified",
+                    "quantity": quantity,
+                    "cost": observed_total,
+                    "remaining_before": located.remaining,
+                    "remaining_after": None,
+                    "verification_error": "确认后校验阶段收到停止请求",
+                }
+            )
+            raise
+        except Exception as error:  # confirmation is an irreversible boundary
+            logger.exception(f"购买已提交但无法读取结果: {located.item.name}")
+            return _finalize_attempt({
+                "id": located.item.id,
+                "name": located.item.name,
+                "status": "submitted_unverified",
+                "quantity": quantity,
+                "cost": observed_total,
+                "remaining_before": located.remaining,
+                "remaining_after": None,
+                "verification_error": f"{type(error).__name__}: {error}",
+            })
+        if any("不足" in str(item.get("text", "")) for item in result_ocr):
+            input_tap((100, 650))
+            time.sleep(0.5)
+            self.recorder.capture(f"insufficient-{located.item.id}")
+            return _finalize_attempt({
+                "id": located.item.id,
+                "name": located.item.name,
+                "status": "insufficient_currency",
+                "quantity": 0,
+                "cost": 0,
+            })
+        if _has_quantity_dialog(result_ocr):
+            # Never tap confirmation twice.  The server may still be processing,
+            # so leave this as a submitted/unknown outcome and suppress retries.
+            return _finalize_attempt({
+                "id": located.item.id,
+                "name": located.item.name,
+                "status": "submitted_unverified",
+                "quantity": quantity,
+                "cost": observed_total,
+                "remaining_before": located.remaining,
+                "remaining_after": None,
+                "verification_error": "确认后数量弹窗仍可见",
+            })
+        refreshed = locate_product(result_ocr, located.item)
+        expected_remaining = max(0, located.remaining - quantity)
+        verified = refreshed is not None and refreshed.remaining == expected_remaining
+        return _finalize_attempt({
+            "id": located.item.id,
+            "name": located.item.name,
+            "status": "purchased" if verified else "submitted_unverified",
+            "quantity": quantity,
+            "cost": observed_total,
+            "remaining_before": located.remaining,
+            "remaining_after": refreshed.remaining if refreshed else None,
+            "verification_error": "" if verified else "未能核对购买后的限购余量",
+        })
+
+    def scan(
+        self,
+        purchases: Iterable[ConfiguredPurchase] | None = None,
+        dry_run: bool = True,
+        max_pages: int = MAX_SCAN_PAGES,
+    ) -> dict:
+        if isinstance(max_pages, bool) or not isinstance(max_pages, int) or max_pages < 1:
+            raise ValueError("商店扫描页数上限必须是正整数")
+        catalog_probe = purchases is None
+        requested = {
+            purchase.item.id: purchase
+            for purchase in (
+                purchases
+                if purchases is not None
+                else [
+                    ConfiguredPurchase(self.shop, item, "one")
+                    for item in self.shop.items
+                ]
+            )
+        }
+        pending = dict(requested)
+        results: list[dict] = []
+        page_count = 0
+        stable = 0
+        previous_matrix = None
+        reached_bottom = False
+        stop_for_review = False
+        while page_count < max_pages:
+            page_index = page_count
+            page_image = screenshot()
+            page_ocr = page_image.ocr()
+            self.recorder.capture(f"page-{page_index:02d}", page_image, page_ocr)
+            page_matrix = page_image.image.copy()
+            page_count += 1
+            if previous_matrix is not None:
+                difference = _content_difference(previous_matrix, page_matrix)
+                stable = stable + 1 if difference <= 4.0 else 0
+                logger.debug(f"商店第 {page_index} 页差异: {difference:.3f}")
+            for item_id, purchase in list(pending.items()):
+                located = locate_product(page_ocr, purchase.item)
+                if not located:
+                    continue
+                if located.remaining <= 0:
+                    result = {
+                        "id": item_id,
+                        "name": purchase.item.name,
+                        "status": "sold_out",
+                        "remaining": 0,
+                    }
+                    results.append(result)
+                    if not catalog_probe and not dry_run:
+                        record_shop_attempt(
+                            purchase.item,
+                            purchase.quantity,
+                            status="sold_out",
+                        )
+                elif catalog_probe:
+                    results.append(
+                        {
+                            "id": item_id,
+                            "name": purchase.item.name,
+                            "status": "found",
+                            "remaining": located.remaining,
+                            "limit": located.total,
+                        }
+                    )
+                else:
+                    result = self.purchase(located, purchase.quantity, dry_run)
+                    results.append(result)
+                    if result["status"] == "submitted_unverified":
+                        stop_for_review = True
+                    elif not dry_run:
+                        page_image = screenshot()
+                        page_ocr = page_image.ocr()
+                        page_matrix = page_image.image.copy()
+                pending.pop(item_id, None)
+                if stop_for_review:
+                    break
+            # A configured purchase may stop as soon as every requested item
+            # has been handled.  A catalog probe must still prove it reached
+            # the actual bottom with two consecutive stable swipes, otherwise
+            # newly added/unknown products below the known catalog are missed.
+            reached_bottom = stable >= 2
+            if reached_bottom or stop_for_review or (not catalog_probe and not pending):
+                break
+            previous_matrix = page_matrix
+            if page_count >= max_pages:
+                break
+            input_swipe(PRODUCT_SCROLL_START, PRODUCT_SCROLL_END, swipe_time=650)
+            time.sleep(1.0)
+        if catalog_probe and not reached_bottom:
+            raise RuntimeError(
+                f"商店扫描达到 {max_pages} 页安全上限，仍未确认触底"
+            )
+        page_limit_reached = (
+            bool(pending) and page_count >= max_pages and not reached_bottom
+        )
+        missing = [
+            {"id": purchase.item.id, "name": purchase.item.name}
+            for purchase in pending.values()
+        ]
+        attention_statuses = {"insufficient_currency", "submitted_unverified"}
+        requires_attention = bool(
+            missing
+            or stop_for_review
+            or page_limit_reached
+            or any(result.get("status") in attention_statuses for result in results)
+        )
+        return {
+            "success": not requires_attention,
+            "shop": self.shop.id,
+            "pages": page_count,
+            "scan_page_limit": max_pages,
+            "reached_bottom": reached_bottom,
+            "page_limit_reached": page_limit_reached,
+            "requires_attention": requires_attention,
+            "results": results,
+            "missing": missing,
+        }
+
+
+ADAPTERS: dict[
+    str,
+    Callable[[ShopDefinition, ShopEvidenceRecorder], HeadquartersBlackMoonAdapter],
+] = {
+    HeadquartersBlackMoonAdapter.key: HeadquartersBlackMoonAdapter,
+}
+
+
+def register_shop_adapter(key: str, factory: Callable) -> None:
+    """Register an additional shop without changing the planner or scheduler."""
+    ADAPTERS[str(key)] = factory
+
+
+def _connected_run(callback: Callable[[], object]) -> object:
+    transport = "adb"
+    try:
+        try:
+            adb_connected = connect_adb()
+        except Exception as error:  # MuMu may leave its TCP transport offline
+            adb_connected = False
+            logger.warning(
+                "TCP ADB 连接异常，将尝试模拟器 IPC: "
+                f"{type(error).__name__}: {error}"
+            )
+        if not adb_connected:
+            if not connect():
+                raise RuntimeError("无法通过 ADB 或模拟器 IPC 连接模拟器")
+            transport = "nemu_ipc"
+            logger.warning("本次商店任务使用 NEMUIPC 回退传输")
+        result = callback()
+        if isinstance(result, dict):
+            result["transport"] = transport
+        return result
+    finally:
+        try:
+            kill()
+        except Exception:
+            # Cleanup must not hide the original connection/callback result.
+            # The next run creates a fresh transport object either way.
+            logger.exception("商店任务结束后释放模拟器连接失败")
+
+
+def probe_shop_catalog(capture_evidence: bool = True) -> dict:
+    """Read-only live catalog probe used by the persistent debug runtime."""
+    catalog = load_shop_catalog()
+    shop = catalog.shop("headquarters_black_moon")
+    recorder = ShopEvidenceRecorder(capture_evidence, "probe")
+
+    def run() -> dict:
+        adapter = HeadquartersBlackMoonAdapter(shop, recorder)
+        adapter.open()
+        return adapter.scan(purchases=None)
+
+    return _connected_run(run)  # type: ignore[return-value]
+
+
+def probe_shop_quantity_dialog(
+    item_id: str = "cactus_energy_weekly_iron",
+    quantity: str = "max",
+    capture_evidence: bool = True,
+) -> dict:
+    """Validate one complete item/dialog/quantity flow and always cancel it."""
+    catalog = load_shop_catalog()
+    item = catalog.item(item_id)
+    shop = catalog.shop(item.shop_id)
+    if quantity not in {"one", "max"}:
+        raise ValueError(f"未知购买数量模式: {quantity}")
+    recorder = ShopEvidenceRecorder(capture_evidence, "dialog-probe")
+    purchase = ConfiguredPurchase(shop=shop, item=item, quantity=quantity)
+
+    def run() -> dict:
+        factory = ADAPTERS.get(shop.adapter)
+        if not factory:
+            raise RuntimeError(f"商店尚未注册自动化适配器: {shop.name}")
+        adapter = factory(shop, recorder)
+        adapter.open()
+        return adapter.scan([purchase], dry_run=True)
+
+    return _connected_run(run)  # type: ignore[return-value]
+
+
+def run_shop_purchase(dry_run: bool = False) -> dict:
+    catalog = load_shop_catalog()
+    plan = load_shop_plan(catalog=catalog)
+    purchases = configured_purchases(plan, catalog)
+    if not purchases:
+        return {"success": True, "skipped": "未启用任何自动购买商品", "shops": []}
+    blocked_by_period = []
+    if not dry_run:
+        due_purchases = []
+        for purchase in purchases:
+            attempt = active_shop_attempt(purchase.item)
+            if attempt:
+                blocked_by_period.append(
+                    {
+                        "id": purchase.item.id,
+                        "name": purchase.item.name,
+                        "status": attempt.get("status", "attempted"),
+                        "blocked_until": attempt.get("blocked_until", ""),
+                    }
+                )
+            else:
+                due_purchases.append(purchase)
+        purchases = due_purchases
+    if not purchases:
+        return {
+            "success": True,
+            "skipped": "所有已选商品均已在当前刷新周期处理",
+            "blocked_by_period": blocked_by_period,
+            "shops": [],
+        }
+    grouped: dict[str, list[ConfiguredPurchase]] = {}
+    for purchase in purchases:
+        grouped.setdefault(purchase.shop.id, []).append(purchase)
+    recorder = ShopEvidenceRecorder(bool(plan["capture_evidence"]), "dry" if dry_run else "run")
+
+    def run() -> dict:
+        shop_results = []
+        for shop_id, shop_purchases in grouped.items():
+            shop = catalog.shop(shop_id)
+            factory = ADAPTERS.get(shop.adapter)
+            if not factory:
+                raise RuntimeError(f"商店尚未注册自动化适配器: {shop.name}")
+            adapter = factory(shop, recorder)
+            adapter.open()
+            shop_results.append(adapter.scan(shop_purchases, dry_run=dry_run))
+        requires_attention = any(
+            bool(result.get("requires_attention")) for result in shop_results
+        )
+        return {
+            "success": not requires_attention,
+            "dry_run": dry_run,
+            "requires_attention": requires_attention,
+            "blocked_by_period": blocked_by_period,
+            "shops": shop_results,
+        }
+
+    return _connected_run(run)  # type: ignore[return-value]

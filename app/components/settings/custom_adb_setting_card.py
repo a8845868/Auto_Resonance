@@ -26,7 +26,11 @@ class CustomAdbSettingCard(LineEditSettingCard):
 
     def initText(self):
         info: EmulatorInfo = self.configItem.value
-        self.lineEdit.setText(str(info.port))
+        previous = self.lineEdit.blockSignals(True)
+        try:
+            self.lineEdit.setText("" if info.port is None else str(info.port))
+        finally:
+            self.lineEdit.blockSignals(previous)
 
     def textChanged(self, text: str):
         self.customInfo.port = int(text) if text.isdigit() else 16384

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import datetime as dt
+import json
 import os
 import runpy
 import sys
@@ -13,17 +14,64 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 LOG_FILE = ROOT / "logs" / "gui-startup-error.log"
+CONFIG_FILE = ROOT / "config" / "app.json"
+
+
+def _self_healing_flags() -> tuple[bool, bool]:
+    try:
+        document = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        settings = document.get("SelfHealing", {})
+        if not isinstance(settings, dict):
+            return False, False
+        return (
+            settings.get("Enabled") is True,
+            settings.get("AllowIsolatedRepair") is True,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return False, False
+
+
+def submit_startup_incident(traceback_text: str) -> None:
+    """Best-effort startup reporting that also works before the GUI imports."""
+
+    try:
+        from core.services.self_healing import submit_incident
+
+        enabled, allow_repair = _self_healing_flags()
+        submit_incident(
+            {
+                "source": "gui_launcher",
+                "task_key": "gui_startup",
+                "task_name": "图形界面启动",
+                "failure_kind": "exception",
+                "message": (
+                    traceback_text.strip().splitlines()[-1]
+                    if traceback_text.strip()
+                    else "GUI startup failed"
+                ),
+                "expected": "图形界面取得运行锁并成功启动",
+                "observed": "启动边界抛出异常",
+                "traceback": traceback_text,
+                "context": {"dispatch_allowed": True},
+            },
+            dispatch=enabled,
+            allow_repair=allow_repair,
+        )
+    except Exception:
+        pass
 
 
 def report_startup_error() -> None:
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    traceback_text = traceback.format_exc()
     details = (
         f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}]\n"
         f"Python: {sys.executable}\n"
         f"Working directory: {ROOT}\n\n"
-        f"{traceback.format_exc()}\n"
+        f"{traceback_text}\n"
     )
     LOG_FILE.write_text(details, encoding="utf-8")
+    submit_startup_incident(traceback_text)
     ctypes.windll.user32.MessageBoxW(
         0,
         f"图形界面启动失败。\n\n错误详情已保存到：\n{LOG_FILE}",
@@ -32,13 +80,56 @@ def report_startup_error() -> None:
     )
 
 
+def report_runtime_busy(owner: dict) -> None:
+    """Explain an intentional GUI/debug handoff without calling it a crash."""
+    mode = str(owner.get("mode", "unknown"))
+    pid = owner.get("pid", "未知")
+    if mode == "debug":
+        reason = f"后台调试正在运行（PID {pid}）"
+        guidance = (
+            "为避免 GUI 和后台同时操作模拟器，图形界面本次没有启动。\n\n"
+            "需要切回 GUI 时，请先执行：\n"
+            "debug_runner.py stop --mode debug"
+        )
+    elif mode == "gui":
+        reason = f"图形界面已经在运行（PID {pid}）"
+        guidance = "无需重复启动；请切换到已经打开的窗口。"
+    else:
+        reason = f"自动化控制器正由 {mode} 占用（PID {pid}）"
+        guidance = "请先安全结束当前自动化运行实例，再启动图形界面。"
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LOG_FILE.write_text(
+        f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}]\n"
+        f"GUI 未启动：{reason}\n"
+        "这是运行时互斥保护，不是图形界面崩溃。\n",
+        encoding="utf-8",
+    )
+    ctypes.windll.user32.MessageBoxW(
+        0,
+        f"{reason}\n\n{guidance}",
+        "黑月无人驾驶 - 运行实例提示",
+        0x40,
+    )
+
+
 if __name__ == "__main__":
     os.chdir(ROOT)
     LOG_FILE.unlink(missing_ok=True)
+    runtime_lease = None
     try:
-        runpy.run_path(str(ROOT / "gui.py"), run_name="__main__")
+        from core.services.runtime_control import RuntimeBusyError, acquire_runtime
+
+        try:
+            runtime_lease = acquire_runtime("gui")
+        except RuntimeBusyError as error:
+            report_runtime_busy(error.owner)
+        else:
+            runpy.run_path(str(ROOT / "gui.py"), run_name="__main__")
     except SystemExit as error:
         if error.code not in (None, 0):
             report_startup_error()
     except BaseException:
         report_startup_error()
+    finally:
+        if runtime_lease is not None:
+            runtime_lease.release()

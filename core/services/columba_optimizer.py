@@ -8,9 +8,11 @@ from datetime import datetime
 from typing import Any
 
 import requests
+from loguru import logger
 
 from core.utils.utils import RESOURCES_PATH, read_json
 from core.services.passenger_planner import PassengerPlanConfig, estimate_passenger_plan
+from core.services.station_availability import available_stations
 
 
 PRICE_API = "https://www.resonance-columba.com/api/get-prices"
@@ -63,9 +65,19 @@ def _load_metadata():
 
 
 def _fetch_prices(products: list[dict], upstream_cities: list[str]) -> tuple[dict, int]:
-    response = requests.get(PRICE_API, timeout=15)
-    response.raise_for_status()
-    compressed = response.json()["data"]
+    try:
+        response = requests.get(PRICE_API, timeout=15)
+        response.raise_for_status()
+        compressed = response.json()["data"]
+    except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
+        # Product metadata already contains buy/sell base prices.  A temporary
+        # Columba outage must not erase a verified restock-book inventory and
+        # silently rebuild the weekly plan with zero books.
+        logger.warning(
+            "科伦巴实时价格不可用，改用内置基础价格离线规划；"
+            f"进货书分配仍会保留（{type(exc).__name__}: {exc}）"
+        )
+        return {}, 0
     decoded: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
     latest = 0
     for product_id, product_data in compressed.items():
@@ -163,8 +175,13 @@ def _distribute_books(gains: list[list[int]], total_books: int) -> tuple[int, li
     return dp[best_books], paths[best_books]
 
 
-def optimize_live_routes(config: OptimizationConfig = OptimizationConfig()) -> dict:
+def optimize_live_routes(
+    config: OptimizationConfig = OptimizationConfig(),
+    *,
+    at: datetime | None = None,
+) -> dict:
     products, upstream_cities, cities, fatigue, belongs_to = _load_metadata()
+    cities = available_stations(cities, at)
     prices, latest_timestamp = _fetch_prices(products, upstream_cities)
     passenger_fatigue = max(0, config.passenger_trips_per_week) * max(0, config.passenger_fatigue_per_trip)
     freight_fatigue_budget = max(0, config.weekly_fatigue - passenger_fatigue)
@@ -334,8 +351,13 @@ def optimize_live_routes(config: OptimizationConfig = OptimizationConfig()) -> d
     if best is None:
         raise RuntimeError("没有找到可用的科伦巴实时周计划")
     best["price_timestamp"] = latest_timestamp
-    best["price_time"] = datetime.fromtimestamp(latest_timestamp).strftime("%Y-%m-%d %H:%M:%S")
-    best["api"] = PRICE_API
+    best["price_time"] = (
+        datetime.fromtimestamp(latest_timestamp).strftime("%Y-%m-%d %H:%M:%S")
+        if latest_timestamp
+        else "离线基础价格"
+    )
+    best["price_source"] = "live" if latest_timestamp else "builtin"
+    best["api"] = PRICE_API if latest_timestamp else ""
     best["assumptions"] = {
         "cargo": config.cargo,
         "weekly_fatigue": config.weekly_fatigue,

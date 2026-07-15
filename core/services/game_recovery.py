@@ -4,12 +4,21 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from adb_shell.adb_device import AdbDeviceTcp
 from loguru import logger
 
+from core.control.control import (
+    get_runtime_auto_start_emulator,
+    get_runtime_device,
+    has_runtime_device,
+    set_runtime_device,
+)
 from core.model import app
-
-GAME_PACKAGE = "com.hermes.goda"
+from core.services.emulator_lifecycle import (
+    GAME_PACKAGE,
+    EmulatorLifecycle,
+    LifecycleOptions,
+    snapshot_device,
+)
 
 
 @dataclass(frozen=True)
@@ -18,34 +27,45 @@ class TradeRecoveryState:
     next_action: str
 
 
-def _adb() -> AdbDeviceTcp:
-    device = AdbDeviceTcp("127.0.0.1", port=int(app.Global.device.port))
-    if not device.connect():
-        raise ConnectionError("无法连接模拟器 ADB")
-    return device
+def _current_lifecycle() -> EmulatorLifecycle:
+    return EmulatorLifecycle(
+        snapshot_device(get_runtime_device()),
+        options=LifecycleOptions(
+            auto_start_emulator=get_runtime_auto_start_emulator(),
+            close_game_when_idle=False,
+        ),
+    )
+
+
+def _activate_ready_device(device) -> None:
+    if has_runtime_device():
+        set_runtime_device(device)
+    else:
+        app.Global.device = snapshot_device(device)
 
 
 def is_game_running() -> bool:
     """Return whether the game package owns a live Android process."""
-    device = _adb()
-    try:
-        output = device.shell(f"pidof {GAME_PACKAGE}")
-        return bool(str(output).strip())
-    finally:
-        device.close()
+    return _current_lifecycle().is_game_running()
 
 
 def start_game() -> None:
-    """Launch the game's default activity without depending on its activity name."""
-    device = _adb()
-    try:
-        output = device.shell(
-            f"monkey -p {GAME_PACKAGE} -c android.intent.category.LAUNCHER 1"
-        )
-        if "No activities found" in str(output):
-            raise RuntimeError(f"未找到游戏包 {GAME_PACKAGE}")
-    finally:
-        device.close()
+    """Ensure the selected emulator and its game process are running."""
+    lifecycle = _current_lifecycle()
+    _activate_ready_device(lifecycle.ensure_emulator_ready())
+    lifecycle.start_game()
+
+
+def stop_game() -> None:
+    """Close only the selected instance's game package, keeping MuMu alive."""
+    _current_lifecycle().stop_game()
+
+
+def restart_game() -> None:
+    """Restart only the selected instance's game package."""
+    lifecycle = _current_lifecycle()
+    _activate_ready_device(lifecycle.ensure_emulator_ready())
+    lifecycle.restart_game()
 
 
 def recover_game(

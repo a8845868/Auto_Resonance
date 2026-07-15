@@ -4,6 +4,7 @@ from core.services.currency_planner import calculate_acquisition, calculate_curr
 def test_currency_alias_lookup():
     assert currency_for_asset("里程点").name == "里程点数"
     assert currency_for_asset("金币").name == "铁盟币"
+    assert currency_for_asset("交子").key == "jiao_zi"
 
 
 def test_plan_shortfall_and_surplus():

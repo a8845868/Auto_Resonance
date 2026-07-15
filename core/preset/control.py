@@ -16,6 +16,16 @@ from core.module.bgr import BGR
 
 from core.control.control import input_tap, screenshot
 from core.exception.exception_handling import get_excption
+from core.services.screen_state import (
+    clarity_replenish_cancel_position,
+    RESOURCE_DOWNLOAD_CONFIRM_TAP,
+    RESOURCE_DOWNLOAD_WAIT_ATTEMPTS,
+    is_inventory_item_detail,
+    is_inventory_screen,
+    is_top_level_hud,
+    is_train_in_transit,
+    startup_screen_action,
+)
 from core.utils.utils import RESOURCES_PATH
 
 
@@ -222,13 +232,79 @@ def go_home():
     # The current game version animates the start button, so the old 0.96
     # template threshold can loop forever even when the main screen is open.
     # The lower-right start area is consistently orange on the main screen.
-    for attempt in range(15):
+    startup_recovery = False
+    resource_download_seen = False
+    attempt = 0
+    attempt_limit = 45
+    while attempt < attempt_limit:
+        attempt += 1
         image = screenshot()
         start_button = image.get_bgr((1200, 680))
         if start_button.b < 90 and start_button.g > 100 and start_button.r > 160:
             logger.info("已返回主界面")
             return True
-        logger.debug(f"尝试返回主界面 ({attempt + 1}/15)")
+        visible = image.ocr()
+        clarity_cancel = clarity_replenish_cancel_position(visible)
+        if clarity_cancel is not None:
+            logger.info("检测到澄明度补充提示，取消后继续返回主界面")
+            input_tap(clarity_cancel)
+            startup_recovery = False
+            time.sleep(1)
+            continue
+        if is_inventory_item_detail(visible):
+            logger.info("识别到背包物品详情页，关闭详情后继续返回主界面")
+            input_tap((100, 650))
+            startup_recovery = False
+            time.sleep(1)
+            continue
+        if is_inventory_screen(visible):
+            logger.info("识别到背包列表页，点击左上角返回主界面")
+            input_tap((78, 38))
+            startup_recovery = False
+            time.sleep(1.5)
+            continue
+        startup_action = startup_screen_action(visible)
+        if startup_action == "cancel_resource_repair":
+            logger.warning("检测到资源完整性修复提示，取消修复")
+            input_tap((320, 500))
+            startup_recovery = True
+            time.sleep(1)
+            continue
+        if startup_action == "confirm_resource_download":
+            logger.info("检测到登录前资源包更新提示，确认下载并等待完成")
+            input_tap(RESOURCE_DOWNLOAD_CONFIRM_TAP)
+            startup_recovery = True
+            if not resource_download_seen:
+                attempt_limit = max(
+                    attempt_limit,
+                    attempt + RESOURCE_DOWNLOAD_WAIT_ATTEMPTS,
+                )
+                resource_download_seen = True
+            time.sleep(2)
+            continue
+        if startup_action == "enter_game":
+            logger.info("检测到游戏登录页，点击安全区域进入游戏")
+            input_tap((640, 560))
+            startup_recovery = True
+            time.sleep(4)
+            continue
+        if startup_action == "dismiss_startup_overlay":
+            logger.info("关闭登录后的启动弹窗")
+            input_tap((100, 650))
+            startup_recovery = True
+            time.sleep(1)
+            continue
+        if is_train_in_transit(visible):
+            logger.info("已返回行车主界面；列车仍在行驶")
+            return True
+        if is_top_level_hud(visible):
+            logger.info("已返回主界面（文本特征确认）")
+            return True
+        if startup_action == "wait_for_game" or startup_recovery:
+            logger.debug("游戏正在启动，等待主界面")
+            time.sleep(2)
+            continue
+        logger.debug(f"尝试返回主界面 ({attempt}/{attempt_limit})")
         clicked = click_image(
             RESOURCES_PATH / "go_home.png",
             (0, 0),

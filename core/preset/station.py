@@ -5,7 +5,10 @@ LastEditTime: 2025-02-11 22:14:21
 LastEditors: Night-stars-1 nujj1042633805@gmail.com
 """
 
+import re
 import time
+from collections import deque
+from datetime import datetime, timedelta
 
 from loguru import logger
 
@@ -20,6 +23,92 @@ MAP_WAIT_TIME = 3000
 SPEED_BOOST_COLOR = (251, 253, 253)
 SPEED_BOOST_EXCLUDED_LOW = (235, 235, 250)
 SPEED_BOOST_EXCLUDED_HIGH = (240, 240, 255)
+ETA_SAMPLE_INTERVAL = 10.0
+ETA_LOG_INTERVAL = 30.0
+
+
+def parse_remaining_distance(texts: list[str]) -> int | None:
+    """Read `剩余行程：1234km` from the driving HUD OCR."""
+    for text in texts:
+        compact = str(text).replace(" ", "").replace(",", "")
+        if "剩余行程" not in compact:
+            continue
+        match = re.search(r"剩余行程[^0-9]*(\d+)\s*km", compact, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _format_eta_duration(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+class TravelEtaTracker:
+    """Estimate real remaining time from observed in-game distance decay."""
+
+    def __init__(
+        self,
+        sample_interval: float = ETA_SAMPLE_INTERVAL,
+        log_interval: float = ETA_LOG_INTERVAL,
+    ) -> None:
+        self.sample_interval = sample_interval
+        self.log_interval = log_interval
+        self.samples = deque(maxlen=6)
+        self.last_sample_at: float | None = None
+        self.last_eta_log_at: float | None = None
+        self.initial_logged = False
+
+    def should_sample(self, now: float) -> bool:
+        return self.last_sample_at is None or now - self.last_sample_at >= self.sample_interval
+
+    def observe(
+        self,
+        texts: list[str],
+        *,
+        now: float,
+        wall_now: datetime | None = None,
+    ) -> str | None:
+        distance = parse_remaining_distance(texts)
+        self.last_sample_at = now
+        if distance is None:
+            return None
+
+        if self.samples and distance > self.samples[-1][1]:
+            self.samples.clear()
+            self.last_eta_log_at = None
+        self.samples.append((now, distance))
+
+        if not self.initial_logged:
+            self.initial_logged = True
+            return f"行车 ETA：剩余 {distance} km，正在采样实际行驶速度"
+        if len(self.samples) < 2:
+            return None
+
+        start_time, start_distance = self.samples[0]
+        elapsed = now - start_time
+        travelled = start_distance - distance
+        if elapsed <= 0 or travelled <= 0:
+            return None
+        km_per_second = travelled / elapsed
+        eta_seconds = distance / km_per_second
+        if eta_seconds <= 0 or eta_seconds > 24 * 3600:
+            return None
+
+        first_estimate = self.last_eta_log_at is None
+        if not first_estimate and now - self.last_eta_log_at < self.log_interval:
+            return None
+        self.last_eta_log_at = now
+        wall_now = wall_now or datetime.now()
+        arrival = wall_now + timedelta(seconds=eta_seconds)
+        return (
+            f"行车 ETA：剩余 {distance} km，实测 {km_per_second * 60:.1f} km/分钟，"
+            f"预计 {_format_eta_duration(eta_seconds)} 后到达（{arrival:%H:%M:%S}）"
+        )
 
 # pick_mask = cv.imread("resources/mask/pick_mask.png", cv.IMREAD_GRAYSCALE)
 # _, pick_mask = cv.threshold(pick_mask, 128, 255, cv.THRESH_BINARY)
@@ -62,8 +151,17 @@ class STATION:
             return True
         logger.info("进入行车监听")
         start = time.perf_counter()
+        eta_tracker = TravelEtaTracker()
         while time.perf_counter() - start < MAP_WAIT_TIME:
             image = screenshot()
+            now = time.perf_counter()
+            if eta_tracker.should_sample(now):
+                eta_message = eta_tracker.observe(
+                    [item["text"] for item in image.ocr()],
+                    now=now,
+                )
+                if eta_message:
+                    logger.info(eta_message)
             # 0-2攻击检测，3-4拦截检测
             attack_bgrs = image.get_bgrs(
                 [(944, 247), (967, 229), (1056, 229), (1120, 312)]

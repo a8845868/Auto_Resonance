@@ -161,11 +161,11 @@ class TwoRunBusinessInterface(ScrollArea):
             spin_box_max=20,
             parent=self.scrollWidget,
         )
-        self.useSilverBranchCard = SwitchSettingCard(
-            FIF.CAFE,
-            "是否使用银枝恢复疲劳",
-            "酒吧免费次数用完后，是否消耗银枝继续喝银枝气泡水",
-            configItem=cfg.UseSilverBranch,
+        self.useNegotiationBookCard = SwitchSettingCard(
+            FIF.BOOK_SHELF,
+            "议价次数不足时使用议价书",
+            "卖货抬价次数耗尽后，消耗议价书重置次数并继续抬价到上限",
+            configItem=cfg.UseNegotiationBook,
             parent=self.scrollWidget,
         )
         self.routeSelectionWidget = QWidget(self.scrollWidget)
@@ -196,7 +196,7 @@ class TwoRunBusinessInterface(ScrollArea):
         # Resume the active weekly route after the app is restarted.
         from core.services import load_weekly_plan
 
-        saved_plan = load_weekly_plan()
+        saved_plan = load_weekly_plan(include_expired=True)
         if saved_plan and len(saved_plan.get("cycle", [])) == 2:
             self.buyCityComboBox.setCurrentText(saved_plan["cycle"][0])
             self.sellCityComboBox.setCurrentText(saved_plan["cycle"][1])
@@ -309,7 +309,7 @@ class TwoRunBusinessInterface(ScrollArea):
         self.expandLayout.addWidget(self.prestigeGroup)
         self.expandLayout.addWidget(self.roleGroup)
         self.expandLayout.addWidget(self.buyCountCard)
-        self.expandLayout.addWidget(self.useSilverBranchCard)
+        self.expandLayout.addWidget(self.useNegotiationBookCard)
 
     def connectSignalToSlot(self):
         self.liveOptimizeCard.clicked.connect(self.calculateLiveRoute)
@@ -521,18 +521,41 @@ class TwoRunBusinessInterface(ScrollArea):
             lambda: self._runBusinessTask(buy_city_name, sell_city_name),
             stop,
             key="run_business",
+            next_run_factory=lambda now: self._nextBusinessRun(
+                buy_city_name, sell_city_name, now
+            ),
         )
+
+    @staticmethod
+    def _nextBusinessRun(buy_city_name: str, sell_city_name: str, now):
+        """Resume an unfinished weekly plan soon after yielding the task queue."""
+        from datetime import timedelta
+
+        from core.services import load_weekly_plan, progress_summary
+        from core.services.task_schedule_state import next_daily_reset
+
+        state = load_weekly_plan()
+        summary = progress_summary(state)
+        if (
+            state
+            and state.get("cycle") == [buy_city_name, sell_city_name]
+            and summary
+            and not summary["finished"]
+        ):
+            return now + timedelta(seconds=5)
+        return next_daily_reset(now)
 
     def _runBusinessTask(self, buy_city_name: str, sell_city_name: str):
         from auto.run_business import adaptive_weekly_run, two_city_run
         from core.services import load_weekly_plan, progress_summary
         saved_plan = load_weekly_plan()
-        weekly_plan_matches = saved_plan and saved_plan["cycle"] == [buy_city_name, sell_city_name]
+        route_plan = saved_plan or load_weekly_plan(include_expired=True)
+        weekly_plan_matches = route_plan and route_plan["cycle"] == [buy_city_name, sell_city_name]
         if weekly_plan_matches:
-            summary = progress_summary(saved_plan)
+            summary = progress_summary(saved_plan) if saved_plan else None
             if summary and summary["finished"]:
                 logger.info("本周跑商计划已经完成，跳过端点跑商")
-                return
+                return True
             return adaptive_weekly_run()
         return two_city_run(
             buy_city_name=buy_city_name,
