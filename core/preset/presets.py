@@ -23,7 +23,7 @@ from core.preset import blurry_ocr_click, go_home
 from core.services.screen_state import is_train_in_transit
 from core.utils.utils import RESOURCES_PATH, read_json
 
-from .control import click_image, ocr_click
+from .control import click_image
 from .station import STATION
 
 FIGHT_TIME = 1000
@@ -69,6 +69,55 @@ STATION_DIFFERENCES = calculate_station_differences(STATION_POS_DATA)
 WORLD_MAP_OPEN_POS = (1201, 666)
 WORLD_MAP_BACK_POS = (84, 40)
 WORLD_MAP_DEFAULT_ZOOM_POS = (1151, 465)
+WORLD_MAP_GESTURE_CENTER = (640.0, 360.0)
+WORLD_MAP_MAX_PAN_STEP_X = 700.0
+WORLD_MAP_MAX_PAN_STEP_Y = 500.0
+WORLD_MAP_MAX_PAN_ATTEMPTS = 10
+WORLD_MAP_LABEL_MIN_SCORE = 0.9
+WORLD_MAP_LABEL_Y_RANGE = (100.0, 620.0)
+
+
+def _station_label_center(map_ocr, station_names):
+    """Return the most central trustworthy station label in one map frame."""
+    candidates = []
+    for item in map_ocr:
+        text = item.get("text", "").strip()
+        if text not in station_names or item.get("score", 1.0) < WORLD_MAP_LABEL_MIN_SCORE:
+            continue
+        position = item.get("position")
+        if not position or len(position) < 3:
+            continue
+        center_x = (position[0][0] + position[2][0]) / 2
+        center_y = (position[0][1] + position[2][1]) / 2
+        if not WORLD_MAP_LABEL_Y_RANGE[0] <= center_y <= WORLD_MAP_LABEL_Y_RANGE[1]:
+            continue
+        distance = (
+            abs(center_x - WORLD_MAP_GESTURE_CENTER[0])
+            + abs(center_y - WORLD_MAP_GESTURE_CENTER[1])
+        )
+        candidates.append((distance, text, center_x, center_y))
+    if not candidates:
+        return None
+    _, station, center_x, center_y = min(candidates)
+    return station, center_x, center_y
+
+
+def _world_map_pan_vector(source_station, target_station):
+    """Calculate the calibrated gesture needed from one map landmark."""
+    city_differences = STATION_DIFFERENCES.get((source_station, target_station))
+    if not city_differences:
+        return None
+    return -city_differences[0] / 2.5, -city_differences[1] / 2.5
+
+
+def _world_map_step(move_x, move_y):
+    """Clamp a pan vector to a gesture that always starts inside the screen."""
+    scale = min(
+        1.0,
+        WORLD_MAP_MAX_PAN_STEP_X / abs(move_x) if move_x else 1.0,
+        WORLD_MAP_MAX_PAN_STEP_Y / abs(move_y) if move_y else 1.0,
+    )
+    return move_x * scale, move_y * scale
 
 
 def _wait_for_departure(timeout: float = 12.0) -> bool:
@@ -142,74 +191,87 @@ def click_station(name: str, cur_station: Optional[str] = None):
         # exact screen center.  Locate its visible label and pan relative to
         # that real anchor; the old hard-coded (640, 360) can miss a distant
         # target by hundreds of pixels.
-        source_x = 640.0
-        source_y = 360.0
+        source_x, source_y = WORLD_MAP_GESTURE_CENTER
         map_ocr = screenshot().ocr()
-        for item in map_ocr:
-            if station in item["text"]:
-                position = item["position"]
-                source_x = (position[0][0] + position[2][0]) / 2
-                source_y = (position[0][1] + position[2][1]) / 2
-                logger.info(f"地图当前站点锚点: {station} ({source_x:.0f}, {source_y:.0f})")
-                break
-        # 如果有路线则进行寻找
-        x1 = source_x + city_differences[0] / 2.5
-        y1 = source_y + city_differences[1] / 2.5
-
-        # Long routes can be several screen widths apart. Android ignores a
-        # swipe when its start point is outside the screen, so split the map
-        # movement into valid in-screen gestures.
-        move_x = source_x - x1
-        move_y = source_y - y1
-        max_step = 760.0
-        steps = max(1, int(max(abs(move_x), abs(move_y)) / max_step) + 1)
-        step_x = move_x / steps
-        step_y = move_y / steps
-        gesture_cx, gesture_cy = 640.0, 360.0
-        logger.info(
-            f"地图分段拖动: 总位移({move_x:.0f}, {move_y:.0f}), {steps} 段"
-        )
+        anchor = _station_label_center(map_ocr, (station,))
+        if anchor:
+            _, source_x, source_y = anchor
+            logger.info(f"地图当前站点锚点: {station} ({source_x:.0f}, {source_y:.0f})")
+        move = _world_map_pan_vector(station, name)
+        if move is None:
+            logger.error("没有该站点的坐标信息")
+            return STATION(False)
+        move_x, move_y = move
+        best_distance = max(abs(move_x), abs(move_y))
+        logger.info(f"地图分段拖动: 总位移({move_x:.0f}, {move_y:.0f})")
         result = None
-        target_visible = False
-        for step in range(steps):
-            start = (gesture_cx - step_x / 2, gesture_cy - step_y / 2)
-            end = (gesture_cx + step_x / 2, gesture_cy + step_y / 2)
-            input_swipe(start, end, swipe_time=450)
-            time.sleep(0.45)
-
-            # ADB/NEMU gestures have momentum. Stop as soon as the destination
-            # enters view instead of blindly executing all calculated swipes.
+        target_anchor = None
+        known_stations = tuple(STATION_POS_DATA)
+        for step in range(WORLD_MAP_MAX_PAN_ATTEMPTS):
             probe = screenshot()
             probe.crop_image((0, 0), (1280, 654))
             result = probe.match_template(
                 RESOURCES_PATH / "stations" / STATION_NAME2PNG[name], 0.95
             )
-            if result or any(name in item["text"] for item in probe.ocr()):
-                target_visible = True
-                logger.info(f"目标站点已在第 {step + 1}/{steps} 段拖动后进入视野")
+            probe_ocr = probe.ocr()
+            target_anchor = _station_label_center(probe_ocr, (name,))
+            if result or target_anchor:
+                logger.info(
+                    f"目标站点已在第 {step}/{WORLD_MAP_MAX_PAN_ATTEMPTS} 次拖动前进入视野"
+                )
                 break
+
+            anchor = _station_label_center(probe_ocr, known_stations)
+            if anchor:
+                station, source_x, source_y = anchor
+                move = _world_map_pan_vector(station, name)
+                if move is not None:
+                    corrected_distance = max(abs(move[0]), abs(move[1]))
+                    if corrected_distance + 8 < best_distance:
+                        move_x, move_y = move
+                        best_distance = corrected_distance
+                        logger.info(
+                            f"地图重新锚定站点: {station} "
+                            f"({source_x:.0f}, {source_y:.0f}), "
+                            f"校正位移({move_x:.0f}, {move_y:.0f})"
+                        )
+
+            if max(abs(move_x), abs(move_y)) < 8:
+                break
+            step_x, step_y = _world_map_step(move_x, move_y)
+            gesture_cx, gesture_cy = WORLD_MAP_GESTURE_CENTER
+            start = (gesture_cx - step_x / 2, gesture_cy - step_y / 2)
+            end = (gesture_cx + step_x / 2, gesture_cy + step_y / 2)
+            input_swipe(start, end, swipe_time=450)
+            time.sleep(0.45)
+            move_x -= step_x
+            move_y -= step_y
+            best_distance = min(best_distance, max(abs(move_x), abs(move_y)))
         # 向回拖动避免画面长时间移动
         input_swipe(
-            (source_x, source_y), (source_x - 10, source_y - 10), swipe_time=500
+            WORLD_MAP_GESTURE_CENTER,
+            (WORLD_MAP_GESTURE_CENTER[0] - 10, WORLD_MAP_GESTURE_CENTER[1] - 10),
+            swipe_time=500,
         )
         # The current world map has a continuously animated background whose
         # frame difference is normally around 7.3M-8.1M.
         wait_stopped(threshold=8500000, timeout=12)  # 等待滑动完成
 
-        if not result and not target_visible:
+        if not result and not target_anchor:
             image = screenshot()
             image.crop_image((0, 0), (1280, 654))
             result = image.match_template(
                 RESOURCES_PATH / "stations" / STATION_NAME2PNG[name], 0.95
             )
+            target_anchor = _station_label_center(image.ocr(), (name,))
         if result:
             # 点击站点
             input_tap(result.loc)
+        elif target_anchor:
+            input_tap((target_anchor[1], target_anchor[2]))
         else:
-            logger.info(f"未找到站点 {name}，尝试OCR识别")
-            if not ocr_click(name):
-                logger.error(f"未找到站点: {name}")
-                return STATION(False)
+            logger.error(f"未找到站点: {name}")
+            return STATION(False)
         time.sleep(0.5)
         # 点击前往目的地按钮
         logger.info("点击前往目的地按钮")
