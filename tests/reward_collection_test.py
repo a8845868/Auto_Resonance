@@ -291,6 +291,39 @@ def test_reward_go_home_enters_login_safely_without_clicking_top_left():
     ]
 
 
+def test_reward_go_home_cancels_clarity_replenish_prompt_before_retrying():
+    driver = RewardDriver(sleep=lambda _seconds: None)
+    driver.texts = Mock(side_effect=[
+        [
+            ocr_box(684, 362, "您当前的澄明度不足，是否补充澄明度？"),
+            ocr_box(350, 509, "取消"),
+            ocr_box(987, 507, "确认"),
+        ],
+        [{"text": "访问城市"}],
+    ])
+    driver.tap = Mock()
+
+    assert driver.go_home()
+    assert [call.args[0] for call in driver.tap.call_args_list] == [(350, 509)]
+
+
+def test_reward_go_home_uses_guarded_cancel_coordinate_when_label_is_missed():
+    driver = RewardDriver(sleep=lambda _seconds: None)
+    driver.texts = Mock(side_effect=[
+        [
+            ocr_box(684, 362, "您当前的澄明度不足，是否补充澄明度？"),
+            ocr_box(987, 507, "确认"),
+        ],
+        [{"text": "访问城市"}],
+    ])
+    driver.tap = Mock()
+
+    assert driver.go_home()
+    assert [call.args[0] for call in driver.tap.call_args_list] == [
+        reward_collection.CLARITY_REPLENISH_CANCEL_TAP
+    ]
+
+
 def test_reward_navigation_failure_is_not_reported_as_zero_reward_success():
     driver = FakeDriver()
     driver.go_home = lambda: False
