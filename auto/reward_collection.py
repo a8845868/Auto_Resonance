@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import time
 import json
-from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -299,6 +298,58 @@ class RewardCollector:
                 self.driver.sleep(0.25)
         return True
 
+    def _claim_daily_stage_batch(
+        self,
+        yellow_boxes: list[tuple[int, int]],
+        attempts: int = 2,
+        confirmation_frames: int = 3,
+    ) -> bool:
+        """Claim the game-side stage batch without chasing stale yellow boxes."""
+        if not yellow_boxes:
+            return False
+
+        # The game claims every unlocked stage reward when any yellow gift is
+        # tapped. Prefer the rightmost (highest unlocked) gift and keep the
+        # retry on that same target instead of producing clicks across boxes.
+        target_x = yellow_boxes[-1][0]
+        for attempt_index in range(attempts):
+            self.driver.tap((target_x, 164))
+
+            # Let the reward presentation appear before dismissing it. The old
+            # 0.8-second blind tap was often early, after which stale page pixels
+            # were mistaken for a failed claim and several other boxes got hit.
+            self.driver.sleep(1.2)
+            self.driver.tap((640, 660))
+
+            saw_daily_page = False
+            for frame_index in range(confirmation_frames):
+                self.driver.sleep(0.7)
+                observation = self.driver.frame()
+                items = observation.ocr()
+                if not _is_daily_activity_page(items):
+                    # A reward presentation may temporarily cover the page.
+                    # Dismiss it, but never interpret another page as success.
+                    self.driver.tap((640, 660))
+                    continue
+                saw_daily_page = True
+                if not _daily_stage_boxes(observation.image):
+                    logger.info("每日活跃阶段奖励已批量领取，并在每日活跃页确认黄色箱消失")
+                    return True
+                if frame_index + 1 < confirmation_frames:
+                    self.driver.sleep(0.4)
+
+            if attempt_index + 1 < attempts:
+                reason = "黄色箱仍存在" if saw_daily_page else "领奖后尚未回到每日活跃页"
+                logger.info(
+                    f"每日活跃阶段箱 x={target_x} {reason}，等待稳定后重试同一箱"
+                )
+
+        logger.warning(
+            f"每日活跃阶段箱 x={target_x} 两次受控点击后仍未在每日活跃页确认领取，"
+            "停止额外点击并留待下次复核"
+        )
+        return False
+
     def collect_daily_activity(self) -> int:
         cycle = _daily_cycle()
         cached_complete = self.state.get("daily_activity_completed_cycle") == cycle
@@ -330,37 +381,12 @@ class RewardCollector:
                 break
             claimed += 1
 
-        # Stage boxes have fixed positions in the normalized layout. Claim one
-        # fresh box at a time and rescan; never assume one click claimed all.
+        # One yellow gift claims all currently unlocked stage rewards. Wait for
+        # the UI to stabilize and confirm the result on this page instead of
+        # iterating over candidates from stale screenshots.
         yellow_boxes = _daily_stage_boxes(self.driver.frame().image)
-        failed_attempts: Counter[int] = Counter()
-        for _ in range(6):
-            if not yellow_boxes:
-                break
-            x, before_yellow = yellow_boxes[0]
-            self.driver.tap((x, 164))
-            self.driver.sleep(0.8)
-            self.driver.tap((640, 660))
-            self.driver.sleep(0.5)
-            updated_boxes = _daily_stage_boxes(self.driver.frame().image)
-            updated_by_x = dict(updated_boxes)
-            if x not in updated_by_x:
-                claimed += 1
-                logger.info(
-                    f"每日活跃阶段奖励已触发，重新扫描后剩余 {len(updated_boxes)} 个黄色箱"
-                )
-                yellow_boxes = updated_boxes
-            else:
-                failed_attempts[x] += 1
-                if failed_attempts[x] < 2:
-                    logger.warning(f"每日活跃阶段箱 x={x} 首次点击后仍存在，稍后重试")
-                    self.driver.sleep(0.5)
-                    yellow_boxes = updated_boxes
-                    continue
-                logger.warning(f"每日活跃阶段箱 x={x} 连续点击无效，改试其他黄色箱")
-                yellow_boxes = [box for box in updated_boxes if box[0] != x] + [
-                    box for box in updated_boxes if box[0] == x
-                ]
+        if self._claim_daily_stage_batch(yellow_boxes):
+            claimed += 1
 
         # Reaching 600 only unlocks every stage. Cache completion only after two
         # fresh frames also prove that no task or stage reward remains claimable.

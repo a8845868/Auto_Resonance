@@ -101,8 +101,8 @@ def test_daily_stage_rewards_click_only_one_yellow_box():
     first.image = before
     second = FakeFrame()
     second.image = after
-    # At 600 activity the game normally clears every yellow stage box after
-    # one click; the third frame is the later completion check.
+    second.items = daily_page_items("600")
+    # The later completion check stops because OCR is absent.
     frames = iter([first, second, FakeFrame()])
     driver.frame = lambda: next(frames)
     collector = RewardCollector(driver)
@@ -110,28 +110,24 @@ def test_daily_stage_rewards_click_only_one_yellow_box():
 
     assert collector.collect_daily_activity() == 1
     stage_taps = [tap for tap in driver.taps if tap[1] == 164]
-    assert stage_taps == [(439, 164)]
+    assert stage_taps == [(684, 164)]
 
 
-def test_daily_stage_rewards_rescan_and_claim_each_remaining_box():
+def test_daily_stage_reward_waits_for_stale_frames_without_clicking_other_boxes():
     driver = FakeDriver()
     frames = iter([
         yellow_stage_frame(439, 562, 684),
-        yellow_stage_frame(562, 684),
-        yellow_stage_frame(684),
-        yellow_stage_frame(),
+        yellow_stage_frame(439, 562, 684, items=daily_page_items("700")),
+        yellow_stage_frame(439, 562, 684, items=daily_page_items("700")),
+        yellow_stage_frame(items=daily_page_items("700")),
         yellow_stage_frame(),  # completion check stops because OCR is absent
     ])
     driver.frame = lambda: next(frames)
     collector = RewardCollector(driver)
     collector.state = {}
 
-    assert collector.collect_daily_activity() == 3
-    assert [tap for tap in driver.taps if tap[1] == 164] == [
-        (439, 164),
-        (562, 164),
-        (684, 164),
-    ]
+    assert collector.collect_daily_activity() == 1
+    assert [tap for tap in driver.taps if tap[1] == 164] == [(684, 164)]
 
 
 def test_daily_completion_requires_two_clean_frames_at_600_or_more():
@@ -177,8 +173,10 @@ def test_daily_stage_reward_retries_when_first_click_does_not_clear_boxes():
     driver = FakeDriver()
     frames = iter([
         yellow_stage_frame(439, 562),
-        yellow_stage_frame(439, 562),  # first click did not take effect
-        yellow_stage_frame(),  # retry triggers the game-side claim-all behavior
+        yellow_stage_frame(439, 562, items=daily_page_items("600")),
+        yellow_stage_frame(439, 562, items=daily_page_items("600")),
+        yellow_stage_frame(439, 562, items=daily_page_items("600")),
+        yellow_stage_frame(items=daily_page_items("600")),  # retry succeeds
         yellow_stage_frame(),  # completion check stops because OCR is absent
     ])
     driver.frame = lambda: next(frames)
@@ -186,24 +184,26 @@ def test_daily_stage_reward_retries_when_first_click_does_not_clear_boxes():
     collector.state = {}
 
     assert collector.collect_daily_activity() == 1
-    assert [tap for tap in driver.taps if tap[1] == 164] == [(439, 164), (439, 164)]
+    assert [tap for tap in driver.taps if tap[1] == 164] == [(562, 164), (562, 164)]
 
 
-def test_daily_stage_reward_does_not_count_a_box_that_is_still_yellow():
-    reduced = np.zeros((720, 1280, 3), dtype=np.uint8)
-    reduced[145:180, 419:459] = (0, 255, 255)  # fewer pixels, still clearly yellow
+def test_daily_stage_reward_does_not_treat_leaving_page_as_success():
     driver = FakeDriver()
     frames = iter([
         yellow_stage_frame(439),
-        FakeFrame(reduced),
-        yellow_stage_frame(),
-        yellow_stage_frame(),  # completion check stops because OCR is absent
+        FakeFrame(),
+        FakeFrame(),
+        FakeFrame(),
+        FakeFrame(),
+        FakeFrame(),
+        FakeFrame(),
+        FakeFrame(),  # completion check also sees a non-daily page
     ])
     driver.frame = lambda: next(frames)
     collector = RewardCollector(driver)
     collector.state = {}
 
-    assert collector.collect_daily_activity() == 1
+    assert collector.collect_daily_activity() == 0
     assert [tap for tap in driver.taps if tap[1] == 164] == [(439, 164), (439, 164)]
 
 
