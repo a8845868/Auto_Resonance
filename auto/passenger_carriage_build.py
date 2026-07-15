@@ -406,8 +406,10 @@ def _wait_for_game(timeout: float = 180.0) -> bool:
     return False
 
 
-def start_next_passenger_carriage() -> BuildScreenState | None:
-    """Navigate from an arbitrary game page and start one passenger carriage."""
+def start_next_passenger_carriage(
+    *, allow_new_construction: bool = True
+) -> BuildScreenState | None:
+    """Inspect the workshop, claim completion, and optionally start one carriage."""
     if not _wait_for_game():
         logger.error("游戏启动超时，未开始下一节客厢")
         return None
@@ -433,6 +435,12 @@ def start_next_passenger_carriage() -> BuildScreenState | None:
         if not _claim_completed_carriage():
             logger.error("已在编组页识别到建造完成，但未能领取完成客厢")
             return None
+        if not allow_new_construction:
+            logger.info("最终一节客厢已领取，按计划停止，不再开始下一节")
+            return BuildScreenState(False, None, False)
+    if not allow_new_construction:
+        logger.error("未识别到最终一节客厢的完成状态，不根据缓存直接确认完成")
+        return None
     if not _click_until_ready(
         BUILD_CARRIAGE_TEXT,
         _is_carriage_build_dialog,
@@ -486,22 +494,20 @@ def run_build_monitor(*, force_verify: bool = False) -> bool:
         logger.info("人工立即执行客厢监控，跳过预计完成时间并实时复核建造状态")
     if state.get("active_due_at"):
         final_carriage = int(state["completed_carriages"]) + 1 >= int(state["target_carriages"])
-        screen_state = None
         if final_carriage:
-            if not _wait_for_game():
-                return False
+            screen_state = start_next_passenger_carriage(allow_new_construction=False)
         else:
             screen_state = start_next_passenger_carriage()
-            if screen_state and screen_state.existing:
-                if screen_state.remaining_seconds is not None:
-                    resync_active_build(
-                        state, remaining_seconds=screen_state.remaining_seconds
-                    )
-                else:
-                    logger.warning("识别到施工中状态，但本次未读出倒计时，稍后重试")
-                return True
-            if not screen_state:
-                return False
+        if screen_state and screen_state.existing:
+            if screen_state.remaining_seconds is not None:
+                resync_active_build(
+                    state, remaining_seconds=screen_state.remaining_seconds
+                )
+            else:
+                logger.warning("识别到施工中状态，但本次未读出倒计时，稍后重试")
+            return True
+        if not screen_state:
+            return False
         state = record_carriage_completed(state)
         if int(state["completed_carriages"]) >= int(state["target_carriages"]):
             logger.info("客厢连续建造计划已全部完成")

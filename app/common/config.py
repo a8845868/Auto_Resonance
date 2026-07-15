@@ -44,7 +44,7 @@ class RunningBusinessConfig(QConfig):
     PassengerReferenceRevenueWan = ConfigItem("PassengerPlanner", "ReferenceRevenueWan", 589, None)
     PassengerOccupancy = ConfigItem("PassengerPlanner", "OccupancyPercent", 100, None)
     PassengerFatiguePerTrip = ConfigItem("PassengerPlanner", "FatiguePerTrip", 95, None)
-    PassengerTargetCarriages = ConfigItem("PassengerBuild", "TargetCarriages", 8, None)
+    PassengerTargetCarriages = ConfigItem("PassengerBuild", "TargetCarriages", 7, None)
     PassengerBuiltExtraCarriages = ConfigItem("PassengerBuild", "BuiltExtraCarriages", 0, None)
     PassengerInstalledSeatGroups = ConfigItem("PassengerBuild", "InstalledSeatGroups", 0, None)
     PassengerCurrentIron = ConfigItem("PassengerBuild", "CurrentIron", 0, None)

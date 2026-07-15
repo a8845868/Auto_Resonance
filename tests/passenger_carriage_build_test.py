@@ -257,3 +257,61 @@ def test_monitor_force_verify_bypasses_future_cached_due_time_and_resyncs():
 
     live_check.assert_called_once_with()
     resync.assert_called_once_with(plan, remaining_seconds=12_345)
+
+
+def test_final_carriage_is_claimed_without_starting_another_one():
+    plan = {
+        "status": "building",
+        "completed_carriages": 6,
+        "target_carriages": 7,
+        "active_due_at": "2026-07-15T17:03:47+08:00",
+    }
+    summary = {"active": True, "due_now": True, "message": "final due"}
+    claimed = passenger_build.BuildScreenState(False, None, False)
+    completed = {**plan, "completed_carriages": 7, "status": "completed"}
+
+    with patch.object(
+        passenger_build, "load_build_monitor_plan", return_value=plan
+    ), patch.object(
+        passenger_build, "build_monitor_summary", return_value=summary
+    ), patch.object(
+        passenger_build, "start_next_passenger_carriage", return_value=claimed
+    ) as inspect, patch.object(
+        passenger_build, "record_carriage_completed", return_value=completed
+    ) as record_completed, patch.object(
+        passenger_build, "record_carriage_started"
+    ) as record_started:
+        assert passenger_build.run_build_monitor()
+
+    inspect.assert_called_once_with(allow_new_construction=False)
+    record_completed.assert_called_once_with(plan)
+    record_started.assert_not_called()
+
+
+def test_claim_only_mode_does_not_open_new_construction_dialog():
+    completed = ["编组", "施工已完成", "领取", "标准客厢"]
+    idle = passenger_build.BuildScreenState(False)
+
+    with patch.object(passenger_build, "_wait_for_game", return_value=True), patch.object(
+        passenger_build, "go_home"
+    ), patch.object(
+        passenger_build, "_click_until_ready", return_value=True
+    ) as click_until_ready, patch.object(
+        passenger_build, "read_passenger_build_inventory_on_workshop", return_value=None
+    ), patch.object(
+        passenger_build, "inspect_build_screen", return_value=idle
+    ), patch.object(
+        passenger_build, "_read_screen_texts", return_value=completed
+    ), patch.object(
+        passenger_build, "_claim_completed_carriage", return_value=True
+    ) as claim, patch.object(
+        passenger_build, "blurry_ocr_click"
+    ) as select_carriage:
+        result = passenger_build.start_next_passenger_carriage(
+            allow_new_construction=False
+        )
+
+    assert result == passenger_build.BuildScreenState(False, None, False)
+    claim.assert_called_once_with()
+    assert click_until_ready.call_count == 2
+    select_carriage.assert_not_called()
