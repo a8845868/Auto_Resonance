@@ -17,9 +17,20 @@ from core.utils.utils import RESOURCES_PATH
 
 FIGHT_TIME = 300
 MAP_WAIT_TIME = 3000
+SPEED_BOOST_COLOR = (251, 253, 253)
+SPEED_BOOST_EXCLUDED_LOW = (235, 235, 250)
+SPEED_BOOST_EXCLUDED_HIGH = (240, 240, 255)
 
 # pick_mask = cv.imread("resources/mask/pick_mask.png", cv.IMREAD_GRAYSCALE)
 # _, pick_mask = cv.threshold(pick_mask, 128, 255, cv.THRESH_BINARY)
+
+
+def _should_use_speed_boost(color: BGR, enabled: bool) -> bool:
+    return (
+        enabled
+        and color.matches(SPEED_BOOST_COLOR, offset=0)
+        and not color.in_range(SPEED_BOOST_EXCLUDED_LOW, SPEED_BOOST_EXCLUDED_HIGH)
+    )
 
 
 class STATION:
@@ -87,11 +98,8 @@ class STATION:
             elif BGR(0, 174, 243) == run_bgr:
                 logger.info("站点到达")
                 return True
-            elif (
-                reach_bgrs[2] == [251, 253, 253]
-                and reach_bgrs[2] < BGR(235, 235, 250) 
-                and reach_bgrs[2] > BGR(240, 240, 255)
-                and config.global_config.is_speed
+            elif _should_use_speed_boost(
+                reach_bgrs[2], config.global_config.is_speed
             ):
                 logger.info("点击加速弹丸")
                 input_tap((1061, 657))
