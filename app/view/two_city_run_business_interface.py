@@ -437,7 +437,7 @@ class TwoRunBusinessInterface(ScrollArea):
         from core.services.server_calendar import SERVER_CLOCK
         from core.services.trade_planning import (
             StalePriceSnapshot,
-            build_executable_trade_plan,
+            validate_executable_trade_budget,
         )
 
         if not self.optimizationResult:
@@ -453,7 +453,7 @@ class TwoRunBusinessInterface(ScrollArea):
                 "books_total": int(self.optimizationResult.get("books_used", 0)),
                 "total_runs": int(self.optimizationResult.get("repeats", 1)),
             }
-            build_executable_trade_plan(
+            validate_executable_trade_budget(
                 preview_state,
                 now=SERVER_CLOCK.server_now(),
                 fatigue_budget=max(0, int(self.optimizerFatigueSpinBox.value())),
@@ -678,7 +678,7 @@ class TwoRunBusinessInterface(ScrollArea):
 
     @staticmethod
     def _nextBusinessRun(buy_city_name: str, sell_city_name: str, now):
-        """Resume an unfinished weekly plan soon after yielding the task queue."""
+        """Avoid tight polling when an unfinished plan has no explicit reason."""
         from datetime import timedelta
 
         from core.services import load_weekly_plan, progress_summary
@@ -692,7 +692,7 @@ class TwoRunBusinessInterface(ScrollArea):
             and summary
             and not summary["finished"]
         ):
-            return now + timedelta(seconds=5)
+            return now + timedelta(minutes=15)
         return next_daily_reset(now)
 
     def _runBusinessTask(self, buy_city_name: str, sell_city_name: str):
