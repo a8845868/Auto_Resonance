@@ -13,6 +13,34 @@ STATE_PATH = Path("config/task_schedule.json")
 _STATE_LOCK = threading.RLock()
 
 
+def _system_local_timezone():
+    return datetime.now().astimezone().tzinfo
+
+
+def _load_unlocked(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("tasks", {})
+    data.setdefault("completed", [])
+    return data
+
+
+def _save_unlocked(state: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(state, stream, ensure_ascii=False, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
 def task_result_succeeded(result: object) -> bool:
     """Honor an explicit result status before falling back to truthiness.
 
@@ -42,26 +70,12 @@ def task_result_deferred(result: object) -> bool:
 
 def load_task_schedule(path: Path = STATE_PATH) -> dict[str, Any]:
     with _STATE_LOCK:
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, TypeError):
-            data = {}
-    data.setdefault("tasks", {})
-    data.setdefault("completed", [])
-    return data
+        return _load_unlocked(path)
 
 
 def _save(state: dict[str, Any], path: Path = STATE_PATH) -> None:
     with _STATE_LOCK:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(
-            f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        )
-        with temporary.open("w", encoding="utf-8") as stream:
-            json.dump(state, stream, ensure_ascii=False, indent=2)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        _save_unlocked(state, path)
 
 
 def task_timing(task_key: str, path: Path = STATE_PATH) -> dict[str, Any]:
@@ -76,9 +90,11 @@ def is_task_due(task_key: str, now: datetime | None = None, path: Path = STATE_P
         target = datetime.fromisoformat(next_run)
         current = now or datetime.now(target.tzinfo)
         if target.tzinfo is not None and current.tzinfo is None:
-            current = current.replace(tzinfo=target.tzinfo)
+            current = current.replace(
+                tzinfo=_system_local_timezone()
+            ).astimezone(target.tzinfo)
         elif target.tzinfo is None and current.tzinfo is not None:
-            current = current.replace(tzinfo=None)
+            current = current.astimezone(_system_local_timezone()).replace(tzinfo=None)
         return target <= current
     except (TypeError, ValueError):
         return True
@@ -89,7 +105,13 @@ def next_daily_reset(now: datetime | None = None) -> datetime:
 
     current = now or datetime.now()
     was_naive = current.tzinfo is None or current.utcoffset() is None
-    aware = current.replace(tzinfo=SERVER_CLOCK.timezone) if was_naive else current
+    aware = (
+        current.replace(tzinfo=_system_local_timezone()).astimezone(
+            SERVER_CLOCK.timezone
+        )
+        if was_naive
+        else current.astimezone(SERVER_CLOCK.timezone)
+    )
     target = SERVER_CLOCK.next_daily_reset(aware)
     return target.replace(tzinfo=None) if was_naive else target
 
@@ -109,22 +131,24 @@ def task_result_next_run(result: object) -> datetime | None:
 
 
 def set_next_run(task_key: str, value: datetime | str | None, path: Path = STATE_PATH) -> None:
-    state = load_task_schedule(path)
-    task = state["tasks"].setdefault(task_key, {})
-    if isinstance(value, datetime):
-        value = value.isoformat(timespec="seconds")
-    task["next_run"] = (value or "").strip()
-    task.pop("force_verify", None)
-    _save(state, path)
+    with _STATE_LOCK:
+        state = _load_unlocked(path)
+        task = state["tasks"].setdefault(task_key, {})
+        if isinstance(value, datetime):
+            value = value.isoformat(timespec="seconds")
+        task["next_run"] = (value or "").strip()
+        task.pop("force_verify", None)
+        _save_unlocked(state, path)
 
 
 def request_immediate_run(task_key: str, path: Path = STATE_PATH) -> None:
     """Schedule a task now and preserve that the run was explicitly requested."""
-    state = load_task_schedule(path)
-    task = state["tasks"].setdefault(task_key, {})
-    task["next_run"] = ""
-    task["force_verify"] = True
-    _save(state, path)
+    with _STATE_LOCK:
+        state = _load_unlocked(path)
+        task = state["tasks"].setdefault(task_key, {})
+        task["next_run"] = ""
+        task["force_verify"] = True
+        _save_unlocked(state, path)
 
 
 def is_force_verify_requested(task_key: str, path: Path = STATE_PATH) -> bool:
@@ -143,43 +167,50 @@ def record_task_execution(
     deferred: bool = False,
 ) -> dict[str, Any]:
     now = now or datetime.now()
-    state = load_task_schedule(path)
-    previous = state["tasks"].get(task_key, {})
-    attempt_time = now.isoformat(timespec="seconds")
-    previous_completed_at = previous.get("completed_at", "")
-    previous_progress_at = previous.get("progress_at", "")
-    if not previous_completed_at and previous.get("status") == "completed":
-        previous_completed_at = previous.get("last_run", "")
-    completed = bool(succeeded and not deferred)
-    entry = {
-        "key": task_key,
-        "name": name,
-        "last_run": attempt_time,
-        "last_attempt": attempt_time,
-        "completed_at": attempt_time if completed else previous_completed_at,
-        "progress_at": (
-            attempt_time
-            if isinstance(result, dict) and result.get("progress_made") is True
-            else previous_progress_at
-        ),
-        "next_run": next_run.isoformat(timespec="seconds") if next_run else "",
-        "status": (
-            "deferred"
-            if succeeded and deferred
-            else "completed"
-            if completed
-            else "failed_or_stopped"
-        ),
-        "result": result if isinstance(result, (dict, list, str, int, float, bool, type(None))) else str(result),
-    }
-    state["tasks"][task_key] = entry
-    history_entry = dict(entry)
-    if not completed:
-        history_entry["completed_at"] = ""
-    state["completed"].insert(0, history_entry)
-    state["completed"] = state["completed"][:100]
-    _save(state, path)
-    return entry
+    with _STATE_LOCK:
+        state = _load_unlocked(path)
+        previous = state["tasks"].get(task_key, {})
+        attempt_time = now.isoformat(timespec="seconds")
+        previous_completed_at = previous.get("completed_at", "")
+        previous_progress_at = previous.get("progress_at", "")
+        if not previous_completed_at and previous.get("status") == "completed":
+            previous_completed_at = previous.get("last_run", "")
+        completed = bool(succeeded and not deferred)
+        entry = {
+            "key": task_key,
+            "name": name,
+            "last_run": attempt_time,
+            "last_attempt": attempt_time,
+            "completed_at": attempt_time if completed else previous_completed_at,
+            "progress_at": (
+                attempt_time
+                if isinstance(result, dict) and result.get("progress_made") is True
+                else previous_progress_at
+            ),
+            "next_run": next_run.isoformat(timespec="seconds") if next_run else "",
+            "status": (
+                "deferred"
+                if succeeded and deferred
+                else "completed"
+                if completed
+                else "failed_or_stopped"
+            ),
+            "result": (
+                result
+                if isinstance(
+                    result, (dict, list, str, int, float, bool, type(None))
+                )
+                else str(result)
+            ),
+        }
+        state["tasks"][task_key] = entry
+        history_entry = dict(entry)
+        if not completed:
+            history_entry["completed_at"] = ""
+        state["completed"].insert(0, history_entry)
+        state["completed"] = state["completed"][:100]
+        _save_unlocked(state, path)
+        return entry
 
 
 def completed_history(path: Path = STATE_PATH) -> list[dict[str, Any]]:
