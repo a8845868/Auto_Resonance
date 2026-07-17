@@ -52,19 +52,38 @@ def _save_state(state: dict) -> None:
 def _daily_cycle(now: Optional[datetime] = None) -> str:
     """Return the game-day key; daily tasks refresh at local time 05:00."""
     current = now or datetime.now(SERVER_CLOCK.timezone)
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=SERVER_CLOCK.timezone)
+    if current.tzinfo is None or current.utcoffset() is None:
+        current = current.replace(
+            tzinfo=datetime.now().astimezone().tzinfo
+        ).astimezone(SERVER_CLOCK.timezone)
+    else:
+        current = current.astimezone(SERVER_CLOCK.timezone)
     return SERVER_CLOCK.server_day_id(current)
 
 
 def _manual_daily_progress(items: list[dict]) -> tuple[int, int] | None:
-    """Read an explicit handbook daily-task ratio; absence stays unknown."""
+    """Read a ratio only inside an explicit handbook daily-task context."""
+
+    texts = [str(item.get("text", "")) for item in items]
+    context_present = any(
+        marker in text
+        for text in texts
+        for marker in ("每日任务", "今日任务", "任务列表")
+    )
+    if not context_present:
+        return None
     for item in items:
         text = str(item.get("text", ""))
         match = re.search(r"(\d+)\s*/\s*(\d+)", text)
         if match:
+            position = item.get("position")
+            if not position:
+                continue
+            x, y = _center(item)
+            if not (120 <= x <= 1100 and 100 <= y <= 650):
+                continue
             completed, total = map(int, match.groups())
-            if 0 <= completed <= total <= 50:
+            if 0 < total <= 50 and 0 <= completed <= total:
                 return completed, total
     if any("今日任务已全部完成" in str(item.get("text", "")) for item in items):
         return 1, 1
@@ -103,6 +122,27 @@ def _daily_activity_value(items: list[dict]) -> int | None:
             if digits:
                 activity = max(activity or 0, int(digits))
     return activity
+
+
+def _daily_activity_progress(items: list[dict]) -> tuple[int, int] | None:
+    """Read current and maximum from the normalized daily-activity region."""
+
+    if not _is_daily_activity_page(items):
+        return None
+    for item in items:
+        position = item.get("position")
+        if not position:
+            continue
+        x, y = _center(item)
+        if not (130 <= x <= 340 and 145 <= y <= 260):
+            continue
+        match = re.search(r"(\d+)\s*/\s*(\d+)", str(item.get("text", "")))
+        if not match:
+            continue
+        current, maximum = map(int, match.groups())
+        if 0 < maximum <= 5000 and 0 <= current <= maximum:
+            return current, maximum
+    return None
 
 
 def _is_daily_activity_page(items: list[dict]) -> bool:
@@ -418,6 +458,37 @@ class RewardCollector:
         logger.info(f"每日活跃奖励处理完成，共触发 {claimed} 次领取")
         return claimed
 
+    def observe_daily_activity(self, stable_frames: int = 2) -> dict[str, int] | None:
+        """Read a stable, known daily activity value and reward-tier state."""
+
+        if not self._open_from_home("每日活跃"):
+            return None
+        observations = []
+        for frame_index in range(max(2, stable_frames)):
+            frame = self.driver.frame()
+            items = frame.ocr()
+            progress = _daily_activity_progress(items)
+            if progress is None:
+                return None
+            current, maximum = progress
+            claimable = len(_daily_stage_boxes(frame.image))
+            thresholds = [maximum * index // 6 for index in range(1, 7)]
+            locked = sum(1 for threshold in thresholds if current < threshold)
+            observations.append((current, maximum, claimable, claimable + locked))
+            if frame_index + 1 < max(2, stable_frames):
+                self.driver.sleep(0.25)
+        if any(item != observations[0] for item in observations[1:]):
+            logger.warning("每日活跃 OCR 多帧不稳定，本次保持 UNKNOWN")
+            return None
+        current, maximum, claimable, unclaimed = observations[0]
+        return {
+            "current": current,
+            "maximum": maximum,
+            "claimable_tiers": claimable,
+            "unclaimed_tiers": unclaimed,
+            "claimed_tiers": max(0, 6 - unclaimed),
+        }
+
     def collect_travel_manual(self) -> int:
         if not self._open_from_home("环游手册"):
             return 0
@@ -445,6 +516,52 @@ class RewardCollector:
         logger.info(f"环游手册奖励处理完成，共触发 {claimed} 次领取")
         return claimed
 
+    def observe_travel_manual(self, stable_frames: int = 2) -> dict[str, int] | None:
+        """Observe task completion and reward availability as separate facts."""
+
+        if not self._open_from_home("环游手册"):
+            return None
+        if not self.driver.click_text("任务列表", attempts=2):
+            return None
+        frames = []
+        for frame_index in range(max(2, stable_frames)):
+            items = self.driver.texts()
+            progress = _manual_daily_progress(items)
+            if progress is None:
+                return None
+            claimable = sum(
+                1
+                for item in items
+                if any(
+                    marker in str(item.get("text", ""))
+                    for marker in ("可领取", "一键领取")
+                )
+            )
+            frames.append((*progress, claimable))
+            if frame_index + 1 < max(2, stable_frames):
+                self.driver.sleep(0.25)
+        if any(item != frames[0] for item in frames[1:]):
+            logger.warning("手册每日任务 OCR 多帧不稳定，本次保持 UNKNOWN")
+            return None
+        completed, total, task_rewards = frames[0]
+        if not self.driver.click_exact_text("环游手册", attempts=2):
+            return None
+        level_items = self.driver.texts()
+        level_rewards = sum(
+            1
+            for item in level_items
+            if any(
+                marker in str(item.get("text", ""))
+                for marker in ("可领取", "一键领取")
+            )
+        )
+        return {
+            "completed": completed,
+            "total": total,
+            "claimable_rewards": task_rewards + level_rewards,
+            "unclaimed_rewards": task_rewards + level_rewards,
+        }
+
     def run(self, daily_activity: bool = True, travel_manual: bool = True) -> dict[str, int]:
         if not connect():
             raise RuntimeError("ADB连接失败")
@@ -465,39 +582,76 @@ def collect_scheduled_rewards(
     travel_manual: bool = True,
     *,
     strategy: str = RewardStrategy.MAXIMIZE_PROGRESS.value,
+    running_dependencies: bool = False,
 ) -> dict:
     """Collect currently unlocked rewards and return a conservative schedule result."""
-    collector = RewardCollector()
-    rewards = collector.run(daily_activity, travel_manual)
     now = SERVER_CLOCK.server_now()
+    collector = RewardCollector()
+    try:
+        rewards = collector.run(daily_activity, travel_manual)
+    except Exception as error:
+        attempt = int(collector.state.get("transient_attempt", 0)) + 1
+        collector.state["transient_attempt"] = min(attempt, 99)
+        _save_state(collector.state)
+        try:
+            selected_strategy = RewardStrategy(strategy)
+        except ValueError:
+            selected_strategy = RewardStrategy.MAXIMIZE_PROGRESS
+        logger.exception(
+            f"奖励生产观察发生暂时异常，使用有界退避: {type(error).__name__}: {error}"
+        )
+        decision = decide_reward_run(
+            None,
+            now=now,
+            strategy=selected_strategy,
+            transient_error=True,
+            attempt=attempt,
+            blocked_reasons=(f"{type(error).__name__}: {error}",),
+        )
+        return {
+            **decision.to_dict(),
+            "task_rewards": {},
+            "rewards_claimed": 0,
+            "progress_made": False,
+            "completion_predicate": False,
+        }
+    collector.state["transient_attempt"] = 0
+    _save_state(collector.state)
     cycle = SERVER_CLOCK.server_day_id(now)
-    daily_complete = (
-        not daily_activity
-        or collector.state.get("daily_activity_completed_cycle") == cycle
+    daily_observation = (
+        {"current": 0, "maximum": 0, "claimable_tiers": 0, "unclaimed_tiers": 0}
+        if not daily_activity
+        else collector.observe_daily_activity()
     )
-    manual = collector.state.get("travel_manual_progress", {})
-    manual_known = not travel_manual or manual.get("cycle") == cycle
-    manual_completed = 0 if not travel_manual else manual.get("completed")
-    manual_total = 0 if not travel_manual else manual.get("total")
+    manual_observation = (
+        {"completed": 0, "total": 0, "claimable_rewards": 0, "unclaimed_rewards": 0}
+        if not travel_manual
+        else collector.observe_travel_manual()
+    )
     snapshot = DailyProgressSnapshot(
         server_day_id=cycle,
-        daily_activity_current=0 if not daily_activity else 600 if daily_complete else None,
-        daily_activity_max=0 if not daily_activity else 600,
-        daily_activity_source="COMPLETION_CONFIRMED" if daily_complete else "UNKNOWN",
-        daily_activity_confidence="HIGH" if daily_complete else "UNKNOWN",
-        daily_activity_claimable_tiers=0 if daily_complete else None,
-        daily_activity_unclaimed_tiers=0 if daily_complete else None,
-        handbook_daily_tasks_total=manual_total if manual_known else None,
-        handbook_daily_tasks_completed=manual_completed if manual_known else None,
-        handbook_rewards_claimable=0 if manual_known and manual_completed == manual_total else None,
-        handbook_rewards_unclaimed=0 if manual_known and manual_completed == manual_total else None,
+        daily_activity_current=(daily_observation or {}).get("current"),
+        daily_activity_max=(daily_observation or {}).get("maximum"),
+        daily_activity_source="OCR" if daily_observation is not None else "UNKNOWN",
+        daily_activity_confidence="HIGH" if daily_observation is not None else "UNKNOWN",
+        daily_activity_claimable_tiers=(daily_observation or {}).get("claimable_tiers"),
+        daily_activity_unclaimed_tiers=(daily_observation or {}).get("unclaimed_tiers"),
+        handbook_daily_tasks_total=(manual_observation or {}).get("total"),
+        handbook_daily_tasks_completed=(manual_observation or {}).get("completed"),
+        handbook_rewards_claimable=(manual_observation or {}).get("claimable_rewards"),
+        handbook_rewards_unclaimed=(manual_observation or {}).get("unclaimed_rewards"),
         observed_at=now,
     )
     try:
         selected_strategy = RewardStrategy(strategy)
     except ValueError:
         selected_strategy = RewardStrategy.MAXIMIZE_PROGRESS
-    decision = decide_reward_run(snapshot, now=now, strategy=selected_strategy)
+    decision = decide_reward_run(
+        snapshot,
+        now=now,
+        strategy=selected_strategy,
+        running_dependencies=running_dependencies,
+    )
     payload = decision.to_dict()
     payload.update(
         task_rewards=rewards,
