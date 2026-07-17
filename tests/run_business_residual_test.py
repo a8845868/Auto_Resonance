@@ -119,6 +119,8 @@ def test_run_from_off_route_station_repositions_before_cleanup_and_route_actions
         business, "_prepare_max_sell_haggle", return_value=2
     ), patch.object(
         business, "sell_business", return_value=True
+    ), patch.object(
+        business, "read_strength", return_value=(100, 816)
     ):
         result = business.run(routes)
 
@@ -127,19 +129,20 @@ def test_run_from_off_route_station_repositions_before_cleanup_and_route_actions
     assert click_station.call_args_list[0].kwargs == {"cur_station": "C"}
     clear.assert_called_once_with(["good-b"])
     assert go_business.call_args_list[0].args == ("sell",)
+    assert click_station.call_args_list[1].args == ("B",)
     assert click_station.call_args_list[1].kwargs == {"cur_station": "A"}
-    assert click_station.call_args_list[2].args == ("B",)
-    assert click_station.call_args_list[2].kwargs == {"cur_station": "A"}
+    assert click_station.call_args_list[2].args == ("A",)
+    assert click_station.call_args_list[2].kwargs == {"cur_station": "B"}
     assert [
         (call.args[0], call.kwargs["cur_station"])
         for call in click_station.call_args_list
-    ] == [("A", "C"), ("A", "A"), ("B", "A"), ("B", "B"), ("A", "B")]
+    ] == [("A", "C"), ("B", "A"), ("A", "B")]
     assert events[:5] == [
         ("navigate", "A", "C"),
         ("business", "sell"),
         ("clear", ("good-b",)),
-        ("navigate", "A", "A"),
         ("business", "buy"),
+        ("buy",),
     ]
 
 
@@ -215,11 +218,13 @@ def test_run_stops_when_buy_step_explicitly_fails():
         business, "prepare_negotiation", return_value=2
     ), patch.object(
         business, "buy_business", return_value=False
+    ), patch.object(
+        business, "read_strength", return_value=(100, 816)
     ):
         result = business.run(routes)
 
     assert result is False
-    assert [call.args[0] for call in click_station.call_args_list] == ["A"]
+    click_station.assert_not_called()
 
 
 def test_run_from_off_route_station_refuses_to_reposition_while_in_transit():

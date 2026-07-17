@@ -7,7 +7,7 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 
 import re
 import time
-from typing import List, Tuple
+from typing import Callable, List, Tuple
 
 import cv2 as cv
 import numpy as np
@@ -77,6 +77,9 @@ def buy_business(
     max_book: int = 0,
     *,
     detailed: bool = False,
+    confirmed_books: int = 0,
+    on_book_confirmed: Callable[[int], None] | None = None,
+    on_purchase_confirmed: Callable[[], None] | None = None,
 ):
     """
     购买商品
@@ -96,7 +99,12 @@ def buy_business(
             else:
                 logger.warning("载货条显示无剩余空间，但未确认满载数值，停止购买")
             return True
-        result, book = buy_good(good, book, max_book)
+        result, book = buy_good(
+            good,
+            book,
+            max_book,
+            on_book_confirmed=on_book_confirmed,
+        )
         if result is None:
             logger.info(f"进货书已用完")
         elif not result:
@@ -104,7 +112,7 @@ def buy_business(
         logger.info(f"剩余载货量: {boatload}%")
         return book
 
-    book = 0
+    book = max(0, int(confirmed_books))
     done = False
     cargo_full = False
     for i in range(max_book + 1):
@@ -124,6 +132,8 @@ def buy_business(
         if not click_buy_button():
             logger.error("点击购买后未确认成交")
             return False
+        if on_purchase_confirmed is not None:
+            on_purchase_confirmed()
         time.sleep(0.5)
         input_tap((896, 676))
         return {"success": True, "confirmed_books": book} if detailed else True
@@ -143,7 +153,14 @@ def is_empty_goods():
     return BGR(27, 26, 26) == bgr
 
 
-def buy_good(good: str, book: int, max_book: int, again: bool = False):
+def buy_good(
+    good: str,
+    book: int,
+    max_book: int,
+    again: bool = False,
+    *,
+    on_book_confirmed: Callable[[int], None] | None = None,
+):
     logger.info(f"正在购买: {good}")
     pos, image = find_text(
         good,
@@ -158,11 +175,21 @@ def buy_good(good: str, book: int, max_book: int, again: bool = False):
         logger.debug(f"是否进货检测: {bgr}")
         if 13 <= bgr.r <= 16:
             if book < max_book:
-                use_book(pos, book)
-                return (
-                    not again and buy_good(good, book, max_book, again=True)[0],
-                    book + 1,
-                )  # 如果不是重复运行则使用再次购买，进货书使用次数+1
+                if not use_book(pos, book):
+                    return False, book
+                confirmed = book + 1
+                if on_book_confirmed is not None:
+                    # This callback is the transaction boundary: the book has
+                    # already left inventory even if the later purchase fails.
+                    on_book_confirmed(confirmed)
+                refreshed, _ = buy_good(
+                    good,
+                    confirmed,
+                    max_book,
+                    again=True,
+                    on_book_confirmed=on_book_confirmed,
+                )
+                return bool(refreshed) and not again, confirmed
             else:
                 return None, book
         else:
@@ -173,7 +200,7 @@ def buy_good(good: str, book: int, max_book: int, again: bool = False):
         return False, book
 
 
-def use_book(pos: Tuple[int, int], book: int):
+def use_book(pos: Tuple[int, int], book: int, timeout: float = 10.0) -> bool:
     """
     说明:
         使用进货书
@@ -182,9 +209,15 @@ def use_book(pos: Tuple[int, int], book: int):
     click((pos[0] - 215, pos[1]))
     time.sleep(1.0)
     click((959, 541))
-    while (hsv := screenshot().get_hsv(pos))[-1] < 60:
+    deadline = time.monotonic() + max(1.0, float(timeout))
+    while time.monotonic() < deadline:
+        hsv = screenshot().get_hsv(pos)
+        if hsv[-1] >= 60:
+            return True
         logger.debug(f"进货书是否所有成功颜色检查: {hsv}")
         time.sleep(0.5)
+    logger.error("进货书确认后商品状态未在时限内刷新，停止后续买入")
+    return False
 
 
 def find_good(good, timeout=10):

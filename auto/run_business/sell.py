@@ -62,7 +62,7 @@ def _wait_for_raise_result(timeout=RAISE_RESULT_TIMEOUT):
     return False
 
 
-def sell_business(num=0, empty_ok=False, expected_goods=None):
+def sell_business(num=0, empty_ok=False, expected_goods=None, *, detailed=False):
     """
     说明:
         出售所有商品
@@ -120,6 +120,12 @@ def sell_business(num=0, empty_ok=False, expected_goods=None):
     time.sleep(0.5)
     input_tap((896, 676))
     input_tap((896, 676))
+    if detailed:
+        return {
+            "success": True,
+            "confirmed_profit": int(profit),
+            "confirmed_sale_total": int(total),
+        }
     return True
 
 

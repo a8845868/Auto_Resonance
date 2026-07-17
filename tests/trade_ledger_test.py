@@ -46,9 +46,13 @@ def test_unknown_weekly_progress_is_not_rendered_as_zero(tmp_path):
 def test_round_trip_is_committed_only_after_verified_cycle_completion(tmp_path):
     path = tmp_path / "ledger.json"
     append_trade_event(path, _event("leg", TradeEventType.LEG_COMPLETED))
-    assert load_trade_week_state(path, now=_at()).confirmed_round_trips == 0
+    state = load_trade_week_state(path, now=_at())
+    assert state.confirmed_round_trips is None
+    assert state.confirmed_delta_since_baseline == 0
     append_trade_event(path, _event("round", TradeEventType.ROUND_TRIP_COMPLETED))
-    assert load_trade_week_state(path, now=_at()).confirmed_round_trips == 1
+    state = load_trade_week_state(path, now=_at())
+    assert state.confirmed_round_trips is None
+    assert state.confirmed_delta_since_baseline == 1
 
 
 def test_crash_after_outbound_resumes_partial_cycle(tmp_path):
@@ -64,7 +68,9 @@ def test_duplicate_round_trip_event_is_idempotent(tmp_path):
     event = _event("same", TradeEventType.ROUND_TRIP_COMPLETED)
     assert append_trade_event(path, event) is True
     assert append_trade_event(path, event) is False
-    assert load_trade_week_state(path, now=_at()).confirmed_round_trips == 1
+    state = load_trade_week_state(path, now=_at())
+    assert state.confirmed_round_trips is None
+    assert state.confirmed_delta_since_baseline == 1
 
 
 def test_purchase_book_is_counted_only_after_confirmed_use(tmp_path):
