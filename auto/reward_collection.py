@@ -35,6 +35,14 @@ from core.services.server_calendar import SERVER_CLOCK
 
 
 STATE_PATH = Path("config") / "reward_state.json"
+READ_ONLY_SHORTCUTS = {
+    "每日活跃": (1048, 82),
+    "环游手册": (1132, 82),
+}
+
+
+class RewardTransientError(RuntimeError):
+    """Explicit retryable screenshot, OCR, or device-transport failure."""
 
 
 def _load_state() -> dict:
@@ -64,13 +72,12 @@ def _daily_cycle(now: Optional[datetime] = None) -> str:
 def _manual_daily_progress(items: list[dict]) -> tuple[int, int] | None:
     """Read a ratio only inside an explicit handbook daily-task context."""
 
-    texts = [str(item.get("text", "")) for item in items]
-    context_present = any(
-        marker in text
-        for text in texts
-        for marker in ("每日任务", "今日任务", "任务列表")
-    )
-    if not context_present:
+    headings = []
+    for item in items:
+        text = str(item.get("text", ""))
+        if any(marker in text for marker in ("每日任务", "今日任务", "任务列表")) and item.get("position"):
+            headings.append(_center(item))
+    if not headings:
         return None
     for item in items:
         text = str(item.get("text", ""))
@@ -80,7 +87,10 @@ def _manual_daily_progress(items: list[dict]) -> tuple[int, int] | None:
             if not position:
                 continue
             x, y = _center(item)
-            if not (120 <= x <= 1100 and 100 <= y <= 650):
+            if not any(
+                abs(x - heading_x) <= 420 and heading_y <= y <= heading_y + 260
+                for heading_x, heading_y in headings
+            ):
                 continue
             completed, total = map(int, match.groups())
             if 0 < total <= 50 and 0 <= completed <= total:
@@ -118,9 +128,15 @@ def _daily_activity_value(items: list[dict]) -> int | None:
     for item in items:
         x, y = _center(item)
         if 150 <= x <= 300 and 160 <= y <= 240:
-            digits = "".join(character for character in item["text"] if character.isdigit())
-            if digits:
-                activity = max(activity or 0, int(digits))
+            text = str(item.get("text", ""))
+            progress = re.search(r"(\d+)\s*/\s*(\d+)", text)
+            if progress:
+                value = int(progress.group(1))
+            else:
+                numbers = re.findall(r"\d+", text)
+                value = int(numbers[0]) if len(numbers) == 1 else None
+            if value is not None:
+                activity = max(activity or 0, value)
     return activity
 
 
@@ -313,8 +329,13 @@ class RewardCollector:
                 ]
 
         if not candidates:
-            logger.info(f"主界面没有发现可用于进入{page_marker}的提醒角标")
-            return False
+            stable = READ_ONLY_SHORTCUTS.get(page_marker)
+            if stable:
+                logger.info(f"{page_marker}当前无提醒角标，使用稳定入口坐标只读复核")
+                candidates = [stable]
+            else:
+                logger.info(f"主界面没有发现可用于进入{page_marker}的提醒角标")
+                return False
 
         for pos in candidates:
             self.driver.tap(pos)
@@ -471,7 +492,11 @@ class RewardCollector:
             if progress is None:
                 return None
             current, maximum = progress
-            claimable = len(_daily_stage_boxes(frame.image))
+            stage_claimable = len(_daily_stage_boxes(frame.image))
+            button_claimable = int(
+                any(_matches(str(item.get("text", "")), "可领取") for item in items)
+            )
+            claimable = max(stage_claimable, button_claimable)
             thresholds = [maximum * index // 6 for index in range(1, 7)]
             locked = sum(1 for threshold in thresholds if current < threshold)
             observations.append((current, maximum, claimable, claimable + locked))
@@ -590,6 +615,16 @@ def collect_scheduled_rewards(
     try:
         rewards = collector.run(daily_activity, travel_manual)
     except Exception as error:
+        programmer_errors = (NameError, AttributeError, TypeError, AssertionError)
+        retryable_runtime = isinstance(error, RuntimeError) and any(
+            marker in str(error).lower()
+            for marker in ("adb", "ocr", "screenshot", "timeout", "连接", "截图", "识别")
+        )
+        if isinstance(error, programmer_errors) or not (
+            isinstance(error, (RewardTransientError, OSError, TimeoutError, ConnectionError))
+            or retryable_runtime
+        ):
+            raise
         attempt = int(collector.state.get("transient_attempt", 0)) + 1
         collector.state["transient_attempt"] = min(attempt, 99)
         _save_state(collector.state)

@@ -1,6 +1,6 @@
 """ALAS-inspired scheduler overview with integrated live log."""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import QFrame, QLabel, QSizePolicy, QSplitter, QVBoxLayout, QWidget
@@ -30,8 +30,13 @@ from core.services.task_schedule_state import (
     task_result_next_run,
     task_timing,
 )
-from core.services.daily_capabilities import DailyCapability, select_daily_capabilities
+from core.services.daily_capabilities import (
+    DailyCapability,
+    PRODUCTION_CAPABILITY_METADATA,
+    select_daily_capabilities,
+)
 from core.services.daily_rewards import DailyProgressSnapshot, RewardStrategy
+from core.services.server_calendar import SERVER_CLOCK
 
 
 def select_reward_dependency_tasks(
@@ -48,25 +53,25 @@ def select_reward_dependency_tasks(
 
 
 def _daily_capability_registry(tasks: list[QueuedTask]) -> list[DailyCapability]:
-    contributions = {
-        "resident_activity": (300, 1),
-        "run_business": (100, 1),
-        "passenger_build": (100, 1),
-    }
-    return [
-        DailyCapability(
-            task_key=task.key,
-            enabled=True,
-            automation_available=callable(task.run),
-            activity_contribution=contributions.get(task.key, (0, 0))[0],
-            handbook_contribution=contributions.get(task.key, (0, 0))[1],
-            premium_currency_risk=False,
-            prerequisites=(),
-            run_factory=lambda task=task: task,
+    capabilities = []
+    for task in tasks:
+        metadata = PRODUCTION_CAPABILITY_METADATA.get(task.key)
+        if not metadata:
+            continue
+        capabilities.append(
+            DailyCapability(
+                task_key=task.key,
+                enabled=True,
+                automation_available=callable(task.run),
+                completed=(
+                    task_timing(task.key).get("status") == "completed"
+                    and not is_task_due(task.key)
+                ),
+                run_factory=lambda task=task: task,
+                **metadata,
+            )
         )
-        for task in tasks
-        if task.key and task.key != "reward_collection"
-    ]
+    return capabilities
 
 
 def _last_reward_snapshot() -> DailyProgressSnapshot | None:
@@ -78,7 +83,17 @@ def _last_reward_snapshot() -> DailyProgressSnapshot | None:
         observed_at = payload.get("observed_at")
         if isinstance(observed_at, str):
             observed_at = datetime.fromisoformat(observed_at)
-        return DailyProgressSnapshot(**{**payload, "observed_at": observed_at})
+        snapshot = DailyProgressSnapshot(**{**payload, "observed_at": observed_at})
+        now = SERVER_CLOCK.server_now()
+        if snapshot.server_day_id != SERVER_CLOCK.server_day_id(now):
+            return None
+        if (
+            snapshot.observed_at.tzinfo is None
+            or snapshot.observed_at.utcoffset() is None
+            or not timedelta(0) <= now - snapshot.observed_at <= timedelta(minutes=15)
+        ):
+            return None
+        return snapshot
     except (TypeError, ValueError):
         return None
 
