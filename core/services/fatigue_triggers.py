@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import threading
 import uuid
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
+from datetime import datetime
 from typing import Any, Callable, Iterable
 
 from core.services.runtime_control import RUNTIME_DIR
@@ -46,27 +48,64 @@ def _write(path: Path, data: dict[str, Any]) -> None:
 def register_deferred_fatigue_actions(
     actions: Iterable[object],
     *,
+    plan_revision: str | None = None,
     path: Path = STATE_PATH,
 ) -> int:
-    normalized = []
-    for index, action in enumerate(actions):
+    payloads = []
+    for action in actions:
         if is_dataclass(action):
             payload = asdict(action)
         elif isinstance(action, dict):
             payload = dict(action)
         else:
             continue
+        payloads.append(payload)
+    if not plan_revision:
+        canonical = json.dumps(payloads, ensure_ascii=False, sort_keys=True, default=str)
+        plan_revision = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    normalized = []
+    for index, payload in enumerate(payloads):
+        trigger_type = str(payload.get("trigger_type", "")).upper()
+        if not trigger_type:
+            if payload.get("waypoint_id"):
+                trigger_type = "WAYPOINT"
+            elif payload.get("fatigue_threshold") is not None:
+                trigger_type = "FATIGUE_THRESHOLD"
+            elif payload.get("run_at"):
+                trigger_type = "REOBSERVE_AT"
+            else:
+                continue
         identity = ":".join(
             (
                 SERVER_CLOCK.server_day_id(),
+                str(plan_revision),
+                trigger_type,
                 str(payload.get("kind", "")),
                 str(payload.get("waypoint_id", "")),
                 str(index),
             )
         )
-        normalized.append({"id": identity, "fired": False, **payload})
+        normalized.append(
+            {
+                "id": identity,
+                "plan_revision": str(plan_revision),
+                "trigger_type": trigger_type,
+                "fired": False,
+                "cancelled": False,
+                "superseded": False,
+                **payload,
+            }
+        )
     with _LOCK:
         data = _read(path)
+        for item in data["actions"]:
+            if (
+                item.get("plan_revision") != plan_revision
+                and item.get("fired") is not True
+                and item.get("cancelled") is not True
+            ):
+                item["superseded"] = True
+                item["superseded_by"] = plan_revision
         existing = {str(item.get("id", "")): item for item in data["actions"]}
         for item in normalized:
             existing.setdefault(item["id"], item)
@@ -79,6 +118,8 @@ def notify_fatigue_event(
     event: str,
     waypoint_id: str = "",
     *,
+    fatigue_used: int | None = None,
+    now: datetime | None = None,
     path: Path = STATE_PATH,
     schedule: Callable[[], None] | None = None,
 ) -> bool:
@@ -89,19 +130,28 @@ def notify_fatigue_event(
     matched = False
     with _LOCK:
         data = _read(path)
+        current = now or SERVER_CLOCK.server_now()
         for item in data["actions"]:
-            if item.get("fired") is True:
+            if any(item.get(flag) is True for flag in ("fired", "cancelled", "superseded")):
                 continue
-            expected_waypoint = str(item.get("waypoint_id", ""))
-            if expected_waypoint and expected_waypoint != waypoint_id:
-                continue
-            if event not in {
-                "arrival",
-                "sale_confirmed",
-                "leg_completed",
-                "bento_release",
-                "fatigue_threshold",
-            }:
+            trigger_type = str(item.get("trigger_type", "")).upper()
+            is_match = False
+            if trigger_type == "WAYPOINT":
+                is_match = event == "arrival" and str(item.get("waypoint_id", "")) == waypoint_id
+            elif trigger_type == "FATIGUE_THRESHOLD":
+                is_match = (
+                    event == "fatigue_threshold"
+                    and fatigue_used is not None
+                    and int(fatigue_used) >= int(item.get("fatigue_threshold", 0))
+                )
+            elif trigger_type in {"BENTO_RELEASE_AT", "REOBSERVE_AT"}:
+                expected_event = "bento_release" if trigger_type == "BENTO_RELEASE_AT" else "reobserve"
+                try:
+                    run_at = datetime.fromisoformat(str(item.get("run_at", "")))
+                    is_match = event == expected_event and current >= run_at
+                except (TypeError, ValueError):
+                    is_match = False
+            if not is_match:
                 continue
             item["fired"] = True
             item["fired_by"] = event
@@ -119,11 +169,11 @@ def notify_fatigue_event(
 
 def cancel_deferred_fatigue_actions(*, path: Path = STATE_PATH) -> None:
     with _LOCK:
-        _write(
-            path,
-            {
-                "server_day_id": SERVER_CLOCK.server_day_id(),
-                "actions": [],
-                "cancelled_at": SERVER_CLOCK.server_now().isoformat(timespec="seconds"),
-            },
-        )
+        data = _read(path)
+        cancelled_at = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
+        for item in data["actions"]:
+            if item.get("fired") is not True and item.get("superseded") is not True:
+                item["cancelled"] = True
+                item["cancelled_at"] = cancelled_at
+        data["cancelled_at"] = cancelled_at
+        _write(path, data)
