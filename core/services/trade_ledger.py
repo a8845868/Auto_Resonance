@@ -47,6 +47,7 @@ class TradeEventType(str, Enum):
     # production writes use BOOK_USE_CONFIRMED at the irreversible boundary.
     PURCHASE_BOOK_CONFIRMED = "PURCHASE_BOOK_CONFIRMED"
     PURCHASE_CONFIRMED = "PURCHASE_CONFIRMED"
+    DEPARTURE_REQUESTED = "DEPARTURE_REQUESTED"
     DEPARTURE_CONFIRMED = "DEPARTURE_CONFIRMED"
     ARRIVAL_CONFIRMED = "ARRIVAL_CONFIRMED"
     SALE_CONFIRMED = "SALE_CONFIRMED"
@@ -319,6 +320,7 @@ def _cycle_phase(events: list[dict[str, Any]]) -> tuple[str, str, str]:
         TradeEventType.BOOK_USE_CONFIRMED,
         TradeEventType.PURCHASE_BOOK_CONFIRMED,
         TradeEventType.PURCHASE_CONFIRMED,
+        TradeEventType.DEPARTURE_REQUESTED,
         TradeEventType.DEPARTURE_CONFIRMED,
         TradeEventType.ARRIVAL_CONFIRMED,
         TradeEventType.SALE_CONFIRMED,

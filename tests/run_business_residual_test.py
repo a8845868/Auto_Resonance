@@ -81,8 +81,10 @@ def test_run_from_off_route_station_repositions_before_cleanup_and_route_actions
     travel.wait.return_value = True
     events = []
 
-    def navigate(name, cur_station=None):
+    def navigate(name, cur_station=None, on_departure_requested=None):
         events.append(("navigate", name, cur_station))
+        if on_departure_requested is not None:
+            on_departure_requested()
         return travel
 
     def enter_business(mode):
@@ -130,9 +132,15 @@ def test_run_from_off_route_station_repositions_before_cleanup_and_route_actions
     clear.assert_called_once_with(["good-b"])
     assert go_business.call_args_list[0].args == ("sell",)
     assert click_station.call_args_list[1].args == ("B",)
-    assert click_station.call_args_list[1].kwargs == {"cur_station": "A"}
+    assert click_station.call_args_list[1].kwargs["cur_station"] == "A"
+    assert callable(
+        click_station.call_args_list[1].kwargs["on_departure_requested"]
+    )
     assert click_station.call_args_list[2].args == ("A",)
-    assert click_station.call_args_list[2].kwargs == {"cur_station": "B"}
+    assert click_station.call_args_list[2].kwargs["cur_station"] == "B"
+    assert callable(
+        click_station.call_args_list[2].kwargs["on_departure_requested"]
+    )
     assert [
         (call.args[0], call.kwargs["cur_station"])
         for call in click_station.call_args_list

@@ -104,7 +104,11 @@ class FatiguePlan:
     reason: str
 
 
-def _allowed_soda_uses(snapshot: FatigueSnapshot, allow_premium_soda: bool) -> int:
+def _allowed_soda_uses(
+    snapshot: FatigueSnapshot,
+    allow_premium_soda: bool,
+    max_iron_soda_cost: int,
+) -> int:
     """Return the contiguous, explicitly allowed prefix of observed price tiers."""
 
     allowed = 0
@@ -112,6 +116,8 @@ def _allowed_soda_uses(snapshot: FatigueSnapshot, allow_premium_soda: bool) -> i
         if isinstance(raw, SodaPriceTier):
             currency = raw.currency_type.upper()
             tier_allowed = bool(raw.allowed)
+            if currency == "IRON" and int(raw.cost) > max(0, int(max_iron_soda_cost)):
+                tier_allowed = False
         else:
             currency = str(raw).upper()
             tier_allowed = currency in {"FREE", "IRON"}
@@ -126,7 +132,9 @@ def _allowed_soda_uses(snapshot: FatigueSnapshot, allow_premium_soda: bool) -> i
 
 
 def _immediate_sequences(
-    snapshot: FatigueSnapshot, allow_premium_soda: bool
+    snapshot: FatigueSnapshot,
+    allow_premium_soda: bool,
+    max_iron_soda_cost: int,
 ) -> list[tuple[tuple[FatigueAction, ...], int, dict[str, int]]]:
     sequences = []
     for order in (("bento", "soda"), ("soda", "bento")):
@@ -144,11 +152,11 @@ def _immediate_sequences(
             elif (
                 "REST_AREA" in snapshot.current_amenities
                 and snapshot.soda_reduction_per_use > 0
-                and _allowed_soda_uses(snapshot, allow_premium_soda) > 0
+                and _allowed_soda_uses(snapshot, allow_premium_soda, max_iron_soda_cost) > 0
             ):
                 safe = min(
                     max(0, snapshot.soda_uses_remaining),
-                    _allowed_soda_uses(snapshot, allow_premium_soda),
+                    _allowed_soda_uses(snapshot, allow_premium_soda, max_iron_soda_cost),
                     fatigue // snapshot.soda_reduction_per_use,
                 )
                 if safe:
@@ -178,6 +186,7 @@ def plan_fatigue_recovery(
     route: TradeRouteContext | None = None,
     *,
     allow_premium_soda: bool = False,
+    max_iron_soda_cost: int = 500,
 ) -> FatiguePlan:
     if snapshot.observed_at.tzinfo is None or snapshot.observed_at.utcoffset() is None:
         raise ValueError("fatigue observations must be timezone-aware")
@@ -187,8 +196,13 @@ def plan_fatigue_recovery(
             "fatigue_snapshot_unknown",
         )
     actions, reduced, usage = max(
-        _immediate_sequences(snapshot, allow_premium_soda),
-        key=lambda item: (item[1], len(item[0])),
+        _immediate_sequences(snapshot, allow_premium_soda, max_iron_soda_cost),
+        key=lambda item: (
+            item[2].get("soda_uses", 0),
+            bool(item[0] and item[0][0].kind == "DRINK_SODA"),
+            item[1],
+            len(item[0]),
+        ),
     )
     if actions:
         return FatiguePlan(
@@ -207,7 +221,7 @@ def plan_fatigue_recovery(
     if (
         snapshot.soda_uses_remaining > 0
         and snapshot.soda_reduction_per_use > 0
-        and _allowed_soda_uses(snapshot, allow_premium_soda) > 0
+        and _allowed_soda_uses(snapshot, allow_premium_soda, max_iron_soda_cost) > 0
     ):
         thresholds.append(snapshot.soda_reduction_per_use)
     if snapshot.bento_batches_available > 0 and snapshot.bento_total_reduction_available > 0:
@@ -223,7 +237,7 @@ def plan_fatigue_recovery(
                 "REST_AREA" in leg.destination_amenities
                 and snapshot.soda_uses_remaining > 0
                 and fatigue >= snapshot.soda_reduction_per_use
-                and _allowed_soda_uses(snapshot, allow_premium_soda) > 0
+                and _allowed_soda_uses(snapshot, allow_premium_soda, max_iron_soda_cost) > 0
             )
             bento_ready = (
                 snapshot.bento_batches_available > 0
@@ -234,7 +248,7 @@ def plan_fatigue_recovery(
                 count = (
                     min(
                         snapshot.soda_uses_remaining,
-                        _allowed_soda_uses(snapshot, allow_premium_soda),
+                        _allowed_soda_uses(snapshot, allow_premium_soda, max_iron_soda_cost),
                         fatigue // snapshot.soda_reduction_per_use,
                     )
                     if soda_ready

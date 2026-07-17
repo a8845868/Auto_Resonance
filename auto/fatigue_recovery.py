@@ -2,7 +2,7 @@
 
 import time
 from dataclasses import asdict, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 
 from loguru import logger
@@ -198,6 +198,7 @@ def run_daily_fatigue_recovery() -> dict:
         snapshot,
         route,
         allow_premium_soda=bool(cfg.UseSilverBranch.value),
+        max_iron_soda_cost=int(cfg.MaxIronSodaCost.value),
     )
     logger.info(
         f"疲劳规划状态={plan.status.value}，立即动作="
@@ -221,6 +222,7 @@ def run_daily_fatigue_recovery() -> dict:
                 replace(plan.snapshot, source_confidence="UNKNOWN"),
                 route,
                 allow_premium_soda=bool(cfg.UseSilverBranch.value),
+                max_iron_soda_cost=int(cfg.MaxIronSodaCost.value),
             )
             break
         progress_made = True
@@ -247,18 +249,37 @@ def run_daily_fatigue_recovery() -> dict:
             snapshot,
             route,
             allow_premium_soda=bool(cfg.UseSilverBranch.value),
+            max_iron_soda_cost=int(cfg.MaxIronSodaCost.value),
         )
 
     after = _wait_strength() or (plan.snapshot.fatigue_used, plan.snapshot.fatigue_cap)
     deferred_actions = list(plan.deferred_actions)
-    if not deferred_actions and plan.status in {
-        FatiguePlanStatus.DEFER_UNTIL_FATIGUE,
-        FatiguePlanStatus.DEFER_UNTIL_RELEASE,
-        FatiguePlanStatus.UNKNOWN,
-    }:
-        deferred_actions = [{"kind": "REPLAN", "waypoint_id": ""}]
+    if not deferred_actions and plan.status is FatiguePlanStatus.DEFER_UNTIL_FATIGUE:
+        deferred_actions = [{
+            "kind": "REPLAN",
+            "trigger_type": "FATIGUE_THRESHOLD",
+            "fatigue_threshold": int(plan.next_trigger.get("fatigue_at_least", 0)),
+        }]
+    elif not deferred_actions and plan.status is FatiguePlanStatus.DEFER_UNTIL_RELEASE:
+        deferred_actions = [{
+            "kind": "REPLAN",
+            "trigger_type": "BENTO_RELEASE_AT",
+            "run_at": str(plan.next_trigger.get("at", "")),
+        }]
+    elif not deferred_actions and plan.status is FatiguePlanStatus.UNKNOWN:
+        deferred_actions = [{
+            "kind": "REPLAN",
+            "trigger_type": "REOBSERVE_AT",
+            "run_at": (SERVER_CLOCK.server_now() + timedelta(minutes=15)).isoformat(),
+        }]
+    for action in deferred_actions:
+        if isinstance(action, dict):
+            continue
+        # Waypoint actions are dataclasses and are normalized by the trigger
+        # registry; their non-empty waypoint makes the trigger unambiguous.
     if deferred_actions:
-        register_deferred_fatigue_actions(deferred_actions)
+        revision = f"{plan.snapshot.server_day_id}:{plan.snapshot.observed_at.isoformat()}"
+        register_deferred_fatigue_actions(deferred_actions, plan_revision=revision)
     go_home()
     result = {
         "success": True,
@@ -276,8 +297,17 @@ def run_daily_fatigue_recovery() -> dict:
     }
     if plan.status is not FatiguePlanStatus.COMPLETE_FOR_DAY:
         result.update(deferred=True, reason=plan.reason, status=plan.status.value)
-        if plan.snapshot.next_bento_release_at is not None:
+        if plan.status is FatiguePlanStatus.DEFER_UNTIL_RELEASE and plan.snapshot.next_bento_release_at is not None:
             result["next_run_at"] = plan.snapshot.next_bento_release_at.isoformat()
+        elif plan.status is FatiguePlanStatus.DEFER_UNTIL_FATIGUE:
+            target = plan.snapshot.natural_recovery_at or (
+                SERVER_CLOCK.server_now() + timedelta(minutes=30)
+            )
+            result["next_run_at"] = target.isoformat()
+        elif plan.status is FatiguePlanStatus.UNKNOWN:
+            result["next_run_at"] = (
+                SERVER_CLOCK.server_now() + timedelta(minutes=15)
+            ).isoformat()
         return result
     logger.info(
         f"每日疲劳规划完成: {before[0]}/{before[1]} -> "

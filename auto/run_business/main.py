@@ -7,6 +7,7 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 
 import time
 import uuid
+from datetime import timedelta
 from typing import Any, Dict, Literal
 
 from loguru import logger
@@ -79,6 +80,7 @@ def _fatigue_deferral(reason: str, required_available: int):
         f"Trading deferred: {reason}; available fatigue {available}, "
         f"required {required_available}"
     )
+    next_run = SERVER_CLOCK.server_now() + timedelta(minutes=6)
     return {
         "success": True,
         "deferred": True,
@@ -87,6 +89,7 @@ def _fatigue_deferral(reason: str, required_available: int):
         "maximum": maximum,
         "available": available,
         "required_available": max(0, int(required_available)),
+        "next_run_at": next_run.isoformat(timespec="seconds"),
     }
 
 
@@ -103,6 +106,36 @@ def _route_availability_deferral(*cities: str):
         "deferred": True,
         "reason": "route_station_unavailable",
         "stations": unavailable,
+        "next_run_at": (
+            SERVER_CLOCK.server_now() + timedelta(minutes=30)
+        ).isoformat(timespec="seconds"),
+    }
+
+
+def _departure_wait_deferral(cycle_id: str) -> dict[str, object]:
+    """Use bounded short polling only while a confirmed train is in flight."""
+
+    return {
+        "success": True,
+        "deferred": True,
+        "progress_made": False,
+        "reason": "departure_confirmed_waiting_for_arrival",
+        "cycle_id": cycle_id,
+        "next_run_at": (
+            SERVER_CLOCK.server_now() + timedelta(seconds=45)
+        ).isoformat(timespec="seconds"),
+    }
+
+
+def _stale_price_deferral(reason: str = "stale_price_reoptimization_failed") -> dict[str, object]:
+    return {
+        "success": True,
+        "deferred": True,
+        "progress_made": False,
+        "reason": reason,
+        "next_run_at": (
+            SERVER_CLOCK.server_now() + timedelta(minutes=15)
+        ).isoformat(timespec="seconds"),
     }
 
 
@@ -331,6 +364,8 @@ def resume_action_for_leg(context: dict | None, leg_id: str) -> str:
         return "SELL"
     if "DEPARTURE_CONFIRMED" in phases:
         return "WAIT_ARRIVAL"
+    if "DEPARTURE_REQUESTED" in phases:
+        return "DEPART"
     if "PURCHASE_CONFIRMED" in phases:
         return "DEPART"
     if phases & {"BOOK_USE_CONFIRMED", "PURCHASE_BOOK_CONFIRMED", "LEG_STARTED", "LEG_PLANNED"}:
@@ -346,6 +381,42 @@ def should_issue_departure(
     """Prevent a replay from issuing an already confirmed departure."""
 
     return resume_action != "WAIT_ARRIVAL" and current_city != destination
+
+
+def _begin_departure(
+    ledger_context: dict | None,
+    *,
+    origin: str,
+    destination: str,
+    leg_id: str,
+):
+    """Record click intent separately from stable observed travel state."""
+
+    def departure_requested():
+        _record_ledger_event(
+            ledger_context,
+            "DEPARTURE_REQUESTED",
+            origin=origin,
+            destination=destination,
+            leg_id=leg_id,
+        )
+
+    travel = click_station(
+        destination,
+        cur_station=origin,
+        on_departure_requested=departure_requested,
+    )
+    if travel:
+        # click_station becomes truthy only after a stable driving frame has
+        # been observed; a click alone is only DEPARTURE_REQUESTED.
+        _record_ledger_event(
+            ledger_context,
+            "DEPARTURE_CONFIRMED",
+            origin=origin,
+            destination=destination,
+            leg_id=leg_id,
+        )
+    return travel
 
 
 def _cycle_books_used(context: dict | None) -> int:
@@ -592,12 +663,8 @@ def run(
                 resume_action, city_name, city.sell_city_name
             ):
                 before_travel = read_strength()
-                travel = click_station(
-                    city.sell_city_name, cur_station=city.buy_city_name
-                )
-                _record_ledger_event(
+                travel = _begin_departure(
                     ledger_context,
-                    "DEPARTURE_CONFIRMED",
                     origin=city.buy_city_name,
                     destination=city.sell_city_name,
                     leg_id=leg_id,
@@ -610,13 +677,7 @@ def run(
                 logger.info(
                     f"账本已确认 {leg_id} 发车，当前尚未确认到站；等待下一次安全复核"
                 )
-                return {
-                    "success": True,
-                    "deferred": True,
-                    "progress_made": False,
-                    "reason": "departure_confirmed_waiting_for_arrival",
-                    "cycle_id": ledger_context["cycle_id"],
-                }
+                return _departure_wait_deferral(ledger_context["cycle_id"])
             actual_fatigue = (
                 max(0, int(after_travel[0]) - int(before_travel[0]))
                 if before_travel and after_travel
@@ -633,6 +694,11 @@ def run(
             from core.services.fatigue_triggers import notify_fatigue_event
 
             notify_fatigue_event("arrival", city.sell_city_name)
+            if after_travel is not None:
+                notify_fatigue_event(
+                    "fatigue_threshold",
+                    fatigue_used=int(after_travel[0]),
+                )
         if not (is_sell_page() or go_business("sell")):
             return False
         # Selling profit is always maximized: pursue the game's two-success cap
@@ -895,7 +961,15 @@ def two_city_weekly_run(
                     f"本次调度已在完整往返边界让出队列，完成 {completed}/{total_runs} 次；"
                     "剩余计划将在下一次调度继续"
                 )
-                return True
+                return {
+                    "success": True,
+                    "deferred": True,
+                    "progress_made": True,
+                    "reason": "route_completed_yield",
+                    "next_run_at": (
+                        SERVER_CLOCK.server_now() + timedelta(seconds=5)
+                    ).isoformat(timespec="seconds"),
+                }
     logger.info(f"周计划完成，共 {completed} 次完整往返")
     return True
 
@@ -915,7 +989,7 @@ def adaptive_weekly_run():
     )
     from core.services.trade_planning import (
         StalePriceSnapshot,
-        build_executable_trade_plan,
+        validate_executable_trade_budget,
     )
 
     state = load_weekly_plan()
@@ -956,8 +1030,9 @@ def adaptive_weekly_run():
         qconfig.set(cfg.InventoryBooks, actual)
     required = int(summary["remaining_books"])
     price_invalid = False
+    execution_invalid = False
     try:
-        executable = build_executable_trade_plan(
+        executable = validate_executable_trade_budget(
             state,
             now=SERVER_CLOCK.server_now(),
             fatigue_budget=max(0, int(summary["remaining_fatigue"])),
@@ -971,10 +1046,14 @@ def adaptive_weekly_run():
     except StalePriceSnapshot as error:
         logger.warning(f"现有周计划价格不可执行，强制重新读取并优化: {error}")
         price_invalid = True
+    except ValueError as error:
+        logger.warning(f"现有周计划不满足实时利润或资源预算，强制重新优化: {error}")
+        execution_invalid = True
     needs_reoptimization = (
         bool(state.get("needs_reoptimization"))
         or bool(unavailable_cycle)
         or price_invalid
+        or execution_invalid
     ) and not sell_resume
     if available >= required and not needs_reoptimization:
         logger.info(f"进货书库存 {available} 本，足够完成剩余计划（需要 {required} 本）")
@@ -1002,8 +1081,25 @@ def adaptive_weekly_run():
     raw_config["weekly_fatigue"] = max(1, int(summary["remaining_fatigue"]))
     try:
         replacement = optimize_live_routes(OptimizationConfig(**raw_config))
+        preview = {
+            **replacement,
+            "expected_profit": int(
+                replacement.get(
+                    "expected_profit",
+                    replacement.get("combined_profit", replacement.get("profit", 0)),
+                )
+            ),
+            "books_total": int(replacement.get("books_used", 0)),
+            "total_runs": int(replacement.get("repeats", 1)),
+        }
+        validate_executable_trade_budget(
+            preview,
+            now=SERVER_CLOCK.server_now(),
+            fatigue_budget=max(0, int(summary["remaining_fatigue"])),
+            purchase_books=max(0, int(available)),
+        )
         state = save_weekly_plan(replacement)
-        build_executable_trade_plan(
+        validate_executable_trade_budget(
             state,
             now=SERVER_CLOCK.server_now(),
             fatigue_budget=max(0, int(summary["remaining_fatigue"])),
@@ -1016,7 +1112,7 @@ def adaptive_weekly_run():
         raise
     except StalePriceSnapshot:
         logger.exception("重新计算后的价格快照仍不可执行，阻止真实跑商")
-        return False
+        return _stale_price_deferral("stale_price_replacement_not_fresh")
     except Exception:
         if unavailable_cycle:
             logger.exception(
@@ -1024,14 +1120,13 @@ def adaptive_weekly_run():
                 "禁止回退原路线，留待下次复核"
             )
             return _route_availability_deferral(*state["cycle"])
-        logger.exception("科伦巴实时替代路线计算失败，降级为原路线不使用进货书")
-        safe_batches = [{"runs": summary["remaining_runs"], "books": {city: 0 for city in state["cycle"]}}]
-        return two_city_weekly_run(
-            state["cycle"][0],
-            state["cycle"][1],
-            safe_batches,
-            max_runs=1,
-        )
+        if price_invalid:
+            logger.exception(
+                "陈旧价格重优化失败；禁止使用旧路线、零进货书或离线价格回退"
+            )
+            return _stale_price_deferral()
+        logger.exception("实时替代路线计算失败；保留原计划但禁止本轮真实交易")
+        return _stale_price_deferral("trade_reoptimization_failed")
 
 
 def stop():

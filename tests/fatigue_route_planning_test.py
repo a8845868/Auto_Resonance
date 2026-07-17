@@ -108,8 +108,8 @@ def test_bento_all_use_waits_until_no_waste():
 def test_soda_and_bento_order_maximizes_free_reduction_without_waste():
     plan = plan_fatigue_recovery(_snapshot(fatigue_used=172, soda_uses_remaining=2))
     assert [action.kind for action in plan.immediate_actions] == [
-        "USE_ALL_BENTOS",
         "DRINK_SODA",
+        "USE_ALL_BENTOS",
     ]
     assert plan.expected_waste == 0
 

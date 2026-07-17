@@ -23,7 +23,8 @@ def test_weekly_run_yields_after_one_complete_round_trip():
             "岚心城", "武林源", batches, max_runs=1
         )
 
-    assert result is True
+    assert result["success"] is True
+    assert result["reason"] == "route_completed_yield"
     assert run.call_count == 1
     record.assert_called_once()
     assert record.call_args.args == ({"岚心城": 0, "武林源": 0},)
@@ -31,7 +32,7 @@ def test_weekly_run_yields_after_one_complete_round_trip():
     assert record.call_args.kwargs["cycle_id"]
 
 
-def test_unfinished_weekly_plan_is_scheduled_again_after_five_seconds():
+def test_unfinished_weekly_plan_without_reason_uses_conservative_retry():
     now = datetime(2026, 7, 13, 11, 30)
     state = {"cycle": ["岚心城", "武林源"]}
 
@@ -42,7 +43,7 @@ def test_unfinished_weekly_plan_is_scheduled_again_after_five_seconds():
             "岚心城", "武林源", now
         )
 
-    assert next_run == now + timedelta(seconds=5)
+    assert next_run == now + timedelta(minutes=15)
 
 
 def test_finished_weekly_plan_waits_until_next_daily_reset():
