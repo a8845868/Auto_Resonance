@@ -13,6 +13,7 @@ from .book_budget import BOOK_SOURCES, calculate_book_budget
 from .inventory_assets import Asset, classify_asset, merge_assets, parse_amount, parse_ocr_assets
 from .currency_planner import ActivityYield, CURRENCIES, CurrencyInfo, ExchangeItem, calculate_acquisition, calculate_currency_plan, currency_for_asset
 from .gacha_planner import GACHA_SOURCES, STONE_PER_PULL, calculate_gacha_plan, expected_source_total, pulls_to_guarantee
+from .trade_planning import StalePriceSnapshot, validate_executable_trade_budget
 
 __all__ = [
     "OptimizationConfig",
@@ -44,4 +45,6 @@ __all__ = [
     "calculate_gacha_plan",
     "expected_source_total",
     "pulls_to_guarantee",
+    "StalePriceSnapshot",
+    "validate_executable_trade_budget",
 ]

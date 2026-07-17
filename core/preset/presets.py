@@ -6,7 +6,7 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 """
 
 import time
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 from loguru import logger
 
@@ -222,7 +222,12 @@ def _open_world_map_at_default_zoom():
     wait_stopped(threshold=8500000, timeout=8)
 
 
-def click_station(name: str, cur_station: Optional[str] = None):
+def click_station(
+    name: str,
+    cur_station: Optional[str] = None,
+    *,
+    on_departure_requested: Callable[[], None] | None = None,
+):
     """
     点击站点, 该滑动通过站点间相对距离完成
 
@@ -378,6 +383,8 @@ def click_station(name: str, cur_station: Optional[str] = None):
                 trynum=1,
                 check_err=False,
             ):
+                if on_departure_requested is not None:
+                    on_departure_requested()
                 time.sleep(1.0)
                 if _wait_for_departure():
                     return STATION(True)

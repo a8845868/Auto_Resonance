@@ -113,14 +113,14 @@ def _parse_price_time(value: object) -> datetime:
     return parsed
 
 
-def build_executable_trade_plan(
+def validate_executable_trade_budget(
     state: dict[str, Any],
     *,
     now: datetime | None = None,
     fatigue_budget: int,
     purchase_books: int,
 ) -> TradePlan:
-    """Validate prices and run the finite optimizer used before real execution."""
+    """Validate one persisted route against fresh prices and finite budgets."""
 
     current = now or SERVER_CLOCK.server_now()
     calculated_at = _parse_price_time(state.get("price_time"))
@@ -128,21 +128,32 @@ def build_executable_trade_plan(
         raise StalePriceSnapshot(
             f"price snapshot expired: calculated_at={calculated_at.isoformat()} now={current.isoformat()}"
         )
+    price_source = str(state.get("price_source", "live_exchange")).lower()
+    if price_source in {"basic", "offline", "synthetic", "fallback"} and not bool(
+        state.get("allow_conservative_execution", False)
+    ):
+        raise StalePriceSnapshot(
+            f"price source {price_source!r} is not approved for real execution"
+        )
     cycle = [str(city) for city in state.get("cycle", [])]
+    if len(cycle) < 2 or len(set(cycle)) < 2:
+        raise ValueError("executable trade plan requires two distinct stations")
     total_runs = max(1, int(state.get("total_runs", 1)))
     per_cycle_profit = int(state.get("expected_profit", state.get("profit", 0)))
     if int(state.get("total_runs", 0)) > 0:
         per_cycle_profit //= total_runs
-    per_cycle_books = min(
-        max(0, int(purchase_books)),
-        max(0, int(state.get("books_total", 0)) // total_runs),
-    )
+    if per_cycle_profit <= 0:
+        raise ValueError("executable trade plan must have positive net profit")
+    cycle_fatigue = int(round(float(state.get("cycle_fatigue", 0))))
+    if cycle_fatigue <= 0:
+        raise ValueError("executable trade plan must have positive fatigue cost")
+    per_cycle_books = max(0, int(state.get("books_total", 0)) // total_runs)
     candidate = TradeCandidate(
         route_id="|".join(cycle),
         current_city=str(state.get("current_city", cycle[0] if cycle else "")),
         partial_cycle=state.get("current_partial_cycle"),
         net_profit=per_cycle_profit,
-        fatigue=max(1, int(round(float(state.get("cycle_fatigue", 0))))),
+        fatigue=cycle_fatigue,
         books=per_cycle_books,
         cargo=int((state.get("optimizer_config") or {}).get("cargo", 0)),
         passenger_profit=int(state.get("passenger_profit", 0)),
@@ -152,11 +163,19 @@ def build_executable_trade_plan(
         return_cost=int(state.get("return_cost", 0)),
         recovery_resources=dict(state.get("recovery_resources") or {}),
     )
-    return choose_trade_plan(
+    plan = choose_trade_plan(
         (candidate,),
         fatigue_budget=max(0, int(fatigue_budget)),
         purchase_books=max(0, int(purchase_books)),
     )
+    if plan.expected_total_net_profit <= 0:
+        raise ValueError("no profitable route fits the current fatigue and book budgets")
+    return plan
+
+
+# Compatibility for external callers. Production code uses the precise name
+# above; this alias can be removed after downstream integrations migrate.
+build_executable_trade_plan = validate_executable_trade_budget
 
 
 def plan_price_is_fresh(
@@ -172,7 +191,7 @@ def plan_price_is_fresh(
     )
 
 
-def recommend_today_runs(
+def recommend_max_feasible_runs_today(
     *,
     remaining_runs: int,
     cycle_fatigue: float,
@@ -197,3 +216,6 @@ def recommend_today_runs(
     )
     partial_credit = 1 if partial_cycle and partial_cycle.get("confirmed_legs") else 0
     return min(max(0, int(remaining_runs)), max(partial_credit, min(fatigue_runs, book_runs)))
+
+
+recommend_today_runs = recommend_max_feasible_runs_today
