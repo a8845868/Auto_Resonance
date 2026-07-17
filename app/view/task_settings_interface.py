@@ -4,7 +4,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QComboBox, QGridLayout, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 from qfluentwidgets import (
     FluentIcon,
     ScrollArea,
@@ -17,6 +17,7 @@ from app.common.style_sheet import StyleSheet
 from app.components.task_schedule_card import TaskScheduleCard
 from auto.resident_activity import FULL_REALM_REWARDS, SIEGE_REWARDS, SIEGE_TASKS
 from core.services.fatigue_planner import fatigue_plan_lines, next_fatigue_refresh
+from core.services.task_schedule_state import task_timing
 
 
 REWARD_ICON_DIR = Path(__file__).resolve().parents[2] / "resources" / "rewards"
@@ -108,6 +109,29 @@ class RewardCollectionInterface(TaskSettingsPage):
         self.scheduleCard = TaskScheduleCard("reward_collection", self.scrollWidget)
         self.layout.addWidget(self.scheduleCard)
 
+        strategy_row = QWidget(self.scrollWidget)
+        strategy_layout = QHBoxLayout(strategy_row)
+        strategy_layout.setContentsMargins(12, 8, 12, 8)
+        strategy_layout.addWidget(QLabel("领取策略", strategy_row))
+        self.strategyCombo = QComboBox(strategy_row)
+        self.strategyCombo.addItem("尽可能完成后领取", "maximize_progress")
+        self.strategyCombo.addItem("仅领取当前已解锁奖励", "claim_only")
+        index = self.strategyCombo.findData(str(cfg.rewardStrategy.value))
+        self.strategyCombo.setCurrentIndex(max(0, index))
+        self.strategyCombo.currentIndexChanged.connect(
+            lambda _index: qconfig.set(
+                cfg.rewardStrategy, self.strategyCombo.currentData()
+            )
+        )
+        strategy_layout.addWidget(self.strategyCombo, 1)
+        self.layout.addWidget(strategy_row)
+        self.rewardStatusLabel = QLabel(self.scrollWidget)
+        self.rewardStatusLabel.setWordWrap(True)
+        self.rewardStatusLabel.setStyleSheet(
+            "padding: 10px; border-radius: 8px; background: rgba(128,128,128,.06);"
+        )
+        self.layout.addWidget(self.rewardStatusLabel)
+
         self.layout.addWidget(SwitchSettingCard(
             FluentIcon.CALENDAR,
             "领取每日活跃奖励",
@@ -122,6 +146,31 @@ class RewardCollectionInterface(TaskSettingsPage):
             cfg.autoCollectTravelManual,
             self.scrollWidget,
         ))
+
+    def updateRewardStatus(self):
+        timing = task_timing("reward_collection")
+        result = timing.get("result") if isinstance(timing.get("result"), dict) else {}
+        snapshot = result.get("snapshot_after") if isinstance(result.get("snapshot_after"), dict) else {}
+        activity = (
+            f"{snapshot.get('daily_activity_current')}/{snapshot.get('daily_activity_max')}"
+            if snapshot.get("daily_activity_current") is not None
+            else "未知"
+        )
+        handbook = (
+            f"{snapshot.get('handbook_daily_tasks_completed')}/{snapshot.get('handbook_daily_tasks_total')}"
+            if snapshot.get("handbook_daily_tasks_completed") is not None
+            else "未知"
+        )
+        blockers = "、".join(result.get("blocked_reasons") or []) or "无"
+        self.rewardStatusLabel.setText(
+            f"当前状态：{result.get('status') or '尚未检查'} · 每日活跃 {activity} · "
+            f"手册每日任务 {handbook}\n当前待办/阻塞：{blockers} · "
+            f"下一次原因：{result.get('next_run_reason') or '未记录'}"
+        )
+
+    def showEvent(self, event):
+        self.updateRewardStatus()
+        super().showEvent(event)
 
 
 class FatiguePlannerInterface(TaskSettingsPage):
@@ -165,12 +214,28 @@ class FatiguePlannerInterface(TaskSettingsPage):
         self.updatePlanSummary()
 
     def updatePlanSummary(self):
+        lines = list(
+            fatigue_plan_lines(bool(cfg.UseSilverBranch.value))
+        )
+        timing = task_timing("fatigue_recovery")
+        result = timing.get("result") if isinstance(timing.get("result"), dict) else {}
+        plan = result.get("plan") if isinstance(result.get("plan"), dict) else {}
+        if plan:
+            snapshot = plan.get("snapshot") or {}
+            actions = plan.get("immediate_actions") or []
+            lines.extend(
+                [
+                    f"最近观测：疲劳 {snapshot.get('fatigue_used', '未知')}/"
+                    f"{snapshot.get('fatigue_cap', '未知')}，站点 {snapshot.get('current_station_id', '未知')}",
+                    f"最近规划：{plan.get('status', 'UNKNOWN')}；立即动作 "
+                    f"{', '.join(action.get('kind', '') for action in actions) or '无'}；"
+                    f"下一触发 {plan.get('next_trigger') or '未记录'}",
+                ]
+            )
         self.planSummaryLabel.setText(
             "\n".join(
                 f"{index}. {line}"
-                for index, line in enumerate(
-                    fatigue_plan_lines(bool(cfg.UseSilverBranch.value)), start=1
-                )
+                for index, line in enumerate(lines, start=1)
             )
         )
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -25,6 +26,12 @@ from core.services.screen_state import (
     clarity_replenish_cancel_position,
     startup_screen_action,
 )
+from core.services.daily_rewards import (
+    DailyProgressSnapshot,
+    RewardStrategy,
+    decide_reward_run,
+)
+from core.services.server_calendar import SERVER_CLOCK
 
 
 STATE_PATH = Path("config") / "reward_state.json"
@@ -44,10 +51,24 @@ def _save_state(state: dict) -> None:
 
 def _daily_cycle(now: Optional[datetime] = None) -> str:
     """Return the game-day key; daily tasks refresh at local time 05:00."""
-    current = now or datetime.now()
-    if current.hour < 5:
-        current -= timedelta(days=1)
-    return current.date().isoformat()
+    current = now or datetime.now(SERVER_CLOCK.timezone)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=SERVER_CLOCK.timezone)
+    return SERVER_CLOCK.server_day_id(current)
+
+
+def _manual_daily_progress(items: list[dict]) -> tuple[int, int] | None:
+    """Read an explicit handbook daily-task ratio; absence stays unknown."""
+    for item in items:
+        text = str(item.get("text", ""))
+        match = re.search(r"(\d+)\s*/\s*(\d+)", text)
+        if match:
+            completed, total = map(int, match.groups())
+            if 0 <= completed <= total <= 50:
+                return completed, total
+    if any("今日任务已全部完成" in str(item.get("text", "")) for item in items):
+        return 1, 1
+    return None
 
 
 def _center(item: dict) -> tuple[int, int]:
@@ -404,6 +425,15 @@ class RewardCollector:
         if self.driver.click_text("任务列表", attempts=2):
             if self._claim_one_click("环游手册任务列表"):
                 claimed += 1
+            progress = _manual_daily_progress(self.driver.texts())
+            if progress is not None:
+                completed, total = progress
+                self.state["travel_manual_progress"] = {
+                    "cycle": _daily_cycle(),
+                    "completed": completed,
+                    "total": total,
+                }
+                _save_state(self.state)
         if not self.driver.click_exact_text("环游手册", attempts=2):
             logger.warning("未能准确点击底部‘环游手册’标签，暂不检查等级奖励")
             return claimed
@@ -428,3 +458,51 @@ class RewardCollector:
 
 def collect_rewards(daily_activity: bool = True, travel_manual: bool = True) -> dict[str, int]:
     return RewardCollector().run(daily_activity, travel_manual)
+
+
+def collect_scheduled_rewards(
+    daily_activity: bool = True,
+    travel_manual: bool = True,
+    *,
+    strategy: str = RewardStrategy.MAXIMIZE_PROGRESS.value,
+) -> dict:
+    """Collect currently unlocked rewards and return a conservative schedule result."""
+    collector = RewardCollector()
+    rewards = collector.run(daily_activity, travel_manual)
+    now = SERVER_CLOCK.server_now()
+    cycle = SERVER_CLOCK.server_day_id(now)
+    daily_complete = (
+        not daily_activity
+        or collector.state.get("daily_activity_completed_cycle") == cycle
+    )
+    manual = collector.state.get("travel_manual_progress", {})
+    manual_known = not travel_manual or manual.get("cycle") == cycle
+    manual_completed = 0 if not travel_manual else manual.get("completed")
+    manual_total = 0 if not travel_manual else manual.get("total")
+    snapshot = DailyProgressSnapshot(
+        server_day_id=cycle,
+        daily_activity_current=0 if not daily_activity else 600 if daily_complete else None,
+        daily_activity_max=0 if not daily_activity else 600,
+        daily_activity_source="COMPLETION_CONFIRMED" if daily_complete else "UNKNOWN",
+        daily_activity_confidence="HIGH" if daily_complete else "UNKNOWN",
+        daily_activity_claimable_tiers=0 if daily_complete else None,
+        daily_activity_unclaimed_tiers=0 if daily_complete else None,
+        handbook_daily_tasks_total=manual_total if manual_known else None,
+        handbook_daily_tasks_completed=manual_completed if manual_known else None,
+        handbook_rewards_claimable=0 if manual_known and manual_completed == manual_total else None,
+        handbook_rewards_unclaimed=0 if manual_known and manual_completed == manual_total else None,
+        observed_at=now,
+    )
+    try:
+        selected_strategy = RewardStrategy(strategy)
+    except ValueError:
+        selected_strategy = RewardStrategy.MAXIMIZE_PROGRESS
+    decision = decide_reward_run(snapshot, now=now, strategy=selected_strategy)
+    payload = decision.to_dict()
+    payload.update(
+        task_rewards=rewards,
+        rewards_claimed=sum(rewards.values()),
+        progress_made=any(rewards.values()),
+        completion_predicate=decision.all_tracked_objectives_complete,
+    )
+    return payload

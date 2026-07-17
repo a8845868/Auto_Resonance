@@ -6,6 +6,7 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 """
 
 import time
+import uuid
 from typing import Any, Dict, Literal
 
 from loguru import logger
@@ -252,7 +253,48 @@ def go_business(type: Literal["buy", "sell"] = "buy"):
         return False
 
 
-def run(routes: RoutesModel, recovery_attempts: int = 2):
+def _record_ledger_event(
+    context: dict | None,
+    event_type: str,
+    *,
+    origin: str,
+    destination: str,
+    leg_id: str,
+    purchase_book_delta: int = 0,
+) -> None:
+    if context is None:
+        return
+    from core.services.trade_ledger import (
+        LEDGER_PATH,
+        TradeEvent,
+        TradeEventType,
+        append_trade_event,
+    )
+    from core.services.server_calendar import SERVER_CLOCK
+
+    append_trade_event(
+        context.get("ledger_path", LEDGER_PATH),
+        TradeEvent(
+            event_id=f"{context['cycle_id']}:{event_type}:{leg_id}",
+            server_week_id=context["server_week_id"],
+            route_id=context["route_id"],
+            cycle_id=context["cycle_id"],
+            leg_id=leg_id,
+            event_type=TradeEventType(event_type),
+            origin=origin,
+            destination=destination,
+            observed_at=SERVER_CLOCK.server_now(),
+            confirmed_by="GAME_OBSERVED",
+            purchase_book_delta=max(0, int(purchase_book_delta)),
+        ),
+    )
+
+
+def run(
+    routes: RoutesModel,
+    recovery_attempts: int = 2,
+    ledger_context: dict | None = None,
+):
     logger.info(show(routes))
     status = connect()
     if not status:
@@ -327,7 +369,22 @@ def run(routes: RoutesModel, recovery_attempts: int = 2):
         return residual_result
     if not residual_result:
         return False
-    for city in routes.city_data:
+    route_items = list(routes.city_data)
+    if ledger_context and int(ledger_context.get("completed_legs", 0)) == 1:
+        origin = ledger_context.get("origin")
+        resume = [
+            item
+            for item in route_items
+            if item.buy_city_name == city_name and item.sell_city_name == origin
+        ]
+        if resume:
+            route_items = resume
+            logger.info(
+                f"从账本恢复部分往返 {ledger_context['cycle_id']}："
+                f"仅继续 {city_name} → {origin}"
+            )
+    confirmed_books = 0
+    for city in route_items:
         logger.info(f"{city.buy_city_name}->{city.sell_city_name}")
         if not click_station(city.buy_city_name, cur_station=city_name).wait():
             logger.error(f"无法到达买货城市 {city.buy_city_name}，停止本次跑商")
@@ -352,9 +409,25 @@ def run(routes: RoutesModel, recovery_attempts: int = 2):
             goods_data[1:],
             buy_haggle,
             max_book=city.book,
+            detailed=ledger_context is not None,
         )
         if not buy_result:
             return False
+        books_used = (
+            int(buy_result.get("confirmed_books", 0))
+            if isinstance(buy_result, dict)
+            else 0
+        )
+        confirmed_books += books_used
+        if books_used:
+            _record_ledger_event(
+                ledger_context,
+                "PURCHASE_BOOK_CONFIRMED",
+                origin=city.buy_city_name,
+                destination=city.sell_city_name,
+                leg_id=f"{city.buy_city_name}|{city.sell_city_name}",
+                purchase_book_delta=books_used,
+            )
         if not click_station(city.sell_city_name, cur_station=city_name).wait():
             logger.error(f"无法到达卖货城市 {city.sell_city_name}，停止本次跑商")
             return False
@@ -374,17 +447,38 @@ def run(routes: RoutesModel, recovery_attempts: int = 2):
         ):
             logger.error("卖货未完成，不将本轮记为完成")
             return False
+        _record_ledger_event(
+            ledger_context,
+            "LEG_COMPLETED",
+            origin=city.buy_city_name,
+            destination=city.sell_city_name,
+            leg_id=f"{city.buy_city_name}|{city.sell_city_name}",
+        )
         # 流程跑完，更改站点名称为当前出售商品的站点
         city_name = city.sell_city_name
     logger.info("运行完成")
+    if ledger_context is not None:
+        return {
+            "success": True,
+            "cycle_id": ledger_context["cycle_id"],
+            "confirmed_books": confirmed_books,
+        }
     return True
 
 
-def run_with_recovery(routes: RoutesModel, recovery_attempts: int = 2):
+def run_with_recovery(
+    routes: RoutesModel,
+    recovery_attempts: int = 2,
+    ledger_context: dict | None = None,
+):
     """Run one round, restarting a crashed client and re-checking its station."""
     for attempt in range(recovery_attempts + 1):
         try:
-            return run(routes, recovery_attempts=recovery_attempts - attempt)
+            return run(
+                routes,
+                recovery_attempts=recovery_attempts - attempt,
+                ledger_context=ledger_context,
+            )
         except Exception:
             if is_stopped():
                 raise
@@ -460,6 +554,8 @@ def two_city_weekly_run(
     train halfway through a leg or leaving a sale unfinished.
     """
     from core.services import record_completed_run
+    from core.services.server_calendar import SERVER_CLOCK
+    from core.services.trade_ledger import load_trade_week_state
 
     global STOP
     STOP = False
@@ -477,6 +573,22 @@ def two_city_weekly_run(
         batch_runs = int(batch.get("runs", 0))
         logger.info(f"周计划阶段 {batch_index}/{len(execution_batches)}: {batch_runs} 次完整往返，进货书 {books}")
         for _ in range(batch_runs):
+            route_id = f"{buy_city_name}|{sell_city_name}"
+            facts = load_trade_week_state()
+            partial = facts.current_partial_cycle
+            if partial and partial.get("route_id") == route_id:
+                cycle_id = str(partial["cycle_id"])
+                completed_legs = int(partial.get("confirmed_legs", 0))
+            else:
+                cycle_id = uuid.uuid4().hex
+                completed_legs = 0
+            ledger_context = {
+                "cycle_id": cycle_id,
+                "route_id": route_id,
+                "origin": buy_city_name,
+                "server_week_id": SERVER_CLOCK.server_week_id(),
+                "completed_legs": completed_legs,
+            }
             routes = RoutesModel(
                 city_data=[
                     RouteModel(
@@ -495,7 +607,7 @@ def two_city_weekly_run(
                     ),
                 ]
             )
-            result = run_with_recovery(routes)
+            result = run_with_recovery(routes, ledger_context=ledger_context)
             if task_result_deferred(result):
                 logger.info(
                     f"周计划资源暂缓，本次已完成 {completed}/{total_runs} 次完整往返"
@@ -505,7 +617,15 @@ def two_city_weekly_run(
                 logger.info(f"周计划停止，本次已完成 {completed}/{total_runs} 次完整往返")
                 return False
             completed += 1
-            record_completed_run(books)
+            record_completed_run(
+                books,
+                cycle_id=cycle_id,
+                confirmed_books=(
+                    int(result.get("confirmed_books", 0))
+                    if isinstance(result, dict)
+                    else 0
+                ),
+            )
             if completed >= run_limit and completed < total_runs:
                 logger.info(
                     f"本次调度已在完整往返边界让出队列，完成 {completed}/{total_runs} 次；"

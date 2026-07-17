@@ -28,7 +28,7 @@ class TaskScheduleCard(QWidget):
         self.taskKey = task_key
         # ExpandLayout otherwise compresses a plain QWidget to roughly one
         # text line, hiding the next-run editor and buttons.
-        self.setMinimumHeight(96)
+        self.setMinimumHeight(128)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.setObjectName("taskScheduleCard")
         self.setStyleSheet(
@@ -55,7 +55,14 @@ class TaskScheduleCard(QWidget):
 
     def refresh(self):
         timing = task_timing(self.taskKey)
-        self.lastRunLabel.setText(f"上次执行：{timing.get('last_run') or '从未执行'}")
+        result = timing.get("result") if isinstance(timing.get("result"), dict) else {}
+        reason = result.get("next_run_reason") or result.get("reason") or "未记录"
+        self.lastRunLabel.setText(
+            f"上次检查：{timing.get('last_attempt') or timing.get('last_run') or '从未执行'}\n"
+            f"上次取得进度：{timing.get('progress_at') or '尚无'} · "
+            f"上次完整完成：{timing.get('completed_at') or '尚无'}\n"
+            f"下一次检查原因：{reason}"
+        )
         self.nextRunEdit.setText((timing.get("next_run") or "").replace("T", " "))
 
     def save(self):

@@ -100,8 +100,11 @@ def connect(adb_port: Optional[int] = None):
         try:
             nemu_candidate = NEMU(device)
             status = nemu_candidate.connect(adb_port)
-        except Exception:
-            logger.exception("MUMUIPC连接异常，尝试使用ADB连接")
+        except Exception as error:
+            logger.warning(
+                "MUMUIPC当前不可用，按预期降级到ADB："
+                f"{type(error).__name__}: {error}"
+            )
             status = False
         if status:
             _activate_backend(nemu_candidate)

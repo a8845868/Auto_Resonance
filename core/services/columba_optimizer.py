@@ -345,7 +345,11 @@ def optimize_live_routes(
                 "profit_per_fatigue": round(total_profit / (repeats * cycle_fatigue)),
                 "legs": base_legs,
             }
-            if best is None or result["profit"] > best["profit"]:
+            if best is None or (
+                result["profit"], result["profit_per_fatigue"]
+            ) > (
+                best["profit"], best["profit_per_fatigue"]
+            ):
                 best = result
 
     if best is None:
