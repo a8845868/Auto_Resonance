@@ -13,6 +13,7 @@ from loguru import logger
 
 from core.control.control import connect, input_swipe, input_tap, screenshot
 from core.control.adb_port import EmulatorInfo, get_adb_port
+from core.services.screen_state import clarity_replenish_cancel_position
 
 
 SIEGE_TASKS = (
