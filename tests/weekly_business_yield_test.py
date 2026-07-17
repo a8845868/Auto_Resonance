@@ -25,7 +25,10 @@ def test_weekly_run_yields_after_one_complete_round_trip():
 
     assert result is True
     assert run.call_count == 1
-    record.assert_called_once_with({"岚心城": 0, "武林源": 0})
+    record.assert_called_once()
+    assert record.call_args.args == ({"岚心城": 0, "武林源": 0},)
+    assert record.call_args.kwargs["confirmed_books"] == 0
+    assert record.call_args.kwargs["cycle_id"]
 
 
 def test_unfinished_weekly_plan_is_scheduled_again_after_five_seconds():

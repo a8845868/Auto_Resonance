@@ -75,6 +75,8 @@ def buy_business(
     secondary_goods: List[str],
     num: int = 0,
     max_book: int = 0,
+    *,
+    detailed: bool = False,
 ):
     """
     购买商品
@@ -124,9 +126,9 @@ def buy_business(
             return False
         time.sleep(0.5)
         input_tap((896, 676))
-        return True
+        return {"success": True, "confirmed_books": book} if detailed else True
     elif cargo_full:
-        return True
+        return {"success": True, "confirmed_books": book} if detailed else True
     else:
         logger.error("未购买物品")
         go_home()

@@ -448,25 +448,47 @@ class TwoRunBusinessInterface(ScrollArea):
             self.weeklyProgressLabel.setText("本周尚未套用计划。请先实时计算，再点击“套用路线”。")
             return
         cycle = summary["cycle"]
+        confirmed = summary.get("confirmed_round_trips")
+        fact_text = (
+            "未知 / 待同步"
+            if confirmed is None
+            else f"{confirmed} 次已确认完整往返"
+        )
+        source = summary.get("progress_source", "UNKNOWN")
+        partial = summary.get("current_partial_cycle")
+        partial_text = (
+            f"当前部分周期：{partial.get('confirmed_legs', 0)} 程已确认，"
+            f"停在 {partial.get('last_destination') or '未知站点'}"
+            if partial
+            else "当前部分周期：无账本确认"
+        )
         if summary["finished"]:
             self.weeklyProgressLabel.setText(
-                f"本周计划已完成：{cycle[0]} → {cycle[1]} → {cycle[0]}\n"
-                f"已完成 {summary['completed_runs']}/{summary['total_runs']} 次完整往返，"
-                f"已使用 {summary['completed_books']}/{summary['books_total']} 本进货书。"
+                f"本周事实（{source}）：{fact_text}；{partial_text}\n"
+                f"本周计划已完成：{cycle[0]} → {cycle[1]} → {cycle[0]}；"
+                f"计划执行记录 {summary['completed_runs']}/{summary['total_runs']} 次。"
             )
             return
         current = summary["current_batch"]
         later_batches = summary["remaining_batches"][1:]
         later = "；完成后再跑 " + "；".join(self._format_batch(batch) for batch in later_batches) if later_batches else ""
-        today = date.today()
-        sunday = today + timedelta(days=6 - today.weekday())
-        days_left = max(1, (sunday - today).days + 1)
+        from core.services.server_calendar import SERVER_CLOCK
+
+        today = SERVER_CLOCK.server_day_date()
+        days_left = max(1, 7 - today.weekday())
         suggested_today = (summary["remaining_runs"] + days_left - 1) // days_left
         self.weeklyProgressLabel.setText(
-            f"本周进度：已完成 {summary['completed_runs']} 次往返，还剩 {summary['remaining_runs']} 次；"
-            f"进货书已用 {summary['completed_books']} 本，还剩 {summary['remaining_books']} 本\n"
-            f"现在要做：{self._format_batch(current)}{later}\n"
-            f"今天建议至少完成 {suggested_today} 次完整往返；预计剩余疲劳约 {round(summary['remaining_fatigue'])}"
+            f"本周事实（{source}）：{fact_text}；{partial_text}；"
+            f"已确认进货书 {summary.get('confirmed_books_used', 0)} 本\n"
+            f"本周计划：计划记录完成 {summary['completed_runs']} 次，"
+            f"剩余计划 {summary['planned_round_trips_remaining']} 次；"
+            f"按疲劳最多 {summary['feasible_round_trips_by_fatigue']} 次；"
+            f"预计净利润 {summary['expected_total_net_profit']}，"
+            f"预计疲劳 {summary['expected_total_fatigue']}，"
+            f"净利润/疲劳 {summary['expected_profit_per_fatigue']}\n"
+            f"下一步动作：{self._format_batch(current)}{later}\n"
+            f"今日建议：{suggested_today} 次完整往返；"
+            f"预计剩余计划疲劳约 {round(summary['remaining_fatigue'])}"
         )
 
     def routeCities(self):
