@@ -4,6 +4,7 @@ from core.services.fatigue_planner import (
     FatiguePlanStatus,
     FatigueSnapshot,
     RouteLeg,
+    SodaPriceTier,
     TradeRouteContext,
     plan_fatigue_recovery,
 )
@@ -23,7 +24,15 @@ def _snapshot(**overrides):
         "soda_uses_used": 0,
         "soda_uses_remaining": 6,
         "soda_reduction_per_use": 50,
-        "soda_price_tiers": ("FREE", "IRON"),
+        "soda_price_tiers": tuple(
+            SodaPriceTier(
+                index,
+                "FREE" if index == 1 else "IRON",
+                0 if index == 1 else 500,
+                True,
+            )
+            for index in range(1, 7)
+        ),
         "bento_batches_available": 3,
         "bento_total_reduction_available": 72,
         "next_bento_release_at": None,

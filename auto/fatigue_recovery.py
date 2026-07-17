@@ -1,13 +1,18 @@
 """Independent daily fatigue recovery task."""
 
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from enum import Enum
 
 from loguru import logger
 
-from auto.module.strength import read_strength, recover_strength
+from auto.module.strength import (
+    execute_planned_recovery_action,
+    observe_recovery_resources,
+    read_strength,
+)
+from app.common.config import cfg
 from core.control.control import connect, input_tap
 from core.preset import get_station, go_outlets
 from core.preset.control import go_home
@@ -20,6 +25,7 @@ from core.services.fatigue_planner import (
     load_fatigue_usage,
     plan_fatigue_recovery,
 )
+from core.services.fatigue_triggers import register_deferred_fatigue_actions
 from core.services.server_calendar import SERVER_CLOCK
 from core.services.station_facilities import rest_area_availability
 from core.services.weekly_plan_state import load_weekly_plan
@@ -29,7 +35,7 @@ from core.utils.utils import RESOURCES_PATH, read_json
 MINIMUM_TRADING_FATIGUE = 80
 
 
-def _route_context() -> TradeRouteContext | None:
+def _route_context(current_station: str | None = None) -> TradeRouteContext | None:
     state = load_weekly_plan()
     cycle = state.get("cycle", []) if state else []
     if len(cycle) < 2:
@@ -51,7 +57,24 @@ def _route_context() -> TradeRouteContext | None:
                 amenities,
             )
         )
-    return TradeRouteContext("|".join(cycle), tuple(legs))
+    current_leg_index = 0
+    try:
+        from core.services.trade_ledger import load_trade_week_state
+
+        partial = load_trade_week_state().current_partial_cycle
+    except Exception as error:
+        logger.warning(f"无法读取跑商部分周期，疲劳路线从当前站点推导: {error}")
+        partial = None
+    if partial and partial.get("route_id") == "|".join(cycle):
+        current_leg_index = int(partial.get("confirmed_legs", 0)) % len(legs)
+    if current_station:
+        station_index = next(
+            (index for index, leg in enumerate(legs) if leg.origin == current_station),
+            None,
+        )
+        if station_index is not None:
+            current_leg_index = station_index
+    return TradeRouteContext("|".join(cycle), tuple(legs), current_leg_index)
 
 
 def _json_value(value):
@@ -89,8 +112,68 @@ def _open_exchange_buy_page() -> bool:
     return _wait_strength() is not None
 
 
+def _next_bento_release(now: datetime) -> datetime | None:
+    for hour in (12, 18):
+        candidate = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if candidate > now:
+            return candidate
+    return SERVER_CLOCK.next_daily_reset(now)
+
+
+def _snapshot_from_observation(
+    station_name: str,
+    strength: tuple[int, int],
+    observation: dict[str, object],
+    usage: dict[str, object],
+) -> FatigueSnapshot:
+    lunches = observation.get("lunches_remaining")
+    lunch_total = observation.get("lunch_total_recovery")
+    lunch_values = tuple(observation.get("lunch_recovery_values") or ())
+    if (
+        lunch_total is None
+        and lunches is not None
+        and int(lunches) > 0
+        and len(lunch_values) == int(lunches)
+    ):
+        # Card values are usable only when every observed inventory item has a
+        # corresponding value; otherwise the plan remains UNKNOWN.
+        lunch_total = sum(max(0, int(value)) for value in lunch_values)
+    tiers = tuple(observation.get("soda_price_tiers") or ())
+    resource_known = lunches is not None and (
+        int(lunches) == 0 or lunch_total is not None
+    )
+    return FatigueSnapshot(
+        server_day_id=SERVER_CLOCK.server_day_id(),
+        observed_at=SERVER_CLOCK.server_now(),
+        fatigue_used=int(strength[0]),
+        fatigue_cap=int(strength[1]),
+        current_city_id=station_name,
+        current_station_id=station_name,
+        current_amenities=(
+            frozenset({"REST_AREA"})
+            if observation.get("rest_area_available") is True
+            else frozenset()
+        ),
+        soda_uses_used=int(usage.get("bubble_water_uses", 0)),
+        # Only the currently observed sequential price tier is executable.
+        # Every successful drink forces another observation and replan.
+        soda_uses_remaining=min(
+            max(0, 6 - int(usage.get("bubble_water_uses", 0))), len(tiers)
+        ),
+        soda_reduction_per_use=50,
+        soda_price_tiers=tiers,
+        bento_batches_available=int(lunches) if lunches is not None else 0,
+        bento_total_reduction_available=(
+            int(lunch_total) if lunch_total is not None else 0
+        ),
+        next_bento_release_at=_next_bento_release(SERVER_CLOCK.server_now()),
+        natural_recovery_at=None,
+        source_confidence="HIGH" if resource_known else "UNKNOWN",
+    )
+
+
 def run_daily_fatigue_recovery() -> dict:
-    """Use safe recovery now and keep the plan pending until drinks are checked."""
+    """Observe resources, execute the plan one action at a time, and replan."""
     if not connect():
         raise RuntimeError("疲劳规划无法连接模拟器")
     station_name = get_station()
@@ -106,84 +189,77 @@ def run_daily_fatigue_recovery() -> dict:
         "先用气泡水，再判断全部便当是否会浪费"
     )
     usage_before = load_fatigue_usage()
-    lunches_remaining = usage_before.get("lunches_remaining")
-    lunch_count = int(lunches_remaining) if isinstance(lunches_remaining, int) else 0
-    snapshot = FatigueSnapshot(
-        server_day_id=SERVER_CLOCK.server_day_id(),
-        observed_at=SERVER_CLOCK.server_now(),
-        fatigue_used=before[0],
-        fatigue_cap=before[1],
-        current_city_id=station_name,
-        current_station_id=station_name,
-        current_amenities=(
-            frozenset({"REST_AREA"})
-            if rest_area_availability(station_name) is True
-            else frozenset()
-        ),
-        soda_uses_used=int(usage_before.get("bubble_water_uses", 0)),
-        soda_uses_remaining=max(
-            0, 6 - int(usage_before.get("bubble_water_uses", 0))
-        ),
-        soda_reduction_per_use=50,
-        soda_price_tiers=("FREE", "IRON"),
-        bento_batches_available=lunch_count,
-        bento_total_reduction_available=lunch_count * 24,
-        next_bento_release_at=None,
-        natural_recovery_at=None,
-        source_confidence="HIGH",
+    observation = observe_recovery_resources(station_name)
+    snapshot = _snapshot_from_observation(
+        station_name, before, observation, usage_before
     )
-    plan = plan_fatigue_recovery(snapshot, _route_context())
+    route = _route_context(station_name)
+    plan = plan_fatigue_recovery(
+        snapshot,
+        route,
+        allow_premium_soda=bool(cfg.UseSilverBranch.value),
+    )
     logger.info(
         f"疲劳规划状态={plan.status.value}，立即动作="
         f"{[action.kind for action in plan.immediate_actions]}，"
         f"延迟触发={plan.next_trigger}，预计浪费={plan.expected_waste}"
     )
-    # A low-fatigue observation is not a completed daily plan.  Leave the task
-    # pending until a route/fatigue event or a release time makes an action safe.
-    # When available headroom is already unsafe, keep the existing executor's
-    # cabinet inspection so it can discover an unobserved bento batch.
-    if (
-        plan.status is not FatiguePlanStatus.ACTION_NOW
-        and before[1] - before[0] >= MINIMUM_TRADING_FATIGUE
-    ):
-        go_home()
-        return {
-            "success": True,
-            "deferred": True,
-            "progress_made": False,
-            "reason": plan.reason,
-            "status": plan.status.value,
-            "station": station_name,
-            "before": before[0],
-            "maximum": before[1],
-            "plan": _json_value(asdict(plan)),
-        }
-    recovery_usage: dict[str, object] = {}
-    recovered = recover_strength(
-        "buy",
-        min_available=MINIMUM_TRADING_FATIGUE,
-        station_name=station_name,
-        usage=recovery_usage,
-    )
-    daily_usage = record_fatigue_usage(**recovery_usage)
-    if not recovered:
-        logger.warning("疲劳恢复条件尚未满足，本次暂缓且不更新完成时间")
-        go_home()
-        return {
-            "success": True,
-            "deferred": True,
-            "reason": "recovery_conditions_not_met",
-            "station": station_name,
-            "before": before[0],
-            "maximum": before[1],
-            "usage": daily_usage,
-            "plan": _json_value(asdict(plan)),
-        }
-    after = _wait_strength()
-    if not after:
-        raise RuntimeError("疲劳规划无法读取恢复后疲劳")
-    if not go_home():
-        raise RuntimeError("疲劳恢复完成，但未能安全返回主界面")
+    initial_plan = plan
+    daily_usage = usage_before
+    progress_made = False
+    for _ in range(8):
+        if plan.status is not FatiguePlanStatus.ACTION_NOW or not plan.immediate_actions:
+            break
+        action = plan.immediate_actions[0]
+        action_result = execute_planned_recovery_action(
+            action.kind,
+            station_name=station_name,
+        )
+        if action_result.get("success") is not True:
+            logger.warning(f"疲劳动作验证失败，重新规划前暂缓: {action_result}")
+            plan = plan_fatigue_recovery(
+                replace(plan.snapshot, source_confidence="UNKNOWN"),
+                route,
+                allow_premium_soda=bool(cfg.UseSilverBranch.value),
+            )
+            break
+        progress_made = True
+        daily_usage = record_fatigue_usage(
+            bubble_water_uses=int(action_result.get("bubble_water_uses", 0)),
+            lunch_batches=int(action_result.get("lunch_batches", 0)),
+            lunch_fatigue_restored=int(
+                action_result.get("lunch_fatigue_restored", 0)
+            ),
+            lunches_remaining=(
+                int(action_result["lunches_remaining"])
+                if isinstance(action_result.get("lunches_remaining"), int)
+                else None
+            ),
+        )
+        observed_strength = _wait_strength()
+        if not observed_strength:
+            raise RuntimeError("疲劳动作后无法重新读取疲劳")
+        observation = observe_recovery_resources(station_name)
+        snapshot = _snapshot_from_observation(
+            station_name, observed_strength, observation, daily_usage
+        )
+        plan = plan_fatigue_recovery(
+            snapshot,
+            route,
+            allow_premium_soda=bool(cfg.UseSilverBranch.value),
+        )
+
+    after = _wait_strength() or (plan.snapshot.fatigue_used, plan.snapshot.fatigue_cap)
+    deferred_actions = list(plan.deferred_actions)
+    if not deferred_actions and plan.status in {
+        FatiguePlanStatus.DEFER_UNTIL_FATIGUE,
+        FatiguePlanStatus.DEFER_UNTIL_RELEASE,
+        FatiguePlanStatus.UNKNOWN,
+    }:
+        deferred_actions = [{"kind": "REPLAN", "waypoint_id": ""}]
+    if deferred_actions:
+        register_deferred_fatigue_actions(deferred_actions)
+    go_home()
     result = {
         "success": True,
         "cycle": fatigue_cycle(),
@@ -191,21 +267,17 @@ def run_daily_fatigue_recovery() -> dict:
         "before": before[0],
         "after": after[0],
         "maximum": after[1],
-        "restored": max(0, before[0] - after[0]),
+        "restored": max(0, before[0] - int(after[0])),
         "available": after[1] - after[0],
         "usage": daily_usage,
         "plan": _json_value(asdict(plan)),
-        "progress_made": max(0, before[0] - after[0]) > 0,
+        "initial_plan": _json_value(asdict(initial_plan)),
+        "progress_made": progress_made,
     }
-    if rest_area_availability(station_name) is False and after[0] >= 50:
-        result.update(
-            deferred=True,
-            reason="lunch_only_waiting_for_rest_area",
-        )
-        logger.info(
-            "当前站点无休息区，便当仅完成安全保底；保留疲劳规划，"
-            "抵达有休息区站点后继续使用气泡水并重新判断便当"
-        )
+    if plan.status is not FatiguePlanStatus.COMPLETE_FOR_DAY:
+        result.update(deferred=True, reason=plan.reason, status=plan.status.value)
+        if plan.snapshot.next_bento_release_at is not None:
+            result["next_run_at"] = plan.snapshot.next_bento_release_at.isoformat()
         return result
     logger.info(
         f"每日疲劳规划完成: {before[0]}/{before[1]} -> "

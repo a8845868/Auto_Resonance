@@ -12,7 +12,7 @@ from core.services.station_facilities import (
     remember_rest_area_availability,
     rest_area_availability,
 )
-from core.services.fatigue_planner import lunch_release_schedule
+from core.services.fatigue_planner import SodaPriceTier, lunch_release_schedule
 from app.common.config import cfg
 
 
@@ -296,6 +296,143 @@ def _lunchbox_inventory(image) -> int | None:
     return candidates[-1] if candidates else None
 
 
+def _lunchbox_total_recovery(items) -> int | None:
+    """Read the authoritative total from the use-all confirmation dialog."""
+
+    for item in items:
+        match = re.search(
+            r"(?:使用全部便当[^\d]*)?(?:消除|恢复)\s*(\d+)\s*疲劳值",
+            str(item.get("text", "")),
+        )
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _lunchbox_recovery_values(items) -> tuple[int, ...]:
+    """Read per-bento recovery values from cabinet cards, preserving order."""
+
+    values = []
+    for item in items:
+        match = re.search(
+            r"(?:消除|恢复)\s*(\d+)\s*疲劳(?:值)?",
+            str(item.get("text", "")),
+        )
+        if match:
+            values.append(int(match.group(1)))
+    return tuple(values)
+
+
+def _observed_soda_price_tier(items, use_index: int) -> SodaPriceTier | None:
+    texts = [str(item.get("text", "")) for item in items]
+    joined = " ".join(texts)
+    if "本次免费" in joined or "免费" in joined:
+        return SodaPriceTier(use_index, "FREE", 0, True)
+    iron = re.search(r"(\d+)\s*(?:铁盟币|铁币)", joined)
+    if iron:
+        return SodaPriceTier(use_index, "IRON", int(iron.group(1)), True)
+    silver = re.search(r"(\d+)\s*银枝", joined)
+    if silver or "是否使用银枝" in joined:
+        cost = int(silver.group(1)) if silver else 1
+        return SodaPriceTier(use_index, "SILVER", cost, bool(cfg.UseSilverBranch.value))
+    return None
+
+
+def observe_recovery_resources(station_name: str | None = None) -> dict[str, object]:
+    """Open recovery pages read-only and return only values observed in UI."""
+
+    observation: dict[str, object] = {
+        "lunches_remaining": None,
+        "lunch_recovery_values": (),
+        "lunch_total_recovery": None,
+        "soda_price_tiers": (),
+        "rest_area_available": rest_area_availability(station_name),
+        "source_confidence": "UNKNOWN",
+    }
+    if not _open_fatigue_panel():
+        return observation
+
+    if not _screen_has("不在范围内"):
+        input_tap((1117, 344))
+        if _wait_text("喝一杯", "休息区", timeout=8) and _ensure_drink_selection():
+            tier = _observed_soda_price_tier(screenshot().ocr(), 1)
+            if tier is not None:
+                observation["soda_price_tiers"] = (tier,)
+            observation["rest_area_available"] = True
+            remember_rest_area_availability(station_name, True)
+        go_home()
+        _open_fatigue_panel()
+    else:
+        observation["rest_area_available"] = False
+        remember_rest_area_availability(station_name, False)
+
+    input_tap((1117, 607))
+    if _wait_text("便当柜", "BENTO CABINET", timeout=8):
+        cabinet = screenshot()
+        observation["lunches_remaining"] = _lunchbox_inventory(cabinet)
+        observation["lunch_recovery_values"] = _lunchbox_recovery_values(
+            cabinet.ocr()
+        )
+        input_tap((1070, 427))
+        time.sleep(1.0)
+        total = _lunchbox_total_recovery(screenshot().ocr())
+        observation["lunch_total_recovery"] = total
+        # Observation is read-only; always cancel the irreversible batch use.
+        input_tap((320, 503))
+        observation["source_confidence"] = (
+            "HIGH"
+            if observation["lunches_remaining"] is not None
+            and (total is not None or observation["lunches_remaining"] == 0)
+            else "PARTIAL"
+        )
+    go_home()
+    return observation
+
+
+def execute_planned_recovery_action(
+    kind: str,
+    *,
+    station_name: str | None,
+) -> dict[str, object]:
+    """Execute exactly one planned recovery action and verify its effect."""
+
+    before = read_strength()
+    if before is None or not _open_fatigue_panel():
+        return {"success": False, "reason": "fatigue_not_observed"}
+    current, _maximum = before
+    if kind == "DRINK_SODA":
+        result = _use_free_rest_area(
+            current,
+            max(0, current - 50),
+            station_name,
+        )
+        go_home()
+        after = read_strength()
+        success = result.used == 1 and after is not None and after[0] < current
+        return {
+            "success": success,
+            "kind": kind,
+            "bubble_water_uses": result.used if success else 0,
+            "before": current,
+            "after": after[0] if after else current,
+        }
+    if kind == "USE_ALL_BENTOS":
+        usage: dict[str, object] = {}
+        after_value = _use_all_safe_lunchboxes(current, usage)
+        go_home()
+        return {
+            "success": after_value < current,
+            "kind": kind,
+            "lunch_batches": 1 if after_value < current else 0,
+            "lunch_fatigue_restored": max(0, current - after_value),
+            "lunches_remaining": usage.get("lunches_remaining"),
+            "before": current,
+            "after": after_value,
+        }
+    go_home()
+    return {"success": False, "reason": f"unsupported_action:{kind}"}
+
+
 def _use_all_safe_lunchboxes(
     current_fatigue: int,
     usage: dict[str, object] | None = None,
@@ -315,12 +452,7 @@ def _use_all_safe_lunchboxes(
 
     input_tap((1070, 427))  # 全部使用
     time.sleep(2)
-    recovery = None
-    for item in screenshot().ocr():
-        match = re.search(r"消除\s*(\d+)\s*疲劳值", item["text"])
-        if match:
-            recovery = int(match.group(1))
-            break
+    recovery = _lunchbox_total_recovery(screenshot().ocr())
     if recovery is None:
         logger.info("没有可批量使用的便当")
         input_tap((320, 503))
