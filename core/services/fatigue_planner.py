@@ -20,6 +20,14 @@ FATIGUE_PLAN_TIMES = (
 FATIGUE_USAGE_PATH = RUNTIME_DIR / "fatigue-usage.json"
 
 
+def _legacy_server_time(value: datetime) -> tuple[datetime, bool]:
+    was_naive = value.tzinfo is None or value.utcoffset() is None
+    if was_naive:
+        local_zone = datetime.now().astimezone().tzinfo
+        return value.replace(tzinfo=local_zone).astimezone(SERVER_CLOCK.timezone), True
+    return value.astimezone(SERVER_CLOCK.timezone), False
+
+
 class FatiguePlanStatus(str, Enum):
     ACTION_NOW = "ACTION_NOW"
     DEFER_UNTIL_FATIGUE = "DEFER_UNTIL_FATIGUE"
@@ -29,6 +37,14 @@ class FatiguePlanStatus(str, Enum):
     BLOCKED = "BLOCKED"
     UNKNOWN = "UNKNOWN"
     CANCELLED = "CANCELLED"
+
+
+@dataclass(frozen=True)
+class SodaPriceTier:
+    use_index: int
+    currency_type: str
+    cost: int
+    allowed: bool
 
 
 @dataclass(frozen=True)
@@ -43,7 +59,7 @@ class FatigueSnapshot:
     soda_uses_used: int
     soda_uses_remaining: int
     soda_reduction_per_use: int
-    soda_price_tiers: tuple[str, ...]
+    soda_price_tiers: tuple[SodaPriceTier | str, ...]
     bento_batches_available: int
     bento_total_reduction_available: int
     next_bento_release_at: datetime | None
@@ -88,9 +104,25 @@ class FatiguePlan:
     reason: str
 
 
-def _allowed_soda(snapshot: FatigueSnapshot, allow_premium_soda: bool) -> bool:
-    tiers = {tier.upper() for tier in snapshot.soda_price_tiers}
-    return bool(tiers & {"FREE", "IRON"}) or (allow_premium_soda and "PREMIUM" in tiers)
+def _allowed_soda_uses(snapshot: FatigueSnapshot, allow_premium_soda: bool) -> int:
+    """Return the contiguous, explicitly allowed prefix of observed price tiers."""
+
+    allowed = 0
+    for raw in snapshot.soda_price_tiers[: max(0, snapshot.soda_uses_remaining)]:
+        if isinstance(raw, SodaPriceTier):
+            currency = raw.currency_type.upper()
+            tier_allowed = bool(raw.allowed)
+        else:
+            currency = str(raw).upper()
+            tier_allowed = currency in {"FREE", "IRON"}
+        if currency in {"PREMIUM", "SILVER", "银枝"}:
+            tier_allowed = tier_allowed and allow_premium_soda
+        elif currency not in {"FREE", "IRON", "免费", "铁盟币"}:
+            tier_allowed = False
+        if not tier_allowed:
+            break
+        allowed += 1
+    return allowed
 
 
 def _immediate_sequences(
@@ -112,10 +144,11 @@ def _immediate_sequences(
             elif (
                 "REST_AREA" in snapshot.current_amenities
                 and snapshot.soda_reduction_per_use > 0
-                and _allowed_soda(snapshot, allow_premium_soda)
+                and _allowed_soda_uses(snapshot, allow_premium_soda) > 0
             ):
                 safe = min(
                     max(0, snapshot.soda_uses_remaining),
+                    _allowed_soda_uses(snapshot, allow_premium_soda),
                     fatigue // snapshot.soda_reduction_per_use,
                 )
                 if safe:
@@ -174,7 +207,7 @@ def plan_fatigue_recovery(
     if (
         snapshot.soda_uses_remaining > 0
         and snapshot.soda_reduction_per_use > 0
-        and _allowed_soda(snapshot, allow_premium_soda)
+        and _allowed_soda_uses(snapshot, allow_premium_soda) > 0
     ):
         thresholds.append(snapshot.soda_reduction_per_use)
     if snapshot.bento_batches_available > 0 and snapshot.bento_total_reduction_available > 0:
@@ -190,7 +223,7 @@ def plan_fatigue_recovery(
                 "REST_AREA" in leg.destination_amenities
                 and snapshot.soda_uses_remaining > 0
                 and fatigue >= snapshot.soda_reduction_per_use
-                and _allowed_soda(snapshot, allow_premium_soda)
+                and _allowed_soda_uses(snapshot, allow_premium_soda) > 0
             )
             bento_ready = (
                 snapshot.bento_batches_available > 0
@@ -199,7 +232,11 @@ def plan_fatigue_recovery(
             if soda_ready or bento_ready:
                 kind = "DRINK_SODA" if soda_ready else "USE_ALL_BENTOS"
                 count = (
-                    min(snapshot.soda_uses_remaining, fatigue // snapshot.soda_reduction_per_use)
+                    min(
+                        snapshot.soda_uses_remaining,
+                        _allowed_soda_uses(snapshot, allow_premium_soda),
+                        fatigue // snapshot.soda_reduction_per_use,
+                    )
                     if soda_ready
                     else 1
                 )
@@ -247,16 +284,14 @@ def plan_fatigue_recovery(
 def fatigue_cycle(now: datetime | None = None) -> str:
     """Return the game-day key; drinks and lunches refresh at 05:00."""
     current = now or SERVER_CLOCK.server_now()
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=SERVER_CLOCK.timezone)
+    current, _ = _legacy_server_time(current)
     return SERVER_CLOCK.server_day_id(current)
 
 
 def lunch_release_schedule(now: datetime | None = None) -> dict[str, str]:
     """Describe which of today's three lunch issues have reached release time."""
     current = now or SERVER_CLOCK.server_now()
-    was_naive = current.tzinfo is None
-    aware = current.replace(tzinfo=SERVER_CLOCK.timezone) if was_naive else current
+    aware, _was_naive = _legacy_server_time(current)
     cycle_date = date.fromisoformat(fatigue_cycle(aware))
     return {
         f"{hour:02d}:{minute:02d}": (
@@ -276,8 +311,7 @@ def next_fatigue_refresh(now: datetime | None = None) -> datetime:
     at 05:00, 12:00, and 18:00, so every issue needs its own safe batch check.
     """
     current = now or datetime.now()
-    was_naive = current.tzinfo is None
-    aware = current.replace(tzinfo=SERVER_CLOCK.timezone) if was_naive else current
+    aware, was_naive = _legacy_server_time(current)
     for hour, minute in FATIGUE_PLAN_TIMES:
         target = aware.replace(
             hour=hour,

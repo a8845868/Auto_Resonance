@@ -114,6 +114,10 @@ def decide_reward_run(
 
     if transient_error:
         delay_minutes = min(30, 2 ** max(1, min(int(attempt), 5)))
+        next_run = current + timedelta(minutes=delay_minutes)
+        reset = SERVER_CLOCK.next_daily_reset(current)
+        if reset - current <= timedelta(minutes=10):
+            next_run = max(current, min(next_run, reset - timedelta(seconds=5)))
         return DailyRewardRunResult(
             RewardRunStatus.TRANSIENT_ERROR,
             strategy,
@@ -121,19 +125,35 @@ def decide_reward_run(
             False,
             blocked_reasons,
             "retry_observation",
-            current + timedelta(minutes=delay_minutes),
+            next_run,
             "bounded_transient_backoff",
         )
     if snapshot is None or _snapshot_unknown(snapshot):
+        reset = SERVER_CLOCK.next_daily_reset(current)
+        near_reset = reset - current <= timedelta(minutes=10)
+        next_run = current + timedelta(minutes=5)
+        if near_reset:
+            next_run = max(
+                current,
+                min(current + timedelta(seconds=30), reset - timedelta(seconds=5)),
+            )
         return DailyRewardRunResult(
             RewardRunStatus.UNKNOWN,
             strategy,
             snapshot,
             False,
             blocked_reasons or ("state_not_confirmed",),
-            "reobserve_daily_progress",
-            current + timedelta(minutes=5),
-            "unknown_state_same_server_day_retry",
+            (
+                "final_check_then_claim_before_reset"
+                if near_reset
+                else "reobserve_daily_progress"
+            ),
+            next_run,
+            (
+                "unknown_state_final_pre_reset_check"
+                if near_reset
+                else "unknown_state_same_server_day_retry"
+            ),
         )
     if running_dependencies:
         return DailyRewardRunResult(
@@ -170,13 +190,20 @@ def decide_reward_run(
         next_run = current + delay
     else:
         next_run = current + timedelta(minutes=30)
+    next_action = (
+        "claim_current_rewards"
+        if claimable
+        else "claim_only_reobserve"
+        if strategy is RewardStrategy.CLAIM_ONLY
+        else "enqueue_safe_progress_dependencies"
+    )
     return DailyRewardRunResult(
         status,
         strategy,
         snapshot,
         False,
         blocked_reasons,
-        "claim_current_rewards" if claimable else "run_enabled_progress_tasks_or_retry",
+        next_action,
         next_run,
         "claimable_rewards_pending" if claimable else "daily_objectives_incomplete",
     )
@@ -197,7 +224,9 @@ def schedule_debounced_reward_recheck(
         try:
             existing = datetime.fromisoformat(existing_text)
             if existing.tzinfo is None:
-                existing = existing.replace(tzinfo=SERVER_CLOCK.timezone)
+                existing = existing.replace(
+                    tzinfo=datetime.now().astimezone().tzinfo
+                ).astimezone(SERVER_CLOCK.timezone)
             if existing <= target:
                 return False
         except (TypeError, ValueError):

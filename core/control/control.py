@@ -16,7 +16,7 @@ from loguru import logger
 from core.control.adb import ADB
 from core.control.adb_port import EmulatorInfo, EmulatorType
 from core.control.base_control import IADB
-from core.control.nemu import NEMU
+from core.control.nemu import IPCUnavailableError, NEMU
 from core.exception.exceptions import StopExecution
 from core.image.image import Image
 from core.model import app
@@ -86,6 +86,27 @@ def _activate_backend(candidate: IADB) -> None:
         _close_backend(previous, "旧控制后端")
 
 
+def _known_nemu_unavailable(error: BaseException) -> bool:
+    if isinstance(error, (FileNotFoundError, IPCUnavailableError)):
+        return True
+    if not isinstance(error, OSError):
+        return False
+    winerror = getattr(error, "winerror", None)
+    if winerror in {126, 127, 193}:
+        return True
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "dll",
+            "entry point",
+            "specified module could not be found",
+            "找不到指定的模块",
+            "找不到指定的程序",
+        )
+    )
+
+
 def connect(adb_port: Optional[int] = None):
     """
     连接ADB
@@ -101,11 +122,17 @@ def connect(adb_port: Optional[int] = None):
             nemu_candidate = NEMU(device)
             status = nemu_candidate.connect(adb_port)
         except Exception as error:
-            logger.warning(
-                "MUMUIPC当前不可用，按预期降级到ADB："
-                f"{type(error).__name__}: {error}"
-            )
-            status = False
+            if _known_nemu_unavailable(error):
+                logger.warning(
+                    "MUMUIPC当前不可用，按预期降级到ADB："
+                    f"{type(error).__name__}: {error}"
+                )
+                status = False
+            else:
+                if nemu_candidate is not None:
+                    _close_backend(nemu_candidate, "NEMUIPC")
+                logger.exception("MUMUIPC发生非预期编程错误，禁止静默降级")
+                raise
         if status:
             _activate_backend(nemu_candidate)
             return True

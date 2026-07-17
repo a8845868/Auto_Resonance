@@ -12,10 +12,11 @@ from core.utils.utils import ROOT_PATH
 from core.services.server_calendar import SERVER_CLOCK
 from core.services.trade_ledger import (
     LEDGER_PATH,
-    TradeEvent,
     TradeEventType,
-    append_trade_event,
+    finalize_trade_cycle,
+    load_trade_cycle_state,
     load_trade_week_state,
+    stable_trade_event_id,
 )
 
 
@@ -135,68 +136,133 @@ def record_completed_run(
     ledger_path: Path = LEDGER_PATH,
     cycle_id: str | None = None,
     confirmed_books: int = 0,
+    server_week_id: str | None = None,
 ) -> dict[str, Any] | None:
     state = load_weekly_plan()
     if not state:
         return None
-    previous_completed = int(state.get("completed_runs", 0))
-    completed = min(previous_completed + 1, int(state.get("total_runs", 0)))
     route = [str(city) for city in state.get("cycle", [])]
     now = SERVER_CLOCK.server_now()
-    cycle_id = cycle_id or f"{SERVER_CLOCK.server_week_id(now)}:{'|'.join(route)}:{completed}"
-    event_id = f"{cycle_id}:round-trip-complete"
+    next_sequence = int(state.get("completed_runs", 0)) + 1
+    cycle_id = cycle_id or f"{SERVER_CLOCK.server_week_id(now)}:{'|'.join(route)}:{next_sequence}"
+    frozen_week_id = server_week_id or SERVER_CLOCK.server_week_id(now)
+    event_id = stable_trade_event_id(
+        frozen_week_id,
+        "|".join(route),
+        cycle_id,
+        "|".join(route),
+        TradeEventType.CYCLE_COMPLETED,
+        0,
+    )
     committed_event_ids = list(state.get("committed_event_ids", []))
-    if event_id in committed_event_ids:
+    already_recorded_in_plan = event_id in committed_event_ids
+    cycle = load_trade_cycle_state(ledger_path, cycle_id)
+    if cycle.ready_to_finalize:
+        finalize_trade_cycle(ledger_path, cycle_id, observed_at=now)
+        cycle = load_trade_cycle_state(ledger_path, cycle_id)
+    if cycle.phase != "CYCLE_COMPLETED":
+        # Never advance the plan from a caller's boolean alone. Both leg facts
+        # must already exist in the ledger before a cycle can affect progress.
         return state
-    append_trade_event(
-        ledger_path,
-        TradeEvent(
-            event_id=event_id,
-            server_week_id=SERVER_CLOCK.server_week_id(now),
-            route_id="|".join(route),
-            cycle_id=cycle_id,
-            leg_id="|".join(route),
-            event_type=TradeEventType.ROUND_TRIP_COMPLETED,
-            origin=route[0] if route else "",
-            destination=route[0] if route else "",
-            observed_at=now,
-            confirmed_by="LEDGER_CONFIRMED",
-        ),
+    facts = load_trade_week_state(ledger_path, now=now)
+    fact_completed = (
+        facts.full_week_total
+        if facts.baseline_known
+        else facts.confirmed_delta_since_baseline
     )
-    state["completed_runs"] = completed
-    state["completed_books"] = int(state.get("completed_books", 0)) + max(
-        0, int(confirmed_books)
+    state["completed_runs"] = min(
+        max(int(state.get("completed_runs", 0)), int(fact_completed or 0)),
+        int(state.get("total_runs", 0)),
     )
-    state["committed_event_ids"] = (committed_event_ids + [event_id])[-500:]
+    if not already_recorded_in_plan:
+        state["completed_books"] = int(state.get("completed_books", 0)) + max(
+            0, int(confirmed_books)
+        )
+    if event_id not in committed_event_ids:
+        committed_event_ids.append(event_id)
+    state["committed_event_ids"] = committed_event_ids[-500:]
     state["updated_at"] = datetime.now().isoformat(timespec="seconds")
     _write_state(state)
     return state
 
 
-def remaining_batches(state: dict[str, Any] | None = None) -> list[dict]:
+def _effective_completed_runs(
+    state: dict[str, Any],
+    *,
+    ledger_path: Path = LEDGER_PATH,
+    now: datetime | None = None,
+) -> int:
+    facts = load_trade_week_state(ledger_path, now=now)
+    fact_completed = (
+        facts.full_week_total
+        if facts.baseline_known
+        else facts.confirmed_delta_since_baseline
+    )
+    return min(
+        max(int(state.get("completed_runs", 0)), int(fact_completed or 0)),
+        int(state.get("total_runs", 0)),
+    )
+
+
+def remaining_batches(
+    state: dict[str, Any] | None = None,
+    *,
+    ledger_path: Path = LEDGER_PATH,
+    now: datetime | None = None,
+) -> list[dict]:
     state = state or load_weekly_plan()
     if not state:
         return []
-    completed = int(state.get("completed_runs", 0))
+    completed = _effective_completed_runs(state, ledger_path=ledger_path, now=now)
     return _compress_runs(state.get("runs", [])[completed:])
 
 
-def progress_summary(state: dict[str, Any] | None = None) -> dict[str, Any] | None:
+def progress_summary(
+    state: dict[str, Any] | None = None,
+    *,
+    ledger_path: Path = LEDGER_PATH,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
     state = state or load_weekly_plan()
     if not state:
         return None
-    completed = int(state.get("completed_runs", 0))
+    completed = _effective_completed_runs(state, ledger_path=ledger_path, now=now)
     total = int(state.get("total_runs", 0))
     books_used = int(state.get("completed_books", 0))
     books_total = int(state.get("books_total", 0))
     remaining = max(0, total - completed)
-    batches = remaining_batches(state)
+    batches = remaining_batches(state, ledger_path=ledger_path, now=now)
     current = batches[0] if batches else None
-    facts = load_trade_week_state()
+    facts = load_trade_week_state(ledger_path, now=now)
     expected_profit = int(state.get("expected_profit", 0))
     expected_fatigue = float(state.get("cycle_fatigue", 0)) * total
     profit_per_fatigue = (
         round(expected_profit / expected_fatigue, 2) if expected_fatigue else 0.0
+    )
+    from core.services.trade_planning import plan_price_is_fresh, recommend_today_runs
+
+    available_weekly_fatigue = max(
+        0,
+        int(float(state.get("optimizer_config", {}).get("weekly_fatigue", 0)))
+        - int(facts.fatigue_used_for_trade),
+    )
+    current_books_per_cycle = (
+        sum(int(value) for value in current.get("books", {}).values())
+        if current
+        else 0
+    )
+    price_fresh = plan_price_is_fresh(state, now=now)
+    suggested_today = recommend_today_runs(
+        remaining_runs=remaining,
+        cycle_fatigue=float(state.get("cycle_fatigue", 0)),
+        available_fatigue=available_weekly_fatigue,
+        recoverable_fatigue=int(
+            (state.get("recovery_resources") or {}).get("confirmed_available", 0)
+        ),
+        purchase_books=max(0, books_total - books_used),
+        books_per_cycle=current_books_per_cycle,
+        partial_cycle=facts.current_partial_cycle,
+        price_fresh=price_fresh,
     )
     return {
         **state,
@@ -209,10 +275,20 @@ def progress_summary(state: dict[str, Any] | None = None) -> dict[str, Any] | No
         "server_week_id": facts.server_week_id,
         "progress_source": facts.source.value,
         "progress_confidence": facts.confidence,
+        "baseline_known": facts.baseline_known,
+        "baseline_round_trips": facts.baseline_round_trips,
+        "tracking_started_at": (
+            facts.tracking_started_at.isoformat(timespec="seconds")
+            if facts.tracking_started_at
+            else ""
+        ),
+        "confirmed_delta_since_baseline": facts.confirmed_delta_since_baseline,
+        "full_week_total": facts.full_week_total,
         "confirmed_round_trips": facts.confirmed_round_trips,
         "confirmed_legs": facts.confirmed_legs,
         "current_partial_cycle": facts.current_partial_cycle,
         "confirmed_books_used": facts.purchase_books_used,
+        "confirmed_trade_profit": facts.confirmed_profit,
         "last_reconciled_at": (
             facts.last_reconciled_at.isoformat(timespec="seconds")
             if facts.last_reconciled_at
@@ -232,4 +308,6 @@ def progress_summary(state: dict[str, Any] | None = None) -> dict[str, Any] | No
         "expected_total_net_profit": expected_profit,
         "expected_total_fatigue": round(expected_fatigue, 2),
         "expected_profit_per_fatigue": profit_per_fatigue,
+        "price_snapshot_fresh": price_fresh,
+        "today_suggested_runs": suggested_today,
     }

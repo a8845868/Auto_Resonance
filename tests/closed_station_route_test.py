@@ -29,8 +29,12 @@ def test_direct_two_city_route_defers_before_reading_closed_station_config():
 
 
 def test_adaptive_weekly_run_replaces_stale_closed_station_plan():
-    replacement = {"cycle": ["A", "B"], "books_used": 0}
-    saved = {"cycle": ["A", "B"]}
+    replacement = {
+        "cycle": ["A", "B"],
+        "books_used": 0,
+        "price_time": business.SERVER_CLOCK.server_now().isoformat(),
+    }
+    saved = dict(replacement)
 
     with patch.object(
         type(cfg.InventoryBooks), "value", new_callable=PropertyMock, return_value=0

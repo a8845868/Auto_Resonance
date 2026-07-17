@@ -10,7 +10,15 @@ from typing import Dict, Optional
 
 from loguru import logger
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QGridLayout,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QMessageBox,
+    QVBoxLayout,
+    QWidget,
+)
 from qfluentwidgets import ComboBox, ExpandLayout, ExpandSettingCard, PushSettingCard, SpinBox, SwitchSettingCard, qconfig
 from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import ScrollArea, InfoBar
@@ -124,6 +132,20 @@ class TwoRunBusinessInterface(ScrollArea):
             self.scrollWidget,
         )
         self.applyOptimizeCard.button.setEnabled(False)
+        self.syncWeeklyFactsCard = PushSettingCard(
+            "同步本周状态",
+            FIF.SYNC,
+            "同步本周事实",
+            "重新读取交易账本、迁移受支持的旧格式并刷新来源与审计时间",
+            self.scrollWidget,
+        )
+        self.calibrateWeeklyBaselineCard = PushSettingCard(
+            "校准本周基线",
+            FIF.EDIT,
+            "校准本周已完成往返",
+            "仅在游戏历史无法自动读取时人工建立本周截断点",
+            self.scrollWidget,
+        )
         self.optimizerWidget = QWidget(self.scrollWidget)
         self.optimizerWidget.setFixedHeight(275)
         optimizerLayout = QGridLayout(self.optimizerWidget)
@@ -306,6 +328,8 @@ class TwoRunBusinessInterface(ScrollArea):
         self.expandLayout.addWidget(self.liveOptimizeCard)
         self.expandLayout.addWidget(self.optimizerWidget)
         self.expandLayout.addWidget(self.applyOptimizeCard)
+        self.expandLayout.addWidget(self.syncWeeklyFactsCard)
+        self.expandLayout.addWidget(self.calibrateWeeklyBaselineCard)
         self.expandLayout.addWidget(self.prestigeGroup)
         self.expandLayout.addWidget(self.roleGroup)
         self.expandLayout.addWidget(self.buyCountCard)
@@ -314,6 +338,8 @@ class TwoRunBusinessInterface(ScrollArea):
     def connectSignalToSlot(self):
         self.liveOptimizeCard.clicked.connect(self.calculateLiveRoute)
         self.applyOptimizeCard.clicked.connect(self.applyOptimizedRoute)
+        self.syncWeeklyFactsCard.clicked.connect(self.syncWeeklyFacts)
+        self.calibrateWeeklyBaselineCard.clicked.connect(self.calibrateWeeklyBaseline)
         self.openBookPlannerButton.clicked.connect(lambda: signalBus.switchToCard.emit("BookPlannerInterface"))
         signalBus.bookBudgetChanged.connect(self.refreshBookBudget)
 
@@ -408,8 +434,39 @@ class TwoRunBusinessInterface(ScrollArea):
 
     def applyOptimizedRoute(self):
         from core.services import remaining_batches, save_weekly_plan
+        from core.services.server_calendar import SERVER_CLOCK
+        from core.services.trade_planning import (
+            StalePriceSnapshot,
+            build_executable_trade_plan,
+        )
 
         if not self.optimizationResult:
+            return
+        try:
+            preview_state = {
+                **self.optimizationResult,
+                "expected_profit": int(
+                    self.optimizationResult.get(
+                        "combined_profit", self.optimizationResult.get("profit", 0)
+                    )
+                ),
+                "books_total": int(self.optimizationResult.get("books_used", 0)),
+                "total_runs": int(self.optimizationResult.get("repeats", 1)),
+            }
+            build_executable_trade_plan(
+                preview_state,
+                now=SERVER_CLOCK.server_now(),
+                fatigue_budget=max(0, int(self.optimizerFatigueSpinBox.value())),
+                purchase_books=max(0, int(self.optimizerBooksSpinBox.value())),
+            )
+        except StalePriceSnapshot as error:
+            InfoBar.error(
+                title="价格快照不可执行",
+                content=str(error),
+                orient=Qt.Orientation.Horizontal,
+                isClosable=True,
+                parent=self,
+            )
             return
         cycle = self.optimizationResult["cycle"]
         state = save_weekly_plan(self.optimizationResult)
@@ -448,11 +505,12 @@ class TwoRunBusinessInterface(ScrollArea):
             self.weeklyProgressLabel.setText("本周尚未套用计划。请先实时计算，再点击“套用路线”。")
             return
         cycle = summary["cycle"]
-        confirmed = summary.get("confirmed_round_trips")
+        confirmed = summary.get("full_week_total")
         fact_text = (
-            "未知 / 待同步"
-            if confirmed is None
-            else f"{confirmed} 次已确认完整往返"
+            "历史未知，新版开始后已确认 "
+            f"{summary.get('confirmed_delta_since_baseline', 0)} 次"
+            if not summary.get("baseline_known")
+            else f"本周完整往返 {confirmed} 次（人工/权威基线 + 新增确认）"
         )
         source = summary.get("progress_source", "UNKNOWN")
         partial = summary.get("current_partial_cycle")
@@ -472,11 +530,7 @@ class TwoRunBusinessInterface(ScrollArea):
         current = summary["current_batch"]
         later_batches = summary["remaining_batches"][1:]
         later = "；完成后再跑 " + "；".join(self._format_batch(batch) for batch in later_batches) if later_batches else ""
-        from core.services.server_calendar import SERVER_CLOCK
-
-        today = SERVER_CLOCK.server_day_date()
-        days_left = max(1, 7 - today.weekday())
-        suggested_today = (summary["remaining_runs"] + days_left - 1) // days_left
+        suggested_today = int(summary.get("today_suggested_runs", 0))
         self.weeklyProgressLabel.setText(
             f"本周事实（{source}）：{fact_text}；{partial_text}；"
             f"已确认进货书 {summary.get('confirmed_books_used', 0)} 本\n"
@@ -489,6 +543,80 @@ class TwoRunBusinessInterface(ScrollArea):
             f"下一步动作：{self._format_batch(current)}{later}\n"
             f"今日建议：{suggested_today} 次完整往返；"
             f"预计剩余计划疲劳约 {round(summary['remaining_fatigue'])}"
+        )
+
+    def syncWeeklyFacts(self):
+        from core.services.trade_ledger import (
+            LedgerMigrationRequired,
+            LEDGER_PATH,
+            load_trade_week_state,
+            migrate_trade_ledger,
+        )
+
+        try:
+            migrate_trade_ledger(LEDGER_PATH)
+            facts = load_trade_week_state()
+        except LedgerMigrationRequired as error:
+            InfoBar.error(
+                title="账本需要显式迁移",
+                content=str(error),
+                orient=Qt.Orientation.Horizontal,
+                isClosable=True,
+                parent=self,
+            )
+            return
+        self.refreshWeeklyProgress()
+        InfoBar.success(
+            title="本周事实已同步",
+            content=(
+                f"来源 {facts.source.value}；追踪开始 "
+                f"{facts.tracking_started_at.isoformat(timespec='seconds') if facts.tracking_started_at else '尚无事件'}"
+            ),
+            orient=Qt.Orientation.Horizontal,
+            isClosable=True,
+            parent=self,
+        )
+
+    def calibrateWeeklyBaseline(self):
+        value, accepted = QInputDialog.getInt(
+            self,
+            "校准本周基线",
+            "请输入截至当前已经完成的完整往返次数：",
+            0,
+            0,
+            999,
+            1,
+        )
+        if not accepted:
+            return
+        confirmation = QMessageBox.question(
+            self,
+            "确认校准",
+            f"确认将当前本周完整往返基线设为 {value} 次？\n"
+            "校准会建立截断点，截断点前的部分周期不再自动恢复。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return
+        self.applyManualWeeklyBaseline(value)
+
+    def applyManualWeeklyBaseline(self, value: int):
+        from core.services.server_calendar import SERVER_CLOCK
+        from core.services.trade_ledger import LEDGER_PATH, reconcile_trade_baseline
+
+        reconcile_trade_baseline(
+            LEDGER_PATH,
+            max(0, int(value)),
+            observed_at=SERVER_CLOCK.server_now(),
+        )
+        self.refreshWeeklyProgress()
+        InfoBar.success(
+            title="本周基线已校准",
+            content=f"已记录 {max(0, int(value))} 次完整往返及审计时间",
+            orient=Qt.Orientation.Horizontal,
+            isClosable=True,
+            parent=self,
         )
 
     def routeCities(self):

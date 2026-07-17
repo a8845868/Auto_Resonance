@@ -295,8 +295,14 @@ def next_weekly_shop_reset(now: datetime | None = None) -> datetime:
     from core.services.server_calendar import SERVER_CLOCK
 
     current = now or datetime.now()
-    was_naive = current.tzinfo is None
-    aware = current.replace(tzinfo=SERVER_CLOCK.timezone) if was_naive else current
+    was_naive = current.tzinfo is None or current.utcoffset() is None
+    aware = (
+        current.replace(tzinfo=datetime.now().astimezone().tzinfo).astimezone(
+            SERVER_CLOCK.timezone
+        )
+        if was_naive
+        else current.astimezone(SERVER_CLOCK.timezone)
+    )
     target = SERVER_CLOCK.next_weekly_reset(aware)
     return target.replace(tzinfo=None) if was_naive else target
 

@@ -25,6 +25,15 @@ EMPTY_USAGE = {
 }
 
 
+def _observation(*, lunches, total, tiers=(), rest_area=False):
+    return {
+        "lunches_remaining": lunches,
+        "lunch_total_recovery": total,
+        "soda_price_tiers": tiers,
+        "rest_area_available": rest_area,
+    }
+
+
 def test_fatigue_resources_follow_the_five_am_game_day():
     assert fatigue_cycle(datetime(2026, 7, 13, 4, 59)) == "2026-07-12"
     assert fatigue_cycle(datetime(2026, 7, 13, 5, 0)) == "2026-07-13"
@@ -91,26 +100,38 @@ def test_daily_fatigue_task_is_independent_and_returns_explicit_result():
     ), patch.object(
         fatigue_recovery, "_open_exchange_buy_page", return_value=True
     ), patch.object(
-        fatigue_recovery, "_wait_strength", side_effect=[(612, 816), (12, 816)]
+        fatigue_recovery,
+        "_wait_strength",
+        side_effect=[(612, 816), (562, 816), (562, 816)],
     ), patch.object(
-        fatigue_recovery, "recover_strength", return_value=True
-    ) as recover, patch.object(
+        fatigue_recovery,
+        "observe_recovery_resources",
+        side_effect=[
+            _observation(lunches=0, total=None, tiers=("FREE",), rest_area=True),
+            _observation(lunches=0, total=None, rest_area=True),
+        ],
+    ), patch.object(
+        fatigue_recovery,
+        "execute_planned_recovery_action",
+        return_value={"success": True, "bubble_water_uses": 1},
+    ) as execute, patch.object(
         fatigue_recovery, "go_home", return_value=True
-    ) as go_home, patch.object(
-        fatigue_recovery, "rest_area_availability", return_value=True
     ), patch.object(
         fatigue_recovery, "record_fatigue_usage", return_value=EMPTY_USAGE
+    ), patch.object(
+        fatigue_recovery, "register_deferred_fatigue_actions"
+    ), patch.object(
+        fatigue_recovery, "_route_context", return_value=None
     ):
         result = fatigue_recovery.run_daily_fatigue_recovery()
 
-    recover.assert_called_once_with(
-        "buy", min_available=80, station_name="岚心城", usage={}
-    )
+    execute.assert_called_once()
     assert result["success"] is True
     assert result["before"] == 612
-    assert result["after"] == 12
-    assert result["restored"] == 600
-    assert "deferred" not in result
+    assert result["after"] == 562
+    assert result["restored"] == 50
+    assert result["progress_made"] is True
+    assert result["deferred"] is True
 
 
 def test_daily_fatigue_task_uses_safe_lunches_at_station_without_rest_area():
@@ -119,25 +140,40 @@ def test_daily_fatigue_task_uses_safe_lunches_at_station_without_rest_area():
     ), patch.object(
         fatigue_recovery, "_open_exchange_buy_page", return_value=True
     ), patch.object(
-        fatigue_recovery, "_wait_strength", side_effect=[(791, 816), (600, 816)]
+        fatigue_recovery,
+        "_wait_strength",
+        side_effect=[(791, 816), (600, 816), (600, 816)],
     ), patch.object(
-        fatigue_recovery, "recover_strength", return_value=True
-    ) as recover, patch.object(
+        fatigue_recovery,
+        "observe_recovery_resources",
+        side_effect=[
+            _observation(lunches=2, total=191),
+            _observation(lunches=0, total=None),
+        ],
+    ), patch.object(
+        fatigue_recovery,
+        "execute_planned_recovery_action",
+        return_value={
+            "success": True,
+            "lunch_batches": 1,
+            "lunch_fatigue_restored": 191,
+            "lunches_remaining": 0,
+        },
+    ) as execute, patch.object(
         fatigue_recovery, "go_home", return_value=True
     ) as go_home, patch.object(
-        fatigue_recovery, "rest_area_availability", return_value=False
-    ), patch.object(
         fatigue_recovery, "record_fatigue_usage", return_value=EMPTY_USAGE
+    ), patch.object(
+        fatigue_recovery, "register_deferred_fatigue_actions"
+    ), patch.object(
+        fatigue_recovery, "_route_context", return_value=None
     ):
         result = fatigue_recovery.run_daily_fatigue_recovery()
 
     assert result["success"] is True
     assert result["deferred"] is True
-    assert result["reason"] == "lunch_only_waiting_for_rest_area"
     assert result["restored"] == 191
-    recover.assert_called_once_with(
-        "buy", min_available=80, station_name="武林源", usage={}
-    )
+    execute.assert_called_once()
     go_home.assert_called_once()
 
 
@@ -149,20 +185,26 @@ def test_daily_fatigue_task_keeps_low_fatigue_plan_pending_at_no_rest_station():
     ), patch.object(
         fatigue_recovery, "_wait_strength", return_value=(12, 816)
     ), patch.object(
-        fatigue_recovery, "recover_strength", return_value=True
-    ) as recover, patch.object(
+        fatigue_recovery,
+        "observe_recovery_resources",
+        return_value=_observation(lunches=1, total=24),
+    ), patch.object(
+        fatigue_recovery, "execute_planned_recovery_action"
+    ) as execute, patch.object(
         fatigue_recovery, "go_home", return_value=True
     ) as go_home, patch.object(
-        fatigue_recovery, "rest_area_availability", return_value=False
-    ), patch.object(
         fatigue_recovery, "record_fatigue_usage", return_value=EMPTY_USAGE
-    ), patch.object(fatigue_recovery, "_route_context", return_value=None):
+    ), patch.object(
+        fatigue_recovery, "register_deferred_fatigue_actions"
+    ), patch.object(
+        fatigue_recovery, "_route_context", return_value=None
+    ):
         result = fatigue_recovery.run_daily_fatigue_recovery()
 
     assert result["success"] is True
     assert result["deferred"] is True
     assert result["status"] == "DEFER_UNTIL_FATIGUE"
-    recover.assert_not_called()
+    execute.assert_not_called()
     go_home.assert_called_once()
 
 
@@ -174,12 +216,20 @@ def test_daily_fatigue_task_defers_with_explicit_success_when_recovery_is_unneed
     ), patch.object(
         fatigue_recovery, "_wait_strength", return_value=(12, 816)
     ), patch.object(
-        fatigue_recovery, "recover_strength", return_value=False
+        fatigue_recovery,
+        "observe_recovery_resources",
+        return_value=_observation(lunches=1, total=24),
     ), patch.object(
+        fatigue_recovery, "execute_planned_recovery_action"
+    ) as execute, patch.object(
         fatigue_recovery, "go_home", return_value=True
     ) as go_home, patch.object(
         fatigue_recovery, "record_fatigue_usage", return_value=EMPTY_USAGE
-    ), patch.object(fatigue_recovery, "_route_context", return_value=None):
+    ), patch.object(
+        fatigue_recovery, "register_deferred_fatigue_actions"
+    ), patch.object(
+        fatigue_recovery, "_route_context", return_value=None
+    ):
         result = fatigue_recovery.run_daily_fatigue_recovery()
 
     assert result["success"] is True
@@ -188,4 +238,5 @@ def test_daily_fatigue_task_defers_with_explicit_success_when_recovery_is_unneed
     assert result["station"] == "test-station"
     assert result["before"] == 12
     assert result["maximum"] == 816
+    execute.assert_not_called()
     go_home.assert_called_once()

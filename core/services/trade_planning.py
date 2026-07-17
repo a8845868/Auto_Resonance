@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Any
+
+from core.services.server_calendar import SERVER_CLOCK
 
 
 @dataclass(frozen=True)
@@ -12,6 +15,15 @@ class TradeCandidate:
     net_profit: int
     fatigue: int
     books: int = 0
+    current_city: str = ""
+    partial_cycle: dict[str, Any] | None = None
+    cargo: int = 0
+    passenger_profit: int = 0
+    tax: float = 0.0
+    haggle: float = 0.0
+    markup: float = 0.0
+    return_cost: int = 0
+    recovery_resources: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -21,6 +33,10 @@ class TradePlan:
     expected_total_fatigue: int
     expected_profit_per_fatigue: float
     purchase_books_used: int
+
+
+class StalePriceSnapshot(RuntimeError):
+    """Raised when an executable plan is based on an expired price snapshot."""
 
 
 def choose_trade_plan(
@@ -82,3 +98,102 @@ def price_snapshot_is_fresh(
         raise ValueError("price snapshot timestamps must be timezone-aware")
     age = now - calculated_at.astimezone(now.tzinfo)
     return timedelta(0) <= age <= max_age
+
+
+def _parse_price_time(value: object) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        parsed = datetime.fromisoformat(value.strip())
+    else:
+        raise StalePriceSnapshot("trade plan has no confirmed price timestamp")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        local_zone = datetime.now().astimezone().tzinfo
+        parsed = parsed.replace(tzinfo=local_zone).astimezone(SERVER_CLOCK.timezone)
+    return parsed
+
+
+def build_executable_trade_plan(
+    state: dict[str, Any],
+    *,
+    now: datetime | None = None,
+    fatigue_budget: int,
+    purchase_books: int,
+) -> TradePlan:
+    """Validate prices and run the finite optimizer used before real execution."""
+
+    current = now or SERVER_CLOCK.server_now()
+    calculated_at = _parse_price_time(state.get("price_time"))
+    if not price_snapshot_is_fresh(calculated_at, now=current):
+        raise StalePriceSnapshot(
+            f"price snapshot expired: calculated_at={calculated_at.isoformat()} now={current.isoformat()}"
+        )
+    cycle = [str(city) for city in state.get("cycle", [])]
+    total_runs = max(1, int(state.get("total_runs", 1)))
+    per_cycle_profit = int(state.get("expected_profit", state.get("profit", 0)))
+    if int(state.get("total_runs", 0)) > 0:
+        per_cycle_profit //= total_runs
+    per_cycle_books = min(
+        max(0, int(purchase_books)),
+        max(0, int(state.get("books_total", 0)) // total_runs),
+    )
+    candidate = TradeCandidate(
+        route_id="|".join(cycle),
+        current_city=str(state.get("current_city", cycle[0] if cycle else "")),
+        partial_cycle=state.get("current_partial_cycle"),
+        net_profit=per_cycle_profit,
+        fatigue=max(1, int(round(float(state.get("cycle_fatigue", 0))))),
+        books=per_cycle_books,
+        cargo=int((state.get("optimizer_config") or {}).get("cargo", 0)),
+        passenger_profit=int(state.get("passenger_profit", 0)),
+        tax=float(state.get("tax", 0.0)),
+        haggle=float(state.get("haggle", 0.0)),
+        markup=float(state.get("markup", 0.0)),
+        return_cost=int(state.get("return_cost", 0)),
+        recovery_resources=dict(state.get("recovery_resources") or {}),
+    )
+    return choose_trade_plan(
+        (candidate,),
+        fatigue_budget=max(0, int(fatigue_budget)),
+        purchase_books=max(0, int(purchase_books)),
+    )
+
+
+def plan_price_is_fresh(
+    state: dict[str, Any], *, now: datetime | None = None
+) -> bool:
+    try:
+        calculated_at = _parse_price_time(state.get("price_time"))
+    except (StalePriceSnapshot, TypeError, ValueError):
+        return False
+    return price_snapshot_is_fresh(
+        calculated_at,
+        now=now or SERVER_CLOCK.server_now(),
+    )
+
+
+def recommend_today_runs(
+    *,
+    remaining_runs: int,
+    cycle_fatigue: float,
+    available_fatigue: int,
+    recoverable_fatigue: int,
+    purchase_books: int,
+    books_per_cycle: int,
+    partial_cycle: dict[str, Any] | None,
+    price_fresh: bool,
+) -> int:
+    """Bound today's recommendation by executable resources, not calendar division."""
+
+    if not price_fresh or remaining_runs <= 0 or cycle_fatigue <= 0:
+        return 0
+    fatigue_runs = int(
+        max(0, available_fatigue + recoverable_fatigue) // max(1, int(cycle_fatigue))
+    )
+    book_runs = (
+        remaining_runs
+        if books_per_cycle <= 0
+        else max(0, int(purchase_books)) // int(books_per_cycle)
+    )
+    partial_credit = 1 if partial_cycle and partial_cycle.get("confirmed_legs") else 0
+    return min(max(0, int(remaining_runs)), max(partial_credit, min(fatigue_runs, book_runs)))

@@ -63,7 +63,7 @@ def _patch_mumu_backends(monkeypatch, nemu, adb, events):
 def test_nemu_constructor_exception_falls_back_to_adb(monkeypatch):
     events = []
     adb = FakeBackend("adb", events)
-    _patch_mumu_backends(monkeypatch, RuntimeError("DLL load failed"), adb, events)
+    _patch_mumu_backends(monkeypatch, FileNotFoundError("DLL load failed"), adb, events)
 
     assert control_module.connect(16384) is True
     assert control_module.control is adb
@@ -72,7 +72,7 @@ def test_nemu_constructor_exception_falls_back_to_adb(monkeypatch):
 
 def test_nemu_connect_exception_closes_before_adb(monkeypatch):
     events = []
-    nemu = FakeBackend("nemu", events, error=RuntimeError("IPC failed"))
+    nemu = FakeBackend("nemu", events, error=FileNotFoundError("IPC failed"))
     adb = FakeBackend("adb", events)
     _patch_mumu_backends(monkeypatch, nemu, adb, events)
 

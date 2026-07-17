@@ -1,5 +1,7 @@
 """ALAS-inspired scheduler overview with integrated live log."""
 
+from datetime import datetime
+
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import QFrame, QLabel, QSizePolicy, QSplitter, QVBoxLayout, QWidget
 from qfluentwidgets import FluentIcon, PrimaryPushButton, ScrollArea
@@ -28,6 +30,57 @@ from core.services.task_schedule_state import (
     task_result_next_run,
     task_timing,
 )
+from core.services.daily_capabilities import DailyCapability, select_daily_capabilities
+from core.services.daily_rewards import DailyProgressSnapshot, RewardStrategy
+
+
+def select_reward_dependency_tasks(
+    capabilities: list[DailyCapability],
+    snapshot: DailyProgressSnapshot | None,
+    strategy: RewardStrategy,
+) -> list[QueuedTask]:
+    """Materialize only safe production tasks selected by the capability registry."""
+
+    return [
+        capability.run_factory()
+        for capability in select_daily_capabilities(capabilities, snapshot, strategy)
+    ]
+
+
+def _daily_capability_registry(tasks: list[QueuedTask]) -> list[DailyCapability]:
+    contributions = {
+        "resident_activity": (300, 1),
+        "run_business": (100, 1),
+        "passenger_build": (100, 1),
+    }
+    return [
+        DailyCapability(
+            task_key=task.key,
+            enabled=True,
+            automation_available=callable(task.run),
+            activity_contribution=contributions.get(task.key, (0, 0))[0],
+            handbook_contribution=contributions.get(task.key, (0, 0))[1],
+            premium_currency_risk=False,
+            prerequisites=(),
+            run_factory=lambda task=task: task,
+        )
+        for task in tasks
+        if task.key and task.key != "reward_collection"
+    ]
+
+
+def _last_reward_snapshot() -> DailyProgressSnapshot | None:
+    result = task_timing("reward_collection").get("result")
+    payload = result.get("snapshot_after") if isinstance(result, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        observed_at = payload.get("observed_at")
+        if isinstance(observed_at, str):
+            observed_at = datetime.fromisoformat(observed_at)
+        return DailyProgressSnapshot(**{**payload, "observed_at": observed_at})
+    except (TypeError, ValueError):
+        return None
 
 class StatusPanel(QFrame):
     def __init__(self, title, parent=None):
@@ -223,6 +276,27 @@ class DashboardInterface(ScrollArea):
     def _enabledTasks(self):
         tasks = self._allEnabledTasks()
         due = [task for task in tasks if not task.key or is_task_due(task.key)]
+        reward_task = next(
+            (task for task in due if task.key == "reward_collection"), None
+        )
+        if reward_task is not None:
+            try:
+                strategy = RewardStrategy(str(cfg.rewardStrategy.value))
+            except ValueError:
+                strategy = RewardStrategy.MAXIMIZE_PROGRESS
+            dependencies = select_reward_dependency_tasks(
+                _daily_capability_registry(tasks),
+                _last_reward_snapshot(),
+                strategy,
+            )
+            existing = {task.key for task in due}
+            insertion = due.index(reward_task)
+            for dependency in dependencies:
+                if dependency.key in existing:
+                    continue
+                due.insert(insertion, dependency)
+                insertion += 1
+                existing.add(dependency.key)
         waiting = []
         for task in tasks:
             if task in due:
@@ -320,6 +394,9 @@ class DashboardInterface(ScrollArea):
             self.queueWorker.stop()
             if self.currentTask == "扫荡与全域整备":
                 self.activityStateChanged.emit("■  已请求停止", "#f0a44b")
+        from core.services.fatigue_triggers import cancel_deferred_fatigue_actions
+
+        cancel_deferred_fatigue_actions()
 
     def _runDueTasks(self):
         """Wake scheduled tasks without keeping the queue worker blocked."""

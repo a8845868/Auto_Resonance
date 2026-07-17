@@ -31,6 +31,7 @@ from core.preset import click_station, get_station, go_outlets, wait_gbr
 from core.preset.control import click, go_home
 from core.preset.station import STATION
 from core.services.screen_state import is_train_in_transit
+from core.services.server_calendar import SERVER_CLOCK
 from core.services.task_schedule_state import (
     task_result_deferred,
     task_result_succeeded,
@@ -260,8 +261,12 @@ def _record_ledger_event(
     origin: str,
     destination: str,
     leg_id: str,
+    operation_sequence: int = 0,
     purchase_book_delta: int = 0,
-) -> None:
+    fatigue_delta: int = 0,
+    profit_delta: int = 0,
+    observed_at=None,
+) -> bool:
     if context is None:
         return
     from core.services.trade_ledger import (
@@ -269,24 +274,102 @@ def _record_ledger_event(
         TradeEvent,
         TradeEventType,
         append_trade_event,
+        stable_trade_event_id,
     )
     from core.services.server_calendar import SERVER_CLOCK
 
-    append_trade_event(
+    event_kind = TradeEventType(event_type)
+    when = observed_at or SERVER_CLOCK.server_now()
+    return append_trade_event(
         context.get("ledger_path", LEDGER_PATH),
         TradeEvent(
-            event_id=f"{context['cycle_id']}:{event_type}:{leg_id}",
+            event_id=stable_trade_event_id(
+                context["server_week_id"],
+                context["route_id"],
+                context["cycle_id"],
+                leg_id,
+                event_kind,
+                operation_sequence,
+            ),
             server_week_id=context["server_week_id"],
             route_id=context["route_id"],
             cycle_id=context["cycle_id"],
             leg_id=leg_id,
-            event_type=TradeEventType(event_type),
+            event_type=event_kind,
             origin=origin,
             destination=destination,
-            observed_at=SERVER_CLOCK.server_now(),
+            observed_at=when,
             confirmed_by="GAME_OBSERVED",
+            operation_sequence=max(0, int(operation_sequence)),
             purchase_book_delta=max(0, int(purchase_book_delta)),
+            fatigue_delta=max(0, int(fatigue_delta)),
+            profit_delta=int(profit_delta),
         ),
+    )
+
+
+def resume_action_for_leg(context: dict | None, leg_id: str) -> str:
+    """Return the first safe action after replaying one leg's confirmed facts."""
+
+    if context is None:
+        return "START"
+    from core.services.trade_ledger import LEDGER_PATH, load_trade_cycle_state
+
+    state = load_trade_cycle_state(
+        context.get("ledger_path", LEDGER_PATH), context["cycle_id"]
+    )
+    phases = {
+        str(item.get("event_type", ""))
+        for item in state.events
+        if str(item.get("leg_id", "")) == leg_id
+    }
+    if "LEG_COMPLETED" in phases:
+        return "COMPLETE"
+    if "SALE_CONFIRMED" in phases:
+        return "FINALIZE_LEG"
+    if "ARRIVAL_CONFIRMED" in phases:
+        return "SELL"
+    if "DEPARTURE_CONFIRMED" in phases:
+        return "WAIT_ARRIVAL"
+    if "PURCHASE_CONFIRMED" in phases:
+        return "DEPART"
+    if phases & {"BOOK_USE_CONFIRMED", "PURCHASE_BOOK_CONFIRMED", "LEG_STARTED", "LEG_PLANNED"}:
+        return "PURCHASE"
+    return "START"
+
+
+def should_issue_departure(
+    resume_action: str,
+    current_city: str,
+    destination: str,
+) -> bool:
+    """Prevent a replay from issuing an already confirmed departure."""
+
+    return resume_action != "WAIT_ARRIVAL" and current_city != destination
+
+
+def _cycle_books_used(context: dict | None) -> int:
+    if context is None:
+        return 0
+    from core.services.trade_ledger import LEDGER_PATH, load_trade_cycle_state
+
+    return load_trade_cycle_state(
+        context.get("ledger_path", LEDGER_PATH), context["cycle_id"]
+    ).purchase_books_used
+
+
+def _leg_books_used(context: dict | None, leg_id: str) -> int:
+    if context is None:
+        return 0
+    from core.services.trade_ledger import BOOK_EVENT_TYPES, LEDGER_PATH, load_trade_cycle_state
+
+    state = load_trade_cycle_state(
+        context.get("ledger_path", LEDGER_PATH), context["cycle_id"]
+    )
+    return sum(
+        max(0, int(item.get("purchase_book_delta", 0)))
+        for item in state.events
+        if item.get("leg_id") == leg_id and item.get("event_type") in BOOK_EVENT_TYPES
     )
 
 
@@ -348,27 +431,39 @@ def run(
         return False
     if routes.city_data[0].sell_city_name == city_name:
         routes.city_data = [routes.city_data[1], routes.city_data[0]]
+    in_flight_cycle = False
+    if ledger_context is not None:
+        from core.services.trade_ledger import LEDGER_PATH, load_trade_cycle_state
+
+        cycle_state = load_trade_cycle_state(
+            ledger_context.get("ledger_path", LEDGER_PATH),
+            ledger_context["cycle_id"],
+        )
+        in_flight_cycle = bool(cycle_state.events) and cycle_state.phase != "CYCLE_COMPLETED"
     # Interrupted runs can leave cargo from the other city in the warehouse.
     # Inspect the exchange sell page before buying, clear what is sellable in
     # the current city, then restock and depart as usual.
-    logger.info(
-        f"Preflight warehouse check in {city_name}: "
-        "sell residual cargo before restocking"
-    )
-    if resume_sell_page or is_sell_page():
-        logger.info("Already on the exchange sell page; resume the current sale state")
-    elif not go_business("sell"):
-        return False
-    residual_route = next(
-        (item for item in routes.city_data if item.sell_city_name == city_name),
-        None,
-    )
-    residual_goods = list(residual_route.goods_data) if residual_route else []
-    residual_result = _clear_residual_cargo(residual_goods)
-    if task_result_deferred(residual_result):
-        return residual_result
-    if not residual_result:
-        return False
+    if in_flight_cycle:
+        logger.info("检测到有事务事件的未完成周期，跳过清仓预检并按阶段恢复")
+    else:
+        logger.info(
+            f"Preflight warehouse check in {city_name}: "
+            "sell residual cargo before restocking"
+        )
+        if resume_sell_page or is_sell_page():
+            logger.info("Already on the exchange sell page; resume the current sale state")
+        elif not go_business("sell"):
+            return False
+        residual_route = next(
+            (item for item in routes.city_data if item.sell_city_name == city_name),
+            None,
+        )
+        residual_goods = list(residual_route.goods_data) if residual_route else []
+        residual_result = _clear_residual_cargo(residual_goods)
+        if task_result_deferred(residual_result):
+            return residual_result
+        if not residual_result:
+            return False
     route_items = list(routes.city_data)
     if ledger_context and int(ledger_context.get("completed_legs", 0)) == 1:
         origin = ledger_context.get("origin")
@@ -383,55 +478,162 @@ def run(
                 f"从账本恢复部分往返 {ledger_context['cycle_id']}："
                 f"仅继续 {city_name} → {origin}"
             )
-    confirmed_books = 0
+    _record_ledger_event(
+        ledger_context,
+        "CYCLE_STARTED",
+        origin=ledger_context.get("origin", city_name) if ledger_context else city_name,
+        destination=ledger_context.get("origin", city_name) if ledger_context else city_name,
+        leg_id="",
+    )
     for city in route_items:
         logger.info(f"{city.buy_city_name}->{city.sell_city_name}")
-        if not click_station(city.buy_city_name, cur_station=city_name).wait():
-            logger.error(f"无法到达买货城市 {city.buy_city_name}，停止本次跑商")
-            return False
-        if not go_business("buy"):
-            return False
-        buy_haggle = prepare_negotiation("buy", min(city.haggle_num, 2))
+        leg_id = f"{city.buy_city_name}|{city.sell_city_name}"
+        resume_action = resume_action_for_leg(ledger_context, leg_id)
+        if resume_action == "COMPLETE":
+            logger.info(f"账本已确认腿 {leg_id} 完成，跳过重放")
+            city_name = city.sell_city_name
+            continue
+        if resume_action == "FINALIZE_LEG":
+            _record_ledger_event(
+                ledger_context,
+                "LEG_COMPLETED",
+                origin=city.buy_city_name,
+                destination=city.sell_city_name,
+                leg_id=leg_id,
+            )
+            from core.services.fatigue_triggers import notify_fatigue_event
+
+            notify_fatigue_event("leg_completed", city.sell_city_name)
+            city_name = city.sell_city_name
+            continue
+        if resume_action == "START":
+            _record_ledger_event(
+                ledger_context,
+                "LEG_PLANNED",
+                origin=city.buy_city_name,
+                destination=city.sell_city_name,
+                leg_id=leg_id,
+            )
+            _record_ledger_event(
+                ledger_context,
+                "LEG_STARTED",
+                origin=city.buy_city_name,
+                destination=city.sell_city_name,
+                leg_id=leg_id,
+            )
         travel_cost = int(
             _city_tired_data.get(f"{city.buy_city_name}-{city.sell_city_name}", 0)
         )
-        if buy_haggle == 0 and not can_afford_fatigue(travel_cost):
-            logger.warning(
-                "恢复资源已用完，剩余疲劳不足以到达下一城市，本轮不进货并暂停"
+        if resume_action in {"START", "PURCHASE"}:
+            if city_name != city.buy_city_name:
+                if not click_station(city.buy_city_name, cur_station=city_name).wait():
+                    logger.error(f"无法到达买货城市 {city.buy_city_name}，停止本次跑商")
+                    return False
+                city_name = city.buy_city_name
+            if not go_business("buy"):
+                return False
+            buy_haggle = prepare_negotiation("buy", min(city.haggle_num, 2))
+            if buy_haggle == 0 and not can_afford_fatigue(travel_cost):
+                logger.warning(
+                    "恢复资源已用完，剩余疲劳不足以到达下一城市，本轮不进货并暂停"
+                )
+                return _fatigue_deferral(
+                    "insufficient_fatigue_for_route",
+                    required_available=travel_cost,
+                ) or False
+            confirmed_before = _leg_books_used(ledger_context, leg_id)
+
+            def book_committed(sequence: int):
+                _record_ledger_event(
+                    ledger_context,
+                    "BOOK_USE_CONFIRMED",
+                    origin=city.buy_city_name,
+                    destination=city.sell_city_name,
+                    leg_id=leg_id,
+                    operation_sequence=sequence,
+                    purchase_book_delta=1,
+                )
+
+            def purchase_committed():
+                _record_ledger_event(
+                    ledger_context,
+                    "PURCHASE_CONFIRMED",
+                    origin=city.buy_city_name,
+                    destination=city.sell_city_name,
+                    leg_id=leg_id,
+                )
+
+            goods_data = list(city.goods_data.keys())
+            buy_result = buy_business(
+                goods_data[:1],
+                goods_data[1:],
+                buy_haggle,
+                max_book=city.book,
+                detailed=ledger_context is not None,
+                confirmed_books=confirmed_before,
+                on_book_confirmed=book_committed,
+                on_purchase_confirmed=purchase_committed,
             )
-            return _fatigue_deferral(
-                "insufficient_fatigue_for_route",
-                required_available=travel_cost,
-            ) or False
-        goods_data = list(city.goods_data.keys())
-        buy_result = buy_business(
-            goods_data[:1],
-            goods_data[1:],
-            buy_haggle,
-            max_book=city.book,
-            detailed=ledger_context is not None,
-        )
-        if not buy_result:
-            return False
-        books_used = (
-            int(buy_result.get("confirmed_books", 0))
-            if isinstance(buy_result, dict)
-            else 0
-        )
-        confirmed_books += books_used
-        if books_used:
+            if not buy_result:
+                return False
+            # Full-cargo verification is also a confirmed purchase outcome and
+            # does not invoke the click callback; the stable event deduplicates.
             _record_ledger_event(
                 ledger_context,
-                "PURCHASE_BOOK_CONFIRMED",
+                "PURCHASE_CONFIRMED",
                 origin=city.buy_city_name,
                 destination=city.sell_city_name,
-                leg_id=f"{city.buy_city_name}|{city.sell_city_name}",
-                purchase_book_delta=books_used,
+                leg_id=leg_id,
             )
-        if not click_station(city.sell_city_name, cur_station=city_name).wait():
-            logger.error(f"无法到达卖货城市 {city.sell_city_name}，停止本次跑商")
-            return False
-        if not go_business("sell"):
+        if resume_action in {"START", "PURCHASE", "DEPART", "WAIT_ARRIVAL"}:
+            before_travel = None
+            after_travel = None
+            if should_issue_departure(
+                resume_action, city_name, city.sell_city_name
+            ):
+                before_travel = read_strength()
+                travel = click_station(
+                    city.sell_city_name, cur_station=city.buy_city_name
+                )
+                _record_ledger_event(
+                    ledger_context,
+                    "DEPARTURE_CONFIRMED",
+                    origin=city.buy_city_name,
+                    destination=city.sell_city_name,
+                    leg_id=leg_id,
+                )
+                if not travel.wait():
+                    logger.error(f"无法到达卖货城市 {city.sell_city_name}，停止本次跑商")
+                    return False
+                after_travel = read_strength()
+            elif city_name != city.sell_city_name:
+                logger.info(
+                    f"账本已确认 {leg_id} 发车，当前尚未确认到站；等待下一次安全复核"
+                )
+                return {
+                    "success": True,
+                    "deferred": True,
+                    "progress_made": False,
+                    "reason": "departure_confirmed_waiting_for_arrival",
+                    "cycle_id": ledger_context["cycle_id"],
+                }
+            actual_fatigue = (
+                max(0, int(after_travel[0]) - int(before_travel[0]))
+                if before_travel and after_travel
+                else 0
+            )
+            _record_ledger_event(
+                ledger_context,
+                "ARRIVAL_CONFIRMED",
+                origin=city.buy_city_name,
+                destination=city.sell_city_name,
+                leg_id=leg_id,
+                fatigue_delta=actual_fatigue,
+            )
+            from core.services.fatigue_triggers import notify_fatigue_event
+
+            notify_fatigue_event("arrival", city.sell_city_name)
+        if not (is_sell_page() or go_business("sell")):
             return False
         # Selling profit is always maximized: pursue the game's two-success cap
         # regardless of the per-city buy-side haggle setting.
@@ -441,19 +643,38 @@ def run(
                 "insufficient_fatigue_for_endpoint_sale",
                 required_available=80,
             ) or False
-        if not sell_business(
+        sell_result = sell_business(
             sell_haggle,
             expected_goods=list(city.goods_data),
-        ):
+            detailed=ledger_context is not None,
+        )
+        if not sell_result:
             logger.error("卖货未完成，不将本轮记为完成")
             return False
+        confirmed_profit = (
+            int(sell_result.get("confirmed_profit", 0))
+            if isinstance(sell_result, dict)
+            else 0
+        )
+        _record_ledger_event(
+            ledger_context,
+            "SALE_CONFIRMED",
+            origin=city.buy_city_name,
+            destination=city.sell_city_name,
+            leg_id=leg_id,
+            profit_delta=confirmed_profit,
+        )
+        from core.services.fatigue_triggers import notify_fatigue_event
+
+        notify_fatigue_event("sale_confirmed", city.sell_city_name)
         _record_ledger_event(
             ledger_context,
             "LEG_COMPLETED",
             origin=city.buy_city_name,
             destination=city.sell_city_name,
-            leg_id=f"{city.buy_city_name}|{city.sell_city_name}",
+            leg_id=leg_id,
         )
+        notify_fatigue_event("leg_completed", city.sell_city_name)
         # 流程跑完，更改站点名称为当前出售商品的站点
         city_name = city.sell_city_name
     logger.info("运行完成")
@@ -461,7 +682,7 @@ def run(
         return {
             "success": True,
             "cycle_id": ledger_context["cycle_id"],
-            "confirmed_books": confirmed_books,
+            "confirmed_books": _cycle_books_used(ledger_context),
         }
     return True
 
@@ -498,6 +719,47 @@ def run_with_recovery(
                 return False
             logger.info(f"已确认当前城市 {state.city}，重新核对路线后继续本轮")
     return False
+
+
+def execute_weekly_cycle(
+    routes: RoutesModel,
+    ledger_context: dict,
+    *,
+    runner=None,
+    now=None,
+):
+    """Execute or deterministically finalize one persisted weekly cycle."""
+
+    from core.services.trade_ledger import (
+        LEDGER_PATH,
+        finalize_trade_cycle,
+        load_trade_cycle_state,
+    )
+
+    path = ledger_context.get("ledger_path", LEDGER_PATH)
+    cycle_id = ledger_context["cycle_id"]
+    state = load_trade_cycle_state(path, cycle_id)
+    if state.phase == "CYCLE_COMPLETED":
+        return {
+            "success": True,
+            "cycle_id": cycle_id,
+            "confirmed_books": state.purchase_books_used,
+            "finalized_without_route_rerun": True,
+        }
+    if state.ready_to_finalize:
+        finalize_trade_cycle(path, cycle_id, observed_at=now)
+        finalized = load_trade_cycle_state(path, cycle_id)
+        return {
+            "success": True,
+            "cycle_id": cycle_id,
+            "confirmed_books": finalized.purchase_books_used,
+            "finalized_without_route_rerun": True,
+        }
+    execute = runner or run_with_recovery
+    result = execute(routes, ledger_context=ledger_context)
+    if task_result_succeeded(result):
+        finalize_trade_cycle(path, cycle_id, observed_at=now)
+    return result
 
 
 def two_city_run(buy_city_name: str, sell_city_name: str):
@@ -555,7 +817,7 @@ def two_city_weekly_run(
     """
     from core.services import record_completed_run
     from core.services.server_calendar import SERVER_CLOCK
-    from core.services.trade_ledger import load_trade_week_state
+    from core.services.trade_ledger import LEDGER_PATH, find_recoverable_cycle
 
     global STOP
     STOP = False
@@ -574,19 +836,20 @@ def two_city_weekly_run(
         logger.info(f"周计划阶段 {batch_index}/{len(execution_batches)}: {batch_runs} 次完整往返，进货书 {books}")
         for _ in range(batch_runs):
             route_id = f"{buy_city_name}|{sell_city_name}"
-            facts = load_trade_week_state()
-            partial = facts.current_partial_cycle
-            if partial and partial.get("route_id") == route_id:
-                cycle_id = str(partial["cycle_id"])
-                completed_legs = int(partial.get("confirmed_legs", 0))
+            recoverable = find_recoverable_cycle(LEDGER_PATH, route_id)
+            if recoverable is not None:
+                cycle_id = recoverable.cycle_id
+                completed_legs = len(recoverable.completed_leg_ids)
+                server_week_id = recoverable.server_week_id
             else:
                 cycle_id = uuid.uuid4().hex
                 completed_legs = 0
+                server_week_id = SERVER_CLOCK.server_week_id()
             ledger_context = {
                 "cycle_id": cycle_id,
                 "route_id": route_id,
                 "origin": buy_city_name,
-                "server_week_id": SERVER_CLOCK.server_week_id(),
+                "server_week_id": server_week_id,
                 "completed_legs": completed_legs,
             }
             routes = RoutesModel(
@@ -607,7 +870,7 @@ def two_city_weekly_run(
                     ),
                 ]
             )
-            result = run_with_recovery(routes, ledger_context=ledger_context)
+            result = execute_weekly_cycle(routes, ledger_context)
             if task_result_deferred(result):
                 logger.info(
                     f"周计划资源暂缓，本次已完成 {completed}/{total_runs} 次完整往返"
@@ -625,6 +888,7 @@ def two_city_weekly_run(
                     if isinstance(result, dict)
                     else 0
                 ),
+                server_week_id=server_week_id,
             )
             if completed >= run_limit and completed < total_runs:
                 logger.info(
@@ -648,6 +912,10 @@ def adaptive_weekly_run():
         remaining_batches,
         roll_weekly_plan_forward,
         save_weekly_plan,
+    )
+    from core.services.trade_planning import (
+        StalePriceSnapshot,
+        build_executable_trade_plan,
     )
 
     state = load_weekly_plan()
@@ -687,8 +955,26 @@ def adaptive_weekly_run():
         from qfluentwidgets import qconfig
         qconfig.set(cfg.InventoryBooks, actual)
     required = int(summary["remaining_books"])
+    price_invalid = False
+    try:
+        executable = build_executable_trade_plan(
+            state,
+            now=SERVER_CLOCK.server_now(),
+            fatigue_budget=max(0, int(summary["remaining_fatigue"])),
+            purchase_books=max(0, int(available)),
+        )
+        logger.info(
+            "执行前实时计划已通过价格时效与有限预算校验："
+            f"预计净利润 {executable.expected_total_net_profit}，"
+            f"疲劳 {executable.expected_total_fatigue}"
+        )
+    except StalePriceSnapshot as error:
+        logger.warning(f"现有周计划价格不可执行，强制重新读取并优化: {error}")
+        price_invalid = True
     needs_reoptimization = (
-        bool(state.get("needs_reoptimization")) or bool(unavailable_cycle)
+        bool(state.get("needs_reoptimization"))
+        or bool(unavailable_cycle)
+        or price_invalid
     ) and not sell_resume
     if available >= required and not needs_reoptimization:
         logger.info(f"进货书库存 {available} 本，足够完成剩余计划（需要 {required} 本）")
@@ -717,11 +1003,20 @@ def adaptive_weekly_run():
     try:
         replacement = optimize_live_routes(OptimizationConfig(**raw_config))
         state = save_weekly_plan(replacement)
+        build_executable_trade_plan(
+            state,
+            now=SERVER_CLOCK.server_now(),
+            fatigue_budget=max(0, int(summary["remaining_fatigue"])),
+            purchase_books=max(0, int(available)),
+        )
         cycle = state["cycle"]
         logger.info(f"已切换替代路线: {cycle[0]} → {cycle[1]} → {cycle[0]}，计划使用 {replacement['books_used']} 本")
         return two_city_weekly_run(cycle[0], cycle[1], remaining_batches(state), max_runs=1)
     except StopExecution:
         raise
+    except StalePriceSnapshot:
+        logger.exception("重新计算后的价格快照仍不可执行，阻止真实跑商")
+        return False
     except Exception:
         if unavailable_cycle:
             logger.exception(
@@ -746,4 +1041,7 @@ def stop():
     """
     global STOP
     STOP = True
+    from core.services.fatigue_triggers import cancel_deferred_fatigue_actions
+
+    cancel_deferred_fatigue_actions()
     stop_control()

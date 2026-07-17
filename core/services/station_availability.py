@@ -18,8 +18,10 @@ KNOWN_LIMITED_STATIONS = frozenset({"武林源"})
 
 def _local_time(at: datetime | None = None) -> datetime:
     value = at or datetime.now(LOCAL_TIMEZONE)
-    if value.tzinfo is None:
-        return value.replace(tzinfo=LOCAL_TIMEZONE)
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(
+            tzinfo=datetime.now().astimezone().tzinfo
+        ).astimezone(LOCAL_TIMEZONE)
     return value.astimezone(LOCAL_TIMEZONE)
 
 

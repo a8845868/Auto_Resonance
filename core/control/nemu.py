@@ -14,6 +14,10 @@ from core.control.nemu_dll.nemu_dll import init
 from core.model import app
 from core.services.repair_safety import ensure_automation_allowed
 
+
+class IPCUnavailableError(OSError):
+    """Known environment failure indicating that NEMU IPC cannot be loaded."""
+
 def swipe_path(p0, p3, time):
     path = []
     p0 = np.array(p0)
