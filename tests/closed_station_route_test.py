@@ -25,6 +25,7 @@ def test_direct_two_city_route_defers_before_reading_closed_station_config():
         "deferred": True,
         "reason": "route_station_unavailable",
         "stations": ["武林源"],
+        "next_run_at": result["next_run_at"],
     }
 
 
@@ -33,6 +34,10 @@ def test_adaptive_weekly_run_replaces_stale_closed_station_plan():
         "cycle": ["A", "B"],
         "books_used": 0,
         "price_time": business.SERVER_CLOCK.server_now().isoformat(),
+        "expected_profit": 100,
+        "cycle_fatigue": 10,
+        "total_runs": 1,
+        "books_total": 0,
     }
     saved = dict(replacement)
 
