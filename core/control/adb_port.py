@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from os import path
+from pathlib import Path
 from subprocess import run
 
 import psutil
@@ -54,12 +55,15 @@ class EmulatorInfo:
 
     @staticmethod
     def from_dict(data: dict) -> "EmulatorInfo":
+        raw_index = data.get("index", 0)
+        if raw_index is None:
+            raise ValueError("MuMu 实例 ID 不能为空；0 是合法实例 ID")
         return EmulatorInfo(
             name=data["name"],
             port=data.get("port"),
             path=data["path"],
             type=EmulatorType(data["type"]),
-            index=data.get("index", 0),
+            index=int(raw_index),
         )
     
     @property
@@ -83,6 +87,83 @@ EMULATOR_DATA = {
         type=EmulatorType.MUMUV4,
     ),
 }
+
+
+class EmulatorPathError(ValueError):
+    """Raised when a configured emulator path cannot identify a launcher."""
+
+
+@dataclass(frozen=True)
+class MuMuLauncher:
+    executable: Path
+    install_root: Path
+
+
+def resolve_mumu_launcher(device: EmulatorInfo) -> MuMuLauncher:
+    """Resolve a MuMu install root, launcher directory, or explicit launcher.
+
+    MuMu V5 installations expose identical ``MuMuManager.exe`` and
+    ``mumu-cli.exe`` entry points in ``nx_main``.  Resolution is deliberately
+    finite and name-based; never select an arbitrary executable recursively.
+    """
+
+    raw_path = str(device.path or "").strip().strip('"')
+    if not raw_path:
+        raise EmulatorPathError("MuMu 安装路径无效：配置为空")
+    expanded = os.path.expandvars(os.path.expanduser(raw_path))
+    configured = Path(os.path.abspath(expanded))
+    supported_names = {"mumumanager.exe", "mumu-cli.exe"}
+
+    if configured.is_file():
+        if configured.name.lower() not in supported_names:
+            raise EmulatorPathError(
+                f"未找到受支持的启动器：{raw_path}（仅支持 MuMuManager.exe 或 mumu-cli.exe）"
+            )
+        if device.type == EmulatorType.MUMUV5:
+            if configured.parent.name.lower() != "nx_main":
+                raise EmulatorPathError(
+                    f"MuMu V5 启动器不在 nx_main 目录：{raw_path}"
+                )
+            install_root = configured.parent.parent
+        else:
+            install_root = (
+                configured.parent.parent
+                if configured.parent.name.lower() == "shell"
+                else configured.parent
+            )
+        return MuMuLauncher(configured, install_root)
+
+    if not configured.is_dir():
+        raise EmulatorPathError(f"MuMu 安装路径无效：{raw_path}")
+
+    if device.type == EmulatorType.MUMUV5:
+        launcher_dir = (
+            configured
+            if configured.name.lower() == "nx_main"
+            else configured / "nx_main"
+        )
+        install_root = launcher_dir.parent
+    else:
+        launcher_dir = (
+            configured if configured.name.lower() == "shell" else configured / "shell"
+        )
+        install_root = launcher_dir.parent
+
+    candidates = (
+        launcher_dir / "MuMuManager.exe",
+        launcher_dir / "mumu-cli.exe",
+    )
+    if device.type == EmulatorType.MUMUV4:
+        candidates += (
+            configured / "MuMuManager.exe",
+            configured / "mumu-cli.exe",
+        )
+    executable = next((item for item in candidates if item.is_file()), None)
+    if executable is None:
+        raise EmulatorPathError(
+            f"未找到受支持的启动器：{raw_path}（已检查 MuMuManager.exe 和 mumu-cli.exe）"
+        )
+    return MuMuLauncher(executable, install_root)
 
 
 def get_mumu_info(exe_path: str, data: EmulatorDataItem):
@@ -144,15 +225,15 @@ def get_configured_mumu_info(device: EmulatorInfo) -> list[EmulatorInfo]:
 
     if not device.is_mumu or not device.path:
         return []
-    if device.type == EmulatorType.MUMUV5:
-        manager_path = path.join(device.path, "nx_main", "MuMuManager.exe")
-    else:
-        manager_path = path.join(device.path, "shell", "MuMuManager.exe")
-        if not path.isfile(manager_path):
-            manager_path = path.join(device.path, "MuMuManager.exe")
-    if not path.isfile(manager_path):
+    try:
+        launcher = resolve_mumu_launcher(device)
+    except EmulatorPathError:
         return []
-    return get_mumu_manager_info(manager_path, device.path, device.type)
+    return get_mumu_manager_info(
+        str(launcher.executable),
+        str(launcher.install_root),
+        device.type,
+    )
 
 
 def get_default_mumu_info() -> list[EmulatorInfo]:

@@ -48,6 +48,9 @@ def test_high_level_connect_is_blocked_before_device_discovery(monkeypatch):
 def test_mumu_manager_is_blocked_before_subprocess(monkeypatch, tmp_path):
     monkeypatch.setenv("HEIYUE_CODEX_REPAIR", "yes")
     calls = []
+    launcher_dir = tmp_path / "nx_main"
+    launcher_dir.mkdir()
+    (launcher_dir / "MuMuManager.exe").write_bytes(b"")
     device = EmulatorInfo(
         name="repair-test",
         port=16384,

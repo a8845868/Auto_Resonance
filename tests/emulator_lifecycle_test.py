@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import core.services.emulator_lifecycle as emulator_lifecycle
 from core.control.adb_port import EmulatorInfo, EmulatorType
 from core.services.emulator_lifecycle import (
     GAME_PACKAGE,
@@ -27,6 +28,18 @@ def _device(index=5, port=16544, emulator_type=EmulatorType.MUMUV5):
         type=emulator_type,
         index=index,
     )
+
+
+def _manager_device(tmp_path, *, index=5, emulator_type=EmulatorType.MUMUV5):
+    root = tmp_path / "MuMu"
+    launcher_dir = root / (
+        "nx_main" if emulator_type == EmulatorType.MUMUV5 else "shell"
+    )
+    launcher_dir.mkdir(parents=True)
+    (launcher_dir / "MuMuManager.exe").write_bytes(b"")
+    device = _device(index=index, emulator_type=emulator_type)
+    device.path = str(root)
+    return device
 
 
 class FakeClock:
@@ -57,6 +70,8 @@ class FakeAdbState:
 
             def shell(self, command, **_kwargs):
                 state.commands.append((port, command))
+                if command == "getprop sys.boot_completed":
+                    return "1"
                 if command == f"pidof {GAME_PACKAGE}":
                     return "2468" if state.running else ""
                 if command.startswith("monkey "):
@@ -122,7 +137,7 @@ class FakeManager:
         return ""
 
 
-def test_mumu_manager_targets_exact_v5_index_and_parses_flat_info():
+def test_mumu_manager_targets_exact_v5_index_and_parses_flat_info(tmp_path):
     calls = []
 
     def runner(argv, **_kwargs):
@@ -134,7 +149,7 @@ def test_mumu_manager_targets_exact_v5_index_and_parses_flat_info():
             )
         return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
-    client = MuMuManagerClient(_device(), runner=runner)
+    client = MuMuManagerClient(_manager_device(tmp_path), runner=runner)
     assert client.info()["index"] == "5"
     client.launch_emulator()
     client.shutdown_emulator()
@@ -158,7 +173,7 @@ def test_mumu_manager_targets_exact_v5_index_and_parses_flat_info():
     assert str(client.executable).endswith(r"nx_main\MuMuManager.exe")
 
 
-def test_mumu_manager_supports_nested_info_and_v4_path():
+def test_mumu_manager_supports_nested_info_and_v4_path(tmp_path):
     def runner(argv, **_kwargs):
         return subprocess.CompletedProcess(
             argv,
@@ -168,26 +183,79 @@ def test_mumu_manager_supports_nested_info_and_v4_path():
         )
 
     client = MuMuManagerClient(
-        _device(index=2, emulator_type=EmulatorType.MUMUV4), runner=runner
+        _manager_device(tmp_path, index=2, emulator_type=EmulatorType.MUMUV4),
+        runner=runner,
     )
     assert client.info()["name"] == "二号"
     assert str(client.executable).endswith(r"shell\MuMuManager.exe")
 
 
-def test_manager_errors_are_explicit():
+def test_manager_errors_are_explicit(tmp_path):
     def runner(argv, **_kwargs):
         return subprocess.CompletedProcess(argv, 7, stdout="", stderr="bad index")
 
     with pytest.raises(LifecycleError, match="bad index"):
-        MuMuManagerClient(_device(), runner=runner).info()
+        MuMuManagerClient(_manager_device(tmp_path), runner=runner).info()
 
 
-def test_manager_timeout_is_wrapped_as_lifecycle_error():
+def test_manager_timeout_is_wrapped_as_lifecycle_error(tmp_path):
     def runner(argv, **_kwargs):
         raise subprocess.TimeoutExpired(argv, 1)
 
     with pytest.raises(LifecycleError, match="命令超时"):
-        MuMuManagerClient(_device(), runner=runner, timeout=1).info()
+        MuMuManagerClient(
+            _manager_device(tmp_path), runner=runner, timeout=1
+        ).info()
+
+
+def test_default_manager_timeout_kills_descendants_before_reaping_pipes(
+    monkeypatch,
+):
+    events = []
+
+    class Child:
+        def kill(self):
+            events.append("child-kill")
+
+    class Root:
+        def children(self, *, recursive):
+            assert recursive is True
+            return [Child()]
+
+    class Process:
+        pid = 1234
+        returncode = None
+
+        def __init__(self, argv, **kwargs):
+            events.append((argv, kwargs))
+            self.communicate_calls = 0
+
+        def communicate(self, *, timeout):
+            self.communicate_calls += 1
+            if self.communicate_calls == 1:
+                raise subprocess.TimeoutExpired(["MuMuManager"], timeout)
+            return "partial-out", "partial-err"
+
+        def kill(self):
+            events.append("parent-kill")
+            self.returncode = 1
+
+    monkeypatch.setattr(emulator_lifecycle.subprocess, "Popen", Process)
+    monkeypatch.setattr(emulator_lifecycle.psutil, "Process", lambda _pid: Root())
+
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        emulator_lifecycle._run_subprocess_tree(
+            ["MuMuManager", "sh"],
+            timeout=1,
+            correlation_id="test-correlation",
+            shell=False,
+            capture_output=True,
+            text=True,
+        )
+
+    assert events[-2:] == ["child-kill", "parent-kill"]
+    assert caught.value.output == "partial-out"
+    assert caught.value.stderr == "partial-err"
 
 
 def test_ensure_ready_cold_starts_exact_instance_and_game():
@@ -226,6 +294,7 @@ def test_existing_game_start_is_idempotent():
     lifecycle.ensure_game_ready()
 
     assert manager.events == []
+    assert manager.shell_commands == []
 
 
 def test_game_restart_is_close_force_stop_then_launch():
@@ -449,6 +518,7 @@ def test_running_v5_waits_for_android_boot_without_auto_launch():
 
     assert ready.port == 16544
     assert manager.events == []
+    assert adb.commands[-1] == (16544, "getprop sys.boot_completed")
 
 
 def test_v5_android_false_is_not_considered_ready():

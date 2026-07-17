@@ -11,14 +11,21 @@ import json
 import os
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Protocol
 
+import psutil
 from adb_shell.adb_device import AdbDeviceTcp
 from loguru import logger
 
-from core.control.adb_port import EmulatorInfo, EmulatorType
+from core.control.adb_port import (
+    EmulatorInfo,
+    EmulatorPathError,
+    EmulatorType,
+    resolve_mumu_launcher,
+)
 from core.services.repair_safety import ensure_automation_allowed
 
 
@@ -36,6 +43,60 @@ class LifecycleCancelled(LifecycleError):
 
 class UnsupportedEmulatorOperation(LifecycleError):
     """Raised when a custom ADB target is asked to control its host emulator."""
+
+
+def _run_subprocess_tree(
+    argv: list[str],
+    *,
+    timeout: float,
+    correlation_id: str,
+    **kwargs,
+) -> subprocess.CompletedProcess:
+    """Run a CLI and tear down descendants before collecting timed-out pipes."""
+
+    popen_kwargs = dict(kwargs)
+    popen_kwargs.pop("capture_output", None)
+    popen_kwargs.pop("timeout", None)
+    popen_kwargs["stdout"] = subprocess.PIPE
+    popen_kwargs["stderr"] = subprocess.PIPE
+    process = subprocess.Popen(argv, **popen_kwargs)
+    logger.info(
+        "MuMuManager 进程已创建: "
+        f"correlation_id={correlation_id} pid={process.pid}"
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        descendants = []
+        try:
+            descendants = psutil.Process(process.pid).children(recursive=True)
+        except (psutil.Error, OSError):
+            pass
+        for child in reversed(descendants):
+            try:
+                child.kill()
+            except (psutil.Error, OSError):
+                pass
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            stdout, stderr = process.communicate(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = exc.output, exc.stderr
+        raise subprocess.TimeoutExpired(
+            argv,
+            timeout,
+            output=stdout,
+            stderr=stderr,
+        ) from exc
+    return subprocess.CompletedProcess(
+        argv,
+        int(process.returncode or 0),
+        stdout,
+        stderr,
+    )
 
 
 class QueueLifecycle(Protocol):
@@ -84,31 +145,34 @@ class MuMuManagerClient:
         *,
         runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
         timeout: float = 10.0,
+        correlation_id: str | None = None,
     ) -> None:
         if not device.is_mumu:
             raise UnsupportedEmulatorOperation("该设备不是 MuMu 多开实例")
         self.device = snapshot_device(device)
         self.runner = runner
         self.timeout = max(0.1, float(timeout))
-        self.executable = self._manager_path(self.device)
+        self.correlation_id = correlation_id or uuid.uuid4().hex
+        try:
+            launcher = resolve_mumu_launcher(self.device)
+        except EmulatorPathError as exc:
+            raise LifecycleError(str(exc)) from exc
+        self.executable = launcher.executable
+        self.install_root = launcher.install_root
 
     @staticmethod
     def _manager_path(device: EmulatorInfo) -> Path:
-        root = Path(device.path)
-        if device.type == EmulatorType.MUMUV5:
-            candidates = (root / "nx_main" / "MuMuManager.exe",)
-        else:
-            candidates = (
-                root / "shell" / "MuMuManager.exe",
-                root / "MuMuManager.exe",
-            )
-        return next((item for item in candidates if item.is_file()), candidates[0])
+        try:
+            return resolve_mumu_launcher(device).executable
+        except EmulatorPathError as exc:
+            raise LifecycleError(str(exc)) from exc
 
     def _run(self, *arguments: str) -> subprocess.CompletedProcess:
         ensure_automation_allowed("执行 MuMuManager 命令")
         argv = [str(self.executable), *map(str, arguments)]
         kwargs = {
             "shell": False,
+            "cwd": str(self.executable.parent),
             "capture_output": True,
             "text": True,
             "encoding": "utf-8",
@@ -118,8 +182,26 @@ class MuMuManagerClient:
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         if creation_flags:
             kwargs["creationflags"] = creation_flags
+        started = time.monotonic()
+        logger.info(
+            "MuMuManager 命令开始: "
+            f"correlation_id={self.correlation_id} backend={self.device.type.value} "
+            f"instance_id={int(self.device.index)} "
+            f"configured_path={self.device.path!r} launcher={str(self.executable)!r} "
+            f"argv={argv!r} cwd={str(self.executable.parent)!r}"
+        )
         try:
-            result = self.runner(argv, **kwargs)
+            if self.runner is subprocess.run:
+                default_kwargs = dict(kwargs)
+                default_kwargs.pop("timeout", None)
+                result = _run_subprocess_tree(
+                    argv,
+                    timeout=self.timeout,
+                    correlation_id=self.correlation_id,
+                    **default_kwargs,
+                )
+            else:
+                result = self.runner(argv, **kwargs)
         except subprocess.TimeoutExpired as exc:
             raise LifecycleError(
                 f"MuMuManager 命令超时: {' '.join(argv[1:])}"
@@ -134,6 +216,12 @@ class MuMuManagerClient:
                 f"MuMuManager 命令失败 ({result.returncode}): {' '.join(argv[1:])}"
                 + (f"；{details}" if details else "")
             )
+        logger.info(
+            "MuMuManager 命令完成: "
+            f"correlation_id={self.correlation_id} "
+            f"instance_id={int(self.device.index)} returncode={int(result.returncode)} "
+            f"elapsed={time.monotonic() - started:.3f}s"
+        )
         return result
 
     def _run_json(self, *arguments: str) -> dict:
@@ -152,11 +240,28 @@ class MuMuManagerClient:
     def info(self) -> dict:
         payload = self._run_json("info", "-v", str(self.device.index))
         if str(payload.get("index", "")) == str(self.device.index):
-            return payload
-        nested = payload.get(str(self.device.index))
-        if isinstance(nested, dict):
-            return nested
-        raise LifecycleError(f"MuMuManager 未返回多开实例 {self.device.index} 的状态")
+            info = payload
+        else:
+            nested = payload.get(str(self.device.index))
+            if not isinstance(nested, dict):
+                raise LifecycleError(
+                    f"MuMuManager 未返回多开实例 {self.device.index} 的状态"
+                )
+            info = nested
+        logger.info(
+            "MuMuManager 目标状态: "
+            f"correlation_id={self.correlation_id} "
+            f"instance_id={int(self.device.index)} pid={info.get('pid')} "
+            f"process_started={bool(info.get('is_process_started'))} "
+            f"android_started={bool(info.get('is_android_started'))} "
+            f"adb_endpoint={info.get('adb_host_ip', '127.0.0.1')}:{info.get('adb_port')}"
+        )
+        return info
+
+    def all_info(self) -> dict:
+        """Return the manager's complete instance map for diagnostics."""
+
+        return self._run_json("info", "-v", "all")
 
     def launch_emulator(self) -> None:
         self._run("control", "-v", str(self.device.index), "launch")
@@ -228,13 +333,16 @@ class EmulatorLifecycle:
         adb_factory: Callable[..., AdbDeviceTcp] = AdbDeviceTcp,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        correlation_id: str | None = None,
     ) -> None:
         self.device = snapshot_device(device)
         self.options = options or LifecycleOptions()
+        self.correlation_id = correlation_id or uuid.uuid4().hex
         self.manager = manager or (
             MuMuManagerClient(
                 self.device,
                 timeout=self.options.command_timeout,
+                correlation_id=self.correlation_id,
             )
             if self.device.is_mumu
             else None
@@ -247,7 +355,10 @@ class EmulatorLifecycle:
 
     @property
     def label(self) -> str:
-        return f"{self.device.name} (index={self.device.index})"
+        if self.device.is_mumu:
+            return f"{self.device.name} (instance_id={int(self.device.index)})"
+        endpoint = f"127.0.0.1:{self.device.port}" if self.device.port else "未配置"
+        return f"{self.device.name} (ADB {endpoint})"
 
     @staticmethod
     def _check_cancelled(cancelled: Callable[[], bool] | None) -> None:
@@ -287,6 +398,33 @@ class EmulatorLifecycle:
         )
         return bool(info.get("is_process_started")) and android_ready and port_ready
 
+    def _adb_boot_completed(self) -> bool:
+        try:
+            return self._adb_shell("getprop sys.boot_completed").strip() == "1"
+        except LifecycleError as exc:
+            logger.debug(f"等待目标实例 ADB/Android 就绪: {exc}")
+            return False
+
+    def _target_ready(self, info: dict) -> bool:
+        if not self._emulator_ready(info):
+            return False
+        # Current MuMu V5 reports Android state explicitly.  Once it does,
+        # verify the freshly discovered target port rather than trusting any
+        # unrelated device returned by a global ADB scan.
+        if "is_android_started" in info:
+            return self._adb_boot_completed()
+        return True
+
+    def android_boot_completed(self) -> bool:
+        """Refresh the exact MuMu target, then verify boot over its own ADB."""
+
+        if self.manager is not None:
+            info = self.manager.info()
+            self._update_device_from_info(info)
+            if not self._emulator_ready(info):
+                return False
+        return self._adb_boot_completed()
+
     def _wait_for_emulator_info(
         self,
         deadline: float,
@@ -323,13 +461,21 @@ class EmulatorLifecycle:
         if self.manager is None:
             if not self.device.port:
                 raise LifecycleError("自定义 ADB 端口为空，无法连接游戏")
+            try:
+                self._adb_shell("getprop sys.boot_completed")
+            except LifecycleError as exc:
+                raise LifecycleError(
+                    f"自定义 ADB {self.label} 当前不可用，且无法自动启动宿主模拟器；"
+                    "请在“ADB信息”选择目标 MuMu 多开实例（例如 #0 雷索纳斯），"
+                    f"或先手动启动自定义端口对应的模拟器。原始错误：{exc}"
+                ) from exc
             return snapshot_device(self.device)
 
         self._check_cancelled(cancelled)
         deadline = self.monotonic() + max(0.0, self.options.emulator_start_timeout)
         info = self._wait_for_emulator_info(deadline, cancelled)
         self._update_device_from_info(info)
-        if self._emulator_ready(info):
+        if self._target_ready(info):
             logger.info(f"MuMu 多开实例已运行: {self.label}，ADB {self.device.port}")
             return snapshot_device(self.device)
 
@@ -354,7 +500,7 @@ class EmulatorLifecycle:
             self._check_cancelled(cancelled)
             info = self._wait_for_emulator_info(deadline, cancelled)
             self._update_device_from_info(info)
-            if self._emulator_ready(info):
+            if self._target_ready(info):
                 logger.info(f"MuMu 多开实例就绪: {self.label}，ADB {self.device.port}")
                 return snapshot_device(self.device)
             if self.monotonic() >= deadline:
@@ -412,6 +558,13 @@ class EmulatorLifecycle:
         return self._adb_shell(command)
 
     def is_game_running(self) -> bool:
+        if self.manager is not None:
+            payload = self.manager.game_info(GAME_PACKAGE)
+            state = str(payload.get("state") or "").strip().lower()
+            if state in {"stopped", "not_installed"}:
+                return False
+            if state in {"running", "starting"}:
+                return True
         return bool(self._target_shell(f"pidof {GAME_PACKAGE}").strip())
 
     def start_game(self, cancelled: Callable[[], bool] | None = None) -> None:
@@ -643,9 +796,14 @@ class EmulatorQueueLifecycle:
         options: LifecycleOptions | None = None,
         lifecycle: EmulatorLifecycle | None = None,
         release_controller: Callable[[], None] | None = None,
+        correlation_id: str | None = None,
     ) -> None:
         self.options = options or LifecycleOptions()
-        self.lifecycle = lifecycle or EmulatorLifecycle(device, options=self.options)
+        self.lifecycle = lifecycle or EmulatorLifecycle(
+            device,
+            options=self.options,
+            correlation_id=correlation_id,
+        )
         self.release_controller = release_controller or self._release_global_controller
         self._cleaned = False
         self._prepared = False
