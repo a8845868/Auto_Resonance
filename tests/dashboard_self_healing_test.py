@@ -136,8 +136,17 @@ def test_single_control_button_toggles_scheduler_state():
 def test_scheduled_rewards_defer_without_self_healing_when_nothing_is_claimable(monkeypatch):
     monkeypatch.setattr(
         dashboard_module,
-        "collect_rewards",
-        lambda daily, manual: {"daily": 0, "manual": 0},
+        "collect_scheduled_rewards",
+        lambda daily, manual, strategy: {
+            "success": True,
+            "deferred": True,
+            "status": "INCOMPLETE",
+            "task_rewards": {"daily": 0, "manual": 0},
+            "progress_made": False,
+            "completion_predicate": False,
+            "next_run_at": "2026-07-17T13:08:34+08:00",
+            "next_run_reason": "daily_objectives_incomplete",
+        },
     )
     monkeypatch.setattr(
         dashboard_module,
@@ -147,22 +156,27 @@ def test_scheduled_rewards_defer_without_self_healing_when_nothing_is_claimable(
 
     result = _collect_scheduled_rewards(True, True)
 
-    assert result == {
-        "success": True,
-        "deferred": True,
-        "reason": "nothing_claimed",
-        "task_rewards": {"daily": 0, "manual": 0},
-        "dispatch_collected": False,
-    }
+    assert result["status"] == "INCOMPLETE"
+    assert result["completion_predicate"] is False
+    assert result["dispatch_collected"] is False
     assert task_result_succeeded(result)
     assert task_result_deferred(result)
 
 
-def test_scheduled_rewards_complete_normally_after_a_confirmed_claim(monkeypatch):
+def test_scheduled_rewards_do_not_complete_just_because_something_was_claimed(monkeypatch):
     monkeypatch.setattr(
         dashboard_module,
-        "collect_rewards",
-        lambda daily, manual: {"daily": 1, "manual": 0},
+        "collect_scheduled_rewards",
+        lambda daily, manual, strategy: {
+            "success": True,
+            "deferred": True,
+            "status": "INCOMPLETE",
+            "task_rewards": {"daily": 1, "manual": 0},
+            "progress_made": True,
+            "completion_predicate": False,
+            "next_run_at": "2026-07-17T13:08:34+08:00",
+            "next_run_reason": "daily_objectives_incomplete",
+        },
     )
     monkeypatch.setattr(
         dashboard_module,
@@ -173,7 +187,8 @@ def test_scheduled_rewards_complete_normally_after_a_confirmed_claim(monkeypatch
     result = _collect_scheduled_rewards(True, True)
 
     assert result["success"] is True
-    assert not task_result_deferred(result)
+    assert task_result_deferred(result)
+    assert result["completion_predicate"] is False
 
 
 def test_deferred_reward_uses_failure_interval_without_recording_completion(monkeypatch):

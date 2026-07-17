@@ -157,6 +157,12 @@ class Config(RunningBusinessConfig):
     autoCollectTravelManual = ConfigItem(
         "RewardCollection", "TravelManual", True, None
     )
+    rewardStrategy = ConfigItem(
+        "RewardCollection",
+        "Strategy",
+        "maximize_progress",
+        OptionsValidator(["maximize_progress", "claim_only"]),
+    )
     residentActivityFullRealmReward = ConfigItem(
         "ResidentActivity",
         "FullRealmReward",

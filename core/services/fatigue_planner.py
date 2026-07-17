@@ -3,40 +3,266 @@
 import json
 import os
 import uuid
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from enum import Enum
 from pathlib import Path
 
 from core.services.runtime_control import RUNTIME_DIR
+from core.services.server_calendar import SERVER_CLOCK
 
 
-FATIGUE_RESOURCE_REFRESH_HOUR = 5
-FATIGUE_RESOURCE_REFRESH_MINUTE = 0
-FATIGUE_PLAN_TIMES = ((5, 0), (12, 0), (18, 0))
+FATIGUE_PLAN_TIMES = (
+    (SERVER_CLOCK.daily_reset.hour, SERVER_CLOCK.daily_reset.minute),
+    (12, 0),
+    (18, 0),
+)
 FATIGUE_USAGE_PATH = RUNTIME_DIR / "fatigue-usage.json"
+
+
+class FatiguePlanStatus(str, Enum):
+    ACTION_NOW = "ACTION_NOW"
+    DEFER_UNTIL_FATIGUE = "DEFER_UNTIL_FATIGUE"
+    DEFER_UNTIL_WAYPOINT = "DEFER_UNTIL_WAYPOINT"
+    DEFER_UNTIL_RELEASE = "DEFER_UNTIL_RELEASE"
+    COMPLETE_FOR_DAY = "COMPLETE_FOR_DAY"
+    BLOCKED = "BLOCKED"
+    UNKNOWN = "UNKNOWN"
+    CANCELLED = "CANCELLED"
+
+
+@dataclass(frozen=True)
+class FatigueSnapshot:
+    server_day_id: str
+    observed_at: datetime
+    fatigue_used: int
+    fatigue_cap: int
+    current_city_id: str
+    current_station_id: str
+    current_amenities: frozenset[str]
+    soda_uses_used: int
+    soda_uses_remaining: int
+    soda_reduction_per_use: int
+    soda_price_tiers: tuple[str, ...]
+    bento_batches_available: int
+    bento_total_reduction_available: int
+    next_bento_release_at: datetime | None
+    natural_recovery_at: datetime | None
+    source_confidence: str
+
+
+@dataclass(frozen=True)
+class RouteLeg:
+    origin: str
+    destination: str
+    fatigue_increase: int
+    destination_amenities: frozenset[str]
+
+
+@dataclass(frozen=True)
+class TradeRouteContext:
+    route_id: str
+    legs: tuple[RouteLeg, ...]
+    current_leg_index: int = 0
+
+
+@dataclass(frozen=True)
+class FatigueAction:
+    kind: str
+    count: int = 1
+    waypoint_id: str | None = None
+    reduction: int = 0
+    reobserve_after_each: bool = False
+
+
+@dataclass(frozen=True)
+class FatiguePlan:
+    snapshot: FatigueSnapshot
+    immediate_actions: tuple[FatigueAction, ...]
+    deferred_actions: tuple[FatigueAction, ...]
+    expected_fatigue_by_waypoint: dict[str, int]
+    expected_resource_usage: dict[str, int]
+    expected_waste: int
+    next_trigger: dict[str, object]
+    status: FatiguePlanStatus
+    reason: str
+
+
+def _allowed_soda(snapshot: FatigueSnapshot, allow_premium_soda: bool) -> bool:
+    tiers = {tier.upper() for tier in snapshot.soda_price_tiers}
+    return bool(tiers & {"FREE", "IRON"}) or (allow_premium_soda and "PREMIUM" in tiers)
+
+
+def _immediate_sequences(
+    snapshot: FatigueSnapshot, allow_premium_soda: bool
+) -> list[tuple[tuple[FatigueAction, ...], int, dict[str, int]]]:
+    sequences = []
+    for order in (("bento", "soda"), ("soda", "bento")):
+        fatigue = max(0, snapshot.fatigue_used)
+        actions: list[FatigueAction] = []
+        soda_used = 0
+        bento_used = 0
+        for resource in order:
+            if resource == "bento":
+                reduction = max(0, snapshot.bento_total_reduction_available)
+                if snapshot.bento_batches_available > 0 and reduction and fatigue >= reduction:
+                    actions.append(FatigueAction("USE_ALL_BENTOS", reduction=reduction))
+                    fatigue -= reduction
+                    bento_used = snapshot.bento_batches_available
+            elif (
+                "REST_AREA" in snapshot.current_amenities
+                and snapshot.soda_reduction_per_use > 0
+                and _allowed_soda(snapshot, allow_premium_soda)
+            ):
+                safe = min(
+                    max(0, snapshot.soda_uses_remaining),
+                    fatigue // snapshot.soda_reduction_per_use,
+                )
+                if safe:
+                    reduction = safe * snapshot.soda_reduction_per_use
+                    actions.append(
+                        FatigueAction(
+                            "DRINK_SODA",
+                            count=safe,
+                            reduction=reduction,
+                            reobserve_after_each=True,
+                        )
+                    )
+                    fatigue -= reduction
+                    soda_used = safe
+        sequences.append(
+            (
+                tuple(actions),
+                snapshot.fatigue_used - fatigue,
+                {"soda_uses": soda_used, "bento_batches": bento_used},
+            )
+        )
+    return sequences
+
+
+def plan_fatigue_recovery(
+    snapshot: FatigueSnapshot,
+    route: TradeRouteContext | None = None,
+    *,
+    allow_premium_soda: bool = False,
+) -> FatiguePlan:
+    if snapshot.observed_at.tzinfo is None or snapshot.observed_at.utcoffset() is None:
+        raise ValueError("fatigue observations must be timezone-aware")
+    if snapshot.source_confidence.upper() == "UNKNOWN":
+        return FatiguePlan(
+            snapshot, (), (), {}, {}, 0, {"reobserve": True}, FatiguePlanStatus.UNKNOWN,
+            "fatigue_snapshot_unknown",
+        )
+    actions, reduced, usage = max(
+        _immediate_sequences(snapshot, allow_premium_soda),
+        key=lambda item: (item[1], len(item[0])),
+    )
+    if actions:
+        return FatiguePlan(
+            snapshot,
+            actions,
+            (),
+            {},
+            usage,
+            0,
+            {"reobserve_after_each_action": True},
+            FatiguePlanStatus.ACTION_NOW,
+            "safe_zero_waste_actions_available",
+        )
+
+    thresholds = []
+    if (
+        snapshot.soda_uses_remaining > 0
+        and snapshot.soda_reduction_per_use > 0
+        and _allowed_soda(snapshot, allow_premium_soda)
+    ):
+        thresholds.append(snapshot.soda_reduction_per_use)
+    if snapshot.bento_batches_available > 0 and snapshot.bento_total_reduction_available > 0:
+        thresholds.append(snapshot.bento_total_reduction_available)
+    threshold = min(thresholds) if thresholds else None
+    expected: dict[str, int] = {}
+    if route is not None:
+        fatigue = snapshot.fatigue_used
+        for leg in route.legs[route.current_leg_index :]:
+            fatigue = min(snapshot.fatigue_cap, fatigue + max(0, leg.fatigue_increase))
+            expected[leg.destination] = fatigue
+            soda_ready = (
+                "REST_AREA" in leg.destination_amenities
+                and snapshot.soda_uses_remaining > 0
+                and fatigue >= snapshot.soda_reduction_per_use
+                and _allowed_soda(snapshot, allow_premium_soda)
+            )
+            bento_ready = (
+                snapshot.bento_batches_available > 0
+                and fatigue >= snapshot.bento_total_reduction_available > 0
+            )
+            if soda_ready or bento_ready:
+                kind = "DRINK_SODA" if soda_ready else "USE_ALL_BENTOS"
+                count = (
+                    min(snapshot.soda_uses_remaining, fatigue // snapshot.soda_reduction_per_use)
+                    if soda_ready
+                    else 1
+                )
+                return FatiguePlan(
+                    snapshot,
+                    (),
+                    (FatigueAction(kind, count=count, waypoint_id=leg.destination, reobserve_after_each=soda_ready),),
+                    expected,
+                    {},
+                    0,
+                    {"waypoint_id": leg.destination, "fatigue_at_least": threshold or 0},
+                    FatiguePlanStatus.DEFER_UNTIL_WAYPOINT,
+                    "route_reaches_zero_waste_recovery_threshold",
+                )
+    if threshold is not None:
+        reason = "wait_for_zero_waste_threshold"
+        if route is not None and not any(
+            "REST_AREA" in leg.destination_amenities for leg in route.legs
+        ):
+            reason += ":no_recovery_waypoint"
+        return FatiguePlan(
+            snapshot,
+            (),
+            (),
+            expected,
+            {},
+            0,
+            {"fatigue_at_least": threshold},
+            FatiguePlanStatus.DEFER_UNTIL_FATIGUE,
+            reason,
+        )
+    if snapshot.next_bento_release_at is not None:
+        return FatiguePlan(
+            snapshot, (), (), expected, {}, 0,
+            {"at": snapshot.next_bento_release_at.isoformat()},
+            FatiguePlanStatus.DEFER_UNTIL_RELEASE,
+            "waiting_for_next_bento_release",
+        )
+    return FatiguePlan(
+        snapshot, (), (), expected, {}, 0, {}, FatiguePlanStatus.COMPLETE_FOR_DAY,
+        "no_daily_recovery_resources_remaining",
+    )
 
 
 def fatigue_cycle(now: datetime | None = None) -> str:
     """Return the game-day key; drinks and lunches refresh at 05:00."""
-    current = now or datetime.now()
-    boundary = current.replace(
-        hour=FATIGUE_RESOURCE_REFRESH_HOUR,
-        minute=FATIGUE_RESOURCE_REFRESH_MINUTE,
-        second=0,
-        microsecond=0,
-    )
-    if current < boundary:
-        current -= timedelta(days=1)
-    return current.date().isoformat()
+    current = now or SERVER_CLOCK.server_now()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=SERVER_CLOCK.timezone)
+    return SERVER_CLOCK.server_day_id(current)
 
 
 def lunch_release_schedule(now: datetime | None = None) -> dict[str, str]:
     """Describe which of today's three lunch issues have reached release time."""
-    current = now or datetime.now()
-    cycle_date = date.fromisoformat(fatigue_cycle(current))
+    current = now or SERVER_CLOCK.server_now()
+    was_naive = current.tzinfo is None
+    aware = current.replace(tzinfo=SERVER_CLOCK.timezone) if was_naive else current
+    cycle_date = date.fromisoformat(fatigue_cycle(aware))
     return {
         f"{hour:02d}:{minute:02d}": (
             "released"
-            if current >= datetime.combine(cycle_date, time(hour, minute))
+            if aware
+            >= datetime.combine(cycle_date, time(hour, minute), SERVER_CLOCK.timezone)
             else "pending"
         )
         for hour, minute in FATIGUE_PLAN_TIMES
@@ -50,21 +276,24 @@ def next_fatigue_refresh(now: datetime | None = None) -> datetime:
     at 05:00, 12:00, and 18:00, so every issue needs its own safe batch check.
     """
     current = now or datetime.now()
+    was_naive = current.tzinfo is None
+    aware = current.replace(tzinfo=SERVER_CLOCK.timezone) if was_naive else current
     for hour, minute in FATIGUE_PLAN_TIMES:
-        target = current.replace(
+        target = aware.replace(
             hour=hour,
             minute=minute,
             second=0,
             microsecond=0,
         )
-        if target > current:
-            return target
-    return (current + timedelta(days=1)).replace(
+        if target > aware:
+            return target.replace(tzinfo=None) if was_naive else target
+    target = (aware + timedelta(days=1)).replace(
         hour=FATIGUE_PLAN_TIMES[0][0],
         minute=FATIGUE_PLAN_TIMES[0][1],
         second=0,
         microsecond=0,
     )
+    return target.replace(tzinfo=None) if was_naive else target
 
 
 def load_fatigue_usage(

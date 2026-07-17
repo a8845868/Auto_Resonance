@@ -292,14 +292,13 @@ def shop_plan_enabled(
 
 
 def next_weekly_shop_reset(now: datetime | None = None) -> datetime:
-    now = now or datetime.now()
-    days_until_monday = (7 - now.weekday()) % 7
-    target = (now + timedelta(days=days_until_monday)).replace(
-        hour=5, minute=0, second=0, microsecond=0
-    )
-    if target <= now:
-        target += timedelta(days=7)
-    return target
+    from core.services.server_calendar import SERVER_CLOCK
+
+    current = now or datetime.now()
+    was_naive = current.tzinfo is None
+    aware = current.replace(tzinfo=SERVER_CLOCK.timezone) if was_naive else current
+    target = SERVER_CLOCK.next_weekly_reset(aware)
+    return target.replace(tzinfo=None) if was_naive else target
 
 
 def next_monthly_shop_reset(now: datetime | None = None) -> datetime:

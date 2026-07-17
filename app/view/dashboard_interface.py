@@ -9,7 +9,7 @@ from app.common.style_sheet import StyleSheet
 from app.utils.task_queue import QueuedTask, TaskQueueWorker
 from app.view.logger_interface import LoguruHandler, StructuredLogWidget
 from auto.resident_activity import run_resident_activity
-from auto.reward_collection import collect_rewards
+from auto.reward_collection import collect_scheduled_rewards
 from auto.module.dispatch import collect_dispatch_rewards
 from core.logger import logger
 from core.services.emulator_lifecycle import (
@@ -25,6 +25,7 @@ from core.services.task_schedule_state import (
     is_task_due,
     record_task_execution,
     task_result_deferred,
+    task_result_next_run,
     task_timing,
 )
 
@@ -54,20 +55,23 @@ class StatusPanel(QFrame):
 
 def _collect_scheduled_rewards(daily: bool, manual: bool):
     """Keep all reward side work inside the reward queue task."""
-    result = collect_rewards(daily, manual)
+    result = collect_scheduled_rewards(
+        daily,
+        manual,
+        strategy=str(cfg.rewardStrategy.value),
+    )
     dispatch_collected = collect_dispatch_rewards()
-    payload = {
-        "success": True,
-        "task_rewards": result,
-        "dispatch_collected": dispatch_collected,
-    }
-    if not any(result.values()) and not dispatch_collected:
-        payload.update(
-            deferred=True,
-            reason="nothing_claimed",
+    result["dispatch_collected"] = dispatch_collected
+    result["progress_made"] = bool(result.get("progress_made") or dispatch_collected)
+    logger.info(
+        "奖励检查状态={status} 完成判定={complete} 下次={next_run} 原因={reason}".format(
+            status=result.get("status"),
+            complete=result.get("completion_predicate"),
+            next_run=result.get("next_run_at"),
+            reason=result.get("next_run_reason"),
         )
-        logger.info("奖励检查已完成但没有领取到奖励，10 分钟后复核")
-    return payload
+    )
+    return result
 
 
 def _history_status_label(status: str) -> str:
@@ -194,6 +198,17 @@ class DashboardInterface(ScrollArea):
                 lambda task=activity_task, full_reward=reward: run_resident_activity(task, full_reward),
                 key="resident_activity",
             ))
+        business = self.businessTaskProvider()
+        if business:
+            tasks.append(business)
+        for provider in self.additionalTaskProviders:
+            provided_task = provider()
+            if provided_task:
+                tasks.append(provided_task)
+        # Reward collection is deliberately the final ordinary task.  Existing
+        # sweep, trade, passenger, and other enabled automations contribute
+        # progress first; the collector then claims and evaluates the resulting
+        # state instead of treating one early claim pass as completion.
         if bool(cfg.enableRewardCollection.value):
             daily = bool(cfg.autoCollectDailyActivity.value)
             manual = bool(cfg.autoCollectTravelManual.value)
@@ -203,13 +218,6 @@ class DashboardInterface(ScrollArea):
                     lambda: _collect_scheduled_rewards(daily, manual),
                     key="reward_collection",
                 ))
-        business = self.businessTaskProvider()
-        if business:
-            tasks.append(business)
-        for provider in self.additionalTaskProviders:
-            provided_task = provider()
-            if provided_task:
-                tasks.append(provided_task)
         return tasks
 
     def _enabledTasks(self):
@@ -350,14 +358,31 @@ class DashboardInterface(ScrollArea):
         if not task.key:
             return
         deferred = bool(succeeded and task_result_deferred(result))
+        explicit_next_run = task_result_next_run(result)
         record_task_execution(
             task.key,
             task.name,
             succeeded,
-            task.next_run_after(succeeded and not deferred),
+            explicit_next_run or task.next_run_after(succeeded and not deferred),
             result,
             deferred=deferred,
         )
+        if succeeded and task.key in {
+            "resident_activity",
+            "run_business",
+            "passenger_build",
+        }:
+            progress_made = result is True or (
+                isinstance(result, dict)
+                and (
+                    result.get("progress_made") is True
+                    or any(isinstance(value, int) and value > 0 for value in result.values())
+                )
+            )
+            if progress_made:
+                from core.services.daily_rewards import schedule_debounced_reward_recheck
+
+                schedule_debounced_reward_recheck()
         self.refreshScheduleOverview()
 
     def _queueFinished(self, worker):

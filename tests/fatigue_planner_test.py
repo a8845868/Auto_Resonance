@@ -141,7 +141,7 @@ def test_daily_fatigue_task_uses_safe_lunches_at_station_without_rest_area():
     go_home.assert_called_once()
 
 
-def test_daily_fatigue_task_can_complete_at_no_rest_station_without_lunch_waste():
+def test_daily_fatigue_task_keeps_low_fatigue_plan_pending_at_no_rest_station():
     with patch.object(fatigue_recovery, "connect", return_value=True), patch.object(
         fatigue_recovery, "get_station", return_value="武林源"
     ), patch.object(
@@ -156,15 +156,13 @@ def test_daily_fatigue_task_can_complete_at_no_rest_station_without_lunch_waste(
         fatigue_recovery, "rest_area_availability", return_value=False
     ), patch.object(
         fatigue_recovery, "record_fatigue_usage", return_value=EMPTY_USAGE
-    ):
+    ), patch.object(fatigue_recovery, "_route_context", return_value=None):
         result = fatigue_recovery.run_daily_fatigue_recovery()
 
     assert result["success"] is True
-    assert "deferred" not in result
-    assert result["restored"] == 0
-    recover.assert_called_once_with(
-        "buy", min_available=80, station_name="武林源", usage={}
-    )
+    assert result["deferred"] is True
+    assert result["status"] == "DEFER_UNTIL_FATIGUE"
+    recover.assert_not_called()
     go_home.assert_called_once()
 
 
@@ -181,14 +179,13 @@ def test_daily_fatigue_task_defers_with_explicit_success_when_recovery_is_unneed
         fatigue_recovery, "go_home", return_value=True
     ) as go_home, patch.object(
         fatigue_recovery, "record_fatigue_usage", return_value=EMPTY_USAGE
-    ):
+    ), patch.object(fatigue_recovery, "_route_context", return_value=None):
         result = fatigue_recovery.run_daily_fatigue_recovery()
 
     assert result["success"] is True
     assert result["deferred"] is True
-    assert result["reason"] == "recovery_conditions_not_met"
+    assert result["reason"].startswith("wait_for_zero_waste_threshold")
     assert result["station"] == "test-station"
     assert result["before"] == 12
     assert result["maximum"] == 816
-    assert result["usage"] == EMPTY_USAGE
     go_home.assert_called_once()
