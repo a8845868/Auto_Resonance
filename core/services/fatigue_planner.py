@@ -57,7 +57,7 @@ class FatigueSnapshot:
     current_station_id: str
     current_amenities: frozenset[str]
     soda_uses_used: int
-    soda_uses_remaining: int
+    soda_uses_remaining: int | None
     soda_reduction_per_use: int
     soda_price_tiers: tuple[SodaPriceTier | str, ...]
     bento_batches_available: int
@@ -72,6 +72,12 @@ class FatigueSnapshot:
     soda_remaining_confidence: str = ""
     bento_inventory_confidence: str = ""
     bento_value_confidence: str = ""
+    current_soda_facility_available: bool | None = None
+    soda_daily_limit: int = 6
+    soda_uses_confirmed_used: int = 0
+    soda_uses_confirmed_remaining: int | None = None
+    current_price_tiers: tuple[SodaPriceTier | str, ...] = ()
+    current_tier_observable: bool | None = None
 
     def confidence(self, field: str) -> str:
         return str(getattr(self, field) or self.source_confidence).upper()
@@ -122,8 +128,20 @@ def _allowed_soda_uses(
 ) -> int:
     """Return the contiguous, explicitly allowed prefix of observed price tiers."""
 
+    confirmed_remaining = (
+        snapshot.soda_uses_confirmed_remaining
+        if snapshot.soda_uses_confirmed_remaining is not None
+        else snapshot.soda_uses_remaining
+    )
+    if confirmed_remaining is None:
+        return 0
+    tiers = (
+        snapshot.current_price_tiers
+        if snapshot.current_tier_observable is not None
+        else snapshot.soda_price_tiers
+    )
     allowed = 0
-    for raw in snapshot.soda_price_tiers[: max(0, snapshot.soda_uses_remaining)]:
+    for raw in tiers[: max(0, confirmed_remaining)]:
         if isinstance(raw, SodaPriceTier):
             currency = raw.currency_type.upper()
             tier_allowed = bool(raw.allowed)
@@ -166,7 +184,7 @@ def _immediate_sequences(
                 and _allowed_soda_uses(snapshot, allow_premium_soda, max_iron_soda_cost) > 0
             ):
                 safe = min(
-                    max(0, snapshot.soda_uses_remaining),
+                    max(0, snapshot.soda_uses_remaining or 0),
                     _allowed_soda_uses(snapshot, allow_premium_soda, max_iron_soda_cost),
                     fatigue // snapshot.soda_reduction_per_use,
                 )
@@ -205,8 +223,13 @@ def plan_fatigue_recovery(
     for field in ("fatigue_confidence", "station_confidence", "amenity_confidence"):
         if snapshot.confidence(field) != "HIGH":
             confidence_blockers.append(field)
+    current_soda_facility_available = (
+        snapshot.current_soda_facility_available
+        if snapshot.current_soda_facility_available is not None
+        else "REST_AREA" in snapshot.current_amenities
+    )
     soda_may_be_available = (
-        "REST_AREA" in snapshot.current_amenities
+        current_soda_facility_available is not False
         or snapshot.confidence("amenity_confidence") != "HIGH"
     )
     if soda_may_be_available:
@@ -249,7 +272,7 @@ def plan_fatigue_recovery(
 
     thresholds = []
     if (
-        snapshot.soda_uses_remaining > 0
+        (snapshot.soda_uses_remaining or 0) > 0
         and snapshot.soda_reduction_per_use > 0
         and _allowed_soda_uses(snapshot, allow_premium_soda, max_iron_soda_cost) > 0
     ):
@@ -260,6 +283,16 @@ def plan_fatigue_recovery(
     expected: dict[str, int] = {}
     if route is not None:
         fatigue = snapshot.fatigue_used
+        soda_remaining_unknown = snapshot.soda_uses_confirmed_remaining is None
+        soda_could_remain_today = (
+            soda_remaining_unknown
+            and snapshot.soda_uses_confirmed_used < snapshot.soda_daily_limit
+        ) or (snapshot.soda_uses_confirmed_remaining or 0) > 0
+        route_has_recovery_waypoint = any(
+            leg.destination_amenity_confidence.upper() == "HIGH"
+            and "REST_AREA" in leg.destination_amenities
+            for leg in route.legs[route.current_leg_index :]
+        )
         for leg in route.legs[route.current_leg_index :]:
             fatigue = min(snapshot.fatigue_cap, fatigue + max(0, leg.fatigue_increase))
             expected[leg.destination] = fatigue
@@ -275,9 +308,35 @@ def plan_fatigue_recovery(
                     FatiguePlanStatus.UNKNOWN,
                     "destination_amenity_unknown",
                 )
+            if (
+                "REST_AREA" in leg.destination_amenities
+                and soda_could_remain_today
+                and fatigue >= snapshot.soda_reduction_per_use > 0
+                and (
+                    current_soda_facility_available is False
+                    or soda_remaining_unknown
+                    or snapshot.current_tier_observable is False
+                )
+            ):
+                return FatiguePlan(
+                    snapshot,
+                    (),
+                    (
+                        FatigueAction(
+                            "REOBSERVE_RECOVERY_AT_WAYPOINT",
+                            waypoint_id=leg.destination,
+                        ),
+                    ),
+                    expected,
+                    {},
+                    0,
+                    {"waypoint_id": leg.destination, "reobserve": True},
+                    FatiguePlanStatus.DEFER_UNTIL_WAYPOINT,
+                    "reobserve_recovery_resources_at_future_rest_area",
+                )
             soda_ready = (
                 "REST_AREA" in leg.destination_amenities
-                and snapshot.soda_uses_remaining > 0
+                and (snapshot.soda_uses_remaining or 0) > 0
                 and fatigue >= snapshot.soda_reduction_per_use
                 and _allowed_soda_uses(snapshot, allow_premium_soda, max_iron_soda_cost) > 0
             )
@@ -289,7 +348,7 @@ def plan_fatigue_recovery(
                 kind = "DRINK_SODA" if soda_ready else "USE_ALL_BENTOS"
                 count = (
                     min(
-                        snapshot.soda_uses_remaining,
+                        snapshot.soda_uses_remaining or 0,
                         _allowed_soda_uses(snapshot, allow_premium_soda, max_iron_soda_cost),
                         fatigue // snapshot.soda_reduction_per_use,
                     )
@@ -307,6 +366,18 @@ def plan_fatigue_recovery(
                     FatiguePlanStatus.DEFER_UNTIL_WAYPOINT,
                     "route_reaches_zero_waste_recovery_threshold",
                 )
+        if soda_could_remain_today and not route_has_recovery_waypoint:
+            return FatiguePlan(
+                snapshot,
+                (),
+                (),
+                expected,
+                {},
+                0,
+                {"blocker": "route_has_no_recovery_waypoint"},
+                FatiguePlanStatus.BLOCKED,
+                "route_has_no_recovery_waypoint",
+            )
     if threshold is not None:
         reason = "wait_for_zero_waste_threshold"
         if route is not None and not any(

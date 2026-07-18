@@ -141,6 +141,14 @@ def _snapshot_from_observation(
         # corresponding value; otherwise the plan remains UNKNOWN.
         lunch_total = sum(max(0, int(value)) for value in lunch_values)
     tiers = tuple(observation.get("soda_price_tiers") or ())
+    rest_area_available = observation.get("rest_area_available")
+    soda_daily_limit = 6
+    soda_confirmed_used = int(usage.get("bubble_water_uses", 0))
+    soda_confirmed_remaining = (
+        max(0, soda_daily_limit - soda_confirmed_used)
+        if rest_area_available is True and tiers
+        else None
+    )
     resource_known = lunches is not None and (
         int(lunches) == 0 or lunch_total is not None
     )
@@ -156,12 +164,10 @@ def _snapshot_from_observation(
             if observation.get("rest_area_available") is True
             else frozenset()
         ),
-        soda_uses_used=int(usage.get("bubble_water_uses", 0)),
+        soda_uses_used=soda_confirmed_used,
         # Only the currently observed sequential price tier is executable.
         # Every successful drink forces another observation and replan.
-        soda_uses_remaining=min(
-            max(0, 6 - int(usage.get("bubble_water_uses", 0))), len(tiers)
-        ),
+        soda_uses_remaining=soda_confirmed_remaining,
         soda_reduction_per_use=50,
         soda_price_tiers=tiers,
         bento_batches_available=int(lunches) if lunches is not None else 0,
@@ -175,17 +181,17 @@ def _snapshot_from_observation(
         station_confidence="HIGH" if station_name else "UNKNOWN",
         amenity_confidence=(
             "HIGH"
-            if isinstance(observation.get("rest_area_available"), bool)
+            if isinstance(rest_area_available, bool)
             else "UNKNOWN"
         ),
         soda_tier_confidence=(
             "HIGH"
-            if tiers or observation.get("rest_area_available") is False
+            if tiers and rest_area_available is True
             else "UNKNOWN"
         ),
         soda_remaining_confidence=(
             "HIGH"
-            if tiers or observation.get("rest_area_available") is False
+            if tiers and rest_area_available is True
             else "UNKNOWN"
         ),
         bento_inventory_confidence="HIGH" if lunches is not None else "UNKNOWN",
@@ -193,6 +199,18 @@ def _snapshot_from_observation(
             "HIGH"
             if lunches is not None and (int(lunches) == 0 or lunch_total is not None)
             else "UNKNOWN"
+        ),
+        current_soda_facility_available=(
+            rest_area_available if isinstance(rest_area_available, bool) else None
+        ),
+        soda_daily_limit=soda_daily_limit,
+        soda_uses_confirmed_used=soda_confirmed_used,
+        soda_uses_confirmed_remaining=soda_confirmed_remaining,
+        current_price_tiers=tiers,
+        current_tier_observable=(
+            True if rest_area_available is True and tiers else False
+            if rest_area_available is False
+            else None
         ),
     )
 
