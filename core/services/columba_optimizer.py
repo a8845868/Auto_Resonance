@@ -321,9 +321,20 @@ def optimize_live_routes(
                 if books:
                     plan.append({"from": from_city, "to": to_city, "books": books})
             runs = []
+            run_expected_profits = []
             for repeat in range(repeats):
                 offset = repeat * length
                 runs.append({cycle[i]: visit_books[offset + i] for i in range(length)})
+                run_expected_profits.append(
+                    sum(
+                        calculate_leg(
+                            cycle[i],
+                            cycle[(i + 1) % length],
+                            visit_books[offset + i],
+                        )["profit"]
+                        for i in range(length)
+                    )
+                )
             execution_batches = []
             for run_books in runs:
                 if execution_batches and execution_batches[-1]["books"] == run_books:
@@ -344,6 +355,7 @@ def optimize_live_routes(
                 "cycle_fatigue": round(cycle_fatigue, 2),
                 "profit_per_fatigue": round(total_profit / (repeats * cycle_fatigue)),
                 "legs": base_legs,
+                "run_expected_profits": run_expected_profits,
             }
             if best is None or (
                 result["profit"], result["profit_per_fatigue"]

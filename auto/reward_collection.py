@@ -74,8 +74,10 @@ def _center(item: dict) -> tuple[int, int]:
     return int((points[0][0] + points[2][0]) / 2), int((points[0][1] + points[2][1]) / 2)
 
 
-def _manual_daily_progress(items: list[dict]) -> tuple[int, int] | None:
-    """Read only the handbook aggregate ratio anchored to its summary card."""
+def _manual_daily_progress_observation(
+    items: list[dict],
+) -> tuple[int, int, int, int] | None:
+    """Read one uniquely anchored aggregate ratio and preserve its center."""
 
     task_markers = (
         "姣忔棩浠诲姟", "浠婃棩浠诲姟", "浠诲姟鍒楄〃",
@@ -98,7 +100,7 @@ def _manual_daily_progress(items: list[dict]) -> tuple[int, int] | None:
     ]
     if not task_anchors or not aggregate_anchors:
         return None
-    candidates = []
+    candidates: set[tuple[int, int, int, int]] = set()
     for item in items:
         if not item.get("position"):
             continue
@@ -108,20 +110,25 @@ def _manual_daily_progress(items: list[dict]) -> tuple[int, int] | None:
         x, y = _center(item)
         if not (100 <= x <= 620 and 90 <= y <= 360):
             continue
-        distance = min(
-            abs(x - anchor_x) + abs(y - anchor_y)
-            for anchor_x, anchor_y in aggregate_anchors
-        )
         completed, total = map(int, match.groups())
-        if distance <= 240 and 0 < total <= 50 and 0 <= completed <= total:
-            candidates.append((distance, x, y, completed, total))
-    if not candidates:
+        if not (0 < total <= 50 and 0 <= completed <= total):
+            continue
+        for anchor_x, anchor_y in aggregate_anchors:
+            # The aggregate value is below its label in the same summary card.
+            # Ratios above/beside the label are per-task counters.
+            if abs(x - anchor_x) <= 100 and 35 <= y - anchor_y <= 100:
+                candidates.add((completed, total, x, y))
+    if len(candidates) != 1:
         return None
-    _, _, _, completed, total = min(candidates)
-    return completed, total
+    return next(iter(candidates))
 
 
-def _manual_level_frame_observation(frame) -> tuple[int, int, int] | None:
+def _manual_daily_progress(items: list[dict]) -> tuple[int, int] | None:
+    observation = _manual_daily_progress_observation(items)
+    return observation[:2] if observation is not None else None
+
+
+def _manual_level_frame_observation(frame) -> tuple | None:
     """Return page anchor, numeric level and claim evidence from fixed ROIs."""
 
     items = frame.ocr()
@@ -131,8 +138,8 @@ def _manual_level_frame_observation(frame) -> tuple[int, int, int] | None:
         for item in items
     ):
         return None
-    levels = []
-    claimable = 0
+    levels: set[tuple[int, int, int]] = set()
+    claim_positions: list[tuple[int, int]] = []
     claim_markers = ("鍙鍙?", "涓€閿鍙?", "可领取", "一键领取")
     for item in items:
         if not item.get("position"):
@@ -140,15 +147,23 @@ def _manual_level_frame_observation(frame) -> tuple[int, int, int] | None:
         x, y = _center(item)
         text = str(item.get("text", ""))
         if 120 <= x <= 560 and 80 <= y <= 260:
-            match = re.search(r"(?:LV\.?|等级|绛夌骇)?\s*(\d{1,3})", text, re.IGNORECASE)
+            match = re.search(
+                r"(?:LV\.?|等级|绛夌骇)\s*[:：]?\s*(\d{1,3})",
+                text,
+                re.IGNORECASE,
+            )
             if match:
-                levels.append(int(match.group(1)))
+                level = int(match.group(1))
+                if 1 <= level <= 100:
+                    levels.add((level, x, y))
         if 780 <= x <= 1220 and 430 <= y <= 680 and any(
             marker in text for marker in claim_markers
         ):
-            claimable += 1
+            claim_positions.append((x, y))
+    if len(levels) != 1:
+        return None
     image = getattr(frame, "image", None)
-    red_dot = 0
+    red_dot_center = None
     if isinstance(image, np.ndarray) and image.size:
         hsv = cv.cvtColor(image, cv.COLOR_BGR2HSV)
         roi = hsv[60:680, 760:1240]
@@ -156,8 +171,39 @@ def _manual_level_frame_observation(frame) -> tuple[int, int, int] | None:
             cv.inRange(roi, np.array((0, 120, 120)), np.array((10, 255, 255))),
             cv.inRange(roi, np.array((170, 120, 120)), np.array((179, 255, 255))),
         )
-        red_dot = int(cv.countNonZero(red) >= 12)
-    return max(levels) if levels else -1, claimable, red_dot
+        pixels = cv.findNonZero(red)
+        if pixels is not None and len(pixels) >= 12:
+            mean = pixels.reshape(-1, 2).mean(axis=0)
+            red_dot_center = (int(round(mean[0])) + 760, int(round(mean[1])) + 60)
+    level, level_x, level_y = next(iter(levels))
+    return (
+        level,
+        len(claim_positions),
+        int(red_dot_center is not None),
+        level_x,
+        level_y,
+        tuple(sorted(claim_positions)),
+        red_dot_center,
+    )
+
+
+def _centers_stable(first, second, tolerance: int = 8) -> bool:
+    if first is None or second is None:
+        return first is second
+    if isinstance(first, tuple) and first and isinstance(first[0], tuple):
+        return len(first) == len(second) and all(
+            _centers_stable(left, right, tolerance) for left, right in zip(first, second)
+        )
+    return abs(first[0] - second[0]) <= tolerance and abs(first[1] - second[1]) <= tolerance
+
+
+def _manual_level_observations_stable(first: tuple, other: tuple) -> bool:
+    return bool(
+        first[:3] == other[:3]
+        and _centers_stable(first[3:5], other[3:5])
+        and _centers_stable(first[5], other[5])
+        and _centers_stable(first[6], other[6])
+    )
 
 
 def _observe_manual_level_rewards(driver, stable_frames: int = 2) -> int | None:
@@ -170,9 +216,12 @@ def _observe_manual_level_rewards(driver, stable_frames: int = 2) -> int | None:
         observations.append(observation)
         if index + 1 < count:
             driver.sleep(0.25)
-    if any(item != observations[0] for item in observations[1:]):
+    if any(
+        not _manual_level_observations_stable(observations[0], item)
+        for item in observations[1:]
+    ):
         return None
-    _, claimable, red_dot = observations[0]
+    _, claimable, red_dot, *_ = observations[0]
     return max(claimable, red_dot)
 
 
@@ -622,8 +671,8 @@ class RewardCollector:
         frames = []
         for frame_index in range(max(2, stable_frames)):
             items = self.driver.texts()
-            progress = _manual_daily_progress(items)
-            if progress is None:
+            observation = _manual_daily_progress_observation(items)
+            if observation is None:
                 return None
             claimable = sum(
                 1
@@ -633,13 +682,19 @@ class RewardCollector:
                     for marker in ("可领取", "一键领取")
                 )
             )
-            frames.append((*progress, claimable))
+            frames.append((*observation, claimable))
             if frame_index + 1 < max(2, stable_frames):
                 self.driver.sleep(0.25)
-        if any(item != frames[0] for item in frames[1:]):
+        if any(
+            item[:2] != frames[0][:2]
+            or abs(item[2] - frames[0][2]) > 8
+            or abs(item[3] - frames[0][3]) > 8
+            or item[4] != frames[0][4]
+            for item in frames[1:]
+        ):
             logger.warning("手册每日任务 OCR 多帧不稳定，本次保持 UNKNOWN")
             return None
-        completed, total, task_rewards = frames[0]
+        completed, total, _ratio_x, _ratio_y, task_rewards = frames[0]
         if not self.driver.click_exact_text("环游手册", attempts=2):
             return None
         level_rewards = _observe_manual_level_rewards(
@@ -744,6 +799,11 @@ def collect_scheduled_rewards(
         handbook_rewards_claimable=(manual_observation or {}).get("claimable_rewards"),
         handbook_rewards_unclaimed=(manual_observation or {}).get("unclaimed_rewards"),
         observed_at=now,
+        handbook_confidence="HIGH" if manual_observation is not None else "UNKNOWN",
+        daily_reward_confidence="HIGH" if daily_observation is not None else "UNKNOWN",
+        handbook_reward_confidence=(
+            "HIGH" if manual_observation is not None else "UNKNOWN"
+        ),
     )
     try:
         selected_strategy = RewardStrategy(strategy)
@@ -754,6 +814,8 @@ def collect_scheduled_rewards(
         now=now,
         strategy=selected_strategy,
         running_dependencies=running_dependencies,
+        daily_activity_enabled=daily_activity,
+        travel_manual_enabled=travel_manual,
     )
     payload = decision.to_dict()
     payload.update(

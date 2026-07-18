@@ -39,6 +39,17 @@ from core.services.daily_capabilities import (
 )
 from core.services.daily_rewards import DailyProgressSnapshot, RewardStrategy
 from core.services.server_calendar import SERVER_CLOCK
+from core.services.fatigue_triggers import recover_pending_fatigue_schedules
+
+
+def recover_startup_fatigue_schedules() -> bool:
+    """Recover crash-pending schedule transactions without blocking startup."""
+
+    try:
+        return recover_pending_fatigue_schedules()
+    except Exception as error:
+        logger.warning(f"启动恢复疲劳调度失败，将在下次启动重试: {error}")
+        return False
 
 
 def select_reward_dependency_tasks(
@@ -48,6 +59,8 @@ def select_reward_dependency_tasks(
     *,
     satisfied_prerequisites: frozenset[str] = frozenset(),
     now: datetime | None = None,
+    daily_activity_enabled: bool = True,
+    travel_manual_enabled: bool = True,
 ) -> list[QueuedTask]:
     """Materialize only safe production tasks selected by the capability registry."""
 
@@ -57,6 +70,8 @@ def select_reward_dependency_tasks(
         strategy,
         now=now or (snapshot.observed_at if snapshot is not None else None),
         satisfied_prerequisites=satisfied_prerequisites,
+        daily_activity_enabled=daily_activity_enabled,
+        travel_manual_enabled=travel_manual_enabled,
     )
     return [
         capability.run_factory()
@@ -170,6 +185,7 @@ class DashboardInterface(ScrollArea):
         self.businessTaskProvider = lambda: None
         self.priorityTaskProviders = []
         self.additionalTaskProviders = []
+        recover_startup_fatigue_schedules()
         # Keep the scheduler listening from application startup so reaching a
         # configured next-run time does not require a manual button click.
         self.schedulerArmed = True
@@ -329,6 +345,8 @@ class DashboardInterface(ScrollArea):
                 strategy,
                 satisfied_prerequisites=prerequisite_resolution.satisfied,
                 now=SERVER_CLOCK.server_now(),
+                daily_activity_enabled=bool(cfg.autoCollectDailyActivity.value),
+                travel_manual_enabled=bool(cfg.autoCollectTravelManual.value),
             )
             existing = {task.key for task in due}
             insertion = due.index(reward_task)

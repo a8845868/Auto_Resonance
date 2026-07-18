@@ -154,6 +154,14 @@ def test_prerequisite_resolver_allows_safe_passenger():
             "target_carriages": 8,
             "premium_currency_required": False,
             "automation_safe": True,
+            "automation_safety_source": "game_observed",
+            "automation_safety_reason": "build_button_and_currency_observed",
+            "server_day_id": "2026-07-18",
+            "config_revision": "cfg-1",
+            "evidence_config_revision": "cfg-1",
+            "evidence_target_carriages": 8,
+            "evidence_completed_carriages": 2,
+            "evidence_status": "pending",
             "observed_at": NOW.isoformat(),
         },
         now=NOW,
@@ -198,7 +206,9 @@ def test_unknown_gap_does_not_equal_zero_gap():
         unknown,
         RewardStrategy.MAXIMIZE_PROGRESS,
     )
-    assert [item.task_key for item in selected] == ["known_work"]
+    # An unknown enabled channel is an observation gate, not an invitation to
+    # spend resources merely because the gap is not known to be zero.
+    assert selected == []
 
 
 def test_missing_price_source_is_not_executable():

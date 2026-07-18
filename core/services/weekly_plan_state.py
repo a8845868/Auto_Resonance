@@ -105,6 +105,14 @@ def save_weekly_plan(result: dict) -> dict[str, Any]:
         "completed_books": completed_books,
         "books_total": int(result.get("books_used", 0)),
         "cycle_fatigue": float(result.get("cycle_fatigue", 0)),
+        "leg_fatigue_schedule": [
+            float(item.get("fatigue", 0))
+            for item in result.get("legs", ())
+            if isinstance(item, dict)
+        ],
+        "run_expected_profits": [
+            int(value) for value in result.get("run_expected_profits", ())
+        ],
         "expected_profit": int(result.get("combined_profit", result.get("profit", 0))),
         "cargo_profit": int(result.get("cargo_profit", result.get("profit", 0))),
         "passenger_profit": int(result.get("passenger_profit", 0)),
@@ -112,7 +120,6 @@ def save_weekly_plan(result: dict) -> dict[str, Any]:
         "price_time": result.get("price_time", ""),
         "price_source": result.get("price_source", ""),
         "price_revision": result.get("price_revision", result.get("price_time", "")),
-        "stations_available": list(result.get("cycle", ())),
         "optimizer_config": result.get("optimizer_config", {}),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -244,34 +251,82 @@ def progress_summary(
     )
     from core.services.trade_planning import plan_price_is_fresh, recommend_today_runs
 
-    available_weekly_fatigue = max(
-        0,
-        int(float(state.get("optimizer_config", {}).get("weekly_fatigue", 0)))
-        - int(facts.fatigue_used_for_trade),
+    leg_costs = [max(0, float(value)) for value in state.get("leg_fatigue_schedule", ())]
+    partial = facts.current_partial_cycle or {}
+    confirmed_legs = min(
+        len(leg_costs), max(0, int(partial.get("confirmed_legs", 0)))
     )
-    current_books_per_cycle = (
-        sum(int(value) for value in current.get("books", {}).values())
-        if current
+    if leg_costs and remaining:
+        remaining_required_fatigue = sum(leg_costs[confirmed_legs:]) + max(
+            0, remaining - 1
+        ) * sum(leg_costs)
+    else:
+        remaining_required_fatigue = remaining * float(state.get("cycle_fatigue", 0))
+    run_profits = [int(value) for value in state.get("run_expected_profits", ())]
+    remaining_expected_profit = (
+        sum(run_profits[completed:])
+        if len(run_profits) == total
+        else round(int(state.get("expected_profit", 0)) * remaining / total)
+        if total
         else 0
+    )
+    current_resources = state.get("current_resources") or {}
+    confirmed_available_fatigue = current_resources.get(
+        "confirmed_available_fatigue",
+        state.get("confirmed_available_fatigue"),
+    )
+    if not isinstance(confirmed_available_fatigue, int):
+        confirmed_available_fatigue = None
+    recovery_resources = state.get("recovery_resources") or {}
+    recoverable_fatigue_today = recovery_resources.get(
+        "recoverable_fatigue_today",
+        recovery_resources.get("confirmed_available"),
+    )
+    if not isinstance(recoverable_fatigue_today, int):
+        recoverable_fatigue_today = None
+    remaining_profit_per_fatigue = (
+        round(remaining_expected_profit / remaining_required_fatigue, 2)
+        if remaining_required_fatigue
+        else 0.0
     )
     price_fresh = plan_price_is_fresh(state, now=now)
     suggested_today = recommend_today_runs(
         remaining_runs=remaining,
         cycle_fatigue=float(state.get("cycle_fatigue", 0)),
-        available_fatigue=available_weekly_fatigue,
-        recoverable_fatigue=int(
-            (state.get("recovery_resources") or {}).get("confirmed_available", 0)
-        ),
+        available_fatigue=confirmed_available_fatigue,
+        recoverable_fatigue=recoverable_fatigue_today,
         purchase_books=max(0, books_total - books_used),
-        books_per_cycle=current_books_per_cycle,
+        books_per_cycle=0,
         partial_cycle=facts.current_partial_cycle,
         price_fresh=price_fresh,
+        cycle=state.get("cycle", ()),
+        leg_fatigue_schedule=leg_costs,
+        remaining_run_book_schedule=state.get("runs", ()),
+        current_run_index=completed,
+        current_city=(facts.current_partial_cycle or {}).get("last_destination")
+        or (state.get("cycle") or [""])[0],
+        price_revision=str(state.get("price_revision", "")),
+        current_price_revision=str(state.get("price_revision", "")),
     )
+    if confirmed_available_fatigue is None or recoverable_fatigue_today is None:
+        recommendation_reason = "current_resources_unknown"
+    elif not price_fresh:
+        recommendation_reason = "price_snapshot_not_fresh"
+    elif suggested_today is None:
+        recommendation_reason = "exact_schedule_evidence_unknown"
+    else:
+        recommendation_reason = "exact_remaining_schedule"
     return {
         **state,
         "remaining_runs": remaining,
         "remaining_books": max(0, books_total - books_used),
-        "remaining_fatigue": round(remaining * float(state.get("cycle_fatigue", 0)), 2),
+        "remaining_fatigue": round(remaining_required_fatigue, 2),
+        "remaining_required_fatigue": round(remaining_required_fatigue, 2),
+        "confirmed_available_fatigue": confirmed_available_fatigue,
+        "recoverable_fatigue_today": recoverable_fatigue_today,
+        "remaining_expected_profit": remaining_expected_profit,
+        "remaining_expected_fatigue": round(remaining_required_fatigue, 2),
+        "remaining_profit_per_fatigue": remaining_profit_per_fatigue,
         "current_batch": current,
         "remaining_batches": batches,
         "finished": remaining == 0,
@@ -303,14 +358,11 @@ def progress_summary(
             else ""
         ),
         "planned_round_trips_remaining": remaining,
-        "feasible_round_trips_by_fatigue": (
-            int(float(state.get("optimizer_config", {}).get("weekly_fatigue", 0)) // float(state.get("cycle_fatigue", 1)))
-            if float(state.get("cycle_fatigue", 0)) > 0
-            else 0
-        ),
+        "feasible_round_trips_by_fatigue": suggested_today,
         "expected_total_net_profit": expected_profit,
         "expected_total_fatigue": round(expected_fatigue, 2),
         "expected_profit_per_fatigue": profit_per_fatigue,
         "price_snapshot_fresh": price_fresh,
         "today_suggested_runs": suggested_today,
+        "today_recommendation_reason": recommendation_reason,
     }

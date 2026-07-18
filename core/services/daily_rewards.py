@@ -43,6 +43,9 @@ class DailyProgressSnapshot:
     handbook_rewards_claimable: int | None
     handbook_rewards_unclaimed: int | None
     observed_at: datetime
+    handbook_confidence: str = "HIGH"
+    daily_reward_confidence: str = "HIGH"
+    handbook_reward_confidence: str = "HIGH"
 
 
 @dataclass(frozen=True)
@@ -70,32 +73,63 @@ class DailyRewardRunResult:
         return payload
 
 
+def snapshot_unknown_for_enabled_channels(
+    snapshot: DailyProgressSnapshot,
+    daily_activity_enabled: bool,
+    travel_manual_enabled: bool,
+) -> bool:
+    """Return one fail-closed UNKNOWN decision shared by both reward machines."""
+
+    if daily_activity_enabled:
+        daily_required = (
+            snapshot.daily_activity_current,
+            snapshot.daily_activity_max,
+            snapshot.daily_activity_unclaimed_tiers,
+        )
+        if (
+            snapshot.daily_activity_confidence.upper() != "HIGH"
+            or snapshot.daily_reward_confidence.upper() != "HIGH"
+            or any(value is None for value in daily_required)
+        ):
+            return True
+    if travel_manual_enabled:
+        handbook_required = (
+            snapshot.handbook_daily_tasks_total,
+            snapshot.handbook_daily_tasks_completed,
+            snapshot.handbook_rewards_unclaimed,
+        )
+        if (
+            snapshot.handbook_confidence.upper() != "HIGH"
+            or snapshot.handbook_reward_confidence.upper() != "HIGH"
+            or any(value is None for value in handbook_required)
+        ):
+            return True
+    return False
+
+
 def _snapshot_unknown(snapshot: DailyProgressSnapshot) -> bool:
-    required = (
-        snapshot.daily_activity_current,
-        snapshot.daily_activity_max,
-        snapshot.daily_activity_unclaimed_tiers,
-        snapshot.handbook_daily_tasks_total,
-        snapshot.handbook_daily_tasks_completed,
-        snapshot.handbook_rewards_unclaimed,
-    )
-    return snapshot.daily_activity_confidence.upper() == "UNKNOWN" or any(
-        value is None for value in required
-    )
+    return snapshot_unknown_for_enabled_channels(snapshot, True, True)
 
 
-def _snapshot_complete(snapshot: DailyProgressSnapshot) -> bool:
-    return bool(
+def _snapshot_complete(
+    snapshot: DailyProgressSnapshot,
+    daily_activity_enabled: bool = True,
+    travel_manual_enabled: bool = True,
+) -> bool:
+    daily_complete = not daily_activity_enabled or bool(
         snapshot.daily_activity_current is not None
         and snapshot.daily_activity_max is not None
         and snapshot.daily_activity_current >= snapshot.daily_activity_max
         and snapshot.daily_activity_unclaimed_tiers == 0
-        and snapshot.handbook_daily_tasks_total is not None
+    )
+    handbook_complete = not travel_manual_enabled or bool(
+        snapshot.handbook_daily_tasks_total is not None
         and snapshot.handbook_daily_tasks_completed is not None
         and snapshot.handbook_daily_tasks_completed
         >= snapshot.handbook_daily_tasks_total
         and snapshot.handbook_rewards_unclaimed == 0
     )
+    return daily_complete and handbook_complete
 
 
 def decide_reward_run(
@@ -107,6 +141,8 @@ def decide_reward_run(
     blocked_reasons: tuple[str, ...] = (),
     transient_error: bool = False,
     attempt: int = 1,
+    daily_activity_enabled: bool = True,
+    travel_manual_enabled: bool = True,
 ) -> DailyRewardRunResult:
     current = now or SERVER_CLOCK.server_now()
     if current.tzinfo is None or current.utcoffset() is None:
@@ -128,7 +164,9 @@ def decide_reward_run(
             next_run,
             "bounded_transient_backoff",
         )
-    if snapshot is None or _snapshot_unknown(snapshot):
+    if snapshot is None or snapshot_unknown_for_enabled_channels(
+        snapshot, daily_activity_enabled, travel_manual_enabled
+    ):
         reset = SERVER_CLOCK.next_daily_reset(current)
         near_reset = reset - current <= timedelta(minutes=10)
         next_run = current + timedelta(minutes=5)
@@ -166,7 +204,9 @@ def decide_reward_run(
             current + timedelta(minutes=10),
             "progress_dependency_running",
         )
-    if _snapshot_complete(snapshot):
+    if _snapshot_complete(
+        snapshot, daily_activity_enabled, travel_manual_enabled
+    ):
         return DailyRewardRunResult(
             RewardRunStatus.COMPLETE,
             strategy,
@@ -179,8 +219,8 @@ def decide_reward_run(
             deferred=False,
         )
     claimable = bool(
-        (snapshot.daily_activity_unclaimed_tiers or 0)
-        or (snapshot.handbook_rewards_unclaimed or 0)
+        (daily_activity_enabled and (snapshot.daily_activity_unclaimed_tiers or 0))
+        or (travel_manual_enabled and (snapshot.handbook_rewards_unclaimed or 0))
     )
     status = RewardRunStatus.CLAIMABLE if claimable else RewardRunStatus.INCOMPLETE
     if claimable:
