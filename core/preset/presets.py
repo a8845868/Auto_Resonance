@@ -467,8 +467,7 @@ def go_city():
         input_tap(
             (1270, 494),
             intent=ActionIntent(
-                "navigation_anchor", "home", "city_entry", (1270, 494),
-                correlation_id="preset:home:city-entry",
+                "city_entry_navigation", "city_entry", "preset:home:city-entry",
             ),
         )
         time.sleep(2.0)
@@ -487,16 +486,16 @@ def go_outlets(name: str):
     # lower length ratio than the legacy 0.7 default.
     if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False, score=0.3, action_key="navigation_anchor", page_id="city_outlets"):
         return result
-    input_swipe((457, 340), (457, 369), swipe_time=500, intent=ActionIntent("scroll", "city_outlets", "outlet_list", (457, 340)))
+    input_swipe((457, 340), (457, 369), swipe_time=500, intent=ActionIntent("outlet_list_scroll", "outlet_list", "preset:outlet:scroll-1"))
     if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False, score=0.3, action_key="navigation_anchor", page_id="city_outlets"):
         return result
-    input_swipe((400, 340), (457, 340), swipe_time=500, intent=ActionIntent("scroll", "city_outlets", "outlet_list", (400, 340)))
+    input_swipe((400, 340), (457, 340), swipe_time=500, intent=ActionIntent("outlet_list_scroll", "outlet_list", "preset:outlet:scroll-2"))
     if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False, score=0.3, action_key="navigation_anchor", page_id="city_outlets"):
         return result
-    input_swipe((969, 369), (457, 340), swipe_time=500, intent=ActionIntent("scroll", "city_outlets", "outlet_list", (969, 369)))
+    input_swipe((969, 369), (457, 340), swipe_time=500, intent=ActionIntent("outlet_list_scroll", "outlet_list", "preset:outlet:scroll-3"))
     if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False, score=0.3, action_key="navigation_anchor", page_id="city_outlets"):
         return result
-    input_swipe((641, 246), (637, 615), swipe_time=500, intent=ActionIntent("scroll", "city_outlets", "outlet_list", (641, 246)))
+    input_swipe((641, 246), (637, 615), swipe_time=500, intent=ActionIntent("outlet_list_scroll", "outlet_list", "preset:outlet:scroll-4"))
     if result := blurry_ocr_click(name, excursion_pos=(0, 80), score=0.3, action_key="navigation_anchor", page_id="city_outlets"):
         return result
 

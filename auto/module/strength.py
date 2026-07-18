@@ -41,8 +41,13 @@ def input_tap(
     return _raw_input_tap(
         pos,
         intent=ActionIntent(
-            action_key, page_id, anchor_key, pos,
-            correlation_id=f"fatigue:{page_id}:{anchor_key}",
+            (
+                "page_back" if action_key == "back"
+                else "fatigue_info_open" if action_key == "open_detail"
+                else action_key
+            ),
+            "top_left_back" if action_key == "back" else anchor_key,
+            f"fatigue:{page_id}:{anchor_key}",
         ),
     )
 

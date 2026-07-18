@@ -94,9 +94,9 @@ def click_image(
             return bool(input_tap(
                 pos,
                 intent=ActionIntent(
-                    action_key=action_key, page_id=page_id,
-                    anchor_key=Path(template).name if isinstance(template, (str, Path)) else "template",
-                    coordinate=pos, correlation_id=f"preset:{page_id}:template",
+                    action_key,
+                    Path(template).name if isinstance(template, (str, Path)) else "template",
+                    f"preset:{page_id}:template",
                 ),
             ))
     if check_err:
@@ -199,9 +199,7 @@ def blurry_ocr_click(
             input_tap(
                 coordinates,
                 intent=ActionIntent(
-                    action_key=action_key, page_id=page_id,
-                    anchor_key=text, coordinate=coordinates,
-                    correlation_id=f"preset:{page_id}:{text}",
+                    action_key, text, f"preset:{page_id}:{text}",
                 ),
             )
             return True
@@ -265,32 +263,32 @@ def go_home():
         clarity_cancel = clarity_replenish_cancel_position(visible)
         if clarity_cancel is not None:
             logger.info("检测到澄明度补充提示，取消后继续返回主界面")
-            input_tap(clarity_cancel, intent=ActionIntent("navigation_anchor", "clarity_dialog", "cancel", clarity_cancel))
+            input_tap(clarity_cancel, intent=ActionIntent("dialog_cancel", "cancel", "preset:clarity:cancel"))
             startup_recovery = False
             time.sleep(1)
             continue
         if is_inventory_item_detail(visible):
             logger.info("识别到背包物品详情页，关闭详情后继续返回主界面")
-            input_tap((100, 650), intent=ActionIntent("back", "inventory_detail", "close", (100, 650)))
+            input_tap((100, 650), intent=ActionIntent("page_back", "top_left_back", "preset:inventory-detail:back"))
             startup_recovery = False
             time.sleep(1)
             continue
         if is_inventory_screen(visible):
             logger.info("识别到背包列表页，点击左上角返回主界面")
-            input_tap((78, 38), intent=ActionIntent("back", "inventory", "top_left_back", (78, 38)))
+            input_tap((78, 38), intent=ActionIntent("page_back", "top_left_back", "preset:inventory:back"))
             startup_recovery = False
             time.sleep(1.5)
             continue
         startup_action = startup_screen_action(visible)
         if startup_action == "cancel_resource_repair":
             logger.warning("检测到资源完整性修复提示，取消修复")
-            input_tap((320, 500), intent=ActionIntent("navigation_anchor", "resource_repair", "cancel", (320, 500)))
+            input_tap((320, 500), intent=ActionIntent("dialog_cancel", "cancel", "preset:resource-repair:cancel"))
             startup_recovery = True
             time.sleep(1)
             continue
         if startup_action == "confirm_resource_download":
             logger.info("检测到登录前资源包更新提示，确认下载并等待完成")
-            input_tap(RESOURCE_DOWNLOAD_CONFIRM_TAP, intent=ActionIntent("unclassified_tap", "resource_download", "confirm", RESOURCE_DOWNLOAD_CONFIRM_TAP))
+            input_tap(RESOURCE_DOWNLOAD_CONFIRM_TAP, intent=ActionIntent("unclassified_tap", "confirm", "preset:resource-download:confirm"))
             startup_recovery = True
             if not resource_download_seen:
                 attempt_limit = max(
@@ -302,13 +300,13 @@ def go_home():
             continue
         if startup_action == "enter_game":
             logger.info("检测到游戏登录页，点击安全区域进入游戏")
-            input_tap((640, 560), intent=ActionIntent("navigation_anchor", "login", "enter_game", (640, 560)))
+            input_tap((640, 560), intent=ActionIntent("enter_game", "enter_game", "preset:login:enter"))
             startup_recovery = True
             time.sleep(4)
             continue
         if startup_action == "dismiss_startup_overlay":
             logger.info("关闭登录后的启动弹窗")
-            input_tap((100, 650), intent=ActionIntent("navigation_anchor", "startup_overlay", "dismiss", (100, 650)))
+            input_tap((100, 650), intent=ActionIntent("dialog_cancel", "cancel", "preset:startup-overlay:dismiss"))
             startup_recovery = True
             time.sleep(1)
             continue
@@ -334,7 +332,7 @@ def go_home():
         )
         if not clicked:
             # 1280x720 game layout: stable top-left back button fallback.
-            input_tap((78, 38), intent=ActionIntent("back", "unknown_page", "top_left_back", (78, 38)))
+            input_tap((78, 38), intent=ActionIntent("page_back", "top_left_back", "preset:unknown:back"))
         time.sleep(1.5)
     logger.error("返回主界面超时，已停止继续点击")
     return False

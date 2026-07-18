@@ -194,8 +194,7 @@ def _wait_for_verified_arrival(max_false_arrivals: int = 3) -> bool:
         input_tap(
             (78, 38),
             intent=ActionIntent(
-                "back", "transit_hud", "top_left_route", (78, 38),
-                correlation_id="business:transit:route-monitor",
+                "page_back", "top_left_back", "business:transit:route-monitor",
             ),
         )
         time.sleep(1.0)

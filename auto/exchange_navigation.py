@@ -183,17 +183,17 @@ def open_exchange_action(
 
     def safe_anchor_tap(pos: tuple[int, int]) -> None:
         action_key = (
-            "exchange_buy_anchor"
+            "exchange_buy_navigation"
             if selected is ExchangeAction.BUY
-            else "exchange_sell_anchor"
+            else "exchange_sell_navigation"
         )
+        target = "buy_navigation" if selected is ExchangeAction.BUY else "sell_navigation"
         label = "我要买" if selected is ExchangeAction.BUY else "我要卖"
         input_tap(
             pos,
             intent=ActionIntent(
-                action_key=action_key, page_id="exchange_menu",
-                anchor_key=label, coordinate=pos,
-                correlation_id=f"exchange:{selected.value.lower()}:anchor",
+                action_key, target,
+                f"exchange:{selected.value.lower()}:anchor",
             ),
         )
     frame = screenshot()

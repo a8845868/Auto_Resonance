@@ -28,8 +28,7 @@ def _sell_tap(pos: tuple[int, int], action_key: str = "transaction_sell") -> obj
     return input_tap(
         pos,
         intent=ActionIntent(
-            action_key, "exchange_sell", "transaction_control", pos,
-            correlation_id=f"business:sell:{action_key}",
+            action_key, "transaction_control", f"business:sell:{action_key}",
         ),
     )
 

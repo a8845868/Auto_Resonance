@@ -33,8 +33,7 @@ def _buy_tap(pos: tuple[int, int]) -> object:
     return input_tap(
         pos,
         intent=ActionIntent(
-            "transaction_buy", "exchange_buy", "transaction_control", pos,
-            correlation_id="business:buy:transaction",
+            "transaction_buy", "transaction_control", "business:buy:transaction",
         ),
     )
 
