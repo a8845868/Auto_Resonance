@@ -354,6 +354,7 @@ class PageScanEvidence:
     end_marker: bool
     captured_at: datetime
     displacement_px: int = 0
+    page_anchor_confirmed: bool = True
 
 
 @dataclass(frozen=True)
@@ -377,6 +378,7 @@ class ManualRewardTrackScanner:
         self._end_seen = False
         self._last_captured_at: datetime | None = None
         self._time_separated = True
+        self._anchor_valid = True
 
     @property
     def segments(self) -> tuple[ManualTrackSegment, ...]:
@@ -384,7 +386,12 @@ class ManualRewardTrackScanner:
 
     @property
     def complete(self) -> bool:
-        return self._movement_seen and self._end_seen and self._time_separated
+        return (
+            self._movement_seen
+            and self._end_seen
+            and self._time_separated
+            and self._anchor_valid
+        )
 
     @property
     def claimable_level_rewards(self) -> int:
@@ -399,6 +406,7 @@ class ManualRewardTrackScanner:
             if evidence.captured_at - self._last_captured_at < self.min_frame_separation:
                 self._time_separated = False
         self._last_captured_at = evidence.captured_at
+        self._anchor_valid = self._anchor_valid and evidence.page_anchor_confirmed
         self._movement_seen = self._movement_seen or bool(
             evidence.movement_confirmed and evidence.displacement_px > 0
         )
@@ -518,6 +526,7 @@ class _CardScannerBase:
         self._evidence_mode = False
         self._movement_seen = False
         self._end_seen = False
+        self._anchor_valid = True
 
     @property
     def cards(self):
@@ -530,6 +539,7 @@ class _CardScannerBase:
                 not self.cancelled
                 and self._movement_seen
                 and self._end_seen
+                and self._anchor_valid
                 and self._pages <= self.max_pages
             )
         return not self.cancelled and self._no_new >= 2 and self._pages <= self.max_pages
@@ -587,6 +597,9 @@ class _CardScannerBase:
         self._pages += 1
         if evidence is not None:
             self._evidence_mode = True
+            self._anchor_valid = self._anchor_valid and evidence.page_anchor_confirmed
+            if not evidence.page_anchor_confirmed:
+                self.cancelled = True
             self._movement_seen = self._movement_seen or bool(
                 evidence.movement_confirmed and evidence.displacement_px > 0
             )
@@ -610,6 +623,35 @@ class _CardScannerBase:
 
     def cancel(self) -> None:
         self.cancelled = True
+
+
+def _horizontal_displacement(
+    previous: list[dict], current: list[dict]
+) -> int | None:
+    """Return a verified shared-OCR horizontal displacement, not frame churn."""
+
+    def unique_x(items: list[dict]) -> dict[str, float]:
+        grouped: dict[str, list[float]] = {}
+        for item in items:
+            if not item.get("position"):
+                continue
+            key = _normalized_key(str(item.get("text", "")))
+            if len(key) < 2:
+                continue
+            grouped.setdefault(key, []).append(float(_center(item)[0]))
+        return {key: values[0] for key, values in grouped.items() if len(values) == 1}
+
+    before, after = unique_x(previous), unique_x(current)
+    deltas = [after[key] - before[key] for key in before.keys() & after.keys()]
+    if len(deltas) < 2:
+        return None
+    median = int(round(float(np.median(deltas))))
+    consistent = [value for value in deltas if abs(value - median) <= 20]
+    if len(consistent) < 2:
+        return None
+    if abs(median) < 10:
+        return 0
+    return median if abs(median) >= 30 else None
 
 
 class DailyCardScanner(_CardScannerBase):
@@ -741,7 +783,9 @@ def observe_daily_activity_layout(
         task_rewards_claimable=sum(1 for card in cards if card.claimable),
         stage_rewards_claimable=max(0, int(stage_rewards_claimable)),
         page_complete=complete,
-        confidence="HIGH" if maximum is not None and current is not None and complete else "UNKNOWN",
+        # The total and thresholds are independent fixed-page facts. Card-list
+        # completeness is reported separately and only gates card inventory.
+        confidence="HIGH" if maximum is not None and current is not None else "UNKNOWN",
         observed_at=SERVER_CLOCK.server_now(),
         missing_evidence=tuple(missing),
     )
@@ -809,6 +853,25 @@ def _manual_track_segments(items: list[dict]) -> list[ManualTrackSegment]:
             )
         )
     return segments
+
+
+def _is_manual_task_inventory_page(items: list[dict]) -> bool:
+    return bool(
+        _manual_daily_progress_observation(items) is not None
+        or _card_items(items, manual=True)
+    )
+
+
+def _is_manual_track_page(items: list[dict]) -> bool:
+    texts = [str(item.get("text", "")) for item in items]
+    return bool(
+        _manual_track_segments(items)
+        and any(
+            _matches(text, marker)
+            for text in texts
+            for marker in ("环游手册", "等级奖励")
+        )
+    )
 
 
 @dataclass
@@ -1145,10 +1208,11 @@ class RewardCollector:
                 scanner.add_page(
                     items,
                     evidence=PageScanEvidence(
-                        False, False, datetime.now().astimezone()
+                        False, False, datetime.now().astimezone(),
+                        page_anchor_confirmed=_is_daily_activity_page(items),
                     ),
                 )
-                previous_fingerprint = _items_fingerprint(items)
+                previous_items = items
                 for page_index in range(12):
                     if scanner.complete:
                         break
@@ -1156,18 +1220,21 @@ class RewardCollector:
                         self.driver.swipe_left()
                     next_frame = self.driver.frame()
                     next_items = next_frame.ocr()
-                    next_fingerprint = _items_fingerprint(next_items)
-                    moved = next_fingerprint != previous_fingerprint
+                    displacement = _horizontal_displacement(previous_items, next_items)
+                    anchored = _is_daily_activity_page(next_items)
                     scanner.add_page(
                         next_items,
                         evidence=PageScanEvidence(
-                            moved,
-                            not moved,
+                            displacement is not None and abs(displacement) >= 30,
+                            displacement == 0,
                             datetime.now().astimezone(),
-                            displacement_px=1 if moved else 0,
+                            displacement_px=abs(displacement or 0),
+                            page_anchor_confirmed=anchored,
                         ),
                     )
-                    previous_fingerprint = next_fingerprint
+                    previous_items = next_items
+                    if scanner.cancelled:
+                        break
                     layout_frames.append(next_items)
                     layout_images.append(next_frame.image)
                     stage_claimable = max(stage_claimable, len(_daily_stage_boxes(next_frame.image)))
@@ -1253,30 +1320,34 @@ class RewardCollector:
             scanner.add_page(
                 items,
                 evidence=PageScanEvidence(
-                    False, False, datetime.now().astimezone()
+                    False, False, datetime.now().astimezone(),
+                    page_anchor_confirmed=_is_manual_task_inventory_page(items),
                 ),
             )
             observation = _manual_daily_progress_observation(items)
             if observation is None:
-                previous_fingerprint = _items_fingerprint(items)
+                previous_items = items
                 for _ in range(12 - len(frames)):
                     if scanner.complete:
                         break
                     if hasattr(self.driver, "swipe_left"):
                         self.driver.swipe_left()
                     next_items = self.driver.texts()
-                    next_fingerprint = _items_fingerprint(next_items)
-                    moved = next_fingerprint != previous_fingerprint
+                    displacement = _horizontal_displacement(previous_items, next_items)
+                    anchored = _is_manual_task_inventory_page(next_items)
                     scanner.add_page(
                         next_items,
                         evidence=PageScanEvidence(
-                            moved,
-                            not moved,
+                            displacement is not None and abs(displacement) >= 30,
+                            displacement == 0,
                             datetime.now().astimezone(),
-                            displacement_px=1 if moved else 0,
+                            displacement_px=abs(displacement or 0),
+                            page_anchor_confirmed=anchored,
                         ),
                     )
-                    previous_fingerprint = next_fingerprint
+                    previous_items = next_items
+                    if scanner.cancelled:
+                        break
                 summary = scanner.summary()
                 if summary is None:
                     return None
@@ -1288,24 +1359,30 @@ class RewardCollector:
                 first_items = self.driver.texts()
                 track.add_segments(
                     _manual_track_segments(first_items),
-                    PageScanEvidence(False, False, datetime.now().astimezone()),
+                    PageScanEvidence(
+                        False, False, datetime.now().astimezone(),
+                        page_anchor_confirmed=_is_manual_track_page(first_items),
+                    ),
                 )
-                previous_fingerprint = _items_fingerprint(first_items)
+                previous_items = first_items
                 for _ in range(12):
                     self.driver.swipe_left()
                     next_items = self.driver.texts()
-                    next_fingerprint = _items_fingerprint(next_items)
-                    moved = next_fingerprint != previous_fingerprint
+                    displacement = _horizontal_displacement(previous_items, next_items)
+                    anchored = _is_manual_track_page(next_items)
                     track.add_segments(
                         _manual_track_segments(next_items),
                         PageScanEvidence(
-                            moved,
-                            not moved,
+                            displacement is not None and abs(displacement) >= 30,
+                            displacement == 0,
                             datetime.now().astimezone(),
-                            displacement_px=1 if moved else 0,
+                            displacement_px=abs(displacement or 0),
+                            page_anchor_confirmed=anchored,
                         ),
                     )
-                    previous_fingerprint = next_fingerprint
+                    previous_items = next_items
+                    if not anchored:
+                        break
                     if track.complete:
                         break
                 level = track.observation()
@@ -1352,22 +1429,30 @@ class RewardCollector:
             return None
         track.add_segments(
             _manual_track_segments(first_items),
-            PageScanEvidence(False, False, datetime.now().astimezone()),
+            PageScanEvidence(
+                False, False, datetime.now().astimezone(),
+                page_anchor_confirmed=_is_manual_track_page(first_items),
+            ),
         )
-        previous_fingerprint = _items_fingerprint(first_items)
+        previous_items = first_items
         for _ in range(12):
             self.driver.swipe_left()
             next_items = self.driver.texts()
-            next_fingerprint = _items_fingerprint(next_items)
-            moved = next_fingerprint != previous_fingerprint
+            displacement = _horizontal_displacement(previous_items, next_items)
+            anchored = _is_manual_track_page(next_items)
             track.add_segments(
                 _manual_track_segments(next_items),
                 PageScanEvidence(
-                    moved, not moved, datetime.now().astimezone(),
-                    displacement_px=1 if moved else 0,
+                    displacement is not None and abs(displacement) >= 30,
+                    displacement == 0,
+                    datetime.now().astimezone(),
+                    displacement_px=abs(displacement or 0),
+                    page_anchor_confirmed=anchored,
                 ),
             )
-            previous_fingerprint = next_fingerprint
+            previous_items = next_items
+            if not anchored:
+                break
             if track.complete:
                 break
         level = track.observation()

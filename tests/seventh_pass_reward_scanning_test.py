@@ -13,6 +13,7 @@ from auto.reward_collection import (
     ManualRewardTrackScanner,
     ManualTrackSegment,
     PageScanEvidence,
+    _horizontal_displacement,
     observe_daily_activity_layout,
     observe_manual_level_layout,
 )
@@ -100,7 +101,10 @@ def test_real_sixth_daily_duplicate_title_is_reconciled():
 
 
 def test_standalone_daily_zero_is_observed():
-    assert observe_daily_activity_layout([_daily()] * 3, page_complete=True).current == 0
+    observed = observe_daily_activity_layout([_daily()] * 3, page_complete=False)
+    assert observed.current == 0
+    assert observed.confidence == "HIGH"
+    assert observed.page_complete is False
 
 
 def test_standalone_current_requires_daily_page_anchors():
@@ -195,3 +199,20 @@ def test_track_scan_frames_are_time_separated():
     scanner.add_segments([], PageScanEvidence(False, False, NOW))
     scanner.add_segments([], PageScanEvidence(True, True, NOW + timedelta(milliseconds=50), 300))
     assert scanner.complete is False
+
+
+def test_scanner_fails_closed_when_page_anchor_is_lost():
+    scanner = DailyCardScanner()
+    scanner.add_cards([_card()], evidence=PageScanEvidence(False, False, NOW))
+    scanner.add_cards(
+        [_card("other")],
+        evidence=PageScanEvidence(True, True, NOW + timedelta(seconds=1), 300, False),
+    )
+    assert scanner.cancelled is True
+    assert scanner.complete is False
+
+
+def test_ocr_jitter_is_not_real_scroll_displacement():
+    before = [_ocr("共同标题一", 300, 300), _ocr("共同标题二", 600, 300)]
+    after = [_ocr("共同标题一", 304, 300), _ocr("共同标题二", 597, 300)]
+    assert _horizontal_displacement(before, after) == 0
