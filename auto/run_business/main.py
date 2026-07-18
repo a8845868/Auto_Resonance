@@ -7,6 +7,7 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Dict, Literal
 
@@ -373,6 +374,63 @@ def resume_action_for_leg(context: dict | None, leg_id: str) -> str:
     return "START"
 
 
+@dataclass(frozen=True)
+class ActiveLegRecovery:
+    cycle_id: str
+    leg_id: str
+    origin: str
+    destination: str
+    phase: str
+    current_city: str
+    next_action: str
+    server_week_id: str
+
+
+def active_leg_recovery(
+    context: dict | None,
+    current_city: str,
+) -> ActiveLegRecovery | None:
+    """Resolve the ledger-owned active leg before any city-driven reordering."""
+
+    if context is None:
+        return None
+    from core.services.trade_ledger import LEDGER_PATH, load_trade_cycle_state
+
+    state = load_trade_cycle_state(
+        context.get("ledger_path", LEDGER_PATH), context["cycle_id"]
+    )
+    if not state.events or state.phase == "CYCLE_COMPLETED" or not state.current_leg_id:
+        return None
+    leg_events = [
+        item
+        for item in state.events
+        if str(item.get("leg_id", "")) == state.current_leg_id
+    ]
+    if not leg_events:
+        return None
+    latest = leg_events[-1]
+    origin = str(latest.get("origin", ""))
+    destination = str(latest.get("destination", ""))
+    phase = state.current_leg_phase
+    action = resume_action_for_leg(context, state.current_leg_id)
+    if phase in {"DEPARTURE_REQUESTED", "DEPARTURE_CONFIRMED"} and current_city == destination:
+        action = "ARRIVE_AND_SELL"
+    elif phase == "DEPARTURE_REQUESTED" and current_city == origin:
+        action = "RETRY_DEPARTURE"
+    elif phase == "DEPARTURE_CONFIRMED":
+        action = "WAIT_ARRIVAL"
+    return ActiveLegRecovery(
+        cycle_id=state.cycle_id,
+        leg_id=state.current_leg_id,
+        origin=origin,
+        destination=destination,
+        phase=phase,
+        current_city=current_city,
+        next_action=action,
+        server_week_id=state.server_week_id,
+    )
+
+
 def should_issue_departure(
     resume_action: str,
     current_city: str,
@@ -444,6 +502,41 @@ def _leg_books_used(context: dict | None, leg_id: str) -> int:
     )
 
 
+def _revalidate_purchase_guard(
+    context: dict | None,
+    city: RouteModel,
+    *,
+    confirmed_books: int,
+) -> bool | dict[str, object]:
+    """Run the latest price/resource guard immediately before irreversible buy."""
+
+    if context is None:
+        return True
+    validator = context.get("purchase_validator")
+    if not callable(validator):
+        return (
+            _stale_price_deferral("purchase_guard_missing")
+            if context.get("require_purchase_guard") is True
+            else True
+        )
+    try:
+        result = validator(
+            city,
+            confirmed_books=max(0, int(confirmed_books)),
+            observed_at=SERVER_CLOCK.server_now(),
+        )
+    except StopExecution:
+        raise
+    except Exception as error:
+        logger.exception("不可逆购买前复核异常，阻止点击购买")
+        return _stale_price_deferral(f"purchase_guard_error:{type(error).__name__}")
+    if result is True:
+        return True
+    if isinstance(result, dict):
+        return result
+    return _stale_price_deferral("purchase_guard_rejected")
+
+
 def run(
     routes: RoutesModel,
     recovery_attempts: int = 2,
@@ -483,6 +576,18 @@ def run(
     if not city_name:
         logger.error("无法确定当前城市，已安全停止而非抛出异常")
         return False
+    recovery = active_leg_recovery(ledger_context, city_name)
+    if recovery is not None:
+        logger.info(
+            "Active leg recovery: cycle={cycle} leg={leg} phase={phase} "
+            "city={city} next={action}".format(
+                cycle=recovery.cycle_id,
+                leg=recovery.leg_id,
+                phase=recovery.phase,
+                city=recovery.current_city,
+                action=recovery.next_action,
+            )
+        )
     expected_cities = _route_city_names(routes)
     if city_name not in expected_cities:
         first_buy_city = routes.city_data[0].buy_city_name
@@ -500,8 +605,6 @@ def run(
     if is_train_in_transit(screenshot().ocr()):
         logger.error("安全门禁：城市识别后仍检测到行驶状态，拒绝执行清仓预检")
         return False
-    if routes.city_data[0].sell_city_name == city_name:
-        routes.city_data = [routes.city_data[1], routes.city_data[0]]
     in_flight_cycle = False
     if ledger_context is not None:
         from core.services.trade_ledger import LEDGER_PATH, load_trade_cycle_state
@@ -536,7 +639,31 @@ def run(
         if not residual_result:
             return False
     route_items = list(routes.city_data)
-    if ledger_context and int(ledger_context.get("completed_legs", 0)) == 1:
+    if recovery is not None:
+        active_route = next(
+            (
+                item
+                for item in route_items
+                if item.buy_city_name == recovery.origin
+                and item.sell_city_name == recovery.destination
+            ),
+            None,
+        )
+        if active_route is None:
+            logger.error(
+                f"账本 active leg {recovery.leg_id} 不在当前路线中，拒绝重排或买入"
+            )
+            return False
+        route_items = [active_route] + [
+            item for item in route_items if item is not active_route
+        ]
+    elif route_items and route_items[0].sell_city_name == city_name:
+        route_items = list(reversed(route_items))
+    if (
+        recovery is None
+        and ledger_context
+        and int(ledger_context.get("completed_legs", 0)) == 1
+    ):
         origin = ledger_context.get("origin")
         resume = [
             item
@@ -613,6 +740,11 @@ def run(
                     required_available=travel_cost,
                 ) or False
             confirmed_before = _leg_books_used(ledger_context, leg_id)
+            guard_result = _revalidate_purchase_guard(
+                ledger_context, city, confirmed_books=confirmed_before
+            )
+            if guard_result is not True:
+                return guard_result
 
             def book_committed(sequence: int):
                 _record_ledger_event(
@@ -873,6 +1005,7 @@ def two_city_weekly_run(
     sell_city_name: str,
     execution_batches: list[dict],
     max_runs: int | None = None,
+    available_books: int | None = None,
 ):
     """Execute complete round trips, optionally yielding after a safe run boundary.
 
@@ -881,9 +1014,15 @@ def two_city_weekly_run(
     that became due meanwhile run before the next trip, without ever stopping a
     train halfway through a leg or leaving a sale unfinished.
     """
-    from core.services import record_completed_run
+    from app.common.config import cfg
+    from core.services import load_weekly_plan, record_completed_run
     from core.services.server_calendar import SERVER_CLOCK
-    from core.services.trade_ledger import LEDGER_PATH, find_recoverable_cycle
+    from core.services.trade_ledger import (
+        LEDGER_PATH,
+        find_recoverable_cycle,
+        load_trade_cycle_state,
+    )
+    from core.services.trade_planning import validate_executable_trade_budget
 
     global STOP
     STOP = False
@@ -896,6 +1035,15 @@ def two_city_weekly_run(
     run_limit = total_runs if max_runs is None else min(total_runs, max(1, int(max_runs)))
     logger.info(f"准备运行周计划，共 {total_runs} 次完整往返，{len(execution_batches)} 个阶段")
     completed = 0
+    initial_state = load_weekly_plan() or {}
+    expected_price_revision = str(
+        initial_state.get("price_revision", initial_state.get("price_time", ""))
+    )
+    confirmed_book_budget = (
+        max(0, int(available_books))
+        if available_books is not None
+        else max(0, int(cfg.InventoryBooks.value))
+    )
     for batch_index, batch in enumerate(execution_batches, start=1):
         books = batch.get("books", {})
         batch_runs = int(batch.get("runs", 0))
@@ -917,7 +1065,63 @@ def two_city_weekly_run(
                 "origin": buy_city_name,
                 "server_week_id": server_week_id,
                 "completed_legs": completed_legs,
+                "require_purchase_guard": True,
             }
+
+            def purchase_validator(city, *, confirmed_books=0, observed_at=None):
+                current_state = load_weekly_plan()
+                if not current_state:
+                    return _stale_price_deferral("weekly_plan_missing_before_purchase")
+                current_revision = str(
+                    current_state.get(
+                        "price_revision", current_state.get("price_time", "")
+                    )
+                )
+                if not expected_price_revision or current_revision != expected_price_revision:
+                    return _stale_price_deferral("price_revision_changed_before_purchase")
+                unavailable_now = unavailable_stations(
+                    [city.buy_city_name, city.sell_city_name],
+                    at=observed_at or SERVER_CLOCK.server_now(),
+                )
+                if unavailable_now:
+                    return _route_availability_deferral(
+                        city.buy_city_name, city.sell_city_name
+                    )
+                strength = read_strength()
+                if not strength:
+                    return _fatigue_deferral("fatigue_unknown_before_purchase") or False
+                available_fatigue = max(0, int(strength[1]) - int(strength[0]))
+                cycle = load_trade_cycle_state(LEDGER_PATH, cycle_id)
+                validated_state = dict(current_state)
+                validated_state["current_partial_cycle"] = {
+                    "confirmed_legs": len(cycle.completed_leg_ids)
+                }
+                validated_state["cycle_fatigue"] = max(
+                    1,
+                    int(
+                        _city_tired_data.get(
+                            f"{city.buy_city_name}-{city.sell_city_name}", 0
+                        )
+                    ),
+                )
+                try:
+                    validate_executable_trade_budget(
+                        validated_state,
+                        now=observed_at or SERVER_CLOCK.server_now(),
+                        fatigue_budget=available_fatigue,
+                        purchase_books=max(
+                            0,
+                            confirmed_book_budget
+                            - int(cycle.purchase_books_used),
+                        ),
+                    )
+                except Exception as error:
+                    return _stale_price_deferral(
+                        f"purchase_revalidation_failed:{type(error).__name__}"
+                    )
+                return True
+
+            ledger_context["purchase_validator"] = purchase_validator
             routes = RoutesModel(
                 city_data=[
                     RouteModel(
@@ -1058,7 +1262,13 @@ def adaptive_weekly_run():
     if available >= required and not needs_reoptimization:
         logger.info(f"进货书库存 {available} 本，足够完成剩余计划（需要 {required} 本）")
         cycle = state["cycle"]
-        return two_city_weekly_run(cycle[0], cycle[1], remaining_batches(state), max_runs=1)
+        return two_city_weekly_run(
+            cycle[0],
+            cycle[1],
+            remaining_batches(state),
+            max_runs=1,
+            available_books=available,
+        )
 
     if needs_reoptimization:
         if unavailable_cycle:
@@ -1091,6 +1301,12 @@ def adaptive_weekly_run():
             ),
             "books_total": int(replacement.get("books_used", 0)),
             "total_runs": int(replacement.get("repeats", 1)),
+            "completed_runs": 0,
+            "runs": [
+                dict(batch.get("books", {}))
+                for batch in replacement.get("execution_batches", ())
+                for _ in range(int(batch.get("runs", 0)))
+            ],
         }
         validate_executable_trade_budget(
             preview,
@@ -1107,7 +1323,13 @@ def adaptive_weekly_run():
         )
         cycle = state["cycle"]
         logger.info(f"已切换替代路线: {cycle[0]} → {cycle[1]} → {cycle[0]}，计划使用 {replacement['books_used']} 本")
-        return two_city_weekly_run(cycle[0], cycle[1], remaining_batches(state), max_runs=1)
+        return two_city_weekly_run(
+            cycle[0],
+            cycle[1],
+            remaining_batches(state),
+            max_runs=1,
+            available_books=available,
+        )
     except StopExecution:
         raise
     except StalePriceSnapshot:
