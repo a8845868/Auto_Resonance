@@ -12,6 +12,7 @@ import tempfile
 import time
 import zipfile
 from pathlib import Path
+from typing import Callable, Iterable
 
 import cv2 as cv
 
@@ -24,7 +25,18 @@ TEXT_SUFFIXES = {
     ".txt", ".md", ".json", ".jsonl", ".log", ".csv", ".xml",
     ".yaml", ".yml", ".patch", ".diff", ".py", ".toml", ".ini",
 }
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"}
+RUNTIME_PATH_NAMES = {
+    "artifacts", "logs", "config", "runtime", "runtime_state", "caches",
+    "cache", ".pytest_cache", ".pytest-tmp", "dist", "build", "__pycache__",
+}
+IMAGE_PRIVACY_PATTERNS = {
+    "account_identifier": re.compile(r"(?i)(?:uid|account[_ ]?id|\u8d26\u53f7)\s*[:=\uFF1A]?\s*[A-Za-z0-9_-]{4,}"),
+    "player_name": re.compile(r"(?i)(?:player[_ ]?name|character[_ ]?name|\u89d2\u8272\u540d|\u73a9\u5bb6\u540d)\s*[:=\uFF1A]?\s*\S+"),
+    "balance": re.compile(r"(?i)(?:balance|currency|asset|\u4f59\u989d|\u8d44\u4ea7|\u8d27\u5e01)\s*[:=\uFF1A]?\s*[0-9,]{2,}"),
+    "level": re.compile(r"(?i)(?:level|lv\.?|\u7b49\u7ea7)\s*[:=\uFF1A]?\s*\d+"),
+    "payment": re.compile(r"(?i)(?:payment|order|\u652f\u4ed8|\u8ba2\u5355)\s*[:=\uFF1A]?\s*\S+"),
+}
 _USER_PROFILE = re.compile(
     r"(?i)C:[\\/]+Users[\\/]+(?!Public(?:[\\/]|$)|%USERPROFILE%)[^\\/\s\"']+"
 )
@@ -73,6 +85,52 @@ def _redact_text(text: str, uid_values: tuple[str, ...]) -> str:
 
 def scan_sensitive_text(text: str) -> list[str]:
     return [name for name, pattern in SENSITIVE_PATTERNS.items() if pattern.search(text)]
+
+
+def _normalized_relative(path: Path, root: Path) -> str:
+    relative = path.relative_to(root).as_posix()
+    if relative.startswith("/") or ".." in Path(relative).parts:
+        raise SensitiveDataError("audit tree contains path traversal")
+    return relative
+
+
+def _is_runtime_path(relative: str) -> bool:
+    return any(part.casefold() in RUNTIME_PATH_NAMES for part in Path(relative).parts)
+
+
+def _validate_tree_entries(root: Path) -> None:
+    folded: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        relative = _normalized_relative(path, root)
+        if path.is_symlink():
+            raise SensitiveDataError(f"symbolic link forbidden: {relative}")
+        key = relative.casefold()
+        previous = folded.get(key)
+        if previous is not None and previous != relative:
+            raise SensitiveDataError(f"case-insensitive path collision: {previous} / {relative}")
+        folded[key] = relative
+
+
+def _image_privacy_hits(texts: Iterable[str]) -> list[str]:
+    joined = "\n".join(str(text) for text in texts)
+    hits = set(scan_sensitive_text(joined))
+    hits.update(name for name, pattern in IMAGE_PRIVACY_PATTERNS.items() if pattern.search(joined))
+    return sorted(hits)
+
+
+def minimize_audit_journal(entry: dict) -> dict:
+    """Return the minimum non-account telemetry needed to audit one action."""
+
+    context = str(entry.get("page_context", ""))
+    marker_hash = hashlib.sha256(context.encode("utf-8")).hexdigest()[:16]
+    allowed = {
+        "timestamp", "action_key", "observation_id", "screenshot_hash",
+        "page_classifier", "anchor_key", "anchor_bbox", "permit_id",
+        "correlation_id", "coordinate", "final_trajectory", "allowed", "reason",
+    }
+    minimized = {key: value for key, value in entry.items() if key in allowed}
+    minimized["marker_hash"] = str(entry.get("marker_hash") or marker_hash)
+    return minimized
 
 
 def _json_string_values(value: object):
@@ -150,6 +208,36 @@ def scan_sensitive_tree(root: Path) -> tuple[list[str], dict[str, int]]:
     }
 
 
+def scan_media_tree(
+    root: Path,
+    *,
+    evidence_allowlist: tuple[str, ...] = (),
+    image_ocr_provider: Callable[[Path], Iterable[str]] | None = None,
+) -> tuple[list[str], dict[str, int]]:
+    """Inventory every image and fail closed unless OCR confirms an allowlisted file."""
+
+    hits: list[str] = []
+    allowlist = {Path(item).as_posix() for item in evidence_allowlist}
+    images = [
+        path for path in root.rglob("*")
+        if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+    ]
+    for path in sorted(images):
+        relative = path.relative_to(root).as_posix()
+        if relative not in allowlist:
+            hits.append(f"{relative}:image_not_allowlisted")
+            continue
+        if image_ocr_provider is None:
+            hits.append(f"{relative}:image_ocr_unavailable")
+            continue
+        try:
+            names = _image_privacy_hits(image_ocr_provider(path))
+        except Exception:
+            names = ["image_ocr_failed"]
+        hits.extend(f"{relative}:{name}" for name in names)
+    return hits, {"images_inventoried": len(images), "allowlisted_images": len(images) - len([h for h in hits if h.endswith('image_not_allowlisted')])}
+
+
 def _validate_semantics(root: Path) -> dict[str, int]:
     compiled = 0
     failures: list[str] = []
@@ -214,6 +302,7 @@ def _hash_file(path: Path) -> str:
 
 
 def _write_hash_manifest(root: Path) -> None:
+    _validate_tree_entries(root)
     lines = []
     for path in sorted(item for item in root.rglob("*") if item.is_file() and item.name != "SHA256SUMS.txt"):
         relative = path.relative_to(root).as_posix()
@@ -222,21 +311,79 @@ def _write_hash_manifest(root: Path) -> None:
 
 
 def verify_hash_manifest(root: Path) -> bool:
+    try:
+        _validate_tree_entries(root)
+    except SensitiveDataError:
+        return False
     manifest = root / "SHA256SUMS.txt"
     try:
         lines = manifest.read_text(encoding="utf-8").splitlines()
     except OSError:
         return False
+    listed: set[str] = set()
     for line in lines:
         if "  " not in line:
             return False
         expected, relative = line.split("  ", 1)
-        if "\\" in relative:
+        if "\\" in relative or not relative or relative.startswith("/") or ".." in Path(relative).parts:
             return False
+        if relative.casefold() in {item.casefold() for item in listed}:
+            return False
+        listed.add(relative)
         target = root / Path(relative)
         if not target.is_file() or _hash_file(target) != expected:
             return False
-    return True
+    actual = {
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file() and path.name != "SHA256SUMS.txt"
+    }
+    return listed == actual
+
+
+def verify_zip_exact_set(zip_path: Path) -> bool:
+    """Verify the ZIP has one safe root and exactly the SHA-listed members."""
+
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            if archive.testzip() is not None:
+                return False
+            names = [item.filename for item in archive.infolist() if not item.is_dir()]
+            if not names or any("\\" in name or name.startswith("/") or ".." in Path(name).parts for name in names):
+                return False
+            if len({name.casefold() for name in names}) != len(names):
+                return False
+            roots = {Path(name).parts[0] for name in names}
+            if len(roots) != 1:
+                return False
+            root = next(iter(roots))
+            hash_name = f"{root}/SHA256SUMS.txt"
+            if hash_name not in names:
+                return False
+            lines = archive.read(hash_name).decode("utf-8").splitlines()
+            listed: dict[str, str] = {}
+            for line in lines:
+                if "  " not in line:
+                    return False
+                expected, relative = line.split("  ", 1)
+                if not relative or "\\" in relative or relative.startswith("/") or ".." in Path(relative).parts:
+                    return False
+                if relative.casefold() in {item.casefold() for item in listed}:
+                    return False
+                listed[relative] = expected
+            actual = {
+                name[len(root) + 1:]
+                for name in names
+                if name != hash_name
+            }
+            if set(listed) != actual:
+                return False
+            for relative, expected in listed.items():
+                if hashlib.sha256(archive.read(f"{root}/{relative}")).hexdigest() != expected:
+                    return False
+            return True
+    except (OSError, ValueError, zipfile.BadZipFile, UnicodeError):
+        return False
 
 
 def _replace_with_retry(source: Path, destination: Path, *, attempts: int = 5) -> None:
@@ -269,20 +416,78 @@ def _sanitize_tree(
     *,
     uid_values: tuple[str, ...],
     image_masks: tuple[tuple[int, int, int, int], ...],
-) -> None:
+    evidence_allowlist: tuple[str, ...] = (),
+    image_privacy_manifests: dict[str, dict] | None = None,
+    image_ocr_provider: Callable[[Path], Iterable[str]] | None = None,
+) -> dict:
+    _validate_tree_entries(source)
+    allowlist = {Path(item).as_posix() for item in evidence_allowlist}
+    manifests = image_privacy_manifests or {}
+    image_inventory: list[dict] = []
+    excluded: list[str] = []
     destination.mkdir(parents=True, exist_ok=True)
     for path in sorted(item for item in source.rglob("*") if item.is_file()):
-        relative = path.relative_to(source)
+        relative_text = _normalized_relative(path, source)
+        if _is_runtime_path(relative_text):
+            excluded.append(relative_text)
+            continue
+        relative = Path(relative_text)
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         suffix = path.suffix.lower()
         if suffix in TEXT_SUFFIXES:
             text = path.read_text(encoding="utf-8", errors="replace")
             target.write_text(_redact_text(text, uid_values), encoding="utf-8", newline="\n")
-        elif suffix in IMAGE_SUFFIXES and image_masks:
-            _write_masked_image(path, target, image_masks)
+        elif suffix in IMAGE_SUFFIXES:
+            if relative_text not in allowlist:
+                raise SensitiveDataError(f"image evidence is not allowlisted: {relative_text}")
+            manifest = dict(manifests.get(relative_text) or {})
+            masks = tuple(
+                tuple(map(int, mask))
+                for mask in manifest.get("mask_regions", image_masks)
+                if isinstance(mask, (list, tuple)) and len(mask) == 4
+            )
+            required_false = (
+                "contains_account_identifier", "contains_player_name",
+                "contains_balance", "contains_payment_or_order",
+            )
+            if (
+                not manifest
+                or manifest.get("privacy_review_status") != "APPROVED"
+                or not masks
+                or any(manifest.get(key) is not False for key in required_false)
+            ):
+                raise SensitiveDataError(f"image privacy manifest or mask invalid: {relative_text}")
+            if image_ocr_provider is None:
+                raise SensitiveDataError(f"image privacy OCR confirmation unavailable: {relative_text}")
+            _write_masked_image(path, target, masks)
+            try:
+                image_hits = _image_privacy_hits(image_ocr_provider(target))
+            except Exception as error:
+                raise SensitiveDataError(
+                    f"image privacy OCR confirmation failed: {relative_text}:{type(error).__name__}"
+                ) from error
+            if image_hits:
+                raise SensitiveDataError(
+                    f"image privacy gate failed: {relative_text}:{','.join(image_hits)}"
+                )
+            image_inventory.append({
+                "source_kind": str(manifest.get("source_kind", "")),
+                "purpose": str(manifest.get("purpose", "")),
+                "sanitized_path": relative_text,
+                "mask_regions": [list(mask) for mask in masks],
+                "sanitized_sha256": _hash_file(target),
+                "privacy_review_status": "APPROVED",
+                **{key: False for key in required_false},
+            })
         else:
             shutil.copy2(path, target)
+    if image_inventory:
+        (destination / "IMAGE-PRIVACY-MANIFEST.json").write_text(
+            json.dumps({"images": image_inventory}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8", newline="\n",
+        )
+    return {"images": image_inventory, "excluded_paths": excluded}
 
 
 def _tree_hash(root: Path) -> str:
@@ -356,6 +561,9 @@ def build_reversible_audit_package(
     *,
     uid_values: tuple[str, ...] = (),
     image_masks: tuple[tuple[int, int, int, int], ...] = (),
+    evidence_allowlist: tuple[str, ...] = (),
+    image_privacy_manifests: dict[str, dict] | None = None,
+    image_ocr_provider: Callable[[Path], Iterable[str]] | None = None,
     create_zip: bool = False,
 ) -> Path:
     """Publish one squashed text patch between two independently safe trees."""
@@ -375,11 +583,29 @@ def build_reversible_audit_package(
     try:
         safe_baseline = staging / "sanitized-baseline"
         safe_target = staging / "sanitized-target"
-        _sanitize_tree(baseline_source, safe_baseline, uid_values=uid_values, image_masks=image_masks)
-        _sanitize_tree(target_source, safe_target, uid_values=uid_values, image_masks=image_masks)
+        baseline_inventory = _sanitize_tree(
+            baseline_source, safe_baseline, uid_values=uid_values,
+            image_masks=image_masks, evidence_allowlist=evidence_allowlist,
+            image_privacy_manifests=image_privacy_manifests,
+            image_ocr_provider=image_ocr_provider,
+        )
+        target_inventory = _sanitize_tree(
+            target_source, safe_target, uid_values=uid_values,
+            image_masks=image_masks, evidence_allowlist=evidence_allowlist,
+            image_privacy_manifests=image_privacy_manifests,
+            image_ocr_provider=image_ocr_provider,
+        )
         baseline_hits, baseline_scan = scan_sensitive_tree(safe_baseline)
         target_hits, target_scan = scan_sensitive_tree(safe_target)
-        if baseline_hits or target_hits:
+        baseline_media_hits, baseline_media_scan = scan_media_tree(
+            safe_baseline, evidence_allowlist=evidence_allowlist,
+            image_ocr_provider=image_ocr_provider,
+        )
+        target_media_hits, target_media_scan = scan_media_tree(
+            safe_target, evidence_allowlist=evidence_allowlist,
+            image_ocr_provider=image_ocr_provider,
+        )
+        if baseline_hits or target_hits or baseline_media_hits or target_media_hits:
             raise SensitiveDataError("sanitized baseline/target sensitive data gate failed")
         _validate_semantics(safe_baseline)
         _validate_semantics(safe_target)
@@ -407,7 +633,15 @@ def build_reversible_audit_package(
             _apply_text_patch(safe_target, full_diff, reverse_tree, reverse=True)
             forward_hits, forward_scan = scan_sensitive_tree(forward_tree)
             reverse_hits, reverse_scan = scan_sensitive_tree(reverse_tree)
-            if forward_hits or reverse_hits:
+            forward_media_hits, forward_media_scan = scan_media_tree(
+                forward_tree, evidence_allowlist=evidence_allowlist,
+                image_ocr_provider=image_ocr_provider,
+            )
+            reverse_media_hits, reverse_media_scan = scan_media_tree(
+                reverse_tree, evidence_allowlist=evidence_allowlist,
+                image_ocr_provider=image_ocr_provider,
+            )
+            if forward_hits or reverse_hits or forward_media_hits or reverse_media_hits:
                 raise SensitiveDataError("forward/reverse applied tree sensitive data gate failed")
             forward_hash, reverse_hash = _tree_hash(forward_tree), _tree_hash(reverse_tree)
         baseline_hash, target_hash = _tree_hash(safe_baseline), _tree_hash(safe_target)
@@ -418,15 +652,24 @@ def build_reversible_audit_package(
             raise SensitiveDataError("safe-tree patch sensitive data gate failed")
 
         manifest = {
-            "schema_version": 3, "shareable": True,
+            "schema_version": 4, "shareable": True,
             "patch_model": "sanitized baseline -> 1 text audit patch -> sanitized target",
-            "sanitized_baseline_tree": {"path": "sanitized-baseline", "tree_hash": baseline_hash, "sensitive_hits": 0, **baseline_scan},
-            "sanitized_target_tree": {"path": "sanitized-target", "tree_hash": target_hash, "sensitive_hits": 0, **target_scan},
+            "sanitized_baseline_tree": {"path": "sanitized-baseline", "tree_hash": baseline_hash, "sensitive_hits": 0, **baseline_scan, **baseline_media_scan},
+            "sanitized_target_tree": {"path": "sanitized-target", "tree_hash": target_hash, "sensitive_hits": 0, **target_scan, **target_media_scan},
             "forward_tree_hash": forward_hash, "reverse_tree_hash": reverse_hash,
             "forward_sensitive_hits": 0, "reverse_sensitive_hits": 0,
             "binary_patch_count": 0, "atomic_history_reproducible": False,
             "audit_patch_count": 1,
-            "scan_stats": {"forward": forward_scan, "reverse": reverse_scan, "patches": patch_scan},
+            "runtime_artifacts_included": 0,
+            "image_inventory": {
+                "baseline": baseline_inventory["images"],
+                "target": target_inventory["images"],
+            },
+            "scan_stats": {
+                "forward": {**forward_scan, **forward_media_scan},
+                "reverse": {**reverse_scan, **reverse_media_scan},
+                "patches": patch_scan,
+            },
         }
         (staging / "SHAREABLE-MANIFEST.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
@@ -443,6 +686,8 @@ def build_reversible_audit_package(
             zip_hits, _ = _scan_zip(staging_zip)
             if zip_hits:
                 raise SensitiveDataError("ZIP sensitive data gate failed")
+            if not verify_zip_exact_set(staging_zip):
+                raise SensitiveDataError("ZIP exact-set hash manifest gate failed")
         if destination.exists():
             shutil.rmtree(destination)
         _replace_with_retry(staging, destination)
@@ -463,6 +708,9 @@ def build_shareable_audit(
     *,
     uid_values: tuple[str, ...] = (),
     image_masks: tuple[tuple[int, int, int, int], ...] = (),
+    evidence_allowlist: tuple[str, ...] = (),
+    image_privacy_manifests: dict[str, dict] | None = None,
+    image_ocr_provider: Callable[[Path], Iterable[str]] | None = None,
     create_zip: bool = False,
 ) -> Path:
     """Sanitize into staging and publish only after all gates pass."""
@@ -481,25 +729,23 @@ def build_shareable_audit(
     staging_zip.unlink(missing_ok=True)
     staging.mkdir(parents=True)
     try:
-        for path in sorted(item for item in source.rglob("*") if item.is_file()):
-            relative = path.relative_to(source)
-            target = staging / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            suffix = path.suffix.lower()
-            if suffix in TEXT_SUFFIXES:
-                text = path.read_text(encoding="utf-8", errors="replace")
-                target.write_text(_redact_text(text, uid_values), encoding="utf-8", newline="\n")
-            elif suffix in IMAGE_SUFFIXES and image_masks:
-                _write_masked_image(path, target, image_masks)
-            else:
-                shutil.copy2(path, target)
+        inventory = _sanitize_tree(
+            source, staging, uid_values=uid_values, image_masks=image_masks,
+            evidence_allowlist=evidence_allowlist,
+            image_privacy_manifests=image_privacy_manifests,
+            image_ocr_provider=image_ocr_provider,
+        )
 
         hits, scan_stats = scan_sensitive_tree(staging)
-        if hits:
+        media_hits, media_stats = scan_media_tree(
+            staging, evidence_allowlist=evidence_allowlist,
+            image_ocr_provider=image_ocr_provider,
+        )
+        if hits or media_hits:
             raise SensitiveDataError("sensitive data gate failed: " + ", ".join(hits))
         semantic_stats = _validate_semantics(staging)
         manifest = {
-            "schema_version": 2,
+            "schema_version": 4,
             "shareable": True,
             "sanitization": {
                 "account_identifiers": "[REDACTED_ACCOUNT_ID]",
@@ -508,8 +754,11 @@ def build_shareable_audit(
                 "sensitive_gate_hits": 0,
                 "zip_second_pass_sensitive_gate_hits": 0,
                 **scan_stats,
+                **media_stats,
                 **semantic_stats,
             },
+            "runtime_artifacts_included": 0,
+            "image_inventory": inventory["images"],
         }
         (staging / "SHAREABLE-MANIFEST.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
@@ -524,6 +773,8 @@ def build_shareable_audit(
             zip_hits, _zip_stats = _scan_zip(staging_zip)
             if zip_hits:
                 raise SensitiveDataError("ZIP sensitive data gate failed: " + ", ".join(zip_hits))
+            if not verify_zip_exact_set(staging_zip):
+                raise SensitiveDataError("ZIP exact-set hash manifest gate failed")
 
         if destination.exists():
             shutil.rmtree(destination)
@@ -545,5 +796,8 @@ __all__ = [
     "build_shareable_audit",
     "scan_sensitive_text",
     "scan_sensitive_tree",
+    "scan_media_tree",
+    "minimize_audit_journal",
     "verify_hash_manifest",
+    "verify_zip_exact_set",
 ]
