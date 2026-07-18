@@ -1,6 +1,8 @@
 """Independent daily fatigue recovery task."""
 
 import time
+import os
+import uuid
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta
 from enum import Enum
@@ -384,12 +386,16 @@ def run_daily_fatigue_recovery(
 
     path = checkpoint_path or STATE_PATH
     checkpoint = None
+    owner_id = f"fatigue-recovery:{os.getpid()}"
+    lease_token = uuid.uuid4().hex
     try:
         checkpoint = claim_fatigue_checkpoint(
             trigger_action_id,
             expected_waypoint=expected_waypoint,
             plan_revision=plan_revision,
             expected_server_day=expected_server_day,
+            owner_id=owner_id,
+            lease_token=lease_token,
             path=path,
         )
     except RuntimeError:
@@ -410,7 +416,8 @@ def run_daily_fatigue_recovery(
         raise
     if checkpoint is not None:
         transaction = complete_fatigue_checkpoint_processing(
-            str(checkpoint["id"]), result, path=path
+            str(checkpoint["id"]), result,
+            owner_id=owner_id, lease_token=lease_token, path=path
         )
         result["checkpoint_id"] = checkpoint["id"]
         result["checkpoint_outcome"] = transaction["outcome"]

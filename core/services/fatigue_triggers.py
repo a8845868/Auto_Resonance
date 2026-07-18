@@ -7,10 +7,11 @@ import hashlib
 import os
 import shutil
 import threading
+import time
 import uuid
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Callable, Iterable
 
@@ -32,6 +33,7 @@ class FatigueActionState(str, Enum):
     MANUAL_BLOCKED = "MANUAL_BLOCKED"
     CANCELLED = "CANCELLED"
     SUPERSEDED = "SUPERSEDED"
+    EXPIRED = "EXPIRED"
 
 
 class CheckpointProcessingOutcome(str, Enum):
@@ -40,6 +42,7 @@ class CheckpointProcessingOutcome(str, Enum):
     RETRY_ON_EVENT = "RETRY_ON_EVENT"
     MANUAL_BLOCKED = "MANUAL_BLOCKED"
     CANCELLED_BY_USER = "CANCELLED_BY_USER"
+    TRANSFER_TO_NEW_CHECKPOINT = "TRANSFER_TO_NEW_CHECKPOINT"
 
 
 class CheckpointStateCorrupt(RuntimeError):
@@ -50,6 +53,7 @@ _TERMINAL_STATES = {
     FatigueActionState.ACKNOWLEDGED.value,
     FatigueActionState.CANCELLED.value,
     FatigueActionState.SUPERSEDED.value,
+    FatigueActionState.EXPIRED.value,
 }
 
 
@@ -83,8 +87,32 @@ def _read(path: Path) -> dict[str, Any]:
         raise CheckpointStateCorrupt("checkpoint state has invalid schema")
     data.setdefault("server_day_id", SERVER_CLOCK.server_day_id())
     data.setdefault("actions", [])
-    if data["server_day_id"] != SERVER_CLOCK.server_day_id():
-        data = {"server_day_id": SERVER_CLOCK.server_day_id(), "actions": []}
+    current_day = SERVER_CLOCK.server_day_id()
+    if data["server_day_id"] != current_day:
+        previous_day = str(data["server_day_id"])
+        expired_ids: list[str] = []
+        preserved_ids: list[str] = []
+        for item in data["actions"]:
+            state = _state(item)
+            active_cycle = bool(item.get("cycle_id") or item.get("cycle_server_day"))
+            if state == FatigueActionState.ACTIVE.value and not active_cycle:
+                _set_state(item, FatigueActionState.EXPIRED)
+                item["expired_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
+                item["expiry_audit"] = {
+                    "reason": "server_day_rollover_untriggered",
+                    "from_server_day": previous_day,
+                    "to_server_day": current_day,
+                }
+                expired_ids.append(str(item.get("id", "")))
+            else:
+                preserved_ids.append(str(item.get("id", "")))
+        data["server_day_id"] = current_day
+        data.setdefault("rollover_audit", []).append({
+            "at": SERVER_CLOCK.server_now().isoformat(timespec="seconds"),
+            "from_server_day": previous_day, "to_server_day": current_day,
+            "expired_ids": expired_ids, "preserved_ids": preserved_ids,
+        })
+        _write(path, data)
     return data
 
 
@@ -107,7 +135,15 @@ def _write(path: Path, data: dict[str, Any]) -> None:
         json.dump(data, stream, ensure_ascii=False, indent=2)
         stream.flush()
         os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    for attempt in range(5):
+        try:
+            os.replace(temporary, path)
+            break
+        except PermissionError:
+            if attempt == 4:
+                temporary.unlink(missing_ok=True)
+                raise
+            time.sleep(0.02 * (attempt + 1))
 
 
 def replace_deferred_fatigue_plan(
@@ -336,7 +372,6 @@ def _matching_checkpoint(
     allowed = {
         FatigueActionState.SCHEDULED.value,
         FatigueActionState.FAILED_RETRYABLE.value,
-        FatigueActionState.CLAIMED.value,
     }
     return next(
         (
@@ -363,6 +398,9 @@ def claim_fatigue_checkpoint(
     expected_waypoint: str | None = None,
     plan_revision: str | None = None,
     expected_server_day: str | None = None,
+    owner_id: str | None = None,
+    lease_token: str | None = None,
+    lease_duration: timedelta = timedelta(minutes=5),
     path: Path = STATE_PATH,
 ) -> dict[str, Any]:
     """Atomically claim a scheduled checkpoint after validating its identity."""
@@ -371,6 +409,21 @@ def claim_fatigue_checkpoint(
         data = _read(path)
         if expected_server_day and data.get("server_day_id") != expected_server_day:
             raise RuntimeError("fatigue checkpoint server day mismatch")
+        owner = str(owner_id or f"legacy-process:{os.getpid()}")
+        token = str(lease_token or uuid.uuid4().hex)
+        claimed = next((
+            entry for entry in data["actions"]
+            if _state(entry) == FatigueActionState.CLAIMED.value
+            and (not action_id or str(entry.get("id")) == str(action_id))
+            and (expected_waypoint is None or str(entry.get("waypoint_id", "")) == str(expected_waypoint))
+            and (plan_revision is None or str(entry.get("plan_revision", "")) == str(plan_revision))
+        ), None)
+        if claimed is not None:
+            if claimed.get("owner_id") == owner and claimed.get("lease_token") == token:
+                return dict(claimed)
+            raise RuntimeError(
+                "fatigue checkpoint is already claimed; expired leases require recover_stale_claim"
+            )
         item = _matching_checkpoint(
             data["actions"],
             action_id=action_id,
@@ -380,8 +433,53 @@ def claim_fatigue_checkpoint(
         if item is None:
             raise RuntimeError("matching fatigue checkpoint is not scheduled")
         _set_state(item, FatigueActionState.CLAIMED)
-        item["claimed_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
+        claimed_at = SERVER_CLOCK.server_now()
+        item["owner_id"] = owner
+        item["lease_token"] = token
+        item["claimed_at"] = claimed_at.isoformat(timespec="seconds")
+        item["lease_expires_at"] = (
+            claimed_at + max(timedelta(seconds=1), lease_duration)
+        ).isoformat(timespec="seconds")
         item["claim_attempt"] = int(item.get("claim_attempt", 0)) + 1
+        _write(path, data)
+        return dict(item)
+
+
+def recover_stale_claim(
+    action_id: str,
+    *,
+    actor: str,
+    reason: str = "lease_expired",
+    now: datetime | None = None,
+    path: Path = STATE_PATH,
+) -> dict[str, Any]:
+    """Explicitly recover an expired lease and preserve an audit trail."""
+
+    if not actor.strip():
+        raise ValueError("stale claim recovery requires an actor")
+    with _LOCK:
+        data = _read(path)
+        item = next((entry for entry in data["actions"] if str(entry.get("id")) == str(action_id)), None)
+        if item is None or _state(item) != FatigueActionState.CLAIMED.value:
+            raise RuntimeError("only a claimed fatigue checkpoint can be recovered")
+        current = now or SERVER_CLOCK.server_now()
+        try:
+            expires = datetime.fromisoformat(str(item.get("lease_expires_at", "")))
+        except ValueError as error:
+            raise RuntimeError("claimed checkpoint lease expiry is invalid") from error
+        if current <= expires:
+            raise RuntimeError("fatigue checkpoint lease has not expired")
+        audit = {
+            "actor": actor.strip(), "reason": str(reason),
+            "recovered_at": current.isoformat(timespec="seconds"),
+            "previous_owner_id": item.get("owner_id"),
+            "previous_lease_token": item.get("lease_token"),
+        }
+        item.setdefault("lease_recovery_history", []).append(audit)
+        item["lease_recovery_audit"] = audit
+        for key in ("owner_id", "lease_token", "claimed_at", "lease_expires_at"):
+            item.pop(key, None)
+        _set_state(item, FatigueActionState.FAILED_RETRYABLE)
         _write(path, data)
         return dict(item)
 
@@ -431,6 +529,8 @@ def checkpoint_processing_outcome(result: dict[str, Any]) -> CheckpointProcessin
     status = str(result.get("status", "")).upper()
     if status == "DEFER_UNTIL_FATIGUE":
         return CheckpointProcessingOutcome.RETRY_ON_EVENT
+    if status == "DEFER_UNTIL_WAYPOINT":
+        return CheckpointProcessingOutcome.TRANSFER_TO_NEW_CHECKPOINT
     if status in {"UNKNOWN", "DEFER_UNTIL_RELEASE"}:
         return CheckpointProcessingOutcome.RETRY_AT
     return CheckpointProcessingOutcome.MANUAL_BLOCKED
@@ -440,6 +540,8 @@ def complete_fatigue_checkpoint_processing(
     action_id: str,
     result: dict[str, Any],
     *,
+    owner_id: str | None = None,
+    lease_token: str | None = None,
     path: Path = STATE_PATH,
 ) -> dict[str, Any]:
     """Atomically persist the processing outcome before returning it."""
@@ -453,6 +555,10 @@ def complete_fatigue_checkpoint_processing(
         )
         if item is None or _state(item) != FatigueActionState.CLAIMED.value:
             raise RuntimeError("only a claimed fatigue checkpoint can be completed")
+        if owner_id is not None and str(item.get("owner_id", "")) != str(owner_id):
+            raise RuntimeError("fatigue checkpoint owner mismatch")
+        if lease_token is not None and str(item.get("lease_token", "")) != str(lease_token):
+            raise RuntimeError("fatigue checkpoint lease token mismatch")
         if outcome is CheckpointProcessingOutcome.ACKNOWLEDGE:
             _set_state(item, FatigueActionState.ACKNOWLEDGED)
             item["acknowledged_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
@@ -460,6 +566,39 @@ def complete_fatigue_checkpoint_processing(
             item["source_result"] = dict(result)
             _write(path, data)
             return {"outcome": outcome.value, "acknowledged": True, "checkpoint": dict(item)}
+
+        if outcome is CheckpointProcessingOutcome.TRANSFER_TO_NEW_CHECKPOINT:
+            target_waypoint = str(result.get("waypoint_id") or result.get("target_waypoint") or "")
+            source_revision = str(result.get("source_plan_revision") or result.get("plan_revision") or "")
+            cycle_day = str(result.get("cycle_server_day") or "")
+            cycle_id = str(result.get("cycle_id") or "")
+            replacement = next((
+                entry for entry in data["actions"]
+                if entry is not item
+                and _state(entry) in {FatigueActionState.ACTIVE.value, FatigueActionState.SCHEDULED.value}
+                and str(entry.get("trigger_type", "")).upper() == "WAYPOINT"
+                and str(entry.get("waypoint_id", "")) == target_waypoint
+                and str(entry.get("parent_checkpoint_id", "")) == str(item.get("id", ""))
+                and (not source_revision or str(entry.get("source_plan_revision") or entry.get("plan_revision") or "") == source_revision)
+                and (not cycle_day or str(entry.get("cycle_server_day") or entry.get("server_day_id") or data.get("server_day_id")) == cycle_day)
+                and (not cycle_id or str(entry.get("cycle_id", "")) == cycle_id)
+            ), None)
+            if replacement is None:
+                outcome = CheckpointProcessingOutcome.MANUAL_BLOCKED
+                result = {**result, "checkpoint_diagnostic": "reliable_future_waypoint_checkpoint_not_found"}
+            else:
+                _set_state(item, FatigueActionState.SUPERSEDED)
+                item["superseded_by"] = str(replacement.get("id"))
+                item["processing_outcome"] = CheckpointProcessingOutcome.TRANSFER_TO_NEW_CHECKPOINT.value
+                item["source_result"] = dict(result)
+                replacement["replaces_checkpoint_id"] = str(item.get("id"))
+                replacement["transfer_validated_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
+                _write(path, data)
+                return {
+                    "outcome": CheckpointProcessingOutcome.TRANSFER_TO_NEW_CHECKPOINT.value,
+                    "acknowledged": False, "checkpoint": dict(item),
+                    "replacement": dict(replacement),
+                }
 
         if outcome is CheckpointProcessingOutcome.MANUAL_BLOCKED:
             _set_state(item, FatigueActionState.MANUAL_BLOCKED)
