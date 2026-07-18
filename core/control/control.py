@@ -30,6 +30,16 @@ MAX_SWIPE_SEGMENTS = 100
 control: IADB = ADB()
 _runtime_device: EmulatorInfo | None = None
 _runtime_auto_start_emulator: bool | None = None
+_ACTION_POLICY = None
+
+
+def install_action_policy(policy):
+    """Install a process-local action boundary and return the previous one."""
+
+    global _ACTION_POLICY
+    previous = _ACTION_POLICY
+    _ACTION_POLICY = policy
+    return previous
 
 
 def set_runtime_device(device: EmulatorInfo | None) -> None:
@@ -195,6 +205,8 @@ def input_swipe(pos1=(919, 617), pos2=(919, 908), swipe_time: int = 100):
     ensure_automation_allowed("滑动游戏界面")
     if STOP:
         raise StopExecution()
+    if _ACTION_POLICY is not None and not _ACTION_POLICY.authorize_swipe(pos1, pos2):
+        return False
     # 添加随机值
     pos_x1 = control.ratio * pos1[0] + random.randint(*EXCURSIONX)
     pos_y1 = control.ratio * pos1[1] + random.randint(*EXCURSIONY)
@@ -320,12 +332,15 @@ def input_tap(pos: Tuple[int, int] = (880, 362), random_offset: bool = True):
     ensure_automation_allowed("点击游戏界面")
     if STOP:
         raise StopExecution()
+    if _ACTION_POLICY is not None and not _ACTION_POLICY.authorize_coordinate(pos):
+        return False
     offset_x = random.randint(*EXCURSIONX) if random_offset else 0
     offset_y = random.randint(*EXCURSIONY) if random_offset else 0
     control.input_tap(
         int(control.ratio * pos[0] + offset_x),
         int(control.ratio * pos[1] + offset_y),
     )
+    return True
 
 
 def screenshot() -> Image:
