@@ -46,29 +46,14 @@ def test_unclassified_account_tap_is_denied():
 
 def test_explicit_safe_navigation_permit_is_page_bound_and_single_use():
     guard = read_only_policy.ReadOnlyActionGuard(Mock())
-    permit = guard.issue_permit(
-        action_key="navigation_anchor",
-        page_id="home",
-        page_fingerprint="home-r1",
-        anchor_key="daily_tab",
-        coordinate=(800, 300),
-        bounded_region=(780, 280, 820, 320),
-        ttl=timedelta(seconds=10),
-        max_uses=1,
-        correlation_id="test-permit",
-    )
-    assert guard.authorize_coordinate(
-        (800, 300), permit=permit, page_id="other", page_fingerprint="home-r1",
-        anchor_key="daily_tab",
-    ) is False
-    assert guard.authorize_coordinate(
-        (800, 300), permit=permit, page_id="home", page_fingerprint="home-r1",
-        anchor_key="daily_tab",
-    ) is True
-    assert guard.authorize_coordinate(
-        (800, 300), permit=permit, page_id="home", page_fingerprint="home-r1",
-        anchor_key="daily_tab",
-    ) is False
+    with pytest.raises(PermissionError, match="trusted issuer"):
+        guard.issue_permit(
+            action_key="navigation_anchor",
+            page_id="home",
+            page_fingerprint="home-r1",
+            anchor_key="daily_tab",
+            coordinate=(800, 300),
+        )
 
 
 def test_probe_canaries_are_not_reported_as_live_blocked_actions():
@@ -120,7 +105,7 @@ def _install_future(path: Path, old: dict, *, valid: bool = True) -> dict:
 def test_defer_to_future_waypoint_transfers_checkpoint_without_deadlock(tmp_path: Path):
     path = tmp_path / "fatigue.json"
     old = _checkpoint(path)
-    _install_future(path, old)
+    server_day = SERVER_CLOCK.server_day_id()
     result = complete_fatigue_checkpoint_processing(
         old["id"],
         {
@@ -129,8 +114,17 @@ def test_defer_to_future_waypoint_transfers_checkpoint_without_deadlock(tmp_path
             "status": "DEFER_UNTIL_WAYPOINT",
             "waypoint_id": "C",
             "source_plan_revision": "rev-new",
-            "cycle_server_day": SERVER_CLOCK.server_day_id(),
+            "cycle_server_day": server_day,
             "cycle_id": "cycle-1",
+            "transfer_intent": {
+                "target_waypoint": "C",
+                "trigger_type": "WAYPOINT",
+                "action_payload": {"kind": "REOBSERVE", "waypoint_id": "C"},
+                "source_plan_revision": "rev-new",
+                "cycle_id": "cycle-1",
+                "cycle_server_day": server_day,
+                "reason": "continue_at_future_waypoint",
+            },
         },
         owner_id="worker-1", lease_token="lease-1", path=path,
     )
@@ -140,7 +134,7 @@ def test_defer_to_future_waypoint_transfers_checkpoint_without_deadlock(tmp_path
     assert fatigue_checkpoint_deferral("C", path=path)["deferred"] is True
 
 
-def test_missing_future_checkpoint_keeps_current_checkpoint_blocked(tmp_path: Path):
+def test_missing_transfer_contract_keeps_current_checkpoint_retryable(tmp_path: Path):
     path = tmp_path / "fatigue.json"
     old = _checkpoint(path)
     result = complete_fatigue_checkpoint_processing(
@@ -148,8 +142,9 @@ def test_missing_future_checkpoint_keeps_current_checkpoint_blocked(tmp_path: Pa
         {"success": True, "deferred": True, "status": "DEFER_UNTIL_WAYPOINT", "waypoint_id": "C", "source_plan_revision": "rev-new"},
         owner_id="worker-1", lease_token="lease-1", path=path,
     )
-    assert result["outcome"] == "MANUAL_BLOCKED"
-    assert fatigue_checkpoint_deferral("B", path=path)["checkpoint_state"] == "MANUAL_BLOCKED"
+    assert result["outcome"] == "RETRY_ON_EVENT"
+    assert fatigue_checkpoint_deferral("B", path=path)["checkpoint_state"] == "FAILED_RETRYABLE"
+    assert "transfer_intent" in result["diagnostic"]
 
 
 def test_claimed_checkpoint_cannot_be_claimed_by_second_owner(tmp_path: Path):

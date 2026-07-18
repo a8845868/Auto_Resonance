@@ -9,7 +9,7 @@ import shutil
 import threading
 import time
 import uuid
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from datetime import datetime, timedelta
 from enum import Enum
@@ -43,6 +43,42 @@ class CheckpointProcessingOutcome(str, Enum):
     MANUAL_BLOCKED = "MANUAL_BLOCKED"
     CANCELLED_BY_USER = "CANCELLED_BY_USER"
     TRANSFER_TO_NEW_CHECKPOINT = "TRANSFER_TO_NEW_CHECKPOINT"
+
+
+@dataclass(frozen=True)
+class CheckpointTransferIntent:
+    target_waypoint: str
+    trigger_type: str
+    action_payload: dict[str, Any]
+    source_plan_revision: str
+    cycle_id: str
+    cycle_server_day: str
+    reason: str
+
+    @classmethod
+    def from_result(cls, result: dict[str, Any]) -> "CheckpointTransferIntent":
+        raw = result.get("transfer_intent")
+        if not isinstance(raw, dict):
+            raise ValueError("DEFER_UNTIL_WAYPOINT requires transfer_intent")
+        intent = cls(
+            target_waypoint=str(raw.get("target_waypoint", "")).strip(),
+            trigger_type=str(raw.get("trigger_type", "")).upper().strip(),
+            action_payload=dict(raw.get("action_payload") or {}),
+            source_plan_revision=str(raw.get("source_plan_revision", "")).strip(),
+            cycle_id=str(raw.get("cycle_id", "")).strip(),
+            cycle_server_day=str(raw.get("cycle_server_day", "")).strip(),
+            reason=str(raw.get("reason", "")).strip(),
+        )
+        if (
+            not intent.target_waypoint
+            or intent.trigger_type != "WAYPOINT"
+            or not intent.source_plan_revision
+            or not intent.cycle_id
+            or not intent.cycle_server_day
+            or str(intent.action_payload.get("waypoint_id", "")) != intent.target_waypoint
+        ):
+            raise ValueError("fatigue checkpoint transfer contract is incomplete")
+        return intent
 
 
 class CheckpointStateCorrupt(RuntimeError):
@@ -553,12 +589,50 @@ def complete_fatigue_checkpoint_processing(
             (entry for entry in data["actions"] if str(entry.get("id")) == str(action_id)),
             None,
         )
-        if item is None or _state(item) != FatigueActionState.CLAIMED.value:
-            raise RuntimeError("only a claimed fatigue checkpoint can be completed")
-        if owner_id is not None and str(item.get("owner_id", "")) != str(owner_id):
+        if item is None:
+            raise RuntimeError("fatigue checkpoint not found")
+        if not owner_id or not lease_token:
+            raise RuntimeError("fatigue checkpoint completion requires owner and lease token")
+        if str(item.get("owner_id", "")) != str(owner_id):
             raise RuntimeError("fatigue checkpoint owner mismatch")
-        if lease_token is not None and str(item.get("lease_token", "")) != str(lease_token):
+        if str(item.get("lease_token", "")) != str(lease_token):
             raise RuntimeError("fatigue checkpoint lease token mismatch")
+        if (
+            outcome is CheckpointProcessingOutcome.TRANSFER_TO_NEW_CHECKPOINT
+            and _state(item) == FatigueActionState.SUPERSEDED.value
+            and item.get("superseded_by")
+        ):
+            intent = CheckpointTransferIntent.from_result(result)
+            replay_identity = "|".join((
+                str(item["id"]), intent.target_waypoint,
+                intent.source_plan_revision, intent.cycle_id,
+                intent.cycle_server_day,
+            ))
+            expected_replacement_id = "transfer:" + hashlib.sha256(
+                replay_identity.encode("utf-8")
+            ).hexdigest()[:24]
+            if str(item["superseded_by"]) != expected_replacement_id:
+                raise RuntimeError("fatigue checkpoint transfer replay intent mismatch")
+            replacement = next(
+                (entry for entry in data["actions"] if str(entry.get("id")) == str(item["superseded_by"])),
+                None,
+            )
+            if replacement is not None:
+                return {
+                    "outcome": outcome.value,
+                    "acknowledged": False,
+                    "checkpoint": dict(item),
+                    "replacement": dict(replacement),
+                    "idempotent_replay": True,
+                }
+        try:
+            lease_expires = datetime.fromisoformat(str(item.get("lease_expires_at", "")))
+        except ValueError as error:
+            raise RuntimeError("fatigue checkpoint lease expiry is invalid") from error
+        if SERVER_CLOCK.server_now() > lease_expires:
+            raise RuntimeError("fatigue checkpoint lease expired; explicit recovery required")
+        if _state(item) != FatigueActionState.CLAIMED.value:
+            raise RuntimeError("only a claimed fatigue checkpoint can be completed")
         if outcome is CheckpointProcessingOutcome.ACKNOWLEDGE:
             _set_state(item, FatigueActionState.ACKNOWLEDGED)
             item["acknowledged_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
@@ -568,37 +642,70 @@ def complete_fatigue_checkpoint_processing(
             return {"outcome": outcome.value, "acknowledged": True, "checkpoint": dict(item)}
 
         if outcome is CheckpointProcessingOutcome.TRANSFER_TO_NEW_CHECKPOINT:
-            target_waypoint = str(result.get("waypoint_id") or result.get("target_waypoint") or "")
-            source_revision = str(result.get("source_plan_revision") or result.get("plan_revision") or "")
-            cycle_day = str(result.get("cycle_server_day") or "")
-            cycle_id = str(result.get("cycle_id") or "")
-            replacement = next((
-                entry for entry in data["actions"]
-                if entry is not item
-                and _state(entry) in {FatigueActionState.ACTIVE.value, FatigueActionState.SCHEDULED.value}
-                and str(entry.get("trigger_type", "")).upper() == "WAYPOINT"
-                and str(entry.get("waypoint_id", "")) == target_waypoint
-                and str(entry.get("parent_checkpoint_id", "")) == str(item.get("id", ""))
-                and (not source_revision or str(entry.get("source_plan_revision") or entry.get("plan_revision") or "") == source_revision)
-                and (not cycle_day or str(entry.get("cycle_server_day") or entry.get("server_day_id") or data.get("server_day_id")) == cycle_day)
-                and (not cycle_id or str(entry.get("cycle_id", "")) == cycle_id)
-            ), None)
-            if replacement is None:
-                outcome = CheckpointProcessingOutcome.MANUAL_BLOCKED
-                result = {**result, "checkpoint_diagnostic": "reliable_future_waypoint_checkpoint_not_found"}
-            else:
-                _set_state(item, FatigueActionState.SUPERSEDED)
-                item["superseded_by"] = str(replacement.get("id"))
-                item["processing_outcome"] = CheckpointProcessingOutcome.TRANSFER_TO_NEW_CHECKPOINT.value
+            try:
+                intent = CheckpointTransferIntent.from_result(result)
+                old_cycle = str(item.get("cycle_id", ""))
+                old_day = str(item.get("cycle_server_day") or data.get("server_day_id") or "")
+                if old_cycle and old_cycle != intent.cycle_id:
+                    raise ValueError("fatigue checkpoint transfer cycle mismatch")
+                if old_day != intent.cycle_server_day:
+                    raise ValueError("fatigue checkpoint transfer server day mismatch")
+                if intent.cycle_server_day != str(data.get("server_day_id", "")):
+                    raise ValueError("fatigue checkpoint transfer is not in the active server day")
+            except ValueError as error:
+                _set_state(item, FatigueActionState.FAILED_RETRYABLE)
+                item["processing_outcome"] = CheckpointProcessingOutcome.RETRY_ON_EVENT.value
+                item["checkpoint_diagnostic"] = str(error)
                 item["source_result"] = dict(result)
-                replacement["replaces_checkpoint_id"] = str(item.get("id"))
-                replacement["transfer_validated_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
                 _write(path, data)
                 return {
-                    "outcome": CheckpointProcessingOutcome.TRANSFER_TO_NEW_CHECKPOINT.value,
-                    "acknowledged": False, "checkpoint": dict(item),
-                    "replacement": dict(replacement),
+                    "outcome": CheckpointProcessingOutcome.RETRY_ON_EVENT.value,
+                    "acknowledged": False,
+                    "checkpoint": dict(item),
+                    "diagnostic": str(error),
                 }
+
+            identity_source = "|".join((
+                str(item["id"]), intent.target_waypoint,
+                intent.source_plan_revision, intent.cycle_id,
+                intent.cycle_server_day,
+            ))
+            replacement_id = "transfer:" + hashlib.sha256(
+                identity_source.encode("utf-8")
+            ).hexdigest()[:24]
+            replacement = next(
+                (entry for entry in data["actions"] if str(entry.get("id")) == replacement_id),
+                None,
+            )
+            if replacement is None:
+                replacement = {
+                    **intent.action_payload,
+                    "id": replacement_id,
+                    "trigger_type": "WAYPOINT",
+                    "waypoint_id": intent.target_waypoint,
+                    "plan_revision": intent.source_plan_revision,
+                    "source_plan_revision": intent.source_plan_revision,
+                    "parent_checkpoint_id": str(item["id"]),
+                    "replaces_checkpoint_id": str(item["id"]),
+                    "cycle_id": intent.cycle_id,
+                    "cycle_server_day": intent.cycle_server_day,
+                    "reason": intent.reason,
+                    "claim_attempt": 0,
+                }
+                _set_state(replacement, FatigueActionState.ACTIVE)
+                data["actions"].append(replacement)
+            _set_state(item, FatigueActionState.SUPERSEDED)
+            item["superseded_by"] = replacement_id
+            item["processing_outcome"] = CheckpointProcessingOutcome.TRANSFER_TO_NEW_CHECKPOINT.value
+            item["source_result"] = dict(result)
+            replacement["transfer_validated_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
+            _write(path, data)
+            return {
+                "outcome": CheckpointProcessingOutcome.TRANSFER_TO_NEW_CHECKPOINT.value,
+                "acknowledged": False,
+                "checkpoint": dict(item),
+                "replacement": dict(replacement),
+            }
 
         if outcome is CheckpointProcessingOutcome.MANUAL_BLOCKED:
             _set_state(item, FatigueActionState.MANUAL_BLOCKED)

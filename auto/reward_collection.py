@@ -13,6 +13,7 @@ import re
 import inspect
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -302,6 +303,11 @@ class DailyTaskCard:
     claimed: bool | None
     contribution: int | None
     page_fingerprint: str
+    claim_state_evidence: CardClaimState | None = None
+
+    @property
+    def claim_state(self) -> "CardClaimState":
+        return self.claim_state_evidence or _claim_state(self.claimable, self.claimed)
 
 
 @dataclass(frozen=True)
@@ -330,6 +336,47 @@ class ManualTaskCard:
     claimed: bool | None
     contribution: int | None
     page_fingerprint: str
+    claim_state_evidence: CardClaimState | None = None
+
+    @property
+    def claim_state(self) -> "CardClaimState":
+        return self.claim_state_evidence or _claim_state(self.claimable, self.claimed)
+
+
+class CardClaimState(str, Enum):
+    UNKNOWN = "UNKNOWN"
+    CLAIMABLE = "CLAIMABLE"
+    CLAIMED = "CLAIMED"
+    NONE_CONFIRMED = "NONE_CONFIRMED"
+    CONFLICT = "CONFLICT"
+
+
+def _claim_state(claimable: bool | None, claimed: bool | None) -> CardClaimState:
+    if claimable is True and claimed is False:
+        return CardClaimState.CLAIMABLE
+    if claimable is False and claimed is True:
+        return CardClaimState.CLAIMED
+    if claimable is False and claimed is False:
+        return CardClaimState.NONE_CONFIRMED
+    if claimable is None and claimed is None:
+        return CardClaimState.UNKNOWN
+    return CardClaimState.CONFLICT
+
+
+class MovementState(str, Enum):
+    MOVED = "MOVED"
+    STATIONARY_CONFIRMED = "STATIONARY_CONFIRMED"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class MovementObservation:
+    state: MovementState
+    displacement_px: int | None
+    matched_content_items: int
+    dispersion: float | None
+    direction_consistent: bool
+    fixed_anchor_displacement: int | None
 
 
 @dataclass(frozen=True)
@@ -356,7 +403,7 @@ class PageScanEvidence:
     movement_confirmed: bool
     end_marker: bool
     captured_at: datetime
-    displacement_px: int = 0
+    displacement_px: int | None = None
     page_anchor_confirmed: bool = True
     swipe_attempted: bool = False
     content_displacement_px: int | None = None
@@ -364,6 +411,25 @@ class PageScanEvidence:
     fixed_anchor_displacement_px: int | None = None
     end_candidate_sequence: int = 0
     end_confirmed_after_last_move: bool = False
+    movement_state: MovementState = MovementState.UNKNOWN
+
+
+def _evidence_movement_state(evidence: PageScanEvidence) -> MovementState:
+    if evidence.movement_state is not MovementState.UNKNOWN:
+        return evidence.movement_state
+    displacement = evidence.content_displacement_px
+    if displacement is None and evidence.movement_confirmed:
+        displacement = evidence.displacement_px
+    if evidence.movement_confirmed and displacement is not None and abs(displacement) >= 30:
+        return MovementState.MOVED
+    if (
+        evidence.swipe_attempted
+        and displacement is not None
+        and abs(displacement) < 10
+        and evidence.matched_content_items >= 2
+    ):
+        return MovementState.STATIONARY_CONFIRMED
+    return MovementState.UNKNOWN
 
 
 @dataclass(frozen=True)
@@ -430,20 +496,15 @@ class ManualRewardTrackScanner:
                 self._time_separated = False
         self._last_captured_at = evidence.captured_at
         self._anchor_valid = self._anchor_valid and evidence.page_anchor_confirmed
-        displacement = (
-            evidence.content_displacement_px
-            if evidence.content_displacement_px is not None
-            else evidence.displacement_px
-        )
-        moved = bool(evidence.movement_confirmed and abs(displacement) >= 30)
-        if moved:
+        movement_state = _evidence_movement_state(evidence)
+        if movement_state is MovementState.MOVED:
             self._movement_seen = True
             self._end_seen = False
             self._end_candidate_sequence = 0
-        elif evidence.swipe_attempted and abs(displacement) < 10 and self._movement_seen:
+        elif movement_state is MovementState.STATIONARY_CONFIRMED and self._movement_seen:
             self._end_candidate_sequence += 1
         if evidence.end_marker and self._movement_seen and (
-            evidence.end_confirmed_after_last_move or moved
+            evidence.end_confirmed_after_last_move
         ):
             self._end_seen = True
         elif self._end_candidate_sequence >= 2 and self._movement_seen:
@@ -563,8 +624,21 @@ def _card_items(items: list[dict], *, manual: bool) -> list[DailyTaskCard | Manu
                 contribution = int(numbers[-1])
                 break
         status_text = " ".join(str(item.get("text", "")) for item in status_candidates)
-        claimable = "可领取" in status_text or (manual and "领取" in status_text and "已领取" not in status_text)
-        claimed = "已领取" in status_text
+        if "已领取" in status_text:
+            claimable, claimed = False, True
+        elif "可领取" in status_text or (
+            manual and "领取" in status_text and "已领取" not in status_text
+        ):
+            claimable, claimed = True, False
+        elif any(
+            marker in status_text
+            for marker in ("无可领取", "不可领取", "奖励已结清", "按钮禁用")
+        ):
+            claimable = claimed = False
+        else:
+            # Absence of OCR status text is missing evidence, not proof that
+            # the card has no reward.
+            claimable = claimed = None
         card_type = ManualTaskCard if manual else DailyTaskCard
         result.append(
             card_type(
@@ -592,6 +666,7 @@ class _CardScannerBase:
         self._last_evidence_at: datetime | None = None
         self._distinct_evidence_times = True
         self._anchor_valid = True
+        self._claim_conflicts: set[str] = set()
 
     @property
     def cards(self):
@@ -610,6 +685,14 @@ class _CardScannerBase:
             )
         return not self.cancelled and self._no_new >= 2 and self._pages <= self.max_pages
 
+    @property
+    def claim_states_complete(self) -> bool:
+        completed = [card for card in self.cards if card.completed]
+        return bool(completed) and all(
+            card.claim_state in (CardClaimState.CLAIMED, CardClaimState.NONE_CONFIRMED)
+            for card in completed
+        )
+
     @staticmethod
     def _same_title(left: str, right: str) -> bool:
         left_key, right_key = _normalized_key(left), _normalized_key(right)
@@ -625,21 +708,27 @@ class _CardScannerBase:
                 return key
         return card.task_key
 
-    @staticmethod
-    def _merge_card(old, new):
+    def _merge_card(self, key, old, new):
         contribution = old.contribution if new.contribution is None else new.contribution
         if old.contribution is not None and new.contribution is not None and old.contribution != new.contribution:
             contribution = old.contribution
-        conflict = (
-            old.claimable is True and new.claimed is True
-            or old.claimed is True and new.claimable is True
-            or old.claimable is None and old.claimed is None
-        )
-        if conflict:
+        old_state, new_state = old.claim_state, new.claim_state
+        if key in self._claim_conflicts:
             claimable = claimed = None
+            claim_state_evidence = CardClaimState.CONFLICT
+        elif new_state is CardClaimState.UNKNOWN:
+            claimable, claimed = old.claimable, old.claimed
+            claim_state_evidence = old.claim_state_evidence
+        elif old_state is CardClaimState.UNKNOWN:
+            claimable, claimed = new.claimable, new.claimed
+            claim_state_evidence = new.claim_state_evidence
+        elif old_state is new_state:
+            claimable, claimed = old.claimable, old.claimed
+            claim_state_evidence = old.claim_state_evidence
         else:
-            claimable = old.claimable is True or new.claimable is True
-            claimed = old.claimed is True or new.claimed is True
+            self._claim_conflicts.add(key)
+            claimable = claimed = None
+            claim_state_evidence = CardClaimState.CONFLICT
         return replace(
             old,
             current=max(old.current, new.current),
@@ -647,6 +736,7 @@ class _CardScannerBase:
             completed=old.completed or new.completed,
             claimable=claimable,
             claimed=claimed,
+            claim_state_evidence=claim_state_evidence,
             contribution=contribution,
             page_fingerprint=new.page_fingerprint,
             title=old.title if len(_normalized_key(old.title)) >= len(_normalized_key(new.title)) else new.title,
@@ -669,20 +759,15 @@ class _CardScannerBase:
             self._anchor_valid = self._anchor_valid and evidence.page_anchor_confirmed
             if not evidence.page_anchor_confirmed:
                 self.cancelled = True
-            displacement = (
-                evidence.content_displacement_px
-                if evidence.content_displacement_px is not None
-                else evidence.displacement_px
-            )
-            moved = bool(evidence.movement_confirmed and abs(displacement) >= 30)
-            if moved:
+            movement_state = _evidence_movement_state(evidence)
+            if movement_state is MovementState.MOVED:
                 self._movement_seen = True
                 self._end_seen = False
                 self._end_candidate_sequence = 0
-            elif evidence.swipe_attempted and abs(displacement) < 10 and self._movement_seen:
+            elif movement_state is MovementState.STATIONARY_CONFIRMED and self._movement_seen:
                 self._end_candidate_sequence += 1
             if evidence.end_marker and self._movement_seen and (
-                evidence.end_confirmed_after_last_move or moved
+                evidence.end_confirmed_after_last_move
             ):
                 self._end_seen = True
             elif self._end_candidate_sequence >= 2 and self._movement_seen:
@@ -691,7 +776,7 @@ class _CardScannerBase:
         for card in cards:
             key = self._canonical_key(card)
             old = self._cards.get(key)
-            self._cards[key] = card if old is None else self._merge_card(old, card)
+            self._cards[key] = card if old is None else self._merge_card(key, old, card)
         added = len(self._cards) - before
         self._no_new = 0 if added else self._no_new + 1
         return added
@@ -713,10 +798,10 @@ def _horizontal_displacement(
     current: list[dict],
     *,
     content_roi: tuple[int, int, int, int] | None = None,
-) -> int | None:
-    """Return displacement of stable objects inside the scrolling content ROI."""
+) -> MovementObservation:
+    """Classify content movement without converting missing evidence to zero."""
 
-    def unique_x(items: list[dict]) -> dict[str, float]:
+    def unique_x(items: list[dict], *, inside_roi: bool) -> dict[str, float]:
         grouped: dict[str, list[float]] = {}
         for item in items:
             if not item.get("position"):
@@ -724,8 +809,14 @@ def _horizontal_displacement(
             x, y = _center(item)
             if content_roi is not None:
                 x1, y1, x2, y2 = content_roi
-                if not (min(x1, x2) <= x <= max(x1, x2) and min(y1, y2) <= y <= max(y1, y2)):
+                inside = (
+                    min(x1, x2) <= x <= max(x1, x2)
+                    and min(y1, y2) <= y <= max(y1, y2)
+                )
+                if inside != inside_roi:
                     continue
+            elif not inside_roi:
+                continue
             key = _normalized_key(str(item.get("text", "")))
             if len(key) < 2:
                 continue
@@ -735,18 +826,81 @@ def _horizontal_displacement(
             grouped.setdefault(key, []).append(float(x))
         return {key: values[0] for key, values in grouped.items() if len(values) == 1}
 
-    before, after = unique_x(previous), unique_x(current)
+    before = unique_x(previous, inside_roi=True)
+    after = unique_x(current, inside_roi=True)
     deltas = [after[key] - before[key] for key in before.keys() & after.keys()]
-    required_matches = 1 if content_roi is not None else 2
-    if len(deltas) < required_matches:
-        return None
+    fixed_displacement = None
+    if content_roi is not None:
+        fixed_before = unique_x(previous, inside_roi=False)
+        fixed_after = unique_x(current, inside_roi=False)
+        fixed_deltas = [
+            fixed_after[key] - fixed_before[key]
+            for key in fixed_before.keys() & fixed_after.keys()
+        ]
+        if fixed_deltas:
+            fixed_displacement = int(round(float(np.median(fixed_deltas))))
+
+    if len(deltas) < 2:
+        return MovementObservation(
+            MovementState.UNKNOWN, None, len(deltas), None, False, fixed_displacement
+        )
     median = int(round(float(np.median(deltas))))
+    dispersion = float(np.std(deltas))
     consistent = [value for value in deltas if abs(value - median) <= 20]
-    if len(consistent) < required_matches:
-        return None
-    if abs(median) < 10:
-        return 0
-    return median if abs(median) >= 30 else None
+    direction_consistent = len(consistent) >= 2 and (
+        abs(median) < 10
+        or all(value <= 0 for value in consistent)
+        or all(value >= 0 for value in consistent)
+    )
+    if direction_consistent and abs(median) >= 30:
+        state = MovementState.MOVED
+    elif direction_consistent and abs(median) < 10 and dispersion <= 10:
+        state = MovementState.STATIONARY_CONFIRMED
+    else:
+        state = MovementState.UNKNOWN
+    return MovementObservation(
+        state, median if state is not MovementState.UNKNOWN else None,
+        len(deltas), dispersion, direction_consistent, fixed_displacement,
+    )
+
+
+def _page_scan_evidence(
+    scanner: object,
+    movement: MovementObservation,
+    captured_at: datetime,
+    *,
+    page_anchor_confirmed: bool = True,
+    swipe_attempted: bool = True,
+) -> PageScanEvidence:
+    """Translate a movement observation into fail-closed scanner evidence."""
+
+    previous_sequence = int(getattr(scanner, "_end_candidate_sequence", 0))
+    movement_seen = bool(getattr(scanner, "_movement_seen", False))
+    if movement.state is MovementState.MOVED:
+        sequence = 0
+    elif movement.state is MovementState.STATIONARY_CONFIRMED and movement_seen:
+        sequence = previous_sequence + 1
+    else:
+        sequence = previous_sequence
+    end_confirmed = bool(movement_seen and sequence >= 2)
+    return PageScanEvidence(
+        movement_confirmed=movement.state is MovementState.MOVED,
+        end_marker=end_confirmed,
+        captured_at=captured_at,
+        displacement_px=(
+            abs(movement.displacement_px)
+            if movement.displacement_px is not None
+            else None
+        ),
+        page_anchor_confirmed=page_anchor_confirmed,
+        swipe_attempted=swipe_attempted,
+        content_displacement_px=movement.displacement_px,
+        matched_content_items=movement.matched_content_items,
+        fixed_anchor_displacement_px=movement.fixed_anchor_displacement,
+        end_candidate_sequence=sequence,
+        end_confirmed_after_last_move=end_confirmed,
+        movement_state=movement.state,
+    )
 
 
 class DailyCardScanner(_CardScannerBase):
@@ -992,26 +1146,41 @@ class RewardDriver:
         page_id: str = "reward_navigation",
         anchor_key: str = "coordinate",
     ) -> bool:
+        if action_key == "open_tab":
+            is_task_tab = "任务列表" in str(anchor_key).replace(" ", "")
+            mapped_action = "manual_tasks_tab" if is_task_tab else "manual_track_tab"
+        else:
+            mapped_action = (
+            "reward_back" if action_key == "back"
+            else action_key
+            )
+        requested_target = (
+            "top_left_back" if mapped_action == "reward_back"
+            else "manual_tasks_tab" if mapped_action == "manual_tasks_tab"
+            else "manual_track_tab" if mapped_action == "manual_track_tab"
+            else anchor_key
+        )
         result = input_tap(
             pos,
             intent=ActionIntent(
-                action_key=action_key, page_id=page_id, anchor_key=anchor_key,
-                coordinate=pos, correlation_id=f"reward:{page_id}:{anchor_key}",
+                mapped_action,
+                requested_target,
+                f"reward:{page_id}:{anchor_key}",
             ),
         )
         if result is False:
             raise PermissionError(f"read-only action denied: {action_key}")
         return bool(result)
 
-    def swipe_left(self) -> None:
+    def swipe_left(self, page_type: str = "daily") -> None:
         start = (1100, 450)
+        manual = str(page_type).startswith("manual")
         result = input_swipe(
             start, (500, 450), swipe_time=650,
             intent=ActionIntent(
-                action_key="scroll", page_id="reward_horizontal_track",
-                anchor_key="content_lane", coordinate=start,
-                bounded_region=(1000, 350, 1180, 550),
-                correlation_id="reward:horizontal-scroll",
+                "manual_horizontal_scroll" if manual else "daily_horizontal_scroll",
+                "manual_content" if manual else "daily_content",
+                f"reward:{page_type}:horizontal-scroll",
             ),
         )
         if result is False:
@@ -1046,13 +1215,13 @@ class RewardDriver:
             clarity_cancel = clarity_replenish_cancel_position(texts)
             if clarity_cancel is not None:
                 logger.info("检测到澄明度补充提示，取消后继续返回主界面")
-                self.tap(clarity_cancel, action_key="navigation_anchor", page_id="clarity_dialog", anchor_key="cancel")
+                self.tap(clarity_cancel, action_key="dialog_cancel", page_id="clarity_dialog", anchor_key="cancel")
                 self.sleep(1)
                 continue
             action = startup_screen_action(texts)
             if action == "cancel_resource_repair":
                 logger.warning("检测到资源完整性修复提示，取消修复")
-                self.tap((320, 500), action_key="navigation_anchor", page_id="resource_repair", anchor_key="cancel")
+                self.tap((320, 500), action_key="dialog_cancel", page_id="resource_repair", anchor_key="cancel")
                 startup_recovery = True
                 self.sleep(1)
                 continue
@@ -1070,13 +1239,13 @@ class RewardDriver:
                 continue
             if action == "enter_game":
                 logger.info("检测到游戏登录页，点击安全区域进入游戏")
-                self.tap((640, 560), action_key="navigation_anchor", page_id="login", anchor_key="enter_game")
+                self.tap((640, 560), action_key="enter_game", page_id="login", anchor_key="enter_game")
                 startup_recovery = True
                 self.sleep(4)
                 continue
             if action == "dismiss_startup_overlay":
                 logger.info("关闭登录后的启动弹窗")
-                self.tap((100, 650), action_key="navigation_anchor", page_id="startup_overlay", anchor_key="dismiss")
+                self.tap((100, 650), action_key="dialog_cancel", page_id="startup_overlay", anchor_key="cancel")
                 startup_recovery = True
                 self.sleep(1)
                 continue
@@ -1134,6 +1303,13 @@ class RewardCollector:
             return bool(self.driver.click_text(text, attempts=attempts, action_key=action_key))
         return bool(self.driver.click_text(text, attempts=attempts))
 
+    def _swipe_left(self, page_type: str) -> None:
+        parameters = inspect.signature(self.driver.swipe_left).parameters
+        if "page_type" in parameters:
+            self.driver.swipe_left(page_type=page_type)
+        else:
+            self.driver.swipe_left()
+
     def _page_is_open(self, page_marker: str) -> bool:
         if self.driver.has_text(page_marker):
             return True
@@ -1187,7 +1363,14 @@ class RewardCollector:
                 return False
 
         for pos in candidates:
-            self._tap(pos, action_key="navigation_anchor", page_id="home", anchor_key=page_marker)
+            keys = tuple(READ_ONLY_SHORTCUTS)
+            daily = bool(keys and page_marker == keys[0])
+            self._tap(
+                pos,
+                action_key="daily_page_open" if daily else "manual_page_open",
+                page_id="home",
+                anchor_key="daily_shortcut" if daily else "manual_shortcut",
+            )
             self.driver.sleep(1.5)
             if self._page_is_open(page_marker):
                 positions = self.state.setdefault("shortcut_positions", {})
@@ -1357,7 +1540,7 @@ class RewardCollector:
                     if scanner.complete:
                         break
                     if hasattr(self.driver, "swipe_left"):
-                        self.driver.swipe_left()
+                        self._swipe_left("daily")
                     next_frame = self.driver.frame()
                     next_items = next_frame.ocr()
                     displacement = _horizontal_displacement(
@@ -1367,14 +1550,11 @@ class RewardCollector:
                     anchored = _is_daily_activity_page(next_items)
                     scanner.add_page(
                         next_items,
-                        evidence=PageScanEvidence(
-                            displacement is not None and abs(displacement) >= 30,
-                            displacement == 0,
+                        evidence=_page_scan_evidence(
+                            scanner,
+                            displacement,
                             datetime.now().astimezone(),
-                            displacement_px=abs(displacement or 0),
                             page_anchor_confirmed=anchored,
-                            swipe_attempted=True,
-                            content_displacement_px=displacement or 0,
                         ),
                     )
                     previous_items = next_items
@@ -1403,10 +1583,8 @@ class RewardCollector:
                     "task_inventory_complete": structured.page_complete,
                     "stage_track_complete": structured.page_complete,
                     "claim_state_confidence": (
-                        "HIGH" if structured.page_complete and all(
-                            card.claimable is not None and card.claimed is not None
-                            for card in structured.task_cards
-                        ) else "UNKNOWN"
+                        "HIGH" if structured.page_complete and scanner.claim_states_complete
+                        else "UNKNOWN"
                     ),
                     "scan_revision": _items_fingerprint(layout_frames[-1]),
                     "page_fingerprint": _items_fingerprint(layout_frames[-1]),
@@ -1494,7 +1672,7 @@ class RewardCollector:
                     if scanner.complete:
                         break
                     if hasattr(self.driver, "swipe_left"):
-                        self.driver.swipe_left()
+                        self._swipe_left("manual_tasks")
                     next_items = self.driver.texts()
                     displacement = _horizontal_displacement(
                         previous_items, next_items,
@@ -1503,14 +1681,11 @@ class RewardCollector:
                     anchored = _is_manual_task_inventory_page(next_items)
                     scanner.add_page(
                         next_items,
-                        evidence=PageScanEvidence(
-                            displacement is not None and abs(displacement) >= 30,
-                            displacement == 0,
+                        evidence=_page_scan_evidence(
+                            scanner,
+                            displacement,
                             datetime.now().astimezone(),
-                            displacement_px=abs(displacement or 0),
                             page_anchor_confirmed=anchored,
-                            swipe_attempted=True,
-                            content_displacement_px=displacement or 0,
                         ),
                     )
                     previous_items = next_items
@@ -1534,7 +1709,7 @@ class RewardCollector:
                 )
                 previous_items = first_items
                 for _ in range(12):
-                    self.driver.swipe_left()
+                    self._swipe_left("manual_track")
                     next_items = self.driver.texts()
                     displacement = _horizontal_displacement(
                         previous_items, next_items,
@@ -1543,14 +1718,11 @@ class RewardCollector:
                     anchored = _is_manual_track_page(next_items)
                     track.add_segments(
                         _manual_track_segments(next_items),
-                        PageScanEvidence(
-                            displacement is not None and abs(displacement) >= 30,
-                            displacement == 0,
+                        _page_scan_evidence(
+                            track,
+                            displacement,
                             datetime.now().astimezone(),
-                            displacement_px=abs(displacement or 0),
                             page_anchor_confirmed=anchored,
-                            swipe_attempted=True,
-                            content_displacement_px=displacement or 0,
                         ),
                     )
                     previous_items = next_items
@@ -1569,7 +1741,9 @@ class RewardCollector:
                     "task_inventory_complete": scanner.complete,
                     "level_track_complete": level.track_scan_complete,
                     "claim_state_confidence": (
-                        "HIGH" if level.claimability_complete and scanner.complete else "UNKNOWN"
+                        "HIGH"
+                        if level.claimability_complete and scanner.complete and scanner.claim_states_complete
+                        else "UNKNOWN"
                     ),
                     "scan_revision": _items_fingerprint(first_items),
                     "page_fingerprint": _items_fingerprint(first_items),
@@ -1616,7 +1790,7 @@ class RewardCollector:
         )
         previous_items = first_items
         for _ in range(12):
-            self.driver.swipe_left()
+            self._swipe_left("manual_track")
             next_items = self.driver.texts()
             displacement = _horizontal_displacement(
                 previous_items, next_items,
@@ -1625,14 +1799,11 @@ class RewardCollector:
             anchored = _is_manual_track_page(next_items)
             track.add_segments(
                 _manual_track_segments(next_items),
-                PageScanEvidence(
-                    displacement is not None and abs(displacement) >= 30,
-                    displacement == 0,
+                _page_scan_evidence(
+                    track,
+                    displacement,
                     datetime.now().astimezone(),
-                    displacement_px=abs(displacement or 0),
                     page_anchor_confirmed=anchored,
-                    swipe_attempted=True,
-                    content_displacement_px=displacement or 0,
                 ),
             )
             previous_items = next_items

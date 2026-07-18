@@ -194,7 +194,7 @@ def kill():
     control.kill()
 
 
-def input_swipe(
+def _legacy_input_swipe(
     pos1=(919, 617),
     pos2=(919, 908),
     swipe_time: int = 100,
@@ -336,7 +336,7 @@ def input_swipe(
     )
 
 
-def input_tap(
+def _legacy_input_tap(
     pos: Tuple[int, int] = (880, 362),
     random_offset: bool = True,
     *,
@@ -365,6 +365,89 @@ def input_tap(
         int(control.ratio * pos[0] + offset_x),
         int(control.ratio * pos[1] + offset_y),
     )
+    return True
+
+
+def _linear_trajectory(
+    start: tuple[int, int],
+    end: tuple[int, int],
+    *,
+    maximum_step: int = 25,
+) -> tuple[tuple[int, int], ...]:
+    distance = max(abs(end[0] - start[0]), abs(end[1] - start[1]))
+    steps = max(1, int((distance + maximum_step - 1) // maximum_step))
+    return tuple(
+        (
+            int(round(start[0] + (end[0] - start[0]) * index / steps)),
+            int(round(start[1] + (end[1] - start[1]) * index / steps)),
+        )
+        for index in range(steps + 1)
+    )
+
+
+def input_swipe(
+    pos1=(919, 617),
+    pos2=(919, 908),
+    swipe_time: int = 100,
+    *,
+    intent=None,
+    permit=None,
+    page_id: str = "",
+    page_fingerprint: str = "",
+    anchor_key: str = "",
+):
+    if _ACTION_POLICY is None:
+        return _legacy_input_swipe(
+            pos1, pos2, swipe_time, intent=intent, permit=permit,
+            page_id=page_id, page_fingerprint=page_fingerprint,
+            anchor_key=anchor_key,
+        )
+    ensure_automation_allowed("滑动游戏界面")
+    if STOP:
+        raise StopExecution()
+    # Read-only mode determines every physical point before authorization and
+    # deliberately disables random offsets and post-authorization segmentation.
+    start = (int(round(control.ratio * pos1[0])), int(round(control.ratio * pos1[1])))
+    end = (int(round(control.ratio * pos2[0])), int(round(control.ratio * pos2[1])))
+    trajectory = _linear_trajectory(start, end)
+    if not _ACTION_POLICY.authorize_swipe(
+        start, end, trajectory=trajectory, intent=intent, permit=permit,
+        page_id=page_id, page_fingerprint=page_fingerprint,
+        anchor_key=anchor_key,
+    ):
+        return False
+    control.input_swipe(start[0], start[1], end[0], end[1], swipe_time)
+    return True
+
+
+def input_tap(
+    pos: Tuple[int, int] = (880, 362),
+    random_offset: bool = True,
+    *,
+    intent=None,
+    permit=None,
+    page_id: str = "",
+    page_fingerprint: str = "",
+    anchor_key: str = "",
+):
+    if _ACTION_POLICY is None:
+        return _legacy_input_tap(
+            pos, random_offset=random_offset, intent=intent, permit=permit,
+            page_id=page_id, page_fingerprint=page_fingerprint,
+            anchor_key=anchor_key,
+        )
+    ensure_automation_allowed("点击游戏界面")
+    if STOP:
+        raise StopExecution()
+    # The guard authorizes the exact physical coordinate.  No random offset is
+    # permitted after this point in read-only mode.
+    physical = (int(round(control.ratio * pos[0])), int(round(control.ratio * pos[1])))
+    if not _ACTION_POLICY.authorize_coordinate(
+        physical, intent=intent, permit=permit, page_id=page_id,
+        page_fingerprint=page_fingerprint, anchor_key=anchor_key,
+    ):
+        return False
+    control.input_tap(*physical)
     return True
 
 
