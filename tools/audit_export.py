@@ -133,6 +133,27 @@ def minimize_audit_journal(entry: dict) -> dict:
     return minimized
 
 
+def _mask_digest_fields(value: object) -> object:
+    """Remove generated digest entropy without hiding ordinary JSON values."""
+
+    if isinstance(value, dict):
+        masked = {}
+        for key, child in value.items():
+            normalized = str(key).casefold()
+            if (
+                "hash" in normalized
+                or "sha256" in normalized
+                or normalized in {"digest", "page_fingerprint"}
+            ) and isinstance(child, str):
+                masked[key] = "[DIGEST]"
+            else:
+                masked[key] = _mask_digest_fields(child)
+        return masked
+    if isinstance(value, list):
+        return [_mask_digest_fields(child) for child in value]
+    return value
+
+
 def _json_string_values(value: object):
     if isinstance(value, str):
         yield value
@@ -159,21 +180,31 @@ def _scan_text_payload(
             line.split("  ", 1)[1] if "  " in line else line
             for line in text.splitlines()
         )
-    hits = set(scan_sensitive_text(text))
     decoded_values = 0
     decoded_objects: list[object] = []
+    fully_decoded = False
     if suffix == ".json":
         try:
             decoded_objects.append(json.loads(text))
+            fully_decoded = True
         except (TypeError, ValueError):
             pass
     elif suffix == ".jsonl":
+        fully_decoded = True
         for line in text.splitlines():
             try:
                 decoded_objects.append(json.loads(line))
             except (TypeError, ValueError):
-                continue
-    for decoded in decoded_objects:
+                fully_decoded = False
+    masked_objects = [_mask_digest_fields(decoded) for decoded in decoded_objects]
+    scan_text = text
+    if fully_decoded:
+        scan_text = "\n".join(
+            json.dumps(decoded, ensure_ascii=False, sort_keys=True)
+            for decoded in masked_objects
+        )
+    hits = set(scan_sensitive_text(scan_text))
+    for decoded in masked_objects:
         for value in _json_string_values(decoded):
             decoded_values += 1
             hits.update(scan_sensitive_text(value))
