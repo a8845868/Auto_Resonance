@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import shutil
 import threading
 import uuid
 from dataclasses import asdict, is_dataclass
@@ -28,8 +29,21 @@ class FatigueActionState(str, Enum):
     CLAIMED = "CLAIMED"
     ACKNOWLEDGED = "ACKNOWLEDGED"
     FAILED_RETRYABLE = "FAILED_RETRYABLE"
+    MANUAL_BLOCKED = "MANUAL_BLOCKED"
     CANCELLED = "CANCELLED"
     SUPERSEDED = "SUPERSEDED"
+
+
+class CheckpointProcessingOutcome(str, Enum):
+    ACKNOWLEDGE = "ACKNOWLEDGE"
+    RETRY_AT = "RETRY_AT"
+    RETRY_ON_EVENT = "RETRY_ON_EVENT"
+    MANUAL_BLOCKED = "MANUAL_BLOCKED"
+    CANCELLED_BY_USER = "CANCELLED_BY_USER"
+
+
+class CheckpointStateCorrupt(RuntimeError):
+    """The checkpoint journal cannot be trusted and must block departure."""
 
 
 _TERMINAL_STATES = {
@@ -57,17 +71,33 @@ def _set_state(item: dict[str, Any], state: FatigueActionState) -> None:
 
 
 def _read(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"server_day_id": SERVER_CLOCK.server_day_id(), "actions": []}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, TypeError, ValueError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
+    except (OSError, TypeError, ValueError) as error:
+        _preserve_corrupt_state(path)
+        raise CheckpointStateCorrupt(f"checkpoint state unreadable: {type(error).__name__}") from error
+    if not isinstance(data, dict) or not isinstance(data.get("actions", []), list):
+        _preserve_corrupt_state(path)
+        raise CheckpointStateCorrupt("checkpoint state has invalid schema")
     data.setdefault("server_day_id", SERVER_CLOCK.server_day_id())
     data.setdefault("actions", [])
     if data["server_day_id"] != SERVER_CLOCK.server_day_id():
         data = {"server_day_id": SERVER_CLOCK.server_day_id(), "actions": []}
     return data
+
+
+def _preserve_corrupt_state(path: Path) -> Path | None:
+    if not path.is_file():
+        return None
+    stamp = SERVER_CLOCK.server_now().strftime("%Y%m%dT%H%M%S%f")
+    backup = path.with_name(f"{path.name}.corrupt.{stamp}.{uuid.uuid4().hex[:8]}")
+    try:
+        shutil.copy2(path, backup)
+    except OSError:
+        return None
+    return backup
 
 
 def _write(path: Path, data: dict[str, Any]) -> None:
@@ -382,12 +412,125 @@ def fail_fatigue_checkpoint(
             raise RuntimeError("fatigue checkpoint not found")
         attempts = int(item.get("claim_attempt", 0))
         if attempts >= max(1, int(max_attempts)):
-            _set_state(item, FatigueActionState.CANCELLED)
-            item["cancelled_reason"] = "retry_limit_exhausted"
+            _set_state(item, FatigueActionState.MANUAL_BLOCKED)
+            item["manual_blocked_reason"] = "retry_limit_exhausted"
+            item["processing_outcome"] = CheckpointProcessingOutcome.MANUAL_BLOCKED.value
         else:
             _set_state(item, FatigueActionState.FAILED_RETRYABLE)
         item["failure_reason"] = str(reason)
         item["failed_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
+        _write(path, data)
+        return dict(item)
+
+
+def checkpoint_processing_outcome(result: dict[str, Any]) -> CheckpointProcessingOutcome:
+    if result.get("success") is not True:
+        return CheckpointProcessingOutcome.MANUAL_BLOCKED
+    if result.get("deferred") is not True:
+        return CheckpointProcessingOutcome.ACKNOWLEDGE
+    status = str(result.get("status", "")).upper()
+    if status == "DEFER_UNTIL_FATIGUE":
+        return CheckpointProcessingOutcome.RETRY_ON_EVENT
+    if status in {"UNKNOWN", "DEFER_UNTIL_RELEASE"}:
+        return CheckpointProcessingOutcome.RETRY_AT
+    return CheckpointProcessingOutcome.MANUAL_BLOCKED
+
+
+def complete_fatigue_checkpoint_processing(
+    action_id: str,
+    result: dict[str, Any],
+    *,
+    path: Path = STATE_PATH,
+) -> dict[str, Any]:
+    """Atomically persist the processing outcome before returning it."""
+
+    outcome = checkpoint_processing_outcome(result)
+    with _LOCK:
+        data = _read(path)
+        item = next(
+            (entry for entry in data["actions"] if str(entry.get("id")) == str(action_id)),
+            None,
+        )
+        if item is None or _state(item) != FatigueActionState.CLAIMED.value:
+            raise RuntimeError("only a claimed fatigue checkpoint can be completed")
+        if outcome is CheckpointProcessingOutcome.ACKNOWLEDGE:
+            _set_state(item, FatigueActionState.ACKNOWLEDGED)
+            item["acknowledged_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
+            item["processing_outcome"] = outcome.value
+            item["source_result"] = dict(result)
+            _write(path, data)
+            return {"outcome": outcome.value, "acknowledged": True, "checkpoint": dict(item)}
+
+        if outcome is CheckpointProcessingOutcome.MANUAL_BLOCKED:
+            _set_state(item, FatigueActionState.MANUAL_BLOCKED)
+            item["processing_outcome"] = outcome.value
+            item["source_result"] = dict(result)
+            item["manual_blocked_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
+            _write(path, data)
+            return {"outcome": outcome.value, "acknowledged": False, "checkpoint": dict(item)}
+
+        # _impl may already have installed the next plan. Prefer that action;
+        # otherwise create a replacement in this same state transaction.
+        replacement = next(
+            (
+                entry
+                for entry in data["actions"]
+                if entry is not item
+                and _state(entry) not in _TERMINAL_STATES
+                and str(entry.get("waypoint_id", "")) == str(item.get("waypoint_id", ""))
+            ),
+            None,
+        )
+        if replacement is None:
+            replacement = dict(item)
+            replacement["id"] = f"{item.get('id')}:retry:{uuid.uuid4().hex[:12]}"
+            replacement.pop("claimed_at", None)
+            replacement["claim_attempt"] = int(item.get("claim_attempt", 0))
+            if outcome is CheckpointProcessingOutcome.RETRY_ON_EVENT:
+                _set_state(replacement, FatigueActionState.ACTIVE)
+            else:
+                _set_state(replacement, FatigueActionState.SCHEDULED)
+            data["actions"].append(replacement)
+        elif outcome is CheckpointProcessingOutcome.RETRY_AT:
+            _set_state(replacement, FatigueActionState.SCHEDULED)
+        replacement["processing_outcome"] = outcome.value
+        replacement["source_result"] = dict(result)
+        replacement["replaces_checkpoint_id"] = str(item.get("id"))
+        if result.get("next_run_at"):
+            replacement["run_at"] = str(result["next_run_at"])
+        _set_state(item, FatigueActionState.SUPERSEDED)
+        item["superseded_by"] = str(replacement.get("id"))
+        item["processing_outcome"] = outcome.value
+        _write(path, data)
+        return {
+            "outcome": outcome.value,
+            "acknowledged": False,
+            "checkpoint": dict(item),
+            "replacement": dict(replacement),
+        }
+
+
+def skip_fatigue_checkpoint(
+    action_id: str,
+    *,
+    reason: str,
+    actor: str,
+    path: Path = STATE_PATH,
+) -> dict[str, Any]:
+    if not reason.strip() or not actor.strip():
+        raise ValueError("checkpoint skip requires actor and reason")
+    with _LOCK:
+        data = _read(path)
+        item = next((entry for entry in data["actions"] if str(entry.get("id")) == str(action_id)), None)
+        if item is None or _state(item) in _TERMINAL_STATES:
+            raise RuntimeError("active fatigue checkpoint not found")
+        _set_state(item, FatigueActionState.CANCELLED)
+        item["processing_outcome"] = CheckpointProcessingOutcome.CANCELLED_BY_USER.value
+        item["skip_audit"] = {
+            "actor": actor.strip(),
+            "reason": reason.strip(),
+            "at": SERVER_CLOCK.server_now().isoformat(timespec="seconds"),
+        }
         _write(path, data)
         return dict(item)
 
@@ -397,8 +540,32 @@ def fatigue_checkpoint_deferral(
     *,
     path: Path = STATE_PATH,
 ) -> dict[str, Any] | None:
-    action = _matching_checkpoint(
-        list_fatigue_actions(path=path), expected_waypoint=str(waypoint_id)
+    try:
+        actions = list_fatigue_actions(path=path)
+    except CheckpointStateCorrupt:
+        return {
+            "success": True,
+            "deferred": True,
+            "progress_made": False,
+            "reason": "fatigue_checkpoint_state_corrupt",
+            "checkpoint_state": "CORRUPT",
+            "expected_waypoint": str(waypoint_id),
+            "server_day_id": SERVER_CLOCK.server_day_id(),
+        }
+    blocking_states = {
+        FatigueActionState.ACTIVE.value,
+        FatigueActionState.SCHEDULED.value,
+        FatigueActionState.CLAIMED.value,
+        FatigueActionState.FAILED_RETRYABLE.value,
+        FatigueActionState.MANUAL_BLOCKED.value,
+    }
+    action = next(
+        (
+            item for item in actions
+            if _state(item) in blocking_states
+            and str(item.get("waypoint_id", "")) == str(waypoint_id)
+        ),
+        None,
     )
     if action is None:
         return None

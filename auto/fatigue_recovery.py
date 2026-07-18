@@ -377,8 +377,8 @@ def run_daily_fatigue_recovery(
 
     from core.services.fatigue_triggers import (
         STATE_PATH,
-        acknowledge_fatigue_checkpoint,
         claim_fatigue_checkpoint,
+        complete_fatigue_checkpoint_processing,
         fail_fatigue_checkpoint,
     )
 
@@ -409,7 +409,19 @@ def run_daily_fatigue_recovery(
             )
         raise
     if checkpoint is not None:
-        acknowledge_fatigue_checkpoint(str(checkpoint["id"]), path=path)
+        transaction = complete_fatigue_checkpoint_processing(
+            str(checkpoint["id"]), result, path=path
+        )
         result["checkpoint_id"] = checkpoint["id"]
-        result["checkpoint_acknowledged"] = True
+        result["checkpoint_outcome"] = transaction["outcome"]
+        result["checkpoint_acknowledged"] = transaction["acknowledged"]
+        replacement = transaction.get("replacement")
+        if replacement is not None:
+            result["replacement_checkpoint_id"] = replacement["id"]
+        if transaction["acknowledged"]:
+            # This only updates scheduler state.  It does not run business on
+            # the fatigue worker's stack, so screen ownership is yielded first.
+            from core.services.task_schedule_state import request_immediate_run
+
+            request_immediate_run("business")
     return result
