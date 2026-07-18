@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import zipfile
 
 import pytest
 
@@ -59,3 +60,22 @@ def test_shareable_package_rejects_binary_patch_with_sensitive_preimage(tmp_path
     with pytest.raises(audit.SensitiveDataError, match="binary patch"):
         audit.build_reversible_audit_package(baseline, target, tmp_path / "out", create_zip=True)
     assert not (tmp_path / "out.zip").exists()
+
+
+def test_hash_manifest_digest_is_not_misclassified_as_phone(tmp_path: Path):
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / "safe.py").write_text("value = 1\n", encoding="utf-8")
+    (package / "SHA256SUMS.txt").write_text(
+        "abc13800138000def  safe.py\n",
+        encoding="utf-8",
+    )
+    hits, _ = audit.scan_sensitive_tree(package)
+    assert hits == []
+
+    archive_path = tmp_path / "package.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.write(package / "safe.py", "package/safe.py")
+        archive.write(package / "SHA256SUMS.txt", "package/SHA256SUMS.txt")
+    zip_hits, _ = audit._scan_zip(archive_path)
+    assert zip_hits == []
