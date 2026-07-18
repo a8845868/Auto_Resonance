@@ -4,7 +4,7 @@ import itertools
 import math
 from dataclasses import asdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import requests
@@ -13,6 +13,7 @@ from loguru import logger
 from core.utils.utils import RESOURCES_PATH, read_json
 from core.services.passenger_planner import PassengerPlanConfig, estimate_passenger_plan
 from core.services.station_availability import available_stations
+from core.services.server_calendar import SERVER_CLOCK
 
 
 PRICE_API = "https://www.resonance-columba.com/api/get-prices"
@@ -374,6 +375,20 @@ def optimize_live_routes(
     )
     best["price_source"] = "live_exchange" if latest_timestamp else "offline"
     best["price_revision"] = latest_timestamp or ""
+    if latest_timestamp:
+        observed_at = datetime.fromtimestamp(
+            latest_timestamp, tz=SERVER_CLOCK.timezone
+        )
+        best["current_price_evidence"] = {
+            "source": "live_exchange",
+            "observed_at": observed_at.isoformat(),
+            "valid_until": (observed_at + timedelta(minutes=30)).isoformat(),
+            "revision": str(latest_timestamp),
+            "station_pair": [str(city) for city in best["cycle"][:2]],
+            "server_day_id": SERVER_CLOCK.server_day_id(observed_at),
+        }
+    else:
+        best["current_price_evidence"] = None
     best["api"] = PRICE_API if latest_timestamp else ""
     best["assumptions"] = {
         "cargo": config.cargo,

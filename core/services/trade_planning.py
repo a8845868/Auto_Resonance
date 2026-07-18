@@ -39,6 +39,89 @@ class StalePriceSnapshot(RuntimeError):
     """Raised when an executable plan is based on an expired price snapshot."""
 
 
+@dataclass(frozen=True)
+class PriceExecutionEvidence:
+    source: str
+    observed_at: datetime
+    valid_until: datetime
+    revision: str
+    station_pair: tuple[str, str]
+    server_day_id: str
+
+
+def _aware_time(value: object, *, field: str) -> datetime:
+    try:
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    except (TypeError, ValueError) as error:
+        raise StalePriceSnapshot(f"price evidence {field} is invalid") from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise StalePriceSnapshot(f"price evidence {field} must be timezone-aware")
+    return parsed
+
+
+def current_price_revision(state: dict[str, Any]) -> str:
+    evidence = state.get("current_price_evidence")
+    return str(evidence.get("revision", "")) if isinstance(evidence, dict) else ""
+
+
+def validate_price_execution_evidence(
+    state: dict[str, Any], *, now: datetime | None = None
+) -> PriceExecutionEvidence:
+    """Shared price gate for both UI recommendations and execution."""
+
+    current = now or SERVER_CLOCK.server_now()
+    calculated_at = _parse_price_time(state.get("price_time"))
+    if not price_snapshot_is_fresh(calculated_at, now=current):
+        raise StalePriceSnapshot("price snapshot expired")
+    plan_source = str(state.get("price_source", "")).strip().lower()
+    if plan_source not in {"live_exchange", "game_observed"}:
+        raise StalePriceSnapshot(
+            f"price source {plan_source!r} is not approved for real execution"
+        )
+
+    raw = state.get("current_price_evidence")
+    # Schema-2 callers predate independent observation evidence. Keep their
+    # deterministic unit contract, but every newly persisted schema-3 plan is
+    # fail-closed until a current observation is present.
+    if not isinstance(raw, dict):
+        if int(state.get("schema_version", 0) or 0) >= 3:
+            raise StalePriceSnapshot("current price evidence is missing")
+        cycle = tuple(str(city) for city in state.get("cycle", ()))
+        if len(cycle) < 2:
+            raise StalePriceSnapshot("price evidence station pair is missing")
+        return PriceExecutionEvidence(
+            plan_source, calculated_at, calculated_at + timedelta(minutes=30),
+            str(state.get("price_revision", "")), (cycle[0], cycle[1]),
+            SERVER_CLOCK.server_day_id(calculated_at),
+        )
+
+    source = str(raw.get("source", "")).strip().lower()
+    if source not in {"live_exchange", "game_observed"}:
+        raise StalePriceSnapshot(
+            f"price source {source!r} is not approved for real execution"
+        )
+    observed_at = _aware_time(raw.get("observed_at"), field="observed_at")
+    valid_until = _aware_time(raw.get("valid_until"), field="valid_until")
+    if not (observed_at <= current <= valid_until):
+        raise StalePriceSnapshot("current price evidence is outside its validity window")
+    revision = str(raw.get("revision", "")).strip()
+    if not revision or revision != str(state.get("price_revision", "")).strip():
+        raise StalePriceSnapshot("price revision mismatch")
+    pair_values = raw.get("station_pair")
+    pair = tuple(str(value) for value in pair_values) if isinstance(pair_values, (list, tuple)) else ()
+    cycle = tuple(str(city) for city in state.get("cycle", ()))
+    if len(pair) != 2 or len(cycle) < 2 or pair != cycle[:2]:
+        raise StalePriceSnapshot("price evidence station pair mismatch")
+    server_day_id = str(raw.get("server_day_id", ""))
+    if server_day_id != SERVER_CLOCK.server_day_id(current):
+        raise StalePriceSnapshot("price evidence server day mismatch")
+    if plan_source != source:
+        raise StalePriceSnapshot("plan and current price sources differ")
+    return PriceExecutionEvidence(
+        source, observed_at, valid_until, revision, (pair[0], pair[1]), server_day_id
+    )
+
+
 def choose_trade_plan(
     candidates: tuple[TradeCandidate, ...],
     *,
@@ -123,16 +206,7 @@ def validate_executable_trade_budget(
     """Validate one persisted route against fresh prices and finite budgets."""
 
     current = now or SERVER_CLOCK.server_now()
-    calculated_at = _parse_price_time(state.get("price_time"))
-    if not price_snapshot_is_fresh(calculated_at, now=current):
-        raise StalePriceSnapshot(
-            f"price snapshot expired: calculated_at={calculated_at.isoformat()} now={current.isoformat()}"
-        )
-    price_source = str(state.get("price_source", "")).strip().lower()
-    if price_source not in {"live_exchange", "game_observed"}:
-        raise StalePriceSnapshot(
-            f"price source {price_source!r} is not approved for real execution"
-        )
+    validate_price_execution_evidence(state, now=current)
     cycle = [str(city) for city in state.get("cycle", [])]
     if len(cycle) < 2 or len(set(cycle)) < 2:
         raise ValueError("executable trade plan requires two distinct stations")
@@ -197,13 +271,10 @@ def plan_price_is_fresh(
     state: dict[str, Any], *, now: datetime | None = None
 ) -> bool:
     try:
-        calculated_at = _parse_price_time(state.get("price_time"))
+        validate_price_execution_evidence(state, now=now)
     except (StalePriceSnapshot, TypeError, ValueError):
         return False
-    return price_snapshot_is_fresh(
-        calculated_at,
-        now=now or SERVER_CLOCK.server_now(),
-    )
+    return True
 
 
 def recommend_max_feasible_runs_today(

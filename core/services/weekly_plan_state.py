@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from core.utils.utils import ROOT_PATH
 from core.services.server_calendar import SERVER_CLOCK
@@ -22,6 +23,10 @@ from core.services.trade_ledger import (
 
 STATE_PATH = Path(ROOT_PATH).resolve() / "config" / "weekly_plan.json"
 _STATE_LOCK = threading.RLock()
+
+
+class WeeklyStateCorrupt(RuntimeError):
+    """The weekly state cannot be trusted and must not be partially replaced."""
 
 
 def current_week_start(today: date | None = None) -> str:
@@ -95,8 +100,8 @@ def save_weekly_plan(result: dict) -> dict[str, Any]:
         completed_runs = min(int(existing.get("completed_runs", 0)), len(runs))
         completed_books = int(existing.get("completed_books", 0))
     state: dict[str, Any] = {
-        "version": 2,
-        "schema_version": 2,
+        "version": 3,
+        "schema_version": 3,
         "week_start": current_week_start(),
         "cycle": result["cycle"],
         "total_runs": len(runs),
@@ -120,6 +125,7 @@ def save_weekly_plan(result: dict) -> dict[str, Any]:
         "price_time": result.get("price_time", ""),
         "price_source": result.get("price_source", ""),
         "price_revision": result.get("price_revision", result.get("price_time", "")),
+        "current_price_evidence": result.get("current_price_evidence"),
         "optimizer_config": result.get("optimizer_config", {}),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -127,18 +133,65 @@ def save_weekly_plan(result: dict) -> dict[str, Any]:
     return state
 
 
+def _write_state_unlocked(state: dict[str, Any], target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target.with_name(
+        f"{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    with temp_path.open("w", encoding="utf-8") as stream:
+        json.dump(state, stream, ensure_ascii=False, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temp_path, target)
+
+
 def _write_state(state: dict[str, Any], *, path: Path | None = None) -> None:
     target = path or STATE_PATH
     with _STATE_LOCK:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = target.with_name(
-            f"{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        )
-        with temp_path.open("w", encoding="utf-8") as stream:
-            json.dump(state, stream, ensure_ascii=False, indent=2)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temp_path, target)
+        _write_state_unlocked(state, target)
+
+
+def _preserve_corrupt_weekly_state(target: Path) -> Path | None:
+    if not target.is_file():
+        return None
+    stamp = SERVER_CLOCK.server_now().strftime("%Y%m%dT%H%M%S%f")
+    backup = target.with_name(
+        f"{target.name}.corrupt.{stamp}.{uuid.uuid4().hex[:8]}"
+    )
+    try:
+        shutil.copy2(target, backup)
+    except OSError:
+        return None
+    return backup
+
+
+def update_weekly_state(
+    mutator: Callable[[dict[str, Any]], object],
+    *,
+    path: Path | None = None,
+) -> dict[str, Any]:
+    """Perform read, mutation and atomic replace under one lock scope."""
+
+    target = path or STATE_PATH
+    with _STATE_LOCK:
+        if target.exists():
+            try:
+                state = json.loads(target.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError) as error:
+                _preserve_corrupt_weekly_state(target)
+                raise WeeklyStateCorrupt(
+                    f"weekly state unreadable: {type(error).__name__}"
+                ) from error
+            if not isinstance(state, dict):
+                _preserve_corrupt_weekly_state(target)
+                raise WeeklyStateCorrupt("weekly state has invalid schema")
+        else:
+            state = {}
+        replacement = mutator(state)
+        if isinstance(replacement, dict) and replacement is not state:
+            state = replacement
+        _write_state_unlocked(state, target)
+        return json.loads(json.dumps(state))
 
 
 def save_current_resource_evidence(evidence, *, path: Path | None = None) -> dict[str, Any]:
@@ -149,23 +202,19 @@ def save_current_resource_evidence(evidence, *, path: Path | None = None) -> dic
     parsed = CurrentResourceEvidence.from_value(evidence)
     if parsed is None:
         raise ValueError("invalid current resource evidence")
-    target = path or STATE_PATH
-    try:
-        state = json.loads(target.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, TypeError, ValueError):
-        state = {}
-    state["current_resources"] = parsed.to_dict()
-    state["recovery_resources"] = {
-        "recoverable_fatigue_today": parsed.recoverable_fatigue_today,
-        "source": parsed.source,
-        "observed_at": parsed.observed_at.isoformat(),
-        "valid_until": parsed.valid_until.isoformat(),
-        "server_day_id": parsed.server_day_id,
-        "revision": parsed.revision,
-    }
-    state["updated_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
-    _write_state(state, path=target)
-    return state
+    def mutate(state: dict[str, Any]) -> None:
+        state["current_resources"] = parsed.to_dict()
+        state["recovery_resources"] = {
+            "recoverable_fatigue_today": parsed.recoverable_fatigue_today,
+            "source": parsed.source,
+            "observed_at": parsed.observed_at.isoformat(),
+            "valid_until": parsed.valid_until.isoformat(),
+            "server_day_id": parsed.server_day_id,
+            "revision": parsed.revision,
+        }
+        state["updated_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
+
+    return update_weekly_state(mutate, path=path)
 
 
 def save_current_city_evidence(
@@ -179,21 +228,17 @@ def save_current_city_evidence(
 ) -> dict[str, Any]:
     if not city or source not in {"game_observed", "user_calibrated"}:
         raise ValueError("current city requires observed or calibrated evidence")
-    target = path or STATE_PATH
-    try:
-        state = json.loads(target.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, TypeError, ValueError):
-        state = {}
-    state["current_city_evidence"] = {
-        "city": city,
-        "source": source,
-        "observed_at": observed_at.isoformat(),
-        "valid_until": valid_until.isoformat(),
-        "server_day_id": SERVER_CLOCK.server_day_id(observed_at),
-        "revision": revision,
-    }
-    _write_state(state, path=target)
-    return state
+    def mutate(state: dict[str, Any]) -> None:
+        state["current_city_evidence"] = {
+            "city": city,
+            "source": source,
+            "observed_at": observed_at.isoformat(),
+            "valid_until": valid_until.isoformat(),
+            "server_day_id": SERVER_CLOCK.server_day_id(observed_at),
+            "revision": revision,
+        }
+
+    return update_weekly_state(mutate, path=path)
 
 
 def record_completed_run(
@@ -305,7 +350,11 @@ def progress_summary(
     profit_per_fatigue = (
         round(expected_profit / expected_fatigue, 2) if expected_fatigue else 0.0
     )
-    from core.services.trade_planning import plan_price_is_fresh, recommend_today_runs
+    from core.services.trade_planning import (
+        current_price_revision,
+        plan_price_is_fresh,
+        recommend_today_runs,
+    )
 
     leg_costs = [max(0, float(value)) for value in state.get("leg_fatigue_schedule", ())]
     partial = facts.current_partial_cycle or {}
@@ -375,6 +424,7 @@ def progress_summary(
         else 0.0
     )
     price_fresh = plan_price_is_fresh(state, now=now)
+    observed_price_revision = current_price_revision(state)
     suggested_today = recommend_today_runs(
         remaining_runs=remaining,
         cycle_fatigue=float(state.get("cycle_fatigue", 0)),
@@ -390,7 +440,7 @@ def progress_summary(
         current_run_index=completed,
         current_city=current_city,
         price_revision=str(state.get("price_revision", "")),
-        current_price_revision=str(state.get("price_revision", "")),
+        current_price_revision=observed_price_revision,
     )
     missing_evidence = []
     if resource_error:
@@ -460,6 +510,7 @@ def progress_summary(
         "expected_total_fatigue": round(expected_fatigue, 2),
         "expected_profit_per_fatigue": profit_per_fatigue,
         "price_snapshot_fresh": price_fresh,
+        "current_price_revision": observed_price_revision,
         "today_suggested_runs": suggested_today,
         "today_recommendation_reason": recommendation_reason,
     }
