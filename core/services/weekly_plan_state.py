@@ -127,17 +127,73 @@ def save_weekly_plan(result: dict) -> dict[str, Any]:
     return state
 
 
-def _write_state(state: dict[str, Any]) -> None:
+def _write_state(state: dict[str, Any], *, path: Path | None = None) -> None:
+    target = path or STATE_PATH
     with _STATE_LOCK:
-        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = STATE_PATH.with_name(
-            f"{STATE_PATH.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = target.with_name(
+            f"{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         )
         with temp_path.open("w", encoding="utf-8") as stream:
             json.dump(state, stream, ensure_ascii=False, indent=2)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temp_path, STATE_PATH)
+        os.replace(temp_path, target)
+
+
+def save_current_resource_evidence(evidence, *, path: Path | None = None) -> dict[str, Any]:
+    """Persist fresh observed inventory separately from plan requirements."""
+
+    from core.services.daily_capabilities import CurrentResourceEvidence
+
+    parsed = CurrentResourceEvidence.from_value(evidence)
+    if parsed is None:
+        raise ValueError("invalid current resource evidence")
+    target = path or STATE_PATH
+    try:
+        state = json.loads(target.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        state = {}
+    state["current_resources"] = parsed.to_dict()
+    state["recovery_resources"] = {
+        "recoverable_fatigue_today": parsed.recoverable_fatigue_today,
+        "source": parsed.source,
+        "observed_at": parsed.observed_at.isoformat(),
+        "valid_until": parsed.valid_until.isoformat(),
+        "server_day_id": parsed.server_day_id,
+        "revision": parsed.revision,
+    }
+    state["updated_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
+    _write_state(state, path=target)
+    return state
+
+
+def save_current_city_evidence(
+    city: str,
+    *,
+    source: str,
+    observed_at: datetime,
+    valid_until: datetime,
+    revision: str,
+    path: Path | None = None,
+) -> dict[str, Any]:
+    if not city or source not in {"game_observed", "user_calibrated"}:
+        raise ValueError("current city requires observed or calibrated evidence")
+    target = path or STATE_PATH
+    try:
+        state = json.loads(target.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        state = {}
+    state["current_city_evidence"] = {
+        "city": city,
+        "source": source,
+        "observed_at": observed_at.isoformat(),
+        "valid_until": valid_until.isoformat(),
+        "server_day_id": SERVER_CLOCK.server_day_id(observed_at),
+        "revision": revision,
+    }
+    _write_state(state, path=target)
+    return state
 
 
 def record_completed_run(
@@ -270,20 +326,49 @@ def progress_summary(
         if total
         else 0
     )
-    current_resources = state.get("current_resources") or {}
-    confirmed_available_fatigue = current_resources.get(
-        "confirmed_available_fatigue",
-        state.get("confirmed_available_fatigue"),
+    from core.services.daily_capabilities import CurrentResourceEvidence
+
+    current = now or SERVER_CLOCK.server_now()
+    resource_observation = CurrentResourceEvidence.from_value(state.get("current_resources"))
+    resource_error = (
+        resource_observation.freshness_error(current)
+        if resource_observation is not None
+        else "current_resources_missing"
     )
-    if not isinstance(confirmed_available_fatigue, int):
-        confirmed_available_fatigue = None
-    recovery_resources = state.get("recovery_resources") or {}
-    recoverable_fatigue_today = recovery_resources.get(
-        "recoverable_fatigue_today",
-        recovery_resources.get("confirmed_available"),
+    confirmed_available_fatigue = (
+        resource_observation.available_fatigue if not resource_error else None
     )
-    if not isinstance(recoverable_fatigue_today, int):
-        recoverable_fatigue_today = None
+    recoverable_fatigue_today = (
+        resource_observation.recoverable_fatigue_today if not resource_error else None
+    )
+    purchase_books_available = (
+        resource_observation.purchase_books_available if not resource_error else None
+    )
+    location = state.get("current_city_evidence") or {}
+    location_observed = None
+    location_valid_until = None
+    try:
+        location_observed = datetime.fromisoformat(str(location.get("observed_at", "")))
+        location_valid_until = datetime.fromisoformat(str(location.get("valid_until", "")))
+    except ValueError:
+        pass
+    location_fresh = bool(
+        location.get("city")
+        and location.get("source") in {"game_observed", "user_calibrated"}
+        and location_observed is not None
+        and location_valid_until is not None
+        and location_observed.tzinfo is not None
+        and location_valid_until.tzinfo is not None
+        and location_observed <= current <= location_valid_until
+        and location.get("server_day_id") == SERVER_CLOCK.server_day_id(current)
+        and location.get("revision")
+    )
+    ledger_city = (
+        str(partial.get("last_destination", ""))
+        if partial and int(partial.get("confirmed_legs", 0)) > 0
+        else ""
+    )
+    current_city = ledger_city or (str(location.get("city")) if location_fresh else None)
     remaining_profit_per_fatigue = (
         round(remaining_expected_profit / remaining_required_fatigue, 2)
         if remaining_required_fatigue
@@ -295,7 +380,7 @@ def progress_summary(
         cycle_fatigue=float(state.get("cycle_fatigue", 0)),
         available_fatigue=confirmed_available_fatigue,
         recoverable_fatigue=recoverable_fatigue_today,
-        purchase_books=max(0, books_total - books_used),
+        purchase_books=purchase_books_available,
         books_per_cycle=0,
         partial_cycle=facts.current_partial_cycle,
         price_fresh=price_fresh,
@@ -303,13 +388,22 @@ def progress_summary(
         leg_fatigue_schedule=leg_costs,
         remaining_run_book_schedule=state.get("runs", ()),
         current_run_index=completed,
-        current_city=(facts.current_partial_cycle or {}).get("last_destination")
-        or (state.get("cycle") or [""])[0],
+        current_city=current_city,
         price_revision=str(state.get("price_revision", "")),
         current_price_revision=str(state.get("price_revision", "")),
     )
-    if confirmed_available_fatigue is None or recoverable_fatigue_today is None:
-        recommendation_reason = "current_resources_unknown"
+    missing_evidence = []
+    if resource_error:
+        missing_evidence.append(resource_error)
+    if current_city is None:
+        missing_evidence.append("current_city_missing")
+    if missing_evidence:
+        suggested_today = None
+        recommendation_reason = (
+            "current_resources_unknown"
+            if resource_error
+            else "current_city_unknown"
+        )
     elif not price_fresh:
         recommendation_reason = "price_snapshot_not_fresh"
     elif suggested_today is None:
@@ -324,6 +418,9 @@ def progress_summary(
         "remaining_required_fatigue": round(remaining_required_fatigue, 2),
         "confirmed_available_fatigue": confirmed_available_fatigue,
         "recoverable_fatigue_today": recoverable_fatigue_today,
+        "purchase_books_available": purchase_books_available,
+        "current_city": current_city,
+        "recommendation_missing_evidence": missing_evidence,
         "remaining_expected_profit": remaining_expected_profit,
         "remaining_expected_fatigue": round(remaining_required_fatigue, 2),
         "remaining_profit_per_fatigue": remaining_profit_per_fatigue,

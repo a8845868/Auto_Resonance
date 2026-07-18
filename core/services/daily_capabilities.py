@@ -118,6 +118,81 @@ class PrerequisiteResolution:
     evidence: dict[str, PrerequisiteEvidence]
 
 
+@dataclass(frozen=True)
+class RemainingRequirements:
+    required_fatigue: int
+    required_books: int
+
+
+@dataclass(frozen=True)
+class CurrentResourceEvidence:
+    fatigue_used: int
+    fatigue_cap: int
+    available_fatigue: int
+    recoverable_fatigue_today: int
+    purchase_books_available: int
+    source: str
+    observed_at: datetime
+    valid_until: datetime
+    server_day_id: str
+    revision: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "fatigue_used": int(self.fatigue_used),
+            "fatigue_cap": int(self.fatigue_cap),
+            "available_fatigue": int(self.available_fatigue),
+            "recoverable_fatigue_today": int(self.recoverable_fatigue_today),
+            "purchase_books_available": int(self.purchase_books_available),
+            "source": self.source,
+            "observed_at": self.observed_at.isoformat(),
+            "valid_until": self.valid_until.isoformat(),
+            "server_day_id": self.server_day_id,
+            "revision": self.revision,
+        }
+
+    @classmethod
+    def from_value(cls, value: object) -> "CurrentResourceEvidence | None":
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, dict):
+            return None
+        try:
+            observed_at = _parse_observed_at(value.get("observed_at"))
+            valid_until = _parse_observed_at(value.get("valid_until"))
+            if observed_at is None or valid_until is None:
+                return None
+            return cls(
+                fatigue_used=int(value.get("fatigue_used", 0)),
+                fatigue_cap=int(value.get("fatigue_cap", 0)),
+                available_fatigue=int(value["available_fatigue"]),
+                recoverable_fatigue_today=int(value.get("recoverable_fatigue_today", 0)),
+                purchase_books_available=int(value["purchase_books_available"]),
+                source=str(value.get("source", "")),
+                observed_at=observed_at,
+                valid_until=valid_until,
+                server_day_id=str(value.get("server_day_id", "")),
+                revision=str(value.get("revision", "")),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def freshness_error(self, now: datetime) -> str:
+        if self.source not in {"game_observed", "user_calibrated", "caller_observed"}:
+            return "current_resources_source_unknown"
+        if not _aware(self.observed_at) or not _aware(self.valid_until):
+            return "current_resources_timestamp_unknown"
+        if self.server_day_id != SERVER_CLOCK.server_day_id(now):
+            return "current_resources_server_day_mismatch"
+        if not self.revision:
+            return "current_resources_revision_missing"
+        if not self.observed_at <= now <= self.valid_until:
+            return "current_resources_stale"
+        if self.available_fatigue < 0 or self.recoverable_fatigue_today < 0 or self.purchase_books_available < 0:
+            return "current_resources_invalid"
+        return ""
+
+
 def _parse_observed_at(value: object) -> datetime | None:
     if isinstance(value, datetime):
         return value
@@ -162,18 +237,33 @@ def resolve_daily_capability_prerequisites(
     now: datetime | None = None,
     fatigue_budget: int | None = None,
     purchase_books: int | None = None,
+    resource_evidence: CurrentResourceEvidence | dict | None = None,
 ) -> PrerequisiteResolution:
     """Resolve production prerequisites from read-only, fail-closed evidence."""
 
     current = now or SERVER_CLOCK.server_now()
     if trade_state is None:
-        from core.services.weekly_plan_state import load_weekly_plan, progress_summary
+        from core.services.weekly_plan_state import load_weekly_plan
 
         trade_state = load_weekly_plan() or {}
-        summary = progress_summary(trade_state, now=current) if trade_state else None
-        if summary:
-            fatigue_budget = int(summary.get("remaining_fatigue", 0))
-            purchase_books = int(summary.get("remaining_books", 0))
+    resources = CurrentResourceEvidence.from_value(resource_evidence)
+    if resources is None:
+        resources = CurrentResourceEvidence.from_value((trade_state or {}).get("current_resources"))
+    # Compatibility for callers that supply independently observed values.
+    # Production dashboard code no longer derives these from remaining plan requirements.
+    if resources is None and fatigue_budget is not None and purchase_books is not None:
+        resources = CurrentResourceEvidence(
+            fatigue_used=0,
+            fatigue_cap=max(0, int(fatigue_budget)),
+            available_fatigue=max(0, int(fatigue_budget)),
+            recoverable_fatigue_today=0,
+            purchase_books_available=max(0, int(purchase_books)),
+            source="caller_observed",
+            observed_at=current,
+            valid_until=current + timedelta(minutes=15),
+            server_day_id=SERVER_CLOCK.server_day_id(current),
+            revision=f"caller:{current.isoformat()}",
+        )
     if passenger_state is None:
         from core.services.passenger_build_planner import load_build_monitor_plan
 
@@ -202,20 +292,22 @@ def resolve_daily_capability_prerequisites(
                 raise ValueError(f"route stations unavailable: {closed}")
             if unknown:
                 raise ValueError(f"route station availability unknown: {unknown}")
-            budget_fatigue = (
-                int(fatigue_budget)
-                if fatigue_budget is not None
-                else int(float(trade_state.get("cycle_fatigue", 0)))
-            )
-            budget_books = (
-                int(purchase_books)
-                if purchase_books is not None
-                else max(
-                    0,
-                    int(trade_state.get("books_total", 0))
-                    - int(trade_state.get("completed_books", 0)),
+            if resources is None:
+                evidence["fresh_trade_plan"] = PrerequisiteEvidence(
+                    "fresh_trade_plan", "UNKNOWN", "weekly_plan+current_resources",
+                    trade_observed, "current_resources_missing",
                 )
-            )
+                raise LookupError
+            freshness_error = resources.freshness_error(current)
+            if freshness_error:
+                evidence["fresh_trade_plan"] = PrerequisiteEvidence(
+                    "fresh_trade_plan", "UNKNOWN",
+                    "weekly_plan+" + (resources.source or "current_resources"),
+                    resources.observed_at, freshness_error,
+                )
+                raise LookupError
+            budget_fatigue = int(resources.available_fatigue) + int(resources.recoverable_fatigue_today)
+            budget_books = int(resources.purchase_books_available)
             validate_executable_trade_budget(
                 trade_state,
                 now=current,
@@ -225,9 +317,12 @@ def resolve_daily_capability_prerequisites(
             evidence["fresh_trade_plan"] = PrerequisiteEvidence(
                 "fresh_trade_plan",
                 "SATISFIED",
-                "weekly_plan+" + str(availability.get("source", "UNKNOWN")),
-                trade_observed,
+                "weekly_plan+" + str(availability.get("source", "UNKNOWN"))
+                + ("" if resources.source == "caller_observed" else "+" + resources.source),
+                resources.observed_at,
             )
+        except LookupError:
+            pass
         except (TypeError, ValueError, RuntimeError) as error:
             availability_source = (
                 str(availability.get("source", "UNKNOWN"))

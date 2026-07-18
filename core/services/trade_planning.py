@@ -165,7 +165,7 @@ def validate_executable_trade_budget(
     per_cycle_books = sum(current_schedule.get(city, 0) for city in remaining_origins)
     candidate = TradeCandidate(
         route_id="|".join(cycle),
-        current_city=str(state.get("current_city", cycle[0] if cycle else "")),
+        current_city=str(state.get("current_city") or ""),
         partial_cycle=state.get("current_partial_cycle"),
         net_profit=per_cycle_profit,
         fatigue=cycle_fatigue,
@@ -250,7 +250,7 @@ def recommend_max_feasible_runs_today(
         confirmed_legs = max(0, int((partial_cycle or {}).get("confirmed_legs", 0)))
         confirmed_legs = min(confirmed_legs, len(route))
         expected_city = route[confirmed_legs % len(route)]
-        if current_city and current_city != expected_city:
+        if not current_city or current_city != expected_city:
             return None
         fatigue_budget = max(0, int(available_fatigue)) + max(0, int(recoverable_fatigue))
         book_budget = max(0, int(purchase_books))
