@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -238,6 +239,19 @@ def verify_hash_manifest(root: Path) -> bool:
     return True
 
 
+def _replace_with_retry(source: Path, destination: Path, *, attempts: int = 5) -> None:
+    """Publish an artifact despite short-lived Windows scanner file locks."""
+
+    for attempt in range(attempts):
+        try:
+            source.replace(destination)
+            return
+        except PermissionError:
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
 def _binary_patch_files(root: Path) -> list[str]:
     found: list[str] = []
     for path in sorted(item for item in Path(root).rglob("*") if item.is_file()):
@@ -431,10 +445,10 @@ def build_reversible_audit_package(
                 raise SensitiveDataError("ZIP sensitive data gate failed")
         if destination.exists():
             shutil.rmtree(destination)
-        staging.replace(destination)
+        _replace_with_retry(staging, destination)
         if create_zip:
             zip_path.unlink(missing_ok=True)
-            staging_zip.replace(zip_path)
+            _replace_with_retry(staging_zip, zip_path)
         return destination
     except Exception:
         if staging.exists():
@@ -513,10 +527,10 @@ def build_shareable_audit(
 
         if destination.exists():
             shutil.rmtree(destination)
-        staging.replace(destination)
+        _replace_with_retry(staging, destination)
         if create_zip:
             zip_path.unlink(missing_ok=True)
-            staging_zip.replace(zip_path)
+            _replace_with_retry(staging_zip, zip_path)
         return destination
     except Exception:
         if staging.exists():
