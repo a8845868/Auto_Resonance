@@ -197,7 +197,7 @@ def test_startup_resumes_existing_travel_before_station_operations():
 
     tap.assert_called_once()
     assert tap.call_args.args == ((78, 38),)
-    assert tap.call_args.kwargs["intent"].action_key == "back"
+    assert tap.call_args.kwargs["intent"].action_key == "page_back"
 
 
 def test_false_arrival_is_ignored_while_transit_markers_remain():

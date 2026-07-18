@@ -109,7 +109,22 @@ def test_audit_export_redacts_uid_from_ocr_json(tmp_path):
 def test_audit_export_masks_uid_pixels(tmp_path):
     source = tmp_path / "raw"; source.mkdir()
     image = np.full((100, 200, 3), 255, np.uint8); cv.imwrite(str(source / "frame.png"), image)
-    package = build_shareable_audit(source, tmp_path / "out", image_masks=((0, 70, 200, 100),))
+    package = build_shareable_audit(
+        source,
+        tmp_path / "out",
+        evidence_allowlist=("frame.png",),
+        image_privacy_manifests={"frame.png": {
+            "source_kind": "synthetic_test",
+            "purpose": "mask_regression",
+            "mask_regions": ((0, 70, 200, 100),),
+            "privacy_review_status": "APPROVED",
+            "contains_account_identifier": False,
+            "contains_player_name": False,
+            "contains_balance": False,
+            "contains_payment_or_order": False,
+        }},
+        image_ocr_provider=lambda _path: (),
+    )
     masked = cv.imread(str(package / "frame.png"))
     assert int(masked[80:95].max()) == 0
 

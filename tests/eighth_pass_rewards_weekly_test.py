@@ -15,6 +15,7 @@ from auto.reward_collection import (
     DailyTaskCard,
     ManualRewardTrackScanner,
     ManualTrackSegment,
+    MovementState,
     PageScanEvidence,
     _horizontal_displacement,
 )
@@ -78,9 +79,18 @@ def _ocr(text: str, x: int, y: int) -> dict:
 
 
 def test_fixed_page_anchors_do_not_mask_real_scroll_displacement():
-    before = [_ocr("每日活跃", 300, 50), _ocr("返回", 80, 50), _ocr("任务标题", 900, 350)]
-    after = [_ocr("每日活跃", 300, 50), _ocr("返回", 80, 50), _ocr("任务标题", 400, 350)]
-    assert _horizontal_displacement(before, after, content_roi=(150, 200, 1150, 650)) == -500
+    before = [
+        _ocr("每日活跃", 300, 50), _ocr("返回", 80, 50),
+        _ocr("任务标题一", 900, 350), _ocr("任务标题二", 1000, 430),
+    ]
+    after = [
+        _ocr("每日活跃", 300, 50), _ocr("返回", 80, 50),
+        _ocr("任务标题一", 400, 350), _ocr("任务标题二", 500, 430),
+    ]
+    observed = _horizontal_displacement(before, after, content_roi=(150, 200, 1150, 650))
+    assert observed.state is MovementState.MOVED
+    assert observed.displacement_px == -500
+    assert observed.fixed_anchor_displacement == 0
 
 
 def _card(name: str = "task") -> DailyTaskCard:

@@ -12,6 +12,7 @@ from auto.reward_collection import (
     DailyTaskCard,
     ManualRewardTrackScanner,
     ManualTrackSegment,
+    MovementState,
     PageScanEvidence,
     _horizontal_displacement,
     observe_daily_activity_layout,
@@ -56,10 +57,33 @@ def test_failed_swipe_does_not_complete_scan():
     assert scanner.complete is False
 
 
-def test_end_marker_completes_scan_after_real_movement():
+def test_end_marker_completes_scan_after_real_movement_and_stationary_confirmation():
     scanner = DailyCardScanner()
     scanner.add_cards([_card()], evidence=PageScanEvidence(False, False, NOW))
-    scanner.add_cards([_card("任务完整标题二")], evidence=PageScanEvidence(True, True, NOW + timedelta(seconds=1), displacement_px=300))
+    scanner.add_cards(
+        [_card("任务完整标题二")],
+        evidence=PageScanEvidence(
+            True, False, NOW + timedelta(seconds=1), displacement_px=300,
+            movement_state=MovementState.MOVED,
+        ),
+    )
+    scanner.add_cards(
+        [_card()],
+        evidence=PageScanEvidence(
+            False, False, NOW + timedelta(seconds=2), swipe_attempted=True,
+            content_displacement_px=0, matched_content_items=2,
+            movement_state=MovementState.STATIONARY_CONFIRMED,
+        ),
+    )
+    scanner.add_cards(
+        [_card()],
+        evidence=PageScanEvidence(
+            False, True, NOW + timedelta(seconds=3), swipe_attempted=True,
+            content_displacement_px=0, matched_content_items=2,
+            end_confirmed_after_last_move=True,
+            movement_state=MovementState.STATIONARY_CONFIRMED,
+        ),
+    )
     assert scanner.complete is True
 
 
@@ -72,8 +96,8 @@ def test_later_missing_contribution_does_not_erase_known_value():
 
 def test_later_ocr_miss_does_not_erase_claimable():
     scanner = DailyCardScanner()
-    scanner.add_cards([_card(claimable=True)])
-    scanner.add_cards([_card(claimable=False)])
+    scanner.add_cards([_card(claimable=True, claimed=False)])
+    scanner.add_cards([_card(claimable=None, claimed=None)])
     assert scanner.cards[0].claimable is True
 
 
@@ -215,4 +239,4 @@ def test_scanner_fails_closed_when_page_anchor_is_lost():
 def test_ocr_jitter_is_not_real_scroll_displacement():
     before = [_ocr("共同标题一", 300, 300), _ocr("共同标题二", 600, 300)]
     after = [_ocr("共同标题一", 304, 300), _ocr("共同标题二", 597, 300)]
-    assert _horizontal_displacement(before, after) == 0
+    assert _horizontal_displacement(before, after).state is MovementState.STATIONARY_CONFIRMED
