@@ -100,7 +100,9 @@ def test_pending_schedule_is_recovered_after_restart(tmp_path):
     calls = []
     assert recover_pending_fatigue_schedules(path=path, schedule=lambda: calls.append(True))
     assert calls == [True]
-    assert _state(path)["actions"][0]["schedule_status"] == "FIRED"
+    # Scheduling is durable but is not an acknowledgement. The recovery task
+    # must still claim and observe this checkpoint after restart.
+    assert _state(path)["actions"][0]["schedule_status"] == "SCHEDULED"
 
 
 def test_same_event_after_schedule_failure_can_retry(tmp_path):

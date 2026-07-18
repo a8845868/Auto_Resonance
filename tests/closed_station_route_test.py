@@ -62,7 +62,11 @@ def test_adaptive_weekly_run_replaces_stale_closed_station_plan():
         business, "is_sell_page", return_value=False
     ), patch.object(
         business, "two_city_weekly_run", return_value=True
-    ) as execute:
+    ) as execute, patch.object(business, "go_business", return_value=True), patch.object(
+        business, "read_strength", return_value=(0, 100)
+    ), patch.object(business, "get_station", return_value="A"), patch(
+        "core.services.weekly_plan_state.save_current_resource_evidence"
+    ), patch("core.services.weekly_plan_state.save_current_city_evidence"):
         result = business.adaptive_weekly_run()
 
     assert result is True
@@ -86,7 +90,11 @@ def test_adaptive_weekly_run_never_falls_back_to_closed_route():
         business, "is_sell_page", return_value=False
     ), patch.object(
         business, "two_city_weekly_run"
-    ) as execute:
+    ) as execute, patch.object(business, "go_business", return_value=True), patch.object(
+        business, "read_strength", return_value=(0, 100)
+    ), patch.object(business, "get_station", return_value="A"), patch(
+        "core.services.weekly_plan_state.save_current_resource_evidence"
+    ), patch("core.services.weekly_plan_state.save_current_city_evidence"):
         result = business.adaptive_weekly_run()
 
     assert result["success"] is True

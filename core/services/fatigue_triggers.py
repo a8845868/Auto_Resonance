@@ -10,6 +10,7 @@ import uuid
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from datetime import datetime
+from enum import Enum
 from typing import Any, Callable, Iterable
 
 from core.services.runtime_control import RUNTIME_DIR
@@ -19,6 +20,40 @@ from core.services.task_schedule_state import set_next_run
 
 STATE_PATH = RUNTIME_DIR / "fatigue-waypoints.json"
 _LOCK = threading.RLock()
+
+
+class FatigueActionState(str, Enum):
+    ACTIVE = "ACTIVE"
+    SCHEDULED = "SCHEDULED"
+    CLAIMED = "CLAIMED"
+    ACKNOWLEDGED = "ACKNOWLEDGED"
+    FAILED_RETRYABLE = "FAILED_RETRYABLE"
+    CANCELLED = "CANCELLED"
+    SUPERSEDED = "SUPERSEDED"
+
+
+_TERMINAL_STATES = {
+    FatigueActionState.ACKNOWLEDGED.value,
+    FatigueActionState.CANCELLED.value,
+    FatigueActionState.SUPERSEDED.value,
+}
+
+
+def _state(item: dict[str, Any]) -> str:
+    value = str(item.get("state") or item.get("schedule_status") or "ACTIVE")
+    if value == "FIRED":
+        return FatigueActionState.ACKNOWLEDGED.value
+    if value == "PENDING_SCHEDULE":
+        return FatigueActionState.ACTIVE.value
+    return value
+
+
+def _set_state(item: dict[str, Any], state: FatigueActionState) -> None:
+    item["state"] = state.value
+    item["schedule_status"] = state.value
+    item["fired"] = state is FatigueActionState.ACKNOWLEDGED
+    item["cancelled"] = state is FatigueActionState.CANCELLED
+    item["superseded"] = state is FatigueActionState.SUPERSEDED
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -91,6 +126,7 @@ def replace_deferred_fatigue_plan(
                 "plan_revision": str(plan_revision),
                 "trigger_type": trigger_type,
                 "fired": False,
+                "state": FatigueActionState.ACTIVE.value,
                 "schedule_status": "ACTIVE",
                 "cancelled": False,
                 "superseded": False,
@@ -102,10 +138,10 @@ def replace_deferred_fatigue_plan(
         for item in data["actions"]:
             if (
                 item.get("plan_revision") != plan_revision
-                and item.get("fired") is not True
-                and item.get("cancelled") is not True
+                and _state(item) not in _TERMINAL_STATES
+                and _state(item) != FatigueActionState.CLAIMED.value
             ):
-                item["superseded"] = True
+                _set_state(item, FatigueActionState.SUPERSEDED)
                 item["superseded_by"] = plan_revision
         existing = {str(item.get("id", "")): item for item in data["actions"]}
         for item in normalized:
@@ -147,10 +183,16 @@ def notify_fatigue_event(
         data = _read(path)
         current = now or SERVER_CLOCK.server_now()
         for item in data["actions"]:
-            if any(item.get(flag) is True for flag in ("fired", "cancelled", "superseded")):
+            if _state(item) in _TERMINAL_STATES:
                 continue
             if item.get("schedule_status") == "PENDING_SCHEDULE":
                 pending_ids.append(str(item.get("id", "")))
+                continue
+            if _state(item) in {
+                FatigueActionState.SCHEDULED.value,
+                FatigueActionState.CLAIMED.value,
+                FatigueActionState.FAILED_RETRYABLE.value,
+            }:
                 continue
             trigger_type = str(item.get("trigger_type", "")).upper()
             is_match = False
@@ -189,11 +231,10 @@ def notify_fatigue_event(
             data = _read(path)
             for item in data["actions"]:
                 if str(item.get("id", "")) in pending_ids:
-                    item["schedule_status"] = (
-                        "PENDING_SCHEDULE"
-                        if event == "recover_pending_schedule"
-                        else "ACTIVE"
-                    )
+                    if event == "recover_pending_schedule":
+                        item["schedule_status"] = "PENDING_SCHEDULE"
+                    else:
+                        _set_state(item, FatigueActionState.ACTIVE)
                     item["schedule_error"] = repr(error)
                     item["schedule_failed_at"] = SERVER_CLOCK.server_now().isoformat(
                         timespec="seconds"
@@ -205,10 +246,9 @@ def notify_fatigue_event(
         for item in data["actions"]:
             if str(item.get("id", "")) not in pending_ids:
                 continue
-            item["schedule_status"] = "FIRED"
-            item["fired"] = True
-            item["fired_by"] = item.pop("pending_by", event)
-            item["fired_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
+            _set_state(item, FatigueActionState.SCHEDULED)
+            item["scheduled_by"] = item.pop("pending_by", event)
+            item["scheduled_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
         _write(path, data)
     return True
 
@@ -224,7 +264,7 @@ def recover_pending_fatigue_schedules(
         data = _read(path)
         if not any(
             item.get("schedule_status") == "PENDING_SCHEDULE"
-            and not any(item.get(flag) is True for flag in ("fired", "cancelled", "superseded"))
+            and _state(item) not in _TERMINAL_STATES
             for item in data["actions"]
         ):
             return False
@@ -236,8 +276,140 @@ def cancel_deferred_fatigue_actions(*, path: Path = STATE_PATH) -> None:
         data = _read(path)
         cancelled_at = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
         for item in data["actions"]:
-            if item.get("fired") is not True and item.get("superseded") is not True:
-                item["cancelled"] = True
+            if _state(item) not in {
+                FatigueActionState.ACKNOWLEDGED.value,
+                FatigueActionState.SUPERSEDED.value,
+            }:
+                _set_state(item, FatigueActionState.CANCELLED)
                 item["cancelled_at"] = cancelled_at
         data["cancelled_at"] = cancelled_at
         _write(path, data)
+
+
+def list_fatigue_actions(*, path: Path = STATE_PATH) -> list[dict[str, Any]]:
+    """Return a detached, normalized checkpoint snapshot for diagnostics."""
+
+    with _LOCK:
+        actions = json.loads(json.dumps(_read(path).get("actions", [])))
+    for item in actions:
+        item["state"] = _state(item)
+    return actions
+
+
+def _matching_checkpoint(
+    actions: list[dict[str, Any]],
+    *,
+    action_id: str | None = None,
+    expected_waypoint: str | None = None,
+    plan_revision: str | None = None,
+) -> dict[str, Any] | None:
+    allowed = {
+        FatigueActionState.SCHEDULED.value,
+        FatigueActionState.FAILED_RETRYABLE.value,
+        FatigueActionState.CLAIMED.value,
+    }
+    return next(
+        (
+            item
+            for item in actions
+            if _state(item) in allowed
+            and (not action_id or str(item.get("id")) == str(action_id))
+            and (
+                expected_waypoint is None
+                or str(item.get("waypoint_id", "")) == str(expected_waypoint)
+            )
+            and (
+                plan_revision is None
+                or str(item.get("plan_revision", "")) == str(plan_revision)
+            )
+        ),
+        None,
+    )
+
+
+def claim_fatigue_checkpoint(
+    action_id: str | None = None,
+    *,
+    expected_waypoint: str | None = None,
+    plan_revision: str | None = None,
+    expected_server_day: str | None = None,
+    path: Path = STATE_PATH,
+) -> dict[str, Any]:
+    """Atomically claim a scheduled checkpoint after validating its identity."""
+
+    with _LOCK:
+        data = _read(path)
+        if expected_server_day and data.get("server_day_id") != expected_server_day:
+            raise RuntimeError("fatigue checkpoint server day mismatch")
+        item = _matching_checkpoint(
+            data["actions"],
+            action_id=action_id,
+            expected_waypoint=expected_waypoint,
+            plan_revision=plan_revision,
+        )
+        if item is None:
+            raise RuntimeError("matching fatigue checkpoint is not scheduled")
+        _set_state(item, FatigueActionState.CLAIMED)
+        item["claimed_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
+        item["claim_attempt"] = int(item.get("claim_attempt", 0)) + 1
+        _write(path, data)
+        return dict(item)
+
+
+def acknowledge_fatigue_checkpoint(action_id: str, *, path: Path = STATE_PATH) -> dict[str, Any]:
+    with _LOCK:
+        data = _read(path)
+        item = next((item for item in data["actions"] if str(item.get("id")) == str(action_id)), None)
+        if item is None or _state(item) != FatigueActionState.CLAIMED.value:
+            raise RuntimeError("only a claimed fatigue checkpoint can be acknowledged")
+        _set_state(item, FatigueActionState.ACKNOWLEDGED)
+        item["acknowledged_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
+        _write(path, data)
+        return dict(item)
+
+
+def fail_fatigue_checkpoint(
+    action_id: str,
+    reason: str,
+    *,
+    max_attempts: int = 3,
+    path: Path = STATE_PATH,
+) -> dict[str, Any]:
+    with _LOCK:
+        data = _read(path)
+        item = next((item for item in data["actions"] if str(item.get("id")) == str(action_id)), None)
+        if item is None:
+            raise RuntimeError("fatigue checkpoint not found")
+        attempts = int(item.get("claim_attempt", 0))
+        if attempts >= max(1, int(max_attempts)):
+            _set_state(item, FatigueActionState.CANCELLED)
+            item["cancelled_reason"] = "retry_limit_exhausted"
+        else:
+            _set_state(item, FatigueActionState.FAILED_RETRYABLE)
+        item["failure_reason"] = str(reason)
+        item["failed_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
+        _write(path, data)
+        return dict(item)
+
+
+def fatigue_checkpoint_deferral(
+    waypoint_id: str,
+    *,
+    path: Path = STATE_PATH,
+) -> dict[str, Any] | None:
+    action = _matching_checkpoint(
+        list_fatigue_actions(path=path), expected_waypoint=str(waypoint_id)
+    )
+    if action is None:
+        return None
+    return {
+        "success": True,
+        "deferred": True,
+        "progress_made": False,
+        "reason": "fatigue_checkpoint_pending",
+        "checkpoint_id": action.get("id"),
+        "checkpoint_state": _state(action),
+        "plan_revision": action.get("plan_revision"),
+        "expected_waypoint": action.get("waypoint_id"),
+        "server_day_id": SERVER_CLOCK.server_day_id(),
+    }

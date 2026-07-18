@@ -7,6 +7,8 @@ from enum import Enum
 
 from loguru import logger
 
+from auto import exchange_navigation
+
 from auto.module.strength import (
     execute_planned_recovery_action,
     observe_recovery_resources,
@@ -104,14 +106,11 @@ def _wait_strength(timeout: float = 10.0):
 
 
 def _open_exchange_buy_page() -> bool:
-    if not go_home():
-        return False
-    if not go_outlets("交易所"):
-        return False
-    time.sleep(1.5)
-    input_tap((927, 321))
-    time.sleep(2)
-    return _wait_strength() is not None
+    result = exchange_navigation.open_exchange_action(
+        exchange_navigation.ExchangeAction.BUY,
+        read_only=True,
+    )
+    return result.success and _wait_strength() is not None
 
 
 def _next_bento_release(now: datetime) -> datetime | None:
@@ -215,13 +214,17 @@ def _snapshot_from_observation(
     )
 
 
-def run_daily_fatigue_recovery() -> dict:
+def _run_daily_fatigue_recovery_impl(*, expected_waypoint: str | None = None) -> dict:
     """Observe resources, execute the plan one action at a time, and replan."""
     if not connect():
         raise RuntimeError("疲劳规划无法连接模拟器")
     station_name = get_station()
     if not station_name:
         raise RuntimeError("疲劳规划未能确认当前站点")
+    if expected_waypoint and station_name != expected_waypoint:
+        raise RuntimeError(
+            f"fatigue checkpoint waypoint mismatch: expected={expected_waypoint} actual={station_name}"
+        )
     if not _open_exchange_buy_page():
         raise RuntimeError("疲劳规划未能进入交易所买入页")
     before = _wait_strength()
@@ -359,4 +362,54 @@ def run_daily_fatigue_recovery() -> dict:
         f"每日疲劳规划完成: {before[0]}/{before[1]} -> "
         f"{after[0]}/{after[1]}，恢复 {result['restored']}"
     )
+    return result
+
+
+def run_daily_fatigue_recovery(
+    *,
+    trigger_action_id: str | None = None,
+    plan_revision: str | None = None,
+    expected_waypoint: str | None = None,
+    expected_server_day: str | None = None,
+    checkpoint_path=None,
+) -> dict:
+    """Claim, observe and acknowledge a scheduled checkpoint transaction."""
+
+    from core.services.fatigue_triggers import (
+        STATE_PATH,
+        acknowledge_fatigue_checkpoint,
+        claim_fatigue_checkpoint,
+        fail_fatigue_checkpoint,
+    )
+
+    path = checkpoint_path or STATE_PATH
+    checkpoint = None
+    try:
+        checkpoint = claim_fatigue_checkpoint(
+            trigger_action_id,
+            expected_waypoint=expected_waypoint,
+            plan_revision=plan_revision,
+            expected_server_day=expected_server_day,
+            path=path,
+        )
+    except RuntimeError:
+        if any((trigger_action_id, plan_revision, expected_waypoint, expected_server_day)):
+            raise
+    effective_waypoint = str((checkpoint or {}).get("waypoint_id") or expected_waypoint or "")
+    try:
+        result = _run_daily_fatigue_recovery_impl(
+            expected_waypoint=effective_waypoint or None
+        )
+    except Exception as error:
+        if checkpoint is not None:
+            fail_fatigue_checkpoint(
+                str(checkpoint["id"]),
+                f"{type(error).__name__}: {error}",
+                path=path,
+            )
+        raise
+    if checkpoint is not None:
+        acknowledge_fatigue_checkpoint(str(checkpoint["id"]), path=path)
+        result["checkpoint_id"] = checkpoint["id"]
+        result["checkpoint_acknowledged"] = True
     return result

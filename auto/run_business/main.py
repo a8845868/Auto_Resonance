@@ -13,6 +13,8 @@ from typing import Any, Dict, Literal
 
 from loguru import logger
 
+from auto import exchange_navigation
+
 from auto.module.strength import can_afford_fatigue, prepare_negotiation, read_strength
 from auto.run_business.buy import buy_business
 from auto.run_business.sell import (
@@ -254,38 +256,12 @@ def go_business(type: Literal["buy", "sell"] = "buy"):
         logger.info("已在交易所卖货页，直接复用当前页面")
         return True
     logger.info("前往交易所")
-    if _is_exchange_lobby():
-        logger.info("已在交易所入口菜单，跳过城市寻路")
-        is_join = True
-    else:
-        result = go_outlets("交易所")
-        is_join = bool(result) and wait_gbr(
-            pos=(286, 35),
-            min_gbr=BGR(250, 250, 250),
-            max_gbr=BGR(255, 255, 255),
-            cropped_pos1=(242, 11),
-            cropped_pos2=(414, 66),
-        )
-    if is_join:
-        if type == "buy":
-            input_tap((927, 321))
-        elif type == "sell":
-            input_tap((932, 404))
-        time.sleep(1.0)
-        bgr = screenshot().get_bgr((1175, 460))
-        logger.debug(f"进入交易所颜色检查: {bgr}")
-        if (
-            BGR(0, 123, 240) <= bgr <= BGR(2, 133, 255)
-            or BGR(225, 225, 225) == bgr
-            or BGR(0, 170, 240) <= bgr <= BGR(5, 185, 255)
-        ):
-            return True
-        else:
-            logger.error("进入交易所失败")
-            return False
-    else:
-        logger.error("进入交易所失败")
-        return False
+    action = (
+        exchange_navigation.ExchangeAction.BUY
+        if type == "buy"
+        else exchange_navigation.ExchangeAction.SELL
+    )
+    return exchange_navigation.open_exchange_action(action, read_only=False).success
 
 
 def _record_ledger_event(
@@ -708,6 +684,12 @@ def run(
             from core.services.fatigue_triggers import notify_fatigue_event
 
             notify_fatigue_event("leg_completed", city.sell_city_name)
+            from core.services.fatigue_triggers import fatigue_checkpoint_deferral
+
+            checkpoint = fatigue_checkpoint_deferral(city.sell_city_name)
+            if checkpoint is not None:
+                checkpoint["checkpoint_boundary"] = "POST_SALE"
+                return checkpoint
             city_name = city.sell_city_name
             continue
         if resume_action == "START":
@@ -879,6 +861,12 @@ def run(
             leg_id=leg_id,
         )
         notify_fatigue_event("leg_completed", city.sell_city_name)
+        from core.services.fatigue_triggers import fatigue_checkpoint_deferral
+
+        checkpoint = fatigue_checkpoint_deferral(city.sell_city_name)
+        if checkpoint is not None:
+            checkpoint["checkpoint_boundary"] = "POST_SALE"
+            return checkpoint
         # 流程跑完，更改站点名称为当前出售商品的站点
         city_name = city.sell_city_name
     logger.info("运行完成")
@@ -1207,6 +1195,11 @@ def adaptive_weekly_run():
         StalePriceSnapshot,
         validate_executable_trade_budget,
     )
+    from core.services.daily_capabilities import CurrentResourceEvidence
+    from core.services.weekly_plan_state import (
+        save_current_city_evidence,
+        save_current_resource_evidence,
+    )
 
     state = load_weekly_plan()
     if not state:
@@ -1245,13 +1238,49 @@ def adaptive_weekly_run():
         from qfluentwidgets import qconfig
         qconfig.set(cfg.InventoryBooks, actual)
     required = int(summary["remaining_books"])
+    observed_available_fatigue = None
+    if not sell_resume:
+        if not go_business("buy"):
+            logger.error("未能进入已验证的买入页，实际疲劳资源保持 UNKNOWN")
+            return False
+        strength = read_strength()
+        station = get_station()
+        if strength is None or not station:
+            logger.error("未能同时确认当前疲劳与站点，禁止把计划需求当作实际预算")
+            return False
+        observed_at = SERVER_CLOCK.server_now()
+        observed_available_fatigue = max(0, int(strength[1]) - int(strength[0]))
+        evidence = CurrentResourceEvidence(
+            fatigue_used=int(strength[0]),
+            fatigue_cap=int(strength[1]),
+            available_fatigue=observed_available_fatigue,
+            recoverable_fatigue_today=0,
+            purchase_books_available=max(0, int(available)),
+            source="game_observed" if actual is not None else "user_calibrated",
+            observed_at=observed_at,
+            valid_until=observed_at + timedelta(minutes=10),
+            server_day_id=SERVER_CLOCK.server_day_id(observed_at),
+            revision=f"trade-preflight:{uuid.uuid4().hex}",
+        )
+        save_current_resource_evidence(evidence)
+        save_current_city_evidence(
+            station,
+            source="game_observed",
+            observed_at=observed_at,
+            valid_until=observed_at + timedelta(minutes=10),
+            revision=evidence.revision,
+        )
     price_invalid = False
     execution_invalid = False
     try:
         executable = validate_executable_trade_budget(
             state,
             now=SERVER_CLOCK.server_now(),
-            fatigue_budget=max(0, int(summary["remaining_fatigue"])),
+            fatigue_budget=(
+                max(0, int(observed_available_fatigue))
+                if observed_available_fatigue is not None
+                else 0
+            ),
             purchase_books=max(0, int(available)),
         )
         logger.info(
@@ -1300,7 +1329,7 @@ def adaptive_weekly_run():
         )
     raw_config = dict(state.get("optimizer_config") or {})
     raw_config["books"] = max(0, available)
-    raw_config["weekly_fatigue"] = max(1, int(summary["remaining_fatigue"]))
+    raw_config["weekly_fatigue"] = max(1, int(observed_available_fatigue or 0))
     try:
         replacement = optimize_live_routes(OptimizationConfig(**raw_config))
         preview = {
@@ -1323,14 +1352,14 @@ def adaptive_weekly_run():
         validate_executable_trade_budget(
             preview,
             now=SERVER_CLOCK.server_now(),
-            fatigue_budget=max(0, int(summary["remaining_fatigue"])),
+            fatigue_budget=max(0, int(observed_available_fatigue or 0)),
             purchase_books=max(0, int(available)),
         )
         state = save_weekly_plan(replacement)
         validate_executable_trade_budget(
             state,
             now=SERVER_CLOCK.server_now(),
-            fatigue_budget=max(0, int(summary["remaining_fatigue"])),
+            fatigue_budget=max(0, int(observed_available_fatigue or 0)),
             purchase_books=max(0, int(available)),
         )
         cycle = state["cycle"]

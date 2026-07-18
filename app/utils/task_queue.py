@@ -234,6 +234,9 @@ class TaskQueueWorker(QThread):
 
     def stop(self):
         self._stop_requested = True
+        from core.services.fatigue_triggers import cancel_deferred_fatigue_actions
+
+        cancel_deferred_fatigue_actions()
         stop()
         if self._current:
             self._current.stop()

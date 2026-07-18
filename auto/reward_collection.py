@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
@@ -19,7 +19,7 @@ import cv2 as cv
 import numpy as np
 from loguru import logger
 
-from core.control.control import connect, input_tap, screenshot
+from core.control.control import connect, input_swipe, input_tap, screenshot
 from core.services.screen_state import (
     RESOURCE_DOWNLOAD_CONFIRM_TAP,
     RESOURCE_DOWNLOAD_WAIT_ATTEMPTS,
@@ -289,6 +289,314 @@ def _is_daily_activity_page(items: list[dict]) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class DailyTaskCard:
+    task_key: str
+    title: str
+    current: int
+    target: int
+    completed: bool
+    claimable: bool
+    claimed: bool
+    contribution: int | None
+    page_fingerprint: str
+
+
+@dataclass(frozen=True)
+class DailyActivityPageObservation:
+    current: int | None
+    maximum: int | None
+    current_source: str
+    threshold_values: tuple[int, ...]
+    task_cards: tuple[DailyTaskCard, ...]
+    task_rewards_claimable: int
+    stage_rewards_claimable: int
+    page_complete: bool
+    confidence: str
+    observed_at: datetime
+    missing_evidence: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ManualTaskCard:
+    task_key: str
+    title: str
+    current: int
+    target: int
+    completed: bool
+    claimable: bool
+    claimed: bool
+    contribution: int | None
+    page_fingerprint: str
+
+
+@dataclass(frozen=True)
+class ManualTaskInventoryObservation:
+    cards: tuple[ManualTaskCard, ...]
+    completed: int | None
+    total: int | None
+    scan_complete: bool
+
+
+@dataclass(frozen=True)
+class ManualLevelObservation:
+    current_level: int | None
+    claimable_level_rewards: int
+    visible_locked_levels: int
+    visible_claimed_levels: int
+    track_scan_complete: bool
+    confidence: str
+
+
+def _normalized_key(title: str) -> str:
+    return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", title).casefold()
+
+
+def _items_fingerprint(items: list[dict]) -> str:
+    import hashlib
+
+    text = "|".join(
+        sorted(
+            f"{_normalized_key(str(item.get('text', '')))}@{_center(item)}"
+            for item in items
+            if item.get("position")
+        )
+    )
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _card_items(items: list[dict], *, manual: bool) -> list[DailyTaskCard | ManualTaskCard]:
+    ratio_rows = []
+    for item in items:
+        if not item.get("position"):
+            continue
+        match = re.fullmatch(r"\s*(\d+)\s*/\s*(\d+)\s*", str(item.get("text", "")))
+        if not match:
+            continue
+        x, y = _center(item)
+        if manual and not (250 <= y <= 380):
+            continue
+        if not manual and not (285 <= y <= 365):
+            continue
+        current, target = map(int, match.groups())
+        if target <= 0 or current < 0 or current > target:
+            continue
+        ratio_rows.append((x, y, current, target))
+    result = []
+    fingerprint = _items_fingerprint(items)
+    for x, y, current, target in ratio_rows:
+        if manual:
+            title_candidates = [
+                item for item in items if item.get("position")
+                and abs(_center(item)[0] - x) <= 115 and 245 <= _center(item)[1] <= 305
+                and "/" not in str(item.get("text", ""))
+            ]
+            contribution_candidates = [
+                item for item in items if item.get("position")
+                and abs(_center(item)[0] - x) <= 110 and 470 <= _center(item)[1] <= 525
+            ]
+            status_candidates = [
+                item for item in items if item.get("position")
+                and abs(_center(item)[0] - x) <= 100 and 520 <= _center(item)[1] <= 570
+            ]
+        else:
+            title_candidates = [
+                item for item in items if item.get("position")
+                and abs(_center(item)[0] - x) <= 120 and 360 <= _center(item)[1] <= 430
+            ]
+            contribution_candidates = [
+                item for item in items if item.get("position")
+                and abs(_center(item)[0] - x) <= 100 and 525 <= _center(item)[1] <= 575
+            ]
+            status_candidates = [
+                item for item in items if item.get("position")
+                and abs(_center(item)[0] - x) <= 105 and 590 <= _center(item)[1] <= 650
+            ]
+        if not title_candidates:
+            continue
+        title = str(min(title_candidates, key=lambda item: abs(_center(item)[0] - x)).get("text", "")).strip()
+        if not _normalized_key(title):
+            continue
+        contribution = None
+        for item in contribution_candidates:
+            numbers = re.findall(r"\d+", str(item.get("text", "")))
+            if numbers:
+                contribution = int(numbers[-1])
+                break
+        status_text = " ".join(str(item.get("text", "")) for item in status_candidates)
+        claimable = "可领取" in status_text or (manual and "领取" in status_text and "已领取" not in status_text)
+        claimed = "已领取" in status_text
+        card_type = ManualTaskCard if manual else DailyTaskCard
+        result.append(
+            card_type(
+                task_key=_normalized_key(title), title=title, current=current, target=target,
+                completed=current >= target, claimable=claimable, claimed=claimed,
+                contribution=contribution, page_fingerprint=fingerprint,
+            )
+        )
+    return result
+
+
+class _CardScannerBase:
+    manual = False
+
+    def __init__(self, *, max_pages: int = 12):
+        self.max_pages = max(1, int(max_pages))
+        self._cards: dict[str, DailyTaskCard | ManualTaskCard] = {}
+        self._pages = 0
+        self._no_new = 0
+        self.cancelled = False
+
+    @property
+    def cards(self):
+        return tuple(self._cards.values())
+
+    @property
+    def complete(self) -> bool:
+        return not self.cancelled and self._no_new >= 2 and self._pages <= self.max_pages
+
+    def add_page(self, items: list[dict]) -> int:
+        if self.cancelled or self._pages >= self.max_pages:
+            return 0
+        self._pages += 1
+        parsed = _card_items(items, manual=self.manual)
+        before = len(self._cards)
+        for card in parsed:
+            self._cards[card.task_key] = card
+        added = len(self._cards) - before
+        self._no_new = 0 if added else self._no_new + 1
+        return added
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+class DailyCardScanner(_CardScannerBase):
+    manual = False
+
+
+class ManualCardScanner(_CardScannerBase):
+    manual = True
+
+    def observation(self) -> ManualTaskInventoryObservation:
+        summary = self.summary()
+        return ManualTaskInventoryObservation(
+            tuple(self.cards),
+            summary[0] if summary else None,
+            summary[1] if summary else None,
+            self.complete,
+        )
+
+    def summary(self) -> tuple[int, int] | None:
+        if not self.complete:
+            return None
+        return sum(1 for card in self.cards if card.completed or card.claimed), len(self.cards)
+
+
+def _stable_visual_daily_current(frames: list[list[dict]]) -> int | None:
+    values = []
+    for items in frames:
+        candidates = []
+        for item in items:
+            if not item.get("position"):
+                continue
+            x, y = _center(item)
+            if not (130 <= x <= 340 and 145 <= y <= 260):
+                continue
+            match = re.search(r"(\d+)\s*/\s*(\d+)", str(item.get("text", "")))
+            if match:
+                candidates.append(int(match.group(1)))
+        values.append(candidates[0] if len(candidates) == 1 else None)
+    return values[0] if values and values[0] is not None and all(value == values[0] for value in values) else None
+
+
+def observe_daily_activity_layout(
+    frames: list[list[dict]],
+    *,
+    scanner: DailyCardScanner | None = None,
+    page_complete: bool | None = None,
+    stage_rewards_claimable: int = 0,
+) -> DailyActivityPageObservation:
+    threshold_sets = []
+    for items in frames:
+        values = {
+            int(str(item.get("text", "")).strip())
+            for item in items
+            if item.get("position")
+            and 90 <= _center(item)[1] <= 190
+            and re.fullmatch(r"\d{2,4}", str(item.get("text", "")).strip())
+        }
+        threshold_sets.append(tuple(sorted(value for value in values if value > 0)))
+    thresholds = threshold_sets[0] if threshold_sets and all(item == threshold_sets[0] for item in threshold_sets) else ()
+    maximum = max(thresholds) if len(thresholds) >= 2 else None
+    visual = _stable_visual_daily_current(frames)
+    cards = tuple(scanner.cards) if scanner else tuple(_card_items(frames[-1] if frames else [], manual=False))
+    complete = scanner.complete if scanner is not None else bool(page_complete)
+    card_current = None
+    if complete and cards and all(card.contribution is not None for card in cards):
+        card_current = sum(
+            int(card.contribution or 0)
+            for card in cards
+            if card.completed or card.claimed
+        )
+    if visual is not None and card_current is not None and visual != card_current:
+        current, source = None, "conflict"
+    elif visual is not None:
+        current, source = visual, "visual_roi"
+    elif card_current is not None:
+        current, source = card_current, "complete_card_inventory"
+    else:
+        current, source = None, "unknown"
+    missing = []
+    if maximum is None:
+        missing.append("stable_stage_thresholds")
+    if current is None:
+        missing.append("stable_current_or_complete_card_inventory")
+    if not complete:
+        missing.append("end_of_card_list")
+    return DailyActivityPageObservation(
+        current=current,
+        maximum=maximum,
+        current_source=source,
+        threshold_values=thresholds,
+        task_cards=cards,
+        task_rewards_claimable=sum(1 for card in cards if card.claimable),
+        stage_rewards_claimable=max(0, int(stage_rewards_claimable)),
+        page_complete=complete,
+        confidence="HIGH" if maximum is not None and current is not None and complete else "UNKNOWN",
+        observed_at=SERVER_CLOCK.server_now(),
+        missing_evidence=tuple(missing),
+    )
+
+
+def observe_manual_level_layout(
+    frames: list[list[dict]],
+    *,
+    track_scan_complete: bool,
+) -> ManualLevelObservation:
+    snapshots = []
+    for items in frames:
+        texts = [str(item.get("text", "")).replace(" ", "") for item in items]
+        levels = {
+            int(match.group(1))
+            for text in texts
+            for match in [re.search(r"(?:LV\.?|等级)[:：]?(\d{1,3})", text, re.I)]
+            if match
+        }
+        snapshots.append((
+            next(iter(levels)) if len(levels) == 1 else None,
+            sum(text == "可领取" for text in texts),
+            sum(any(marker in text for marker in ("未解锁", "锁定")) for text in texts),
+            sum("已领取" in text for text in texts),
+        ))
+    stable = bool(snapshots and all(item == snapshots[0] for item in snapshots))
+    current, claimable, locked, claimed = snapshots[0] if stable else (None, 0, 0, 0)
+    return ManualLevelObservation(
+        current, claimable, locked, claimed, bool(track_scan_complete),
+        "HIGH" if stable and track_scan_complete else "UNKNOWN",
+    )
+
+
 @dataclass
 class RewardDriver:
     sleep: Callable[[float], None] = time.sleep
@@ -301,6 +609,10 @@ class RewardDriver:
 
     def tap(self, pos: tuple[int, int]) -> None:
         input_tap(pos)
+
+    def swipe_left(self) -> None:
+        input_swipe((1100, 450), (500, 450), swipe_time=650)
+        self.sleep(0.8)
 
     def click_text(self, text: str, attempts: int = 3) -> bool:
         for _ in range(attempts):
@@ -605,12 +917,42 @@ class RewardCollector:
         if not self._open_from_home("每日活跃"):
             return None
         observations = []
+        layout_frames: list[list[dict]] = []
         for frame_index in range(max(2, stable_frames)):
             frame = self.driver.frame()
             items = frame.ocr()
+            layout_frames.append(items)
             progress = _daily_activity_progress(items)
             if progress is None:
-                return None
+                scanner = DailyCardScanner()
+                stage_claimable = len(_daily_stage_boxes(frame.image))
+                for page_index in range(12):
+                    page_items = layout_frames[-1]
+                    scanner.add_page(page_items)
+                    if scanner.complete:
+                        break
+                    if hasattr(self.driver, "swipe_left"):
+                        self.driver.swipe_left()
+                    next_frame = self.driver.frame()
+                    layout_frames.append(next_frame.ocr())
+                    stage_claimable = max(stage_claimable, len(_daily_stage_boxes(next_frame.image)))
+                structured = observe_daily_activity_layout(
+                    layout_frames,
+                    scanner=scanner,
+                    stage_rewards_claimable=stage_claimable,
+                )
+                return {
+                    "current": structured.current,
+                    "maximum": structured.maximum,
+                    "claimable_tiers": structured.stage_rewards_claimable + structured.task_rewards_claimable,
+                    "unclaimed_tiers": structured.stage_rewards_claimable + structured.task_rewards_claimable,
+                    "claimed_tiers": 0,
+                    "current_source": structured.current_source,
+                    "confidence": structured.confidence,
+                    "missing_evidence": list(structured.missing_evidence),
+                    "task_cards": [asdict(card) for card in structured.task_cards],
+                    "page_complete": structured.page_complete,
+                }
             current, maximum = progress
             stage_claimable = len(_daily_stage_boxes(frame.image))
             button_claimable = int(
@@ -669,11 +1011,42 @@ class RewardCollector:
         if not self.driver.click_text("任务列表", attempts=2):
             return None
         frames = []
+        scanner = ManualCardScanner()
         for frame_index in range(max(2, stable_frames)):
             items = self.driver.texts()
+            scanner.add_page(items)
             observation = _manual_daily_progress_observation(items)
             if observation is None:
-                return None
+                for _ in range(12 - len(frames)):
+                    if scanner.complete:
+                        break
+                    if hasattr(self.driver, "swipe_left"):
+                        self.driver.swipe_left()
+                    scanner.add_page(self.driver.texts())
+                summary = scanner.summary()
+                if summary is None:
+                    return None
+                completed, total = summary
+                task_rewards = sum(1 for card in scanner.cards if card.claimable)
+                if not self.driver.click_exact_text("环游手册", attempts=2):
+                    return None
+                level_frames = [self.driver.texts() for _ in range(max(2, stable_frames))]
+                level = observe_manual_level_layout(
+                    level_frames, track_scan_complete=True
+                )
+                return {
+                    "completed": completed,
+                    "total": total,
+                    "claimable_rewards": task_rewards + level.claimable_level_rewards,
+                    "unclaimed_rewards": task_rewards + level.claimable_level_rewards,
+                    "task_cards": [asdict(card) for card in scanner.cards],
+                    "track_scan_complete": level.track_scan_complete,
+                    "confidence": (
+                        "HIGH"
+                        if level.confidence == "HIGH" and scanner.complete
+                        else "UNKNOWN"
+                    ),
+                }
             claimable = sum(
                 1
                 for item in items
@@ -790,8 +1163,8 @@ def collect_scheduled_rewards(
         server_day_id=cycle,
         daily_activity_current=(daily_observation or {}).get("current"),
         daily_activity_max=(daily_observation or {}).get("maximum"),
-        daily_activity_source="OCR" if daily_observation is not None else "UNKNOWN",
-        daily_activity_confidence="HIGH" if daily_observation is not None else "UNKNOWN",
+        daily_activity_source=(daily_observation or {}).get("current_source", "OCR") if daily_observation is not None else "UNKNOWN",
+        daily_activity_confidence=(daily_observation or {}).get("confidence", "HIGH") if daily_observation is not None else "UNKNOWN",
         daily_activity_claimable_tiers=(daily_observation or {}).get("claimable_tiers"),
         daily_activity_unclaimed_tiers=(daily_observation or {}).get("unclaimed_tiers"),
         handbook_daily_tasks_total=(manual_observation or {}).get("total"),
@@ -799,10 +1172,11 @@ def collect_scheduled_rewards(
         handbook_rewards_claimable=(manual_observation or {}).get("claimable_rewards"),
         handbook_rewards_unclaimed=(manual_observation or {}).get("unclaimed_rewards"),
         observed_at=now,
-        handbook_confidence="HIGH" if manual_observation is not None else "UNKNOWN",
-        daily_reward_confidence="HIGH" if daily_observation is not None else "UNKNOWN",
+        handbook_confidence=(manual_observation or {}).get("confidence", "HIGH") if manual_observation is not None else "UNKNOWN",
+        daily_reward_confidence=(daily_observation or {}).get("confidence", "HIGH") if daily_observation is not None else "UNKNOWN",
         handbook_reward_confidence=(
-            "HIGH" if manual_observation is not None else "UNKNOWN"
+            (manual_observation or {}).get("confidence", "HIGH")
+            if manual_observation is not None else "UNKNOWN"
         ),
     )
     try:

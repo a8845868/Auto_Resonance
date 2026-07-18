@@ -225,17 +225,14 @@ def test_exchange_navigation_is_blocked_during_transit():
 
 
 def test_existing_exchange_lobby_skips_city_navigation():
+    result = type("Result", (), {"success": True})()
     with patch.object(business, "is_train_in_transit", return_value=False), patch.object(
         business, "is_sell_page", return_value=False
-    ), patch.object(
-        business, "_is_exchange_lobby", return_value=True
-    ), patch.object(business, "screenshot", return_value=FakeSellTradePage()), patch.object(
-        business, "go_outlets"
-    ) as go_outlets, patch.object(business, "wait_gbr") as wait_gbr, patch.object(
-        business, "input_tap"
-    ) as tap, patch.object(business.time, "sleep"):
+    ), patch.object(business, "screenshot", return_value=FakeExchangeLobby()), patch.object(
+        business.exchange_navigation, "open_exchange_action", return_value=result
+    ) as navigate:
         assert business.go_business("sell")
 
-    go_outlets.assert_not_called()
-    wait_gbr.assert_not_called()
-    tap.assert_called_once_with((932, 404))
+    navigate.assert_called_once_with(
+        business.exchange_navigation.ExchangeAction.SELL, read_only=False
+    )
