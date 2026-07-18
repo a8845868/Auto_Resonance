@@ -588,6 +588,12 @@ def run(
                 action=recovery.next_action,
             )
         )
+        if city_name not in {recovery.origin, recovery.destination}:
+            logger.error(
+                f"账本 active leg {recovery.leg_id} 尚未收敛，但当前城市 {city_name!r} "
+                f"不在其两端 {recovery.origin!r}/{recovery.destination!r}；拒绝通用导航或清仓"
+            )
+            return False
     expected_cities = _route_city_names(routes)
     if city_name not in expected_cities:
         first_buy_city = routes.city_data[0].buy_city_name
@@ -1000,6 +1006,9 @@ def two_city_run(buy_city_name: str, sell_city_name: str):
     return True
 
 
+MAX_WEEKLY_RUNS_PER_INVOCATION = 1
+
+
 def two_city_weekly_run(
     buy_city_name: str,
     sell_city_name: str,
@@ -1014,6 +1023,9 @@ def two_city_weekly_run(
     that became due meanwhile run before the next trip, without ever stopping a
     train halfway through a leg or leaving a sale unfinished.
     """
+    if max_runs is not None and int(max_runs) != MAX_WEEKLY_RUNS_PER_INVOCATION:
+        raise ValueError("production weekly API permits one complete round trip per invocation")
+
     from app.common.config import cfg
     from core.services import load_weekly_plan, record_completed_run
     from core.services.server_calendar import SERVER_CLOCK
@@ -1032,7 +1044,7 @@ def two_city_weekly_run(
     buy_haggle_num = app.CityHaggle[buy_city_name]
     sell_haggle_num = app.CityHaggle[sell_city_name]
     total_runs = sum(int(batch["runs"]) for batch in execution_batches)
-    run_limit = total_runs if max_runs is None else min(total_runs, max(1, int(max_runs)))
+    run_limit = min(total_runs, MAX_WEEKLY_RUNS_PER_INVOCATION)
     logger.info(f"准备运行周计划，共 {total_runs} 次完整往返，{len(execution_batches)} 个阶段")
     completed = 0
     initial_state = load_weekly_plan() or {}

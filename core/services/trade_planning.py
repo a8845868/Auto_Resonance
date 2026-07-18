@@ -210,17 +210,65 @@ def recommend_max_feasible_runs_today(
     *,
     remaining_runs: int,
     cycle_fatigue: float,
-    available_fatigue: int,
-    recoverable_fatigue: int,
-    purchase_books: int,
+    available_fatigue: int | None,
+    recoverable_fatigue: int | None,
+    purchase_books: int | None,
     books_per_cycle: int,
     partial_cycle: dict[str, Any] | None,
     price_fresh: bool,
-) -> int:
-    """Bound today's recommendation by executable resources, not calendar division."""
+    cycle: tuple[str, ...] | list[str] | None = None,
+    leg_fatigue_schedule: tuple[int | float, ...] | list[int | float] | None = None,
+    remaining_run_book_schedule: tuple[dict[str, int], ...] | list[dict[str, int]] | None = None,
+    current_run_index: int = 0,
+    current_city: str | None = None,
+    price_revision: str | None = None,
+    current_price_revision: str | None = None,
+) -> int | None:
+    """Return exact completable runs, or ``None`` when current facts are unknown."""
 
     if not price_fresh or remaining_runs <= 0 or cycle_fatigue <= 0:
         return 0
+    if (
+        available_fatigue is None
+        or recoverable_fatigue is None
+        or purchase_books is None
+    ):
+        return None
+    if (
+        price_revision is not None
+        and current_price_revision is not None
+        and price_revision != current_price_revision
+    ):
+        return 0
+    precise = bool(cycle and leg_fatigue_schedule and remaining_run_book_schedule)
+    if precise:
+        route = tuple(str(item) for item in cycle or ())
+        leg_costs = tuple(max(0, int(round(value))) for value in leg_fatigue_schedule or ())
+        schedules = tuple(remaining_run_book_schedule or ())
+        if len(route) != len(leg_costs) or len(schedules) < current_run_index + remaining_runs:
+            return None
+        confirmed_legs = max(0, int((partial_cycle or {}).get("confirmed_legs", 0)))
+        confirmed_legs = min(confirmed_legs, len(route))
+        expected_city = route[confirmed_legs % len(route)]
+        if current_city and current_city != expected_city:
+            return None
+        fatigue_budget = max(0, int(available_fatigue)) + max(0, int(recoverable_fatigue))
+        book_budget = max(0, int(purchase_books))
+        completed_today = 0
+        for offset in range(max(0, int(remaining_runs))):
+            schedule = schedules[current_run_index + offset]
+            start_leg = confirmed_legs if offset == 0 else 0
+            fatigue_cost = sum(leg_costs[start_leg:])
+            book_cost = sum(
+                max(0, int(schedule.get(origin, 0)))
+                for origin in route[start_leg:]
+            )
+            if fatigue_cost > fatigue_budget or book_cost > book_budget:
+                break
+            fatigue_budget -= fatigue_cost
+            book_budget -= book_cost
+            completed_today += 1
+        return completed_today
     fatigue_runs = int(
         max(0, available_fatigue + recoverable_fatigue) // max(1, int(cycle_fatigue))
     )

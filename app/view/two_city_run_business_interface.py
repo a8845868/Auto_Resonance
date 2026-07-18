@@ -530,19 +530,24 @@ class TwoRunBusinessInterface(ScrollArea):
         current = summary["current_batch"]
         later_batches = summary["remaining_batches"][1:]
         later = "；完成后再跑 " + "；".join(self._format_batch(batch) for batch in later_batches) if later_batches else ""
-        suggested_today = int(summary.get("today_suggested_runs", 0))
+        suggested_today = summary.get("today_suggested_runs")
+        suggested_text = (
+            f"{suggested_today} 次完整往返"
+            if isinstance(suggested_today, int)
+            else "资源证据未知，暂不建议执行"
+        )
         self.weeklyProgressLabel.setText(
             f"本周事实（{source}）：{fact_text}；{partial_text}；"
             f"已确认进货书 {summary.get('confirmed_books_used', 0)} 本\n"
-            f"本周计划：计划记录完成 {summary['completed_runs']} 次，"
+            f"剩余计划：计划记录完成 {summary['completed_runs']} 次，"
             f"剩余计划 {summary['planned_round_trips_remaining']} 次；"
-            f"按疲劳最多 {summary['feasible_round_trips_by_fatigue']} 次；"
-            f"预计净利润 {summary['expected_total_net_profit']}，"
-            f"预计疲劳 {summary['expected_total_fatigue']}，"
-            f"净利润/疲劳 {summary['expected_profit_per_fatigue']}\n"
+            f"剩余预计净利润 {summary['remaining_expected_profit']}，"
+            f"剩余所需疲劳 {summary['remaining_required_fatigue']}，"
+            f"剩余净利润/疲劳 {summary['remaining_profit_per_fatigue']}\n"
             f"下一步动作：{self._format_batch(current)}{later}\n"
-            f"今日建议：{suggested_today} 次完整往返；"
-            f"预计剩余计划疲劳约 {round(summary['remaining_fatigue'])}"
+            f"今日可执行建议：{suggested_text}；"
+            f"当前确认可用疲劳 {summary['confirmed_available_fatigue']}，"
+            f"今日可恢复疲劳 {summary['recoverable_fatigue_today']}"
         )
 
     def syncWeeklyFacts(self):
