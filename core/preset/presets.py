@@ -21,6 +21,7 @@ from core.module.bgr import BGR
 from core.image.ocr import predict
 from core.preset import blurry_ocr_click, go_home
 from core.services.screen_state import is_train_in_transit
+from core.services.read_only_policy import ActionIntent
 from core.services.station_availability import station_unavailable_reason
 from core.utils.utils import RESOURCES_PATH, read_json
 
@@ -463,7 +464,13 @@ def go_city():
         .match_template(RESOURCES_PATH / "fame.png", 0.95)
         == False
     ):
-        input_tap((1270, 494))
+        input_tap(
+            (1270, 494),
+            intent=ActionIntent(
+                "navigation_anchor", "home", "city_entry", (1270, 494),
+                correlation_id="preset:home:city-entry",
+            ),
+        )
         time.sleep(2.0)
 
 
@@ -478,19 +485,19 @@ def go_outlets(name: str):
     # New stations append their local market name (for example
     # "交易所-武林市集").  Matching "交易所" against the whole label needs a
     # lower length ratio than the legacy 0.7 default.
-    if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False, score=0.3):
+    if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False, score=0.3, action_key="navigation_anchor", page_id="city_outlets"):
         return result
-    input_swipe((457, 340), (457, 369), swipe_time=500)
-    if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False, score=0.3):
+    input_swipe((457, 340), (457, 369), swipe_time=500, intent=ActionIntent("scroll", "city_outlets", "outlet_list", (457, 340)))
+    if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False, score=0.3, action_key="navigation_anchor", page_id="city_outlets"):
         return result
-    input_swipe((400, 340), (457, 340), swipe_time=500)
-    if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False, score=0.3):
+    input_swipe((400, 340), (457, 340), swipe_time=500, intent=ActionIntent("scroll", "city_outlets", "outlet_list", (400, 340)))
+    if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False, score=0.3, action_key="navigation_anchor", page_id="city_outlets"):
         return result
-    input_swipe((969, 369), (457, 340), swipe_time=500)
-    if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False, score=0.3):
+    input_swipe((969, 369), (457, 340), swipe_time=500, intent=ActionIntent("scroll", "city_outlets", "outlet_list", (969, 369)))
+    if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False, score=0.3, action_key="navigation_anchor", page_id="city_outlets"):
         return result
-    input_swipe((641, 246), (637, 615), swipe_time=500)
-    if result := blurry_ocr_click(name, excursion_pos=(0, 80), score=0.3):
+    input_swipe((641, 246), (637, 615), swipe_time=500, intent=ActionIntent("scroll", "city_outlets", "outlet_list", (641, 246)))
+    if result := blurry_ocr_click(name, excursion_pos=(0, 80), score=0.3, action_key="navigation_anchor", page_id="city_outlets"):
         return result
 
 def go_shop():

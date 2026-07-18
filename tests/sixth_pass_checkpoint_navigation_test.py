@@ -179,7 +179,7 @@ def test_exchange_wrapper_waits_for_late_dialogue_menu(monkeypatch):
     ])
     taps: list[tuple[int, int]] = []
     monkeypatch.setattr(navigation, "screenshot", lambda: next(frames))
-    monkeypatch.setattr(navigation, "input_tap", taps.append)
+    monkeypatch.setattr(navigation, "input_tap", lambda pos, **_semantic: taps.append(pos))
     monkeypatch.setattr(navigation.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr("core.preset.control.go_home", lambda: True)
     monkeypatch.setattr("core.preset.go_outlets", lambda _name: True)

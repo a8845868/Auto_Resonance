@@ -14,6 +14,7 @@ import numpy as np
 from loguru import logger
 
 from core.control.control import input_swipe, input_tap, screenshot, screenshot_image
+from core.services.read_only_policy import ActionIntent
 from core.exception.exception_handling import get_excption
 from core.image.image import Image
 from core.module.bgr import BGR
@@ -26,6 +27,16 @@ BUY_BARGAIN_TIMEOUT = 45
 BUY_RESULT_TIMEOUT = 3.0
 BUY_RESULT_POLL_INTERVAL = 0.2
 CARGO_CAPACITY_ROI = (1080, 350, 1270, 430)
+
+
+def _buy_tap(pos: tuple[int, int]) -> object:
+    return input_tap(
+        pos,
+        intent=ActionIntent(
+            "transaction_buy", "exchange_buy", "transaction_control", pos,
+            correlation_id="business:buy:transaction",
+        ),
+    )
 
 
 def _cargo_capacity_full(items) -> bool:
@@ -135,7 +146,7 @@ def buy_business(
         if on_purchase_confirmed is not None:
             on_purchase_confirmed()
         time.sleep(0.5)
-        input_tap((896, 676))
+        _buy_tap((896, 676))
         return {"success": True, "confirmed_books": book} if detailed else True
     elif cargo_full:
         return {"success": True, "confirmed_books": book} if detailed else True
@@ -287,7 +298,7 @@ def click_bargain_button_of_bargain(target_bargain=0):
         bgr = screenshot().get_bgr((1176, 461))
         logger.debug(f"降价界面颜色检查: {bgr}")
         if BGR(5, 135, 245) == bgr:
-            input_tap((1177, 461))
+            _buy_tap((1177, 461))
             time.sleep(0.5)
         elif bgr == [251, 253, 253]:
             logger.info("议价次数不足")
@@ -314,7 +325,7 @@ def click_bargain_button(num=0):
         bgr = screenshot().get_bgr((1176, 461))
         logger.debug(f"降价界面颜色检查: {bgr}")
         if BGR(0, 123, 240) <= bgr <= BGR(2, 133, 255):
-            input_tap((1177, 461))
+            _buy_tap((1177, 461))
             if _wait_for_discount_result():
                 logger.info("降价成功")
                 num -= 1
@@ -340,7 +351,7 @@ def click_buy_button():
     """
     start = time.time()
     while time.time() - start < 10:
-        input_tap((1056, 647))
+        _buy_tap((1056, 647))
         time.sleep(1)
         image = screenshot()
         bgr = image.get_bgr((1177, 459), offset=5)

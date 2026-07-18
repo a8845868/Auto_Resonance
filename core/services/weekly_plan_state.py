@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import threading
+import time
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -52,62 +53,66 @@ def _compress_runs(runs: list[dict[str, int]]) -> list[dict]:
     return batches
 
 
-def load_weekly_plan(include_expired: bool = False) -> dict[str, Any] | None:
-    if not STATE_PATH.exists():
+def load_weekly_plan(
+    include_expired: bool = False,
+    *,
+    path: Path | None = None,
+) -> dict[str, Any] | None:
+    target = path or STATE_PATH
+    if not target.exists():
         return None
-    try:
-        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return None
+    with _STATE_LOCK:
+        try:
+            state = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as error:
+            _preserve_corrupt_weekly_state(target)
+            raise WeeklyStateCorrupt(
+                f"weekly state unreadable: {type(error).__name__}"
+            ) from error
+        if not isinstance(state, dict):
+            _preserve_corrupt_weekly_state(target)
+            raise WeeklyStateCorrupt("weekly state has invalid schema")
     if not include_expired and state.get("week_start") != current_week_start():
         return None
     return state
 
 
-def roll_weekly_plan_forward() -> dict[str, Any] | None:
+def roll_weekly_plan_forward(*, path: Path | None = None) -> dict[str, Any] | None:
     """Start a new week from the most recent configured plan.
 
     A Monday reset must clear progress, not make an enabled trading task look
     successfully finished.  The saved cycle and execution batches remain the
     user's active plan until they explicitly apply a replacement.
     """
-    current = load_weekly_plan()
-    if current:
-        return current
-    previous = load_weekly_plan(include_expired=True)
-    if not previous or previous.get("week_start", "") > current_week_start():
+    target = path or STATE_PATH
+    if not target.exists():
         return None
-    state = dict(previous)
-    state["week_start"] = current_week_start()
-    state["completed_runs"] = 0
-    state["completed_books"] = 0
-    # A new week can have a different restock-book inventory.  Keep the route
-    # as the safe default, but force the live runner to verify inventory and
-    # rebuild the execution batches before treating last week's book allocation
-    # as current.
-    state["needs_reoptimization"] = True
-    state["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    _write_state(state)
-    return state
+    def mutate(state: dict[str, Any]) -> None:
+        week = current_week_start()
+        if state.get("week_start") == week:
+            return
+        if not state or str(state.get("week_start", "")) > week:
+            return
+        state["week_start"] = week
+        state["completed_runs"] = 0
+        state["completed_books"] = 0
+        state["committed_event_ids"] = []
+        state["needs_reoptimization"] = True
+        state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    return update_weekly_state(mutate, path=target)
 
 
-def save_weekly_plan(result: dict) -> dict[str, Any]:
+def save_weekly_plan(result: dict, *, path: Path | None = None) -> dict[str, Any]:
     runs = _flatten_batches(result["execution_batches"])
-    existing = load_weekly_plan()
-    completed_runs = 0
-    completed_books = 0
-    if existing and existing.get("cycle") == result["cycle"] and existing.get("runs") == runs:
-        completed_runs = min(int(existing.get("completed_runs", 0)), len(runs))
-        completed_books = int(existing.get("completed_books", 0))
-    state: dict[str, Any] = {
+    planned: dict[str, Any] = {
         "version": 3,
         "schema_version": 3,
         "week_start": current_week_start(),
         "cycle": result["cycle"],
         "total_runs": len(runs),
         "runs": runs,
-        "completed_runs": completed_runs,
-        "completed_books": completed_books,
+        "completed_runs": 0,
+        "completed_books": 0,
         "books_total": int(result.get("books_used", 0)),
         "cycle_fatigue": float(result.get("cycle_fatigue", 0)),
         "leg_fatigue_schedule": [
@@ -129,8 +134,20 @@ def save_weekly_plan(result: dict) -> dict[str, Any]:
         "optimizer_config": result.get("optimizer_config", {}),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
-    _write_state(state)
-    return state
+    def mutate(state: dict[str, Any]) -> None:
+        same_plan = state.get("cycle") == result["cycle"] and state.get("runs") == runs
+        completed_runs = min(int(state.get("completed_runs", 0)), len(runs)) if same_plan else 0
+        completed_books = int(state.get("completed_books", 0)) if same_plan else 0
+        preserved = {
+            key: state[key]
+            for key in ("current_resources", "recovery_resources", "current_city_evidence")
+            if key in state
+        }
+        state.update(planned)
+        state.update(preserved)
+        state["completed_runs"] = completed_runs
+        state["completed_books"] = completed_books
+    return update_weekly_state(mutate, path=path)
 
 
 def _write_state_unlocked(state: dict[str, Any], target: Path) -> None:
@@ -142,7 +159,15 @@ def _write_state_unlocked(state: dict[str, Any], target: Path) -> None:
         json.dump(state, stream, ensure_ascii=False, indent=2)
         stream.flush()
         os.fsync(stream.fileno())
-    os.replace(temp_path, target)
+    for attempt in range(5):
+        try:
+            os.replace(temp_path, target)
+            break
+        except PermissionError:
+            if attempt == 4:
+                temp_path.unlink(missing_ok=True)
+                raise
+            time.sleep(0.02 * (attempt + 1))
 
 
 def _write_state(state: dict[str, Any], *, path: Path | None = None) -> None:
@@ -248,8 +273,9 @@ def record_completed_run(
     cycle_id: str | None = None,
     confirmed_books: int = 0,
     server_week_id: str | None = None,
+    path: Path | None = None,
 ) -> dict[str, Any] | None:
-    state = load_weekly_plan()
+    state = load_weekly_plan(path=path)
     if not state:
         return None
     route = [str(city) for city in state.get("cycle", [])]
@@ -265,8 +291,6 @@ def record_completed_run(
         TradeEventType.CYCLE_COMPLETED,
         0,
     )
-    committed_event_ids = list(state.get("committed_event_ids", []))
-    already_recorded_in_plan = event_id in committed_event_ids
     cycle = load_trade_cycle_state(ledger_path, cycle_id)
     if cycle.ready_to_finalize:
         finalize_trade_cycle(ledger_path, cycle_id, observed_at=now)
@@ -281,20 +305,22 @@ def record_completed_run(
         if facts.baseline_known
         else facts.confirmed_delta_since_baseline
     )
-    state["completed_runs"] = min(
-        max(int(state.get("completed_runs", 0)), int(fact_completed or 0)),
-        int(state.get("total_runs", 0)),
-    )
-    if not already_recorded_in_plan:
-        state["completed_books"] = int(state.get("completed_books", 0)) + max(
-            0, int(confirmed_books)
+    expected_route = route
+    def mutate(current: dict[str, Any]) -> None:
+        if [str(city) for city in current.get("cycle", [])] != expected_route:
+            raise RuntimeError("weekly plan changed while committing completed run")
+        committed_event_ids = list(current.get("committed_event_ids", []))
+        already_recorded = event_id in committed_event_ids
+        current["completed_runs"] = min(
+            max(int(current.get("completed_runs", 0)), int(fact_completed or 0)),
+            int(current.get("total_runs", 0)),
         )
-    if event_id not in committed_event_ids:
-        committed_event_ids.append(event_id)
-    state["committed_event_ids"] = committed_event_ids[-500:]
-    state["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    _write_state(state)
-    return state
+        if not already_recorded:
+            current["completed_books"] = int(current.get("completed_books", 0)) + max(0, int(confirmed_books))
+            committed_event_ids.append(event_id)
+        current["committed_event_ids"] = committed_event_ids[-500:]
+        current["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    return update_weekly_state(mutate, path=path)
 
 
 def _effective_completed_runs(

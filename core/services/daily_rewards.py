@@ -46,6 +46,14 @@ class DailyProgressSnapshot:
     handbook_confidence: str = "HIGH"
     daily_reward_confidence: str = "HIGH"
     handbook_reward_confidence: str = "HIGH"
+    daily_task_inventory_complete: bool | None = True
+    daily_stage_track_complete: bool | None = True
+    daily_claim_state_confidence: str = "HIGH"
+    handbook_task_inventory_complete: bool | None = True
+    handbook_level_track_complete: bool | None = True
+    handbook_claim_state_confidence: str = "HIGH"
+    scan_revision: str = ""
+    page_fingerprint: str = ""
 
 
 @dataclass(frozen=True)
@@ -89,6 +97,9 @@ def snapshot_unknown_for_enabled_channels(
         if (
             snapshot.daily_activity_confidence.upper() != "HIGH"
             or snapshot.daily_reward_confidence.upper() != "HIGH"
+            or snapshot.daily_claim_state_confidence.upper() != "HIGH"
+            or snapshot.daily_task_inventory_complete is not True
+            or snapshot.daily_stage_track_complete is not True
             or any(value is None for value in daily_required)
         ):
             return True
@@ -101,6 +112,9 @@ def snapshot_unknown_for_enabled_channels(
         if (
             snapshot.handbook_confidence.upper() != "HIGH"
             or snapshot.handbook_reward_confidence.upper() != "HIGH"
+            or snapshot.handbook_claim_state_confidence.upper() != "HIGH"
+            or snapshot.handbook_task_inventory_complete is not True
+            or snapshot.handbook_level_track_complete is not True
             or any(value is None for value in handbook_required)
         ):
             return True
@@ -120,6 +134,9 @@ def _snapshot_complete(
         snapshot.daily_activity_current is not None
         and snapshot.daily_activity_max is not None
         and snapshot.daily_activity_current >= snapshot.daily_activity_max
+        and snapshot.daily_task_inventory_complete is True
+        and snapshot.daily_stage_track_complete is True
+        and snapshot.daily_claim_state_confidence.upper() == "HIGH"
         and snapshot.daily_activity_unclaimed_tiers == 0
     )
     handbook_complete = not travel_manual_enabled or bool(
@@ -127,6 +144,9 @@ def _snapshot_complete(
         and snapshot.handbook_daily_tasks_completed is not None
         and snapshot.handbook_daily_tasks_completed
         >= snapshot.handbook_daily_tasks_total
+        and snapshot.handbook_task_inventory_complete is True
+        and snapshot.handbook_level_track_complete is True
+        and snapshot.handbook_claim_state_confidence.upper() == "HIGH"
         and snapshot.handbook_rewards_unclaimed == 0
     )
     return daily_complete and handbook_complete

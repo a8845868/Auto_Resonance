@@ -35,6 +35,7 @@ from core.preset import click_station, get_station, go_outlets, wait_gbr
 from core.preset.control import click, go_home
 from core.preset.station import STATION
 from core.services.screen_state import is_train_in_transit
+from core.services.read_only_policy import ActionIntent
 from core.services.server_calendar import SERVER_CLOCK
 from core.services.task_schedule_state import (
     task_result_deferred,
@@ -190,7 +191,13 @@ def _wait_for_verified_arrival(max_false_arrivals: int = 3) -> bool:
         # This is called only after a travel HUD was positively identified.
         # Open the route map and let the existing interception/arrival monitor
         # continue doing its job.
-        input_tap((78, 38))
+        input_tap(
+            (78, 38),
+            intent=ActionIntent(
+                "back", "transit_hud", "top_left_route", (78, 38),
+                correlation_id="business:transit:route-monitor",
+            ),
+        )
         time.sleep(1.0)
         if not STATION(True).wait():
             return False

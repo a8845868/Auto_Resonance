@@ -12,6 +12,7 @@ import cv2 as cv
 from loguru import logger
 
 from core.control.control import input_tap, screenshot
+from core.services.read_only_policy import ActionIntent
 from core.services.runtime_control import RUNTIME_DIR
 
 
@@ -179,6 +180,22 @@ def open_exchange_action(
     """Open a verified action page; never clicks any transaction control."""
 
     selected = _action(action)
+
+    def safe_anchor_tap(pos: tuple[int, int]) -> None:
+        action_key = (
+            "exchange_buy_anchor"
+            if selected is ExchangeAction.BUY
+            else "exchange_sell_anchor"
+        )
+        label = "我要买" if selected is ExchangeAction.BUY else "我要卖"
+        input_tap(
+            pos,
+            intent=ActionIntent(
+                action_key=action_key, page_id="exchange_menu",
+                anchor_key=label, coordinate=pos,
+                correlation_id=f"exchange:{selected.value.lower()}:anchor",
+            ),
+        )
     frame = screenshot()
     if not exchange_menu_matches(_items(frame)):
         from core.preset import go_outlets
@@ -202,7 +219,7 @@ def open_exchange_action(
         if frame is None:
             return ExchangeNavigator(
                 lambda: candidate,
-                input_tap,
+                safe_anchor_tap,
                 time.sleep,
                 diagnostic=_save_diagnostic,
                 cancellation=cancellation,
@@ -219,7 +236,7 @@ def open_exchange_action(
 
     result = ExchangeNavigator(
         next_frame,
-        input_tap,
+        safe_anchor_tap,
         time.sleep,
         diagnostic=_save_diagnostic,
         cancellation=cancellation,

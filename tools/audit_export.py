@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import difflib
 import json
 import re
 import shutil
+import subprocess
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -24,6 +27,10 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 _USER_PROFILE = re.compile(
     r"(?i)C:[\\/]+Users[\\/]+(?!Public(?:[\\/]|$)|%USERPROFILE%)[^\\/\s\"']+"
 )
+_POSIX_USER_HOME = re.compile(r"(?i)(?:/Users|/home)/(?!Shared(?:/|$))[^/\s\"']+")
+_BINARY_PATCH = re.compile(
+    r"(?im)^GIT binary patch\s*$|^(?:literal|delta)\s+\d+\s*$|^Binary files .+ differ\s*$"
+)
 SENSITIVE_PATTERNS = {
     "authorization": re.compile(r"(?i)authorization\s*[:=]\s*(?!\[REDACTED)[^\r\n]{8,}"),
     "bearer_token": re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/-]{12,}"),
@@ -36,6 +43,7 @@ SENSITIVE_PATTERNS = {
         r"(?i)\bUID\s*[:：#]\s*(?!\[REDACTED)[A-Za-z0-9_-]{6,}\b"
     ),
     "user_profile": _USER_PROFILE,
+    "posix_user_home": _POSIX_USER_HOME,
 }
 
 
@@ -54,6 +62,7 @@ def _redact_text(text: str, uid_values: tuple[str, ...]) -> str:
     )
     # [\\/]+ also matches the doubled backslashes in JSON source text.
     result = _USER_PROFILE.sub("%USERPROFILE%", result)
+    result = _POSIX_USER_HOME.sub("%USERPROFILE%", result)
     # Contact data can be replaced deterministically. Secrets and auth headers
     # are not auto-redacted: the gate below fails closed if they are present.
     result = SENSITIVE_PATTERNS["email"].sub("[REDACTED_EMAIL]", result)
@@ -208,6 +217,211 @@ def verify_hash_manifest(root: Path) -> bool:
     return True
 
 
+def _binary_patch_files(root: Path) -> list[str]:
+    found: list[str] = []
+    for path in sorted(item for item in Path(root).rglob("*") if item.is_file()):
+        if path.suffix.lower() not in {".patch", ".diff", ".txt", ".md"}:
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if _BINARY_PATCH.search(text):
+            found.append(path.relative_to(root).as_posix())
+    return found
+
+
+def _sanitize_tree(
+    source: Path,
+    destination: Path,
+    *,
+    uid_values: tuple[str, ...],
+    image_masks: tuple[tuple[int, int, int, int], ...],
+) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    for path in sorted(item for item in source.rglob("*") if item.is_file()):
+        relative = path.relative_to(source)
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        suffix = path.suffix.lower()
+        if suffix in TEXT_SUFFIXES:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            target.write_text(_redact_text(text, uid_values), encoding="utf-8", newline="\n")
+        elif suffix in IMAGE_SUFFIXES and image_masks:
+            _write_masked_image(path, target, image_masks)
+        else:
+            shutil.copy2(path, target)
+
+
+def _tree_hash(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(bytes.fromhex(_hash_file(path)))
+    return digest.hexdigest()
+
+
+def _text_tree_diff(baseline: Path, target: Path) -> str:
+    lines: list[str] = []
+    baseline_files = {path.relative_to(baseline).as_posix(): path for path in baseline.rglob("*") if path.is_file()}
+    target_files = {path.relative_to(target).as_posix(): path for path in target.rglob("*") if path.is_file()}
+    for relative in sorted(baseline_files.keys() | target_files.keys()):
+        old_path, new_path = baseline_files.get(relative), target_files.get(relative)
+        old_bytes = old_path.read_bytes() if old_path else b""
+        new_bytes = new_path.read_bytes() if new_path else b""
+        if old_path and new_path and old_bytes == new_bytes:
+            continue
+        if b"\0" in old_bytes or b"\0" in new_bytes:
+            raise SensitiveDataError(f"binary patch forbidden for shareable tree: {relative}")
+        try:
+            old_text = old_bytes.decode("utf-8")
+            new_text = new_bytes.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise SensitiveDataError(f"binary patch forbidden for shareable tree: {relative}") from error
+        lines.append(f"diff --git a/{relative} b/{relative}\n")
+        if old_path is None:
+            lines.append("new file mode 100644\n")
+        elif new_path is None:
+            lines.append("deleted file mode 100644\n")
+        lines.extend(difflib.unified_diff(
+            old_text.splitlines(keepends=True), new_text.splitlines(keepends=True),
+            fromfile=f"a/{relative}" if old_path else "/dev/null",
+            tofile=f"b/{relative}" if new_path else "/dev/null",
+            lineterm="\n",
+        ))
+    return "".join(lines).replace("\r\n", "\n")
+
+
+def _apply_text_patch(source_tree: Path, patch: Path, output: Path, *, reverse: bool) -> None:
+    shutil.copytree(source_tree, output, dirs_exist_ok=True)
+    command = ["git", "apply", "--no-index", "--whitespace=nowarn"]
+    if reverse:
+        command.append("--reverse")
+    command.append(str(patch))
+    completed = subprocess.run(
+        command, cwd=output, text=True, encoding="utf-8", errors="replace",
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    if completed.returncode:
+        raise SensitiveDataError(
+            "safe-tree patch application failed: "
+            + (completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else "git apply")
+        )
+    # Git on Windows may honor core.autocrlf while materializing patched files;
+    # safe-tree identity is defined over canonical LF bytes.
+    for path in sorted(item for item in output.rglob("*") if item.is_file()):
+        if path.suffix.lower() in TEXT_SUFFIXES:
+            text = path.read_text(encoding="utf-8", errors="strict")
+            path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def build_reversible_audit_package(
+    baseline_source: Path,
+    target_source: Path,
+    destination: Path,
+    *,
+    uid_values: tuple[str, ...] = (),
+    image_masks: tuple[tuple[int, int, int, int], ...] = (),
+    create_zip: bool = False,
+) -> Path:
+    """Publish one squashed text patch between two independently safe trees."""
+
+    baseline_source = Path(baseline_source).resolve()
+    target_source = Path(target_source).resolve()
+    destination = Path(destination).resolve()
+    staging = destination.with_name(destination.name + ".staging")
+    zip_path = destination.with_suffix(".zip")
+    staging_zip = zip_path.with_name(zip_path.name + ".staging")
+    if _binary_patch_files(baseline_source) or _binary_patch_files(target_source):
+        raise SensitiveDataError("binary patch forbidden because reverse preimage cannot be proven safe")
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging_zip.unlink(missing_ok=True)
+    staging.mkdir(parents=True)
+    try:
+        safe_baseline = staging / "sanitized-baseline"
+        safe_target = staging / "sanitized-target"
+        _sanitize_tree(baseline_source, safe_baseline, uid_values=uid_values, image_masks=image_masks)
+        _sanitize_tree(target_source, safe_target, uid_values=uid_values, image_masks=image_masks)
+        baseline_hits, baseline_scan = scan_sensitive_tree(safe_baseline)
+        target_hits, target_scan = scan_sensitive_tree(safe_target)
+        if baseline_hits or target_hits:
+            raise SensitiveDataError("sanitized baseline/target sensitive data gate failed")
+        _validate_semantics(safe_baseline)
+        _validate_semantics(safe_target)
+
+        patches = staging / "patches"
+        patches.mkdir()
+        diff_text = _text_tree_diff(safe_baseline, safe_target)
+        full_diff = patches / "full-safe-tree.diff"
+        full_diff.write_text(diff_text, encoding="utf-8", newline="\n")
+        mail_patch = patches / "0001-safe-tree-audit.patch"
+        mail_patch.write_text(
+            "From audit-safe-tree Mon Sep 17 00:00:00 2001\n"
+            "From: [REDACTED_EMAIL]\n"
+            "Date: Thu, 1 Jan 1970 00:00:00 +0000\n"
+            "Subject: [PATCH] audit safe-tree delta\n\n---\n"
+            + diff_text,
+            encoding="utf-8", newline="\n",
+        )
+        if _binary_patch_files(patches):
+            raise SensitiveDataError("binary patch forbidden in generated shareable artifacts")
+
+        with tempfile.TemporaryDirectory(prefix="audit-forward-") as forward_temp, tempfile.TemporaryDirectory(prefix="audit-reverse-") as reverse_temp:
+            forward_tree, reverse_tree = Path(forward_temp), Path(reverse_temp)
+            _apply_text_patch(safe_baseline, full_diff, forward_tree, reverse=False)
+            _apply_text_patch(safe_target, full_diff, reverse_tree, reverse=True)
+            forward_hits, forward_scan = scan_sensitive_tree(forward_tree)
+            reverse_hits, reverse_scan = scan_sensitive_tree(reverse_tree)
+            if forward_hits or reverse_hits:
+                raise SensitiveDataError("forward/reverse applied tree sensitive data gate failed")
+            forward_hash, reverse_hash = _tree_hash(forward_tree), _tree_hash(reverse_tree)
+        baseline_hash, target_hash = _tree_hash(safe_baseline), _tree_hash(safe_target)
+        if forward_hash != target_hash or reverse_hash != baseline_hash:
+            raise SensitiveDataError("safe-tree patch hash mismatch")
+        patch_hits, patch_scan = scan_sensitive_tree(patches)
+        if patch_hits:
+            raise SensitiveDataError("safe-tree patch sensitive data gate failed")
+
+        manifest = {
+            "schema_version": 3, "shareable": True,
+            "patch_model": "sanitized baseline -> 1 text audit patch -> sanitized target",
+            "sanitized_baseline_tree": {"path": "sanitized-baseline", "tree_hash": baseline_hash, "sensitive_hits": 0, **baseline_scan},
+            "sanitized_target_tree": {"path": "sanitized-target", "tree_hash": target_hash, "sensitive_hits": 0, **target_scan},
+            "forward_tree_hash": forward_hash, "reverse_tree_hash": reverse_hash,
+            "forward_sensitive_hits": 0, "reverse_sensitive_hits": 0,
+            "binary_patch_count": 0, "atomic_history_reproducible": False,
+            "audit_patch_count": 1,
+            "scan_stats": {"forward": forward_scan, "reverse": reverse_scan, "patches": patch_scan},
+        }
+        (staging / "SHAREABLE-MANIFEST.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8", newline="\n",
+        )
+        _write_hash_manifest(staging)
+        if create_zip:
+            with zipfile.ZipFile(staging_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for path in sorted(item for item in staging.rglob("*") if item.is_file()):
+                    archive.write(path, (Path(destination.name) / path.relative_to(staging)).as_posix())
+            with zipfile.ZipFile(staging_zip) as archive:
+                if archive.testzip() is not None:
+                    raise SensitiveDataError("ZIP CRC validation failed")
+            zip_hits, _ = _scan_zip(staging_zip)
+            if zip_hits:
+                raise SensitiveDataError("ZIP sensitive data gate failed")
+        if destination.exists():
+            shutil.rmtree(destination)
+        staging.replace(destination)
+        if create_zip:
+            zip_path.unlink(missing_ok=True)
+            staging_zip.replace(zip_path)
+        return destination
+    except Exception:
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging_zip.unlink(missing_ok=True)
+        raise
+
+
 def build_shareable_audit(
     source: Path,
     destination: Path,
@@ -222,6 +436,8 @@ def build_shareable_audit(
     destination = Path(destination).resolve()
     if source == destination or source in destination.parents:
         raise ValueError("audit destination must be outside the raw source")
+    if _binary_patch_files(source):
+        raise SensitiveDataError("binary patch forbidden because a sensitive preimage may be reversible")
     staging = destination.with_name(destination.name + ".staging")
     zip_path = destination.with_suffix(".zip")
     staging_zip = zip_path.with_name(zip_path.name + ".staging")
@@ -290,6 +506,7 @@ def build_shareable_audit(
 
 __all__ = [
     "SensitiveDataError",
+    "build_reversible_audit_package",
     "build_shareable_audit",
     "scan_sensitive_text",
     "scan_sensitive_tree",

@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 import json
 import re
+import inspect
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -20,6 +21,7 @@ import numpy as np
 from loguru import logger
 
 from core.control.control import connect, input_swipe, input_tap, screenshot
+from core.services.read_only_policy import ActionIntent
 from core.services.screen_state import (
     RESOURCE_DOWNLOAD_CONFIRM_TAP,
     RESOURCE_DOWNLOAD_WAIT_ATTEMPTS,
@@ -346,6 +348,7 @@ class ManualLevelObservation:
     visible_claimed_levels: int
     track_scan_complete: bool
     confidence: str
+    claimability_complete: bool = False
 
 
 @dataclass(frozen=True)
@@ -355,15 +358,24 @@ class PageScanEvidence:
     captured_at: datetime
     displacement_px: int = 0
     page_anchor_confirmed: bool = True
+    swipe_attempted: bool = False
+    content_displacement_px: int | None = None
+    matched_content_items: int = 0
+    fixed_anchor_displacement_px: int | None = None
+    end_candidate_sequence: int = 0
+    end_confirmed_after_last_move: bool = False
 
 
 @dataclass(frozen=True)
 class ManualTrackSegment:
     level: int
     slot: str
-    claimable: bool
-    claimed: bool
-    locked: bool
+    claimable: bool | None
+    claimed: bool | None
+    locked: bool | None
+    reward_lane: str = "default"
+    reward_type: str = "level_reward"
+    screen_x: int | None = None
 
 
 class ManualRewardTrackScanner:
@@ -373,9 +385,11 @@ class ManualRewardTrackScanner:
         min_frame_separation: timedelta = timedelta(milliseconds=200),
     ):
         self.min_frame_separation = min_frame_separation
-        self._segments: dict[tuple[int, str], ManualTrackSegment] = {}
+        self._segments: dict[tuple[int, str, str], ManualTrackSegment] = {}
+        self._conflicts: set[tuple[tuple[int, str, str], str]] = set()
         self._movement_seen = False
         self._end_seen = False
+        self._end_candidate_sequence = 0
         self._last_captured_at: datetime | None = None
         self._time_separated = True
         self._anchor_valid = True
@@ -394,6 +408,15 @@ class ManualRewardTrackScanner:
         )
 
     @property
+    def claimability_complete(self) -> bool:
+        return bool(self.complete and self.segments) and all(
+            item.claimable is not None
+            and item.claimed is not None
+            and item.locked is not None
+            for item in self.segments
+        )
+
+    @property
     def claimable_level_rewards(self) -> int:
         return sum(1 for segment in self.segments if segment.claimable)
 
@@ -407,21 +430,60 @@ class ManualRewardTrackScanner:
                 self._time_separated = False
         self._last_captured_at = evidence.captured_at
         self._anchor_valid = self._anchor_valid and evidence.page_anchor_confirmed
-        self._movement_seen = self._movement_seen or bool(
-            evidence.movement_confirmed and evidence.displacement_px > 0
+        displacement = (
+            evidence.content_displacement_px
+            if evidence.content_displacement_px is not None
+            else evidence.displacement_px
         )
-        self._end_seen = self._end_seen or bool(evidence.end_marker)
+        moved = bool(evidence.movement_confirmed and abs(displacement) >= 30)
+        if moved:
+            self._movement_seen = True
+            self._end_seen = False
+            self._end_candidate_sequence = 0
+        elif evidence.swipe_attempted and abs(displacement) < 10 and self._movement_seen:
+            self._end_candidate_sequence += 1
+        if evidence.end_marker and self._movement_seen and (
+            evidence.end_confirmed_after_last_move or moved
+        ):
+            self._end_seen = True
+        elif self._end_candidate_sequence >= 2 and self._movement_seen:
+            self._end_seen = True
         for segment in segments:
-            self._segments[(int(segment.level), str(segment.slot))] = segment
+            key = (int(segment.level), str(segment.reward_lane), str(segment.reward_type))
+            old = self._segments.get(key)
+            if old is None:
+                self._segments[key] = segment
+                continue
+            merged = {}
+            for field in ("claimable", "claimed", "locked"):
+                old_value, new_value = getattr(old, field), getattr(segment, field)
+                conflict_key = (key, field)
+                if conflict_key in self._conflicts:
+                    value = None
+                elif new_value is None:
+                    value = old_value
+                elif old_value is None:
+                    value = new_value
+                elif old_value == new_value:
+                    value = old_value
+                else:
+                    self._conflicts.add(conflict_key)
+                    value = None
+                merged[field] = value
+            self._segments[key] = replace(
+                old, **merged, screen_x=segment.screen_x,
+                slot=old.slot,
+            )
 
     def observation(self) -> ManualLevelObservation:
         return ManualLevelObservation(
-            current_level=max((item.level for item in self.segments), default=None),
+            current_level=None,
             claimable_level_rewards=self.claimable_level_rewards,
             visible_locked_levels=sum(1 for item in self.segments if item.locked),
             visible_claimed_levels=sum(1 for item in self.segments if item.claimed),
             track_scan_complete=self.complete,
-            confidence="HIGH" if self.complete else "UNKNOWN",
+            confidence="HIGH" if self.complete and self.claimability_complete else "UNKNOWN",
+            claimability_complete=self.claimability_complete,
         )
 
 
@@ -526,6 +588,9 @@ class _CardScannerBase:
         self._evidence_mode = False
         self._movement_seen = False
         self._end_seen = False
+        self._end_candidate_sequence = 0
+        self._last_evidence_at: datetime | None = None
+        self._distinct_evidence_times = True
         self._anchor_valid = True
 
     @property
@@ -539,6 +604,7 @@ class _CardScannerBase:
                 not self.cancelled
                 and self._movement_seen
                 and self._end_seen
+                and self._distinct_evidence_times
                 and self._anchor_valid
                 and self._pages <= self.max_pages
             )
@@ -597,13 +663,30 @@ class _CardScannerBase:
         self._pages += 1
         if evidence is not None:
             self._evidence_mode = True
+            if self._last_evidence_at is not None and evidence.captured_at <= self._last_evidence_at:
+                self._distinct_evidence_times = False
+            self._last_evidence_at = evidence.captured_at
             self._anchor_valid = self._anchor_valid and evidence.page_anchor_confirmed
             if not evidence.page_anchor_confirmed:
                 self.cancelled = True
-            self._movement_seen = self._movement_seen or bool(
-                evidence.movement_confirmed and evidence.displacement_px > 0
+            displacement = (
+                evidence.content_displacement_px
+                if evidence.content_displacement_px is not None
+                else evidence.displacement_px
             )
-            self._end_seen = self._end_seen or bool(evidence.end_marker)
+            moved = bool(evidence.movement_confirmed and abs(displacement) >= 30)
+            if moved:
+                self._movement_seen = True
+                self._end_seen = False
+                self._end_candidate_sequence = 0
+            elif evidence.swipe_attempted and abs(displacement) < 10 and self._movement_seen:
+                self._end_candidate_sequence += 1
+            if evidence.end_marker and self._movement_seen and (
+                evidence.end_confirmed_after_last_move or moved
+            ):
+                self._end_seen = True
+            elif self._end_candidate_sequence >= 2 and self._movement_seen:
+                self._end_seen = True
         before = len(self._cards)
         for card in cards:
             key = self._canonical_key(card)
@@ -626,28 +709,40 @@ class _CardScannerBase:
 
 
 def _horizontal_displacement(
-    previous: list[dict], current: list[dict]
+    previous: list[dict],
+    current: list[dict],
+    *,
+    content_roi: tuple[int, int, int, int] | None = None,
 ) -> int | None:
-    """Return a verified shared-OCR horizontal displacement, not frame churn."""
+    """Return displacement of stable objects inside the scrolling content ROI."""
 
     def unique_x(items: list[dict]) -> dict[str, float]:
         grouped: dict[str, list[float]] = {}
         for item in items:
             if not item.get("position"):
                 continue
+            x, y = _center(item)
+            if content_roi is not None:
+                x1, y1, x2, y2 = content_roi
+                if not (min(x1, x2) <= x <= max(x1, x2) and min(y1, y2) <= y <= max(y1, y2)):
+                    continue
             key = _normalized_key(str(item.get("text", "")))
             if len(key) < 2:
                 continue
-            grouped.setdefault(key, []).append(float(_center(item)[0]))
+            # Quantized vertical lane separates repeated labels on different
+            # rows without binding identity to the moving screen x coordinate.
+            key = f"{key}:lane{int(round(y / 80.0))}"
+            grouped.setdefault(key, []).append(float(x))
         return {key: values[0] for key, values in grouped.items() if len(values) == 1}
 
     before, after = unique_x(previous), unique_x(current)
     deltas = [after[key] - before[key] for key in before.keys() & after.keys()]
-    if len(deltas) < 2:
+    required_matches = 1 if content_roi is not None else 2
+    if len(deltas) < required_matches:
         return None
     median = int(round(float(np.median(deltas))))
     consistent = [value for value in deltas if abs(value - median) <= 20]
-    if len(consistent) < 2:
+    if len(consistent) < required_matches:
         return None
     if abs(median) < 10:
         return 0
@@ -808,7 +903,7 @@ def observe_manual_level_layout(
         levels = {
             int(match.group(1))
             for text in texts
-            for match in [re.search(r"(?:LV\.?|等级)[:：]?(\d{1,3})", text, re.I)]
+            for match in [re.search(r"(?:当前等级|玩家等级)[:：]?\s*(\d{1,3})", text, re.I)]
             if match
         }
         snapshots.append((
@@ -822,6 +917,7 @@ def observe_manual_level_layout(
     return ManualLevelObservation(
         current, claimable, locked, claimed, bool(track_scan_complete),
         "HIGH" if stable and track_scan_complete and page_anchored else "UNKNOWN",
+        bool(stable and track_scan_complete and page_anchored),
     )
 
 
@@ -842,14 +938,18 @@ def _manual_track_segments(items: list[dict]) -> list[ManualTrackSegment]:
             and abs(_center(candidate)[0] - x) <= 80
             and 180 <= _center(candidate)[1] <= 620
         )
+        is_claimable = any(_matches(nearby, marker) for marker in ("可领取", "领取")) and not _matches(nearby, "已领取")
+        is_claimed = _matches(nearby, "已领取")
+        is_locked = any(_matches(nearby, marker) for marker in ("未解锁", "锁定"))
+        explicit = is_claimable or is_claimed or is_locked
         segments.append(
             ManualTrackSegment(
                 level=level,
                 slot=f"x{round(x / 25) * 25}",
-                claimable=any(_matches(nearby, marker) for marker in ("可领取", "领取"))
-                and not _matches(nearby, "已领取"),
-                claimed=_matches(nearby, "已领取"),
-                locked=any(_matches(nearby, marker) for marker in ("未解锁", "锁定")),
+                claimable=is_claimable if explicit else None,
+                claimed=is_claimed if explicit else None,
+                locked=is_locked if explicit else None,
+                reward_lane="main", reward_type="level_reward", screen_x=x,
             )
         )
     return segments
@@ -884,18 +984,47 @@ class RewardDriver:
     def texts(self) -> list[dict]:
         return self.frame().ocr()
 
-    def tap(self, pos: tuple[int, int]) -> None:
-        input_tap(pos)
+    def tap(
+        self,
+        pos: tuple[int, int],
+        *,
+        action_key: str = "unclassified_tap",
+        page_id: str = "reward_navigation",
+        anchor_key: str = "coordinate",
+    ) -> bool:
+        result = input_tap(
+            pos,
+            intent=ActionIntent(
+                action_key=action_key, page_id=page_id, anchor_key=anchor_key,
+                coordinate=pos, correlation_id=f"reward:{page_id}:{anchor_key}",
+            ),
+        )
+        if result is False:
+            raise PermissionError(f"read-only action denied: {action_key}")
+        return bool(result)
 
     def swipe_left(self) -> None:
-        input_swipe((1100, 450), (500, 450), swipe_time=650)
+        start = (1100, 450)
+        result = input_swipe(
+            start, (500, 450), swipe_time=650,
+            intent=ActionIntent(
+                action_key="scroll", page_id="reward_horizontal_track",
+                anchor_key="content_lane", coordinate=start,
+                bounded_region=(1000, 350, 1180, 550),
+                correlation_id="reward:horizontal-scroll",
+            ),
+        )
+        if result is False:
+            raise PermissionError("read-only action denied: scroll")
         self.sleep(0.8)
 
-    def click_text(self, text: str, attempts: int = 3) -> bool:
+    def click_text(
+        self, text: str, attempts: int = 3, *, action_key: str = "open_tab"
+    ) -> bool:
         for _ in range(attempts):
             for item in self.texts():
                 if _matches(item["text"], text):
-                    self.tap(_center(item))
+                    self.tap(_center(item), action_key=action_key, page_id="reward_ocr_page", anchor_key=text)
                     self.sleep(1)
                     return True
             self.sleep(0.4)
@@ -904,11 +1033,11 @@ class RewardDriver:
     def has_text(self, text: str) -> bool:
         return any(_matches(item["text"], text) for item in self.texts())
 
-    def go_home(self) -> bool:
+    def go_home(self, attempt_limit: int = 45) -> bool:
         startup_recovery = False
         resource_download_seen = False
         attempt = 0
-        attempt_limit = 45
+        attempt_limit = max(1, int(attempt_limit))
         while attempt < attempt_limit:
             attempt += 1
             texts = self.texts()
@@ -917,19 +1046,19 @@ class RewardDriver:
             clarity_cancel = clarity_replenish_cancel_position(texts)
             if clarity_cancel is not None:
                 logger.info("检测到澄明度补充提示，取消后继续返回主界面")
-                self.tap(clarity_cancel)
+                self.tap(clarity_cancel, action_key="navigation_anchor", page_id="clarity_dialog", anchor_key="cancel")
                 self.sleep(1)
                 continue
             action = startup_screen_action(texts)
             if action == "cancel_resource_repair":
                 logger.warning("检测到资源完整性修复提示，取消修复")
-                self.tap((320, 500))
+                self.tap((320, 500), action_key="navigation_anchor", page_id="resource_repair", anchor_key="cancel")
                 startup_recovery = True
                 self.sleep(1)
                 continue
             if action == "confirm_resource_download":
                 logger.info("检测到登录前资源包更新提示，确认下载并等待完成")
-                self.tap(RESOURCE_DOWNLOAD_CONFIRM_TAP)
+                self.tap(RESOURCE_DOWNLOAD_CONFIRM_TAP, action_key="unclassified_tap", page_id="resource_download", anchor_key="confirm")
                 startup_recovery = True
                 if not resource_download_seen:
                     attempt_limit = max(
@@ -941,20 +1070,20 @@ class RewardDriver:
                 continue
             if action == "enter_game":
                 logger.info("检测到游戏登录页，点击安全区域进入游戏")
-                self.tap((640, 560))
+                self.tap((640, 560), action_key="navigation_anchor", page_id="login", anchor_key="enter_game")
                 startup_recovery = True
                 self.sleep(4)
                 continue
             if action == "dismiss_startup_overlay":
                 logger.info("关闭登录后的启动弹窗")
-                self.tap((100, 650))
+                self.tap((100, 650), action_key="navigation_anchor", page_id="startup_overlay", anchor_key="dismiss")
                 startup_recovery = True
                 self.sleep(1)
                 continue
             if action == "wait_for_game" or startup_recovery:
                 self.sleep(2)
                 continue
-            self.tap((82, 36))
+            self.tap((82, 36), action_key="back", page_id="unknown_page", anchor_key="top_left_back")
             self.sleep(0.8)
         return False
 
@@ -966,7 +1095,7 @@ class RewardDriver:
         for _ in range(attempts):
             for item in self.texts():
                 if item["text"].replace(" ", "") == expected:
-                    self.tap(_center(item))
+                    self.tap(_center(item), action_key="open_tab", page_id="reward_ocr_page", anchor_key=text)
                     self.sleep(1)
                     return True
             self.sleep(0.4)
@@ -993,6 +1122,17 @@ class RewardCollector:
     def __init__(self, driver: Optional[RewardDriver] = None):
         self.driver = driver or RewardDriver()
         self.state = _load_state()
+
+    def _tap(self, pos: tuple[int, int], **semantic) -> object:
+        """Preserve the small injected-driver protocol used by deterministic tests."""
+        parameters = inspect.signature(self.driver.tap).parameters
+        return self.driver.tap(pos, **semantic) if "action_key" in parameters else self.driver.tap(pos)
+
+    def _click_text(self, text: str, attempts: int, *, action_key: str) -> bool:
+        parameters = inspect.signature(self.driver.click_text).parameters
+        if "action_key" in parameters:
+            return bool(self.driver.click_text(text, attempts=attempts, action_key=action_key))
+        return bool(self.driver.click_text(text, attempts=attempts))
 
     def _page_is_open(self, page_marker: str) -> bool:
         if self.driver.has_text(page_marker):
@@ -1047,23 +1187,23 @@ class RewardCollector:
                 return False
 
         for pos in candidates:
-            self.driver.tap(pos)
+            self._tap(pos, action_key="navigation_anchor", page_id="home", anchor_key=page_marker)
             self.driver.sleep(1.5)
             if self._page_is_open(page_marker):
                 positions = self.state.setdefault("shortcut_positions", {})
                 positions[page_marker] = list(pos)
                 _save_state(self.state)
                 return True
-            self.driver.tap((82, 36))
+            self._tap((82, 36), action_key="back", page_id="reward_candidate", anchor_key="top_left_back")
             self.driver.sleep(0.8)
         logger.info(f"没有找到带提醒角标的{page_marker}入口")
         return False
 
     def _claim_one_click(self, area: str) -> bool:
         """Claim a one-click batch and require the actionable button to go away."""
-        if not self.driver.click_text("一键领取", attempts=2):
+        if not self._click_text("一键领取", attempts=2, action_key="reward_claim"):
             return False
-        self.driver.tap((640, 660))
+        self._tap((640, 660), action_key="reward_claim", page_id=area, anchor_key="dismiss_reward")
         self.driver.sleep(0.8)
         if self.driver.has_text("一键领取"):
             logger.warning(f"{area}的一键领取按钮点击后仍存在，本次不计为已领取")
@@ -1104,13 +1244,13 @@ class RewardCollector:
         # retry on that same target instead of producing clicks across boxes.
         target_x = yellow_boxes[-1][0]
         for attempt_index in range(attempts):
-            self.driver.tap((target_x, 164))
+            self._tap((target_x, 164), action_key="reward_claim", page_id="daily_activity", anchor_key="stage_reward")
 
             # Let the reward presentation appear before dismissing it. The old
             # 0.8-second blind tap was often early, after which stale page pixels
             # were mistaken for a failed claim and several other boxes got hit.
             self.driver.sleep(1.2)
-            self.driver.tap((640, 660))
+            self._tap((640, 660), action_key="reward_claim", page_id="daily_activity", anchor_key="dismiss_reward")
 
             saw_daily_page = False
             for frame_index in range(confirmation_frames):
@@ -1120,7 +1260,7 @@ class RewardCollector:
                 if not _is_daily_activity_page(items):
                     # A reward presentation may temporarily cover the page.
                     # Dismiss it, but never interpret another page as success.
-                    self.driver.tap((640, 660))
+                    self._tap((640, 660), action_key="reward_claim", page_id="daily_activity", anchor_key="dismiss_reward")
                     continue
                 saw_daily_page = True
                 if not _daily_stage_boxes(observation.image):
@@ -1162,9 +1302,9 @@ class RewardCollector:
             before = self._matching_text_count("可领取")
             if before == 0:
                 break
-            if not self.driver.click_text("可领取", attempts=1):
+            if not self._click_text("可领取", attempts=1, action_key="reward_claim"):
                 break
-            self.driver.tap((640, 660))
+            self._tap((640, 660), action_key="reward_claim", page_id="daily_activity", anchor_key="dismiss_reward")
             self.driver.sleep(0.8)
             after = self._matching_text_count("可领取")
             if after >= before:
@@ -1220,7 +1360,10 @@ class RewardCollector:
                         self.driver.swipe_left()
                     next_frame = self.driver.frame()
                     next_items = next_frame.ocr()
-                    displacement = _horizontal_displacement(previous_items, next_items)
+                    displacement = _horizontal_displacement(
+                        previous_items, next_items,
+                        content_roi=(150, 200, 1180, 650),
+                    )
                     anchored = _is_daily_activity_page(next_items)
                     scanner.add_page(
                         next_items,
@@ -1230,6 +1373,8 @@ class RewardCollector:
                             datetime.now().astimezone(),
                             displacement_px=abs(displacement or 0),
                             page_anchor_confirmed=anchored,
+                            swipe_attempted=True,
+                            content_displacement_px=displacement or 0,
                         ),
                     )
                     previous_items = next_items
@@ -1255,6 +1400,16 @@ class RewardCollector:
                     "missing_evidence": list(structured.missing_evidence),
                     "task_cards": [asdict(card) for card in structured.task_cards],
                     "page_complete": structured.page_complete,
+                    "task_inventory_complete": structured.page_complete,
+                    "stage_track_complete": structured.page_complete,
+                    "claim_state_confidence": (
+                        "HIGH" if structured.page_complete and all(
+                            card.claimable is not None and card.claimed is not None
+                            for card in structured.task_cards
+                        ) else "UNKNOWN"
+                    ),
+                    "scan_revision": _items_fingerprint(layout_frames[-1]),
+                    "page_fingerprint": _items_fingerprint(layout_frames[-1]),
                 }
             current, maximum = progress
             stage_claimable = len(_daily_stage_boxes(frame.image))
@@ -1277,6 +1432,14 @@ class RewardCollector:
             "claimable_tiers": claimable,
             "unclaimed_tiers": unclaimed,
             "claimed_tiers": max(0, 6 - unclaimed),
+            # Aggregate OCR does not prove the horizontally scrolling task
+            # inventory reached its end.
+            "page_complete": False,
+            "task_inventory_complete": False,
+            "stage_track_complete": True,
+            "claim_state_confidence": "UNKNOWN",
+            "scan_revision": _items_fingerprint(layout_frames[-1]),
+            "page_fingerprint": _items_fingerprint(layout_frames[-1]),
         }
 
     def collect_travel_manual(self) -> int:
@@ -1333,7 +1496,10 @@ class RewardCollector:
                     if hasattr(self.driver, "swipe_left"):
                         self.driver.swipe_left()
                     next_items = self.driver.texts()
-                    displacement = _horizontal_displacement(previous_items, next_items)
+                    displacement = _horizontal_displacement(
+                        previous_items, next_items,
+                        content_roi=(150, 200, 1180, 650),
+                    )
                     anchored = _is_manual_task_inventory_page(next_items)
                     scanner.add_page(
                         next_items,
@@ -1343,6 +1509,8 @@ class RewardCollector:
                             datetime.now().astimezone(),
                             displacement_px=abs(displacement or 0),
                             page_anchor_confirmed=anchored,
+                            swipe_attempted=True,
+                            content_displacement_px=displacement or 0,
                         ),
                     )
                     previous_items = next_items
@@ -1368,7 +1536,10 @@ class RewardCollector:
                 for _ in range(12):
                     self.driver.swipe_left()
                     next_items = self.driver.texts()
-                    displacement = _horizontal_displacement(previous_items, next_items)
+                    displacement = _horizontal_displacement(
+                        previous_items, next_items,
+                        content_roi=(150, 100, 1180, 650),
+                    )
                     anchored = _is_manual_track_page(next_items)
                     track.add_segments(
                         _manual_track_segments(next_items),
@@ -1378,6 +1549,8 @@ class RewardCollector:
                             datetime.now().astimezone(),
                             displacement_px=abs(displacement or 0),
                             page_anchor_confirmed=anchored,
+                            swipe_attempted=True,
+                            content_displacement_px=displacement or 0,
                         ),
                     )
                     previous_items = next_items
@@ -1393,6 +1566,13 @@ class RewardCollector:
                     "unclaimed_rewards": task_rewards + level.claimable_level_rewards,
                     "task_cards": [asdict(card) for card in scanner.cards],
                     "track_scan_complete": level.track_scan_complete,
+                    "task_inventory_complete": scanner.complete,
+                    "level_track_complete": level.track_scan_complete,
+                    "claim_state_confidence": (
+                        "HIGH" if level.claimability_complete and scanner.complete else "UNKNOWN"
+                    ),
+                    "scan_revision": _items_fingerprint(first_items),
+                    "page_fingerprint": _items_fingerprint(first_items),
                     "confidence": (
                         "HIGH"
                         if level.confidence == "HIGH" and scanner.complete
@@ -1438,7 +1618,10 @@ class RewardCollector:
         for _ in range(12):
             self.driver.swipe_left()
             next_items = self.driver.texts()
-            displacement = _horizontal_displacement(previous_items, next_items)
+            displacement = _horizontal_displacement(
+                previous_items, next_items,
+                content_roi=(150, 100, 1180, 650),
+            )
             anchored = _is_manual_track_page(next_items)
             track.add_segments(
                 _manual_track_segments(next_items),
@@ -1448,6 +1631,8 @@ class RewardCollector:
                     datetime.now().astimezone(),
                     displacement_px=abs(displacement or 0),
                     page_anchor_confirmed=anchored,
+                    swipe_attempted=True,
+                    content_displacement_px=displacement or 0,
                 ),
             )
             previous_items = next_items
@@ -1468,6 +1653,13 @@ class RewardCollector:
             "claimable_rewards": task_rewards + level_rewards,
             "unclaimed_rewards": task_rewards + level_rewards,
             "track_scan_complete": level.track_scan_complete,
+            "task_inventory_complete": False,
+            "level_track_complete": level.track_scan_complete,
+            "claim_state_confidence": (
+                "HIGH" if level.claimability_complete else "UNKNOWN"
+            ),
+            "scan_revision": _items_fingerprint(first_items),
+            "page_fingerprint": _items_fingerprint(first_items),
             "confidence": level.confidence,
         }
 
@@ -1566,6 +1758,38 @@ def collect_scheduled_rewards(
             (manual_observation or {}).get("confidence", "HIGH")
             if manual_observation is not None else "UNKNOWN"
         ),
+        daily_task_inventory_complete=(
+            bool((daily_observation or {}).get("task_inventory_complete", (daily_observation or {}).get("page_complete", False)))
+            if daily_observation is not None else False
+        ),
+        daily_stage_track_complete=(
+            bool((daily_observation or {}).get("stage_track_complete", (daily_observation or {}).get("page_complete", False)))
+            if daily_observation is not None else False
+        ),
+        daily_claim_state_confidence=(
+            (daily_observation or {}).get("claim_state_confidence", "UNKNOWN")
+            if daily_observation is not None else "UNKNOWN"
+        ),
+        handbook_task_inventory_complete=(
+            bool((manual_observation or {}).get("task_inventory_complete", False))
+            if manual_observation is not None else False
+        ),
+        handbook_level_track_complete=(
+            bool((manual_observation or {}).get("level_track_complete", (manual_observation or {}).get("track_scan_complete", False)))
+            if manual_observation is not None else False
+        ),
+        handbook_claim_state_confidence=(
+            (manual_observation or {}).get("claim_state_confidence", "UNKNOWN")
+            if manual_observation is not None else "UNKNOWN"
+        ),
+        scan_revision="|".join(filter(None, (
+            str((daily_observation or {}).get("scan_revision", "")),
+            str((manual_observation or {}).get("scan_revision", "")),
+        ))),
+        page_fingerprint="|".join(filter(None, (
+            str((daily_observation or {}).get("page_fingerprint", "")),
+            str((manual_observation or {}).get("page_fingerprint", "")),
+        ))),
     )
     try:
         selected_strategy = RewardStrategy(strategy)

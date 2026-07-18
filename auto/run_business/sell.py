@@ -12,6 +12,7 @@ from loguru import logger
 
 from app.common.config import cfg
 from core.control.control import input_swipe, input_tap, screenshot
+from core.services.read_only_policy import ActionIntent
 from core.exception.exceptions import StopExecution
 from core.module.bgr import BGR
 from core.preset import go_home
@@ -21,6 +22,16 @@ from auto.module.strength import exit_negotiation_safely
 SELL_BARGAIN_TIMEOUT = 45
 RAISE_RESULT_TIMEOUT = 3.0
 FRAME_RETRY_INTERVAL = 0.2
+
+
+def _sell_tap(pos: tuple[int, int], action_key: str = "transaction_sell") -> object:
+    return input_tap(
+        pos,
+        intent=ActionIntent(
+            action_key, "exchange_sell", "transaction_control", pos,
+            correlation_id=f"business:sell:{action_key}",
+        ),
+    )
 
 # Spread across the trade panel so a partially black NEMU IPC frame is not
 # mistaken for a real bargain result.
@@ -116,10 +127,10 @@ def sell_business(num=0, empty_ok=False, expected_goods=None, *, detailed=False)
         logger.error("Sell confirmation did not complete")
         return False
     time.sleep(0.5)
-    input_tap((896, 676))
+    _sell_tap((896, 676))
     time.sleep(0.5)
-    input_tap((896, 676))
-    input_tap((896, 676))
+    _sell_tap((896, 676))
+    _sell_tap((896, 676))
     if detailed:
         return {
             "success": True,
@@ -178,7 +189,7 @@ def is_sell_page():
         logger.info("Negotiation-exit warning detected; cancel it and preserve the sell state")
         # Left button is Cancel. Never confirm here because confirmation resets
         # the completed raise and leaves the exchange.
-        input_tap((319, 512))
+        _sell_tap((319, 512), "navigation_anchor")
         time.sleep(1.5)
         return True
     markers = ("我要卖", "抬价幅度", "卖出总价")
@@ -268,7 +279,7 @@ def select_all_sellable_cargo(attempts=5) -> bool:
             continue
 
         logger.info(f"Apply Sell All selection ({attempt + 1}/{attempts})")
-        input_tap((1187, 103))
+        _sell_tap((1187, 103))
         time.sleep(0.8)
     return False
 
@@ -333,7 +344,7 @@ def click_bargain_button(num=0):
         bgr = image.get_bgr((1176, 461))
         logger.debug(f"抬价界面颜色检查: {bgr}")
         if BGR(0, 170, 240) <= bgr <= BGR(5, 185, 255):
-            input_tap((1177, 461))
+            _sell_tap((1177, 461))
             if _wait_for_raise_result():
                 logger.info("抬价成功")
                 num -= 1
@@ -369,12 +380,12 @@ def click_bargain_button(num=0):
 def reset_negotiation_with_book(timeout=6):
     """Use one negotiation book from the exhausted-attempt prompt."""
     logger.info("议价次数已耗尽，尝试使用议价书重新议价")
-    input_tap((1177, 461))
+    _sell_tap((1177, 461))
     deadline = time.time() + timeout
     while time.time() < deadline:
         texts = [item["text"] for item in screenshot().ocr()]
         if any("重新议价" in text for text in texts):
-            input_tap((960, 512))
+            _sell_tap((960, 512))
             time.sleep(2)
             logger.info("已使用议价书重置议价次数，继续抬价")
             return True
@@ -394,7 +405,7 @@ def click_sell_button(timeout=25):
     should_click_sell = True
     while time.time() < deadline:
         if should_click_sell:
-            input_tap((1056, 647))
+            _sell_tap((1056, 647))
             should_click_sell = False
             time.sleep(1)
 
@@ -410,7 +421,7 @@ def click_sell_button(timeout=25):
 
         if any("行情" in text and "波动" in text for text in texts):
             logger.warning("Market volatility prompt detected; confirm and revalidate sale")
-            input_tap((960, 512))
+            _sell_tap((960, 512))
             time.sleep(1.5)
             # The confirmation may settle immediately or return to the sell
             # page with a refreshed quote. The next loop identifies either.
@@ -419,14 +430,14 @@ def click_sell_button(timeout=25):
 
         if any("本地商品" in text for text in texts):
             logger.info("检测到包含本地商品，确认出售非本地货物")
-            input_tap((975, 498))
+            _sell_tap((975, 498))
             time.sleep(1.5)
             continue
 
         bgr = image.get_bgr((1175, 470), offset=5)
         logger.debug(f"出售物品界面颜色检查: {bgr}")
         if bgr == [227, 131, 82]:
-            input_tap((975, 498))
+            _sell_tap((975, 498))
             time.sleep(1.5)
             continue
 
