@@ -124,7 +124,13 @@ def test_stale_price_reoptimization_generic_failure_never_runs_old_route():
         services, "optimize_live_routes", side_effect=RuntimeError("offline")
     ), patch.object(business, "unavailable_stations", return_value=[]), patch.object(
         business, "is_sell_page", return_value=False
-    ), patch.object(business, "two_city_weekly_run") as execute:
+    ), patch.object(business, "two_city_weekly_run") as execute, patch.object(
+        business, "go_business", return_value=True
+    ), patch.object(business, "read_strength", return_value=(0, 100)), patch.object(
+        business, "get_station", return_value="A"
+    ), patch("core.services.weekly_plan_state.save_current_resource_evidence"), patch(
+        "core.services.weekly_plan_state.save_current_city_evidence"
+    ):
         result = business.adaptive_weekly_run()
     assert result["deferred"] is True
     assert result["reason"] == "stale_price_reoptimization_failed"

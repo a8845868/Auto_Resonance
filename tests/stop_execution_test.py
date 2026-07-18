@@ -44,7 +44,11 @@ def test_adaptive_plan_does_not_treat_stop_as_optimizer_failure():
         "core.services.optimize_live_routes", side_effect=StopExecution()
     ), patch("auto.inventory.read_restock_book_count", return_value=0), patch.object(
         business, "two_city_weekly_run"
-    ) as weekly_run:
+    ) as weekly_run, patch.object(business, "go_business", return_value=True), patch.object(
+        business, "read_strength", return_value=(0, 100)
+    ), patch.object(business, "get_station", return_value="A"), patch(
+        "core.services.weekly_plan_state.save_current_resource_evidence"
+    ), patch("core.services.weekly_plan_state.save_current_city_evidence"):
         with TestCase().assertRaises(StopExecution):
             business.adaptive_weekly_run()
     weekly_run.assert_not_called()
