@@ -39,6 +39,10 @@ def create_build_monitor_plan(
         "active_started_at": None,
         "active_due_at": None,
         "history": [],
+        "premium_currency_required": False,
+        "currency_type": "IRON",
+        "automation_safe": True,
+        "observed_at": _iso(datetime.now().astimezone()),
     }
     save_build_monitor_plan(state, path)
     return state

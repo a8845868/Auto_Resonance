@@ -110,6 +110,9 @@ def save_weekly_plan(result: dict) -> dict[str, Any]:
         "passenger_profit": int(result.get("passenger_profit", 0)),
         "passenger_plan": result.get("passenger_plan", {}),
         "price_time": result.get("price_time", ""),
+        "price_source": result.get("price_source", ""),
+        "price_revision": result.get("price_revision", result.get("price_time", "")),
+        "stations_available": list(result.get("cycle", ())),
         "optimizer_config": result.get("optimizer_config", {}),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
