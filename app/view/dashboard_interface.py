@@ -33,6 +33,8 @@ from core.services.task_schedule_state import (
 from core.services.daily_capabilities import (
     DailyCapability,
     PRODUCTION_CAPABILITY_METADATA,
+    plan_daily_reward_dependencies,
+    resolve_daily_capability_prerequisites,
     select_daily_capabilities,
 )
 from core.services.daily_rewards import DailyProgressSnapshot, RewardStrategy
@@ -43,12 +45,22 @@ def select_reward_dependency_tasks(
     capabilities: list[DailyCapability],
     snapshot: DailyProgressSnapshot | None,
     strategy: RewardStrategy,
+    *,
+    satisfied_prerequisites: frozenset[str] = frozenset(),
+    now: datetime | None = None,
 ) -> list[QueuedTask]:
     """Materialize only safe production tasks selected by the capability registry."""
 
+    plan = plan_daily_reward_dependencies(
+        capabilities,
+        snapshot,
+        strategy,
+        now=now or (snapshot.observed_at if snapshot is not None else None),
+        satisfied_prerequisites=satisfied_prerequisites,
+    )
     return [
         capability.run_factory()
-        for capability in select_daily_capabilities(capabilities, snapshot, strategy)
+        for capability in plan.capabilities
     ]
 
 
@@ -299,10 +311,24 @@ class DashboardInterface(ScrollArea):
                 strategy = RewardStrategy(str(cfg.rewardStrategy.value))
             except ValueError:
                 strategy = RewardStrategy.MAXIMIZE_PROGRESS
+            prerequisite_resolution = resolve_daily_capability_prerequisites()
+            for prerequisite in prerequisite_resolution.evidence.values():
+                logger.info(
+                    "Daily prerequisite {name}: status={status} source={source} "
+                    "observed_at={observed} reason={reason}".format(
+                        name=prerequisite.name,
+                        status=prerequisite.status,
+                        source=prerequisite.source,
+                        observed=prerequisite.observed_at,
+                        reason=prerequisite.block_reason,
+                    )
+                )
             dependencies = select_reward_dependency_tasks(
                 _daily_capability_registry(tasks),
                 _last_reward_snapshot(),
                 strategy,
+                satisfied_prerequisites=prerequisite_resolution.satisfied,
+                now=SERVER_CLOCK.server_now(),
             )
             existing = {task.key for task in due}
             insertion = due.index(reward_task)
