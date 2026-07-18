@@ -71,6 +71,14 @@ def validate_price_execution_evidence(
 
     current = now or SERVER_CLOCK.server_now()
     calculated_at = _parse_price_time(state.get("price_time"))
+    cycle = tuple(str(city) for city in state.get("cycle", ()))
+    # Production execution currently has one coherent evidence object for one
+    # two-station round trip.  Multi-stop plans must fail before any game input
+    # until every route edge has independently versioned evidence.
+    if len(cycle) != 2 or len(set(cycle)) != 2:
+        raise StalePriceSnapshot(
+            "production execution supports a two-station cycle; every route edge evidence is required"
+        )
     if not price_snapshot_is_fresh(calculated_at, now=current):
         raise StalePriceSnapshot("price snapshot expired")
     plan_source = str(state.get("price_source", "")).strip().lower()
@@ -86,9 +94,6 @@ def validate_price_execution_evidence(
     if not isinstance(raw, dict):
         if int(state.get("schema_version", 0) or 0) >= 3:
             raise StalePriceSnapshot("current price evidence is missing")
-        cycle = tuple(str(city) for city in state.get("cycle", ()))
-        if len(cycle) < 2:
-            raise StalePriceSnapshot("price evidence station pair is missing")
         return PriceExecutionEvidence(
             plan_source, calculated_at, calculated_at + timedelta(minutes=30),
             str(state.get("price_revision", "")), (cycle[0], cycle[1]),
@@ -109,8 +114,7 @@ def validate_price_execution_evidence(
         raise StalePriceSnapshot("price revision mismatch")
     pair_values = raw.get("station_pair")
     pair = tuple(str(value) for value in pair_values) if isinstance(pair_values, (list, tuple)) else ()
-    cycle = tuple(str(city) for city in state.get("cycle", ()))
-    if len(pair) != 2 or len(cycle) < 2 or pair != cycle[:2]:
+    if len(pair) != 2 or pair != cycle:
         raise StalePriceSnapshot("price evidence station pair mismatch")
     server_day_id = str(raw.get("server_day_id", ""))
     if server_day_id != SERVER_CLOCK.server_day_id(current):
