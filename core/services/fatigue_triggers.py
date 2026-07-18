@@ -45,7 +45,7 @@ def _write(path: Path, data: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
-def register_deferred_fatigue_actions(
+def replace_deferred_fatigue_plan(
     actions: Iterable[object],
     *,
     plan_revision: str | None = None,
@@ -91,6 +91,7 @@ def register_deferred_fatigue_actions(
                 "plan_revision": str(plan_revision),
                 "trigger_type": trigger_type,
                 "fired": False,
+                "schedule_status": "ACTIVE",
                 "cancelled": False,
                 "superseded": False,
                 **payload,
@@ -110,8 +111,22 @@ def register_deferred_fatigue_actions(
         for item in normalized:
             existing.setdefault(item["id"], item)
         data["actions"] = list(existing.values())
+        data["active_revision"] = str(plan_revision)
         _write(path, data)
     return len(normalized)
+
+
+def register_deferred_fatigue_actions(
+    actions: Iterable[object],
+    *,
+    plan_revision: str | None = None,
+    path: Path = STATE_PATH,
+) -> int:
+    """Compatibility alias for replacement semantics."""
+
+    return replace_deferred_fatigue_plan(
+        actions, plan_revision=plan_revision, path=path
+    )
 
 
 def notify_fatigue_event(
@@ -127,12 +142,15 @@ def notify_fatigue_event(
 
     event = str(event)
     waypoint_id = str(waypoint_id)
-    matched = False
+    pending_ids: list[str] = []
     with _LOCK:
         data = _read(path)
         current = now or SERVER_CLOCK.server_now()
         for item in data["actions"]:
             if any(item.get(flag) is True for flag in ("fired", "cancelled", "superseded")):
+                continue
+            if item.get("schedule_status") == "PENDING_SCHEDULE":
+                pending_ids.append(str(item.get("id", "")))
                 continue
             trigger_type = str(item.get("trigger_type", "")).upper()
             is_match = False
@@ -153,18 +171,60 @@ def notify_fatigue_event(
                     is_match = False
             if not is_match:
                 continue
-            item["fired"] = True
-            item["fired_by"] = event
-            item["fired_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
-            matched = True
-        if matched:
+            item["schedule_status"] = "PENDING_SCHEDULE"
+            item["pending_by"] = event
+            item["pending_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
+            pending_ids.append(str(item.get("id", "")))
+        if pending_ids:
             _write(path, data)
-    if matched:
-        callback = schedule or (
-            lambda: set_next_run("fatigue_recovery", SERVER_CLOCK.server_now())
-        )
+    if not pending_ids:
+        return False
+    callback = schedule or (
+        lambda: set_next_run("fatigue_recovery", SERVER_CLOCK.server_now())
+    )
+    try:
         callback()
-    return matched
+    except Exception as error:
+        with _LOCK:
+            data = _read(path)
+            for item in data["actions"]:
+                if str(item.get("id", "")) in pending_ids:
+                    item["schedule_status"] = "ACTIVE"
+                    item["schedule_error"] = repr(error)
+                    item["schedule_failed_at"] = SERVER_CLOCK.server_now().isoformat(
+                        timespec="seconds"
+                    )
+            _write(path, data)
+        raise
+    with _LOCK:
+        data = _read(path)
+        for item in data["actions"]:
+            if str(item.get("id", "")) not in pending_ids:
+                continue
+            item["schedule_status"] = "FIRED"
+            item["fired"] = True
+            item["fired_by"] = item.pop("pending_by", event)
+            item["fired_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
+        _write(path, data)
+    return True
+
+
+def recover_pending_fatigue_schedules(
+    *,
+    path: Path = STATE_PATH,
+    schedule: Callable[[], None] | None = None,
+) -> bool:
+    """Finish a scheduling transaction left pending by a process crash."""
+
+    with _LOCK:
+        data = _read(path)
+        if not any(
+            item.get("schedule_status") == "PENDING_SCHEDULE"
+            and not any(item.get(flag) is True for flag in ("fired", "cancelled", "superseded"))
+            for item in data["actions"]
+        ):
+            return False
+    return notify_fatigue_event("recover_pending_schedule", path=path, schedule=schedule)
 
 
 def cancel_deferred_fatigue_actions(*, path: Path = STATE_PATH) -> None:

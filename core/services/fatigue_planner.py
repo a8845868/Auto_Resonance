@@ -65,6 +65,16 @@ class FatigueSnapshot:
     next_bento_release_at: datetime | None
     natural_recovery_at: datetime | None
     source_confidence: str
+    fatigue_confidence: str = ""
+    station_confidence: str = ""
+    amenity_confidence: str = ""
+    soda_tier_confidence: str = ""
+    soda_remaining_confidence: str = ""
+    bento_inventory_confidence: str = ""
+    bento_value_confidence: str = ""
+
+    def confidence(self, field: str) -> str:
+        return str(getattr(self, field) or self.source_confidence).upper()
 
 
 @dataclass(frozen=True)
@@ -73,6 +83,7 @@ class RouteLeg:
     destination: str
     fatigue_increase: int
     destination_amenities: frozenset[str]
+    destination_amenity_confidence: str = "HIGH"
 
 
 @dataclass(frozen=True)
@@ -190,10 +201,29 @@ def plan_fatigue_recovery(
 ) -> FatiguePlan:
     if snapshot.observed_at.tzinfo is None or snapshot.observed_at.utcoffset() is None:
         raise ValueError("fatigue observations must be timezone-aware")
-    if snapshot.source_confidence.upper() == "UNKNOWN":
+    confidence_blockers = []
+    for field in ("fatigue_confidence", "station_confidence", "amenity_confidence"):
+        if snapshot.confidence(field) != "HIGH":
+            confidence_blockers.append(field)
+    soda_may_be_available = (
+        "REST_AREA" in snapshot.current_amenities
+        or snapshot.confidence("amenity_confidence") != "HIGH"
+    )
+    if soda_may_be_available:
+        for field in ("soda_tier_confidence", "soda_remaining_confidence"):
+            if snapshot.confidence(field) != "HIGH":
+                confidence_blockers.append(field)
+    if snapshot.confidence("bento_inventory_confidence") != "HIGH":
+        confidence_blockers.append("bento_inventory_confidence")
+    if (
+        snapshot.bento_batches_available > 0
+        and snapshot.confidence("bento_value_confidence") != "HIGH"
+    ):
+        confidence_blockers.append("bento_value_confidence")
+    if confidence_blockers:
         return FatiguePlan(
             snapshot, (), (), {}, {}, 0, {"reobserve": True}, FatiguePlanStatus.UNKNOWN,
-            "fatigue_snapshot_unknown",
+            "fatigue_snapshot_unknown:" + ",".join(confidence_blockers),
         )
     actions, reduced, usage = max(
         _immediate_sequences(snapshot, allow_premium_soda, max_iron_soda_cost),
@@ -233,6 +263,18 @@ def plan_fatigue_recovery(
         for leg in route.legs[route.current_leg_index :]:
             fatigue = min(snapshot.fatigue_cap, fatigue + max(0, leg.fatigue_increase))
             expected[leg.destination] = fatigue
+            if leg.destination_amenity_confidence.upper() != "HIGH":
+                return FatiguePlan(
+                    snapshot,
+                    (),
+                    (),
+                    expected,
+                    {},
+                    0,
+                    {"reobserve": True, "waypoint_id": leg.destination},
+                    FatiguePlanStatus.UNKNOWN,
+                    "destination_amenity_unknown",
+                )
             soda_ready = (
                 "REST_AREA" in leg.destination_amenities
                 and snapshot.soda_uses_remaining > 0

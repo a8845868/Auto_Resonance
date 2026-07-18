@@ -44,9 +44,10 @@ def _route_context(current_station: str | None = None) -> TradeRouteContext | No
     legs = []
     for index, origin in enumerate(cycle):
         destination = cycle[(index + 1) % len(cycle)]
+        availability = rest_area_availability(destination)
         amenities = (
             frozenset({"REST_AREA"})
-            if rest_area_availability(destination) is True
+            if availability is True
             else frozenset()
         )
         legs.append(
@@ -55,6 +56,7 @@ def _route_context(current_station: str | None = None) -> TradeRouteContext | No
                 destination,
                 int(fatigue.get(f"{origin}-{destination}", 0)),
                 amenities,
+                "HIGH" if isinstance(availability, bool) else "UNKNOWN",
             )
         )
     current_leg_index = 0
@@ -169,6 +171,29 @@ def _snapshot_from_observation(
         next_bento_release_at=_next_bento_release(SERVER_CLOCK.server_now()),
         natural_recovery_at=None,
         source_confidence="HIGH" if resource_known else "UNKNOWN",
+        fatigue_confidence="HIGH",
+        station_confidence="HIGH" if station_name else "UNKNOWN",
+        amenity_confidence=(
+            "HIGH"
+            if isinstance(observation.get("rest_area_available"), bool)
+            else "UNKNOWN"
+        ),
+        soda_tier_confidence=(
+            "HIGH"
+            if tiers or observation.get("rest_area_available") is False
+            else "UNKNOWN"
+        ),
+        soda_remaining_confidence=(
+            "HIGH"
+            if tiers or observation.get("rest_area_available") is False
+            else "UNKNOWN"
+        ),
+        bento_inventory_confidence="HIGH" if lunches is not None else "UNKNOWN",
+        bento_value_confidence=(
+            "HIGH"
+            if lunches is not None and (int(lunches) == 0 or lunch_total is not None)
+            else "UNKNOWN"
+        ),
     )
 
 
@@ -219,7 +244,11 @@ def run_daily_fatigue_recovery() -> dict:
         if action_result.get("success") is not True:
             logger.warning(f"疲劳动作验证失败，重新规划前暂缓: {action_result}")
             plan = plan_fatigue_recovery(
-                replace(plan.snapshot, source_confidence="UNKNOWN"),
+                replace(
+                    plan.snapshot,
+                    source_confidence="UNKNOWN",
+                    fatigue_confidence="UNKNOWN",
+                ),
                 route,
                 allow_premium_soda=bool(cfg.UseSilverBranch.value),
                 max_iron_soda_cost=int(cfg.MaxIronSodaCost.value),
@@ -277,9 +306,8 @@ def run_daily_fatigue_recovery() -> dict:
             continue
         # Waypoint actions are dataclasses and are normalized by the trigger
         # registry; their non-empty waypoint makes the trigger unambiguous.
-    if deferred_actions:
-        revision = f"{plan.snapshot.server_day_id}:{plan.snapshot.observed_at.isoformat()}"
-        register_deferred_fatigue_actions(deferred_actions, plan_revision=revision)
+    revision = f"{plan.snapshot.server_day_id}:{plan.snapshot.observed_at.isoformat()}"
+    register_deferred_fatigue_actions(deferred_actions, plan_revision=revision)
     go_home()
     result = {
         "success": True,
