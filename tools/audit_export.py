@@ -86,7 +86,20 @@ def _json_string_values(value: object):
             yield from _json_string_values(child)
 
 
-def _scan_text_payload(text: str, *, suffix: str) -> tuple[set[str], int]:
+def _scan_text_payload(
+    text: str,
+    *,
+    suffix: str,
+    filename: str = "",
+) -> tuple[set[str], int]:
+    if filename.upper() == "SHA256SUMS.TXT":
+        # A random hexadecimal digest can contain an 11-digit run that looks
+        # like a phone number.  Hashes cannot contain the source plaintext, so
+        # scan only the export-relative path column of the manifest.
+        text = "\n".join(
+            line.split("  ", 1)[1] if "  " in line else line
+            for line in text.splitlines()
+        )
     hits = set(scan_sensitive_text(text))
     decoded_values = 0
     decoded_objects: list[object] = []
@@ -122,7 +135,11 @@ def scan_sensitive_tree(root: Path) -> tuple[list[str], dict[str, int]]:
     ):
         files_scanned += 1
         text = path.read_text(encoding="utf-8", errors="replace")
-        names, count = _scan_text_payload(text, suffix=path.suffix.lower())
+        names, count = _scan_text_payload(
+            text,
+            suffix=path.suffix.lower(),
+            filename=path.name,
+        )
         decoded_values += count
         relative = path.relative_to(root).as_posix()
         hits.extend(f"{relative}:{name}" for name in sorted(names))
@@ -159,7 +176,11 @@ def _scan_zip(zip_path: Path) -> tuple[list[str], dict[str, int]]:
                 continue
             files_scanned += 1
             text = archive.read(name).decode("utf-8", errors="replace")
-            names, count = _scan_text_payload(text, suffix=suffix)
+            names, count = _scan_text_payload(
+                text,
+                suffix=suffix,
+                filename=Path(name).name,
+            )
             decoded_values += count
             hits.extend(f"{name}:{kind}" for kind in sorted(names))
     return hits, {
