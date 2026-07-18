@@ -360,7 +360,8 @@ def optimize_live_routes(
         if latest_timestamp
         else "离线基础价格"
     )
-    best["price_source"] = "live" if latest_timestamp else "builtin"
+    best["price_source"] = "live_exchange" if latest_timestamp else "offline"
+    best["price_revision"] = latest_timestamp or ""
     best["api"] = PRICE_API if latest_timestamp else ""
     best["assumptions"] = {
         "cargo": config.cargo,

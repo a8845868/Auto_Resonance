@@ -34,10 +34,15 @@ def test_adaptive_weekly_run_replaces_stale_closed_station_plan():
         "cycle": ["A", "B"],
         "books_used": 0,
         "price_time": business.SERVER_CLOCK.server_now().isoformat(),
+        "price_source": "game_observed",
+        "price_revision": "test-revision",
         "expected_profit": 100,
         "cycle_fatigue": 10,
         "total_runs": 1,
         "books_total": 0,
+        "repeats": 1,
+        "runs": [{}],
+        "execution_batches": [{"runs": 1, "books": {}}],
     }
     saved = dict(replacement)
 
@@ -63,7 +68,9 @@ def test_adaptive_weekly_run_replaces_stale_closed_station_plan():
     assert result is True
     optimize.assert_called_once()
     save.assert_called_once_with(replacement)
-    execute.assert_called_once_with("A", "B", [{"runs": 1, "books": {}}], max_runs=1)
+    execute.assert_called_once_with(
+        "A", "B", [{"runs": 1, "books": {}}], max_runs=1, available_books=0
+    )
 
 
 def test_adaptive_weekly_run_never_falls_back_to_closed_route():

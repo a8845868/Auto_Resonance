@@ -128,10 +128,8 @@ def validate_executable_trade_budget(
         raise StalePriceSnapshot(
             f"price snapshot expired: calculated_at={calculated_at.isoformat()} now={current.isoformat()}"
         )
-    price_source = str(state.get("price_source", "live_exchange")).lower()
-    if price_source in {"basic", "offline", "synthetic", "fallback"} and not bool(
-        state.get("allow_conservative_execution", False)
-    ):
+    price_source = str(state.get("price_source", "")).strip().lower()
+    if price_source not in {"live_exchange", "game_observed"}:
         raise StalePriceSnapshot(
             f"price source {price_source!r} is not approved for real execution"
         )
@@ -147,7 +145,24 @@ def validate_executable_trade_budget(
     cycle_fatigue = int(round(float(state.get("cycle_fatigue", 0))))
     if cycle_fatigue <= 0:
         raise ValueError("executable trade plan must have positive fatigue cost")
-    per_cycle_books = max(0, int(state.get("books_total", 0)) // total_runs)
+    runs = state.get("runs")
+    if not isinstance(runs, list) or len(runs) != total_runs:
+        raise ValueError("executable trade plan requires an exact per-run book schedule")
+    normalized_runs: list[dict[str, int]] = []
+    for run in runs:
+        if not isinstance(run, dict):
+            raise ValueError("book schedule contains an invalid run")
+        normalized_runs.append({str(city): max(0, int(value)) for city, value in run.items()})
+    scheduled_total = sum(sum(run.values()) for run in normalized_runs)
+    if scheduled_total != max(0, int(state.get("books_total", scheduled_total))):
+        raise ValueError("book schedule total does not match books_total")
+    run_index = min(max(0, int(state.get("completed_runs", 0))), total_runs - 1)
+    current_schedule = normalized_runs[run_index]
+    confirmed_legs = max(
+        0, int((state.get("current_partial_cycle") or {}).get("confirmed_legs", 0))
+    )
+    remaining_origins = cycle[min(confirmed_legs, len(cycle)) :]
+    per_cycle_books = sum(current_schedule.get(city, 0) for city in remaining_origins)
     candidate = TradeCandidate(
         route_id="|".join(cycle),
         current_city=str(state.get("current_city", cycle[0] if cycle else "")),
@@ -214,8 +229,7 @@ def recommend_max_feasible_runs_today(
         if books_per_cycle <= 0
         else max(0, int(purchase_books)) // int(books_per_cycle)
     )
-    partial_credit = 1 if partial_cycle and partial_cycle.get("confirmed_legs") else 0
-    return min(max(0, int(remaining_runs)), max(partial_credit, min(fatigue_runs, book_runs)))
+    return min(max(0, int(remaining_runs)), min(fatigue_runs, book_runs))
 
 
 recommend_today_runs = recommend_max_feasible_runs_today
