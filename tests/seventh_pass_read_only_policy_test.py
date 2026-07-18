@@ -42,3 +42,9 @@ def test_navigation_anchor_is_allowed_but_buy_button_is_blocked():
     assert guard.tap("exchange_buy_anchor", (805, 324), "exchange_menu") is True
     assert guard.tap("unclassified_tap", (1000, 650), "预计买入 买入总价") is False
     tap.assert_called_once_with((805, 324))
+
+
+def test_transaction_page_still_allows_normalized_back_button():
+    guard = ReadOnlyActionGuard()
+    assert guard.authorize_coordinate((80, 40), page_context="预计买入 买入总价") is True
+    assert guard.journal[-1].action_key == "back"

@@ -108,6 +108,11 @@ class ReadOnlyActionGuard:
             except Exception as error:
                 self._record("unclassified_tap", coordinate, f"context_error:{type(error).__name__}")
                 return False
+        x, y = int(coordinate[0]), int(coordinate[1])
+        # The normalized game back button is a navigation invariant.  It must
+        # remain usable even when the current page contains transaction text.
+        if 0 <= x <= 180 and 0 <= y <= 120:
+            return self._record("back", coordinate, context)
         return self._record("unclassified_tap", coordinate, context)
 
     def authorize_swipe(
