@@ -133,8 +133,8 @@ def test_daily_stage_reward_waits_for_stale_frames_without_clicking_other_boxes(
 def test_daily_completion_requires_two_clean_frames_at_600_or_more():
     driver = FakeDriver()
     driver.frame = Mock(side_effect=[
-        yellow_stage_frame(items=daily_page_items("600")),
-        yellow_stage_frame(items=daily_page_items("600")),
+        yellow_stage_frame(items=daily_page_items("600/600")),
+        yellow_stage_frame(items=daily_page_items("600/600")),
     ])
     collector = RewardCollector(driver)
 

@@ -105,6 +105,108 @@ def _center(item: dict) -> tuple[int, int]:
     return int((points[0][0] + points[2][0]) / 2), int((points[0][1] + points[2][1]) / 2)
 
 
+def _manual_daily_progress(items: list[dict]) -> tuple[int, int] | None:
+    """Read only the handbook aggregate ratio anchored to its summary card."""
+
+    task_markers = (
+        "姣忔棩浠诲姟", "浠婃棩浠诲姟", "浠诲姟鍒楄〃",
+        "每日任务", "今日任务", "任务列表",
+    )
+    aggregate_markers = (
+        "鎬昏繘搴?", "瀹屾垚杩涘害", "总进度", "完成进度", "AGGREGATE",
+    )
+    task_anchors = [
+        _center(item)
+        for item in items
+        if item.get("position")
+        and any(marker in str(item.get("text", "")) for marker in task_markers)
+    ]
+    aggregate_anchors = [
+        _center(item)
+        for item in items
+        if item.get("position")
+        and any(marker in str(item.get("text", "")) for marker in aggregate_markers)
+    ]
+    if not task_anchors or not aggregate_anchors:
+        return None
+    candidates = []
+    for item in items:
+        if not item.get("position"):
+            continue
+        match = re.search(r"(\d+)\s*/\s*(\d+)", str(item.get("text", "")))
+        if not match:
+            continue
+        x, y = _center(item)
+        if not (100 <= x <= 620 and 90 <= y <= 360):
+            continue
+        distance = min(
+            abs(x - anchor_x) + abs(y - anchor_y)
+            for anchor_x, anchor_y in aggregate_anchors
+        )
+        completed, total = map(int, match.groups())
+        if distance <= 240 and 0 < total <= 50 and 0 <= completed <= total:
+            candidates.append((distance, x, y, completed, total))
+    if not candidates:
+        return None
+    _, _, _, completed, total = min(candidates)
+    return completed, total
+
+
+def _manual_level_frame_observation(frame) -> tuple[int, int, int] | None:
+    """Return page anchor, numeric level and claim evidence from fixed ROIs."""
+
+    items = frame.ocr()
+    page_markers = ("鐜父鎵嬪唽", "绛夌骇濂栧姳", "环游手册", "等级奖励")
+    if not any(
+        any(marker in str(item.get("text", "")) for marker in page_markers)
+        for item in items
+    ):
+        return None
+    levels = []
+    claimable = 0
+    claim_markers = ("鍙鍙?", "涓€閿鍙?", "可领取", "一键领取")
+    for item in items:
+        if not item.get("position"):
+            continue
+        x, y = _center(item)
+        text = str(item.get("text", ""))
+        if 120 <= x <= 560 and 80 <= y <= 260:
+            match = re.search(r"(?:LV\.?|等级|绛夌骇)?\s*(\d{1,3})", text, re.IGNORECASE)
+            if match:
+                levels.append(int(match.group(1)))
+        if 780 <= x <= 1220 and 430 <= y <= 680 and any(
+            marker in text for marker in claim_markers
+        ):
+            claimable += 1
+    image = getattr(frame, "image", None)
+    red_dot = 0
+    if isinstance(image, np.ndarray) and image.size:
+        hsv = cv.cvtColor(image, cv.COLOR_BGR2HSV)
+        roi = hsv[60:680, 760:1240]
+        red = cv.bitwise_or(
+            cv.inRange(roi, np.array((0, 120, 120)), np.array((10, 255, 255))),
+            cv.inRange(roi, np.array((170, 120, 120)), np.array((179, 255, 255))),
+        )
+        red_dot = int(cv.countNonZero(red) >= 12)
+    return max(levels) if levels else -1, claimable, red_dot
+
+
+def _observe_manual_level_rewards(driver, stable_frames: int = 2) -> int | None:
+    observations = []
+    count = max(2, int(stable_frames))
+    for index in range(count):
+        observation = _manual_level_frame_observation(driver.frame())
+        if observation is None:
+            return None
+        observations.append(observation)
+        if index + 1 < count:
+            driver.sleep(0.25)
+    if any(item != observations[0] for item in observations[1:]):
+        return None
+    _, claimable, red_dot = observations[0]
+    return max(claimable, red_dot)
+
+
 def _matches(actual: str, expected: str) -> bool:
     return expected.replace(" ", "") in actual.replace(" ", "")
 
@@ -369,8 +471,8 @@ class RewardCollector:
             items = observation.ocr()
             if not _is_daily_activity_page(items):
                 return False
-            activity = _daily_activity_value(items)
-            if activity is None or activity < 600:
+            progress = _daily_activity_progress(items)
+            if progress is None or progress[0] < progress[1]:
                 return False
             if any(_matches(str(item.get("text", "")), "可领取") for item in items):
                 return False
@@ -571,15 +673,12 @@ class RewardCollector:
         completed, total, task_rewards = frames[0]
         if not self.driver.click_exact_text("环游手册", attempts=2):
             return None
-        level_items = self.driver.texts()
-        level_rewards = sum(
-            1
-            for item in level_items
-            if any(
-                marker in str(item.get("text", ""))
-                for marker in ("可领取", "一键领取")
-            )
+        level_rewards = _observe_manual_level_rewards(
+            self.driver, stable_frames=stable_frames
         )
+        if level_rewards is None:
+            logger.warning("手册等级奖励页多帧证据不稳定，本次保持 UNKNOWN")
+            return None
         return {
             "completed": completed,
             "total": total,
