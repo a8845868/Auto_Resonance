@@ -29,7 +29,10 @@ from core.services.fatigue_planner import (
     load_fatigue_usage,
     plan_fatigue_recovery,
 )
-from core.services.fatigue_triggers import register_deferred_fatigue_actions
+from core.services.fatigue_triggers import (
+    CheckpointTransferIntent,
+    register_deferred_fatigue_actions,
+)
 from core.services.server_calendar import SERVER_CLOCK
 from core.services.station_facilities import rest_area_availability
 from core.services.weekly_plan_state import load_weekly_plan
@@ -324,13 +327,33 @@ def _run_daily_fatigue_recovery_impl(*, expected_waypoint: str | None = None) ->
             "trigger_type": "REOBSERVE_AT",
             "run_at": (SERVER_CLOCK.server_now() + timedelta(minutes=15)).isoformat(),
         }]
-    for action in deferred_actions:
-        if isinstance(action, dict):
-            continue
-        # Waypoint actions are dataclasses and are normalized by the trigger
-        # registry; their non-empty waypoint makes the trigger unambiguous.
     revision = f"{plan.snapshot.server_day_id}:{plan.snapshot.observed_at.isoformat()}"
-    register_deferred_fatigue_actions(deferred_actions, plan_revision=revision)
+    transfer_intent = None
+    if plan.status is FatiguePlanStatus.DEFER_UNTIL_WAYPOINT:
+        waypoint_action = next(
+            (
+                action for action in deferred_actions
+                if str(getattr(action, "waypoint_id", "") or (action.get("waypoint_id") if isinstance(action, dict) else ""))
+            ),
+            None,
+        )
+        if waypoint_action is None:
+            raise RuntimeError("DEFER_UNTIL_WAYPOINT did not produce a target waypoint action")
+        payload = asdict(waypoint_action) if not isinstance(waypoint_action, dict) else dict(waypoint_action)
+        target_waypoint = str(payload.get("waypoint_id", "")).strip()
+        transfer_intent = CheckpointTransferIntent(
+            target_waypoint=target_waypoint,
+            trigger_type="WAYPOINT",
+            action_payload=_json_value(payload),
+            source_plan_revision=revision,
+            cycle_id=str(route.route_id if route is not None else ""),
+            cycle_server_day=str(plan.snapshot.server_day_id),
+            reason=str(plan.reason),
+        )
+        if not transfer_intent.cycle_id:
+            raise RuntimeError("waypoint transfer requires an active route cycle")
+    else:
+        register_deferred_fatigue_actions(deferred_actions, plan_revision=revision)
     go_home()
     result = {
         "success": True,
@@ -346,6 +369,8 @@ def _run_daily_fatigue_recovery_impl(*, expected_waypoint: str | None = None) ->
         "initial_plan": _json_value(asdict(initial_plan)),
         "progress_made": progress_made,
     }
+    if transfer_intent is not None:
+        result["transfer_intent"] = _json_value(asdict(transfer_intent))
     if plan.status is not FatiguePlanStatus.COMPLETE_FOR_DAY:
         result.update(deferred=True, reason=plan.reason, status=plan.status.value)
         if plan.status is FatiguePlanStatus.DEFER_UNTIL_RELEASE and plan.snapshot.next_bento_release_at is not None:
@@ -414,6 +439,21 @@ def run_daily_fatigue_recovery(
                 path=path,
             )
         raise
+    if checkpoint is None and isinstance(result.get("transfer_intent"), dict):
+        transfer = dict(result["transfer_intent"])
+        initial_action = {
+            **dict(transfer.get("action_payload") or {}),
+            "trigger_type": "WAYPOINT",
+            "waypoint_id": transfer["target_waypoint"],
+            "source_plan_revision": transfer["source_plan_revision"],
+            "cycle_id": transfer["cycle_id"],
+            "cycle_server_day": transfer["cycle_server_day"],
+        }
+        register_deferred_fatigue_actions(
+            [initial_action],
+            plan_revision=str(transfer["source_plan_revision"]),
+            path=path,
+        )
     if checkpoint is not None:
         transaction = complete_fatigue_checkpoint_processing(
             str(checkpoint["id"]), result,
