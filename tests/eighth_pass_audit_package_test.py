@@ -79,3 +79,21 @@ def test_hash_manifest_digest_is_not_misclassified_as_phone(tmp_path: Path):
         archive.write(package / "SHA256SUMS.txt", "package/SHA256SUMS.txt")
     zip_hits, _ = audit._scan_zip(archive_path)
     assert zip_hits == []
+
+
+def test_audit_publish_retries_transient_windows_lock(tmp_path: Path, monkeypatch):
+    baseline, target = _trees(tmp_path)
+    original_replace = Path.replace
+    transient_failures = 0
+
+    def replace_once(self, destination):
+        nonlocal transient_failures
+        if self.name.endswith(".staging") and transient_failures == 0:
+            transient_failures += 1
+            raise PermissionError("transient scanner lock")
+        return original_replace(self, destination)
+
+    monkeypatch.setattr(Path, "replace", replace_once)
+    output = audit.build_reversible_audit_package(baseline, target, tmp_path / "out")
+    assert output.exists()
+    assert transient_failures == 1
