@@ -7,7 +7,11 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Callable, Iterable
 
-from core.services.daily_rewards import DailyProgressSnapshot, RewardStrategy
+from core.services.daily_rewards import (
+    DailyProgressSnapshot,
+    RewardStrategy,
+    snapshot_unknown_for_enabled_channels,
+)
 from core.services.server_calendar import SERVER_CLOCK
 
 
@@ -125,6 +129,32 @@ def _parse_observed_at(value: object) -> datetime | None:
     return None
 
 
+def _aware(value: datetime | None) -> bool:
+    return bool(value is not None and value.tzinfo is not None and value.utcoffset() is not None)
+
+
+def _station_evidence_is_fresh(
+    evidence: object, cycle: list[str], current: datetime
+) -> bool:
+    if not isinstance(evidence, dict):
+        return False
+    source = str(evidence.get("source", ""))
+    observed = _parse_observed_at(evidence.get("observed_at"))
+    valid_until = _parse_observed_at(evidence.get("valid_until"))
+    covered = {
+        str(item)
+        for key in ("available", "closed", "unknown")
+        for item in evidence.get(key, ())
+    }
+    return bool(
+        source in {"station_registry", "game_observed"}
+        and _aware(observed)
+        and _aware(valid_until)
+        and observed <= current <= valid_until
+        and set(cycle) <= covered
+    )
+
+
 def resolve_daily_capability_prerequisites(
     *,
     trade_state: dict | None = None,
@@ -157,18 +187,21 @@ def resolve_daily_capability_prerequisites(
         )
     else:
         try:
-            from core.services.station_availability import unavailable_stations
+            from core.services import station_availability
             from core.services.trade_planning import validate_executable_trade_budget
 
             cycle = [str(item) for item in trade_state.get("cycle", ())]
-            declared = trade_state.get("stations_available")
-            if declared is not None:
-                available = {str(item) for item in declared}
-                closed = [item for item in cycle if item not in available]
-            else:
-                closed = unavailable_stations(cycle, at=current)
+            availability = trade_state.get("station_availability_evidence")
+            if not _station_evidence_is_fresh(availability, cycle, current):
+                availability = station_availability.station_availability_evidence(
+                    cycle, at=current
+                )
+            closed = [str(item) for item in availability.get("closed", ())]
+            unknown = [str(item) for item in availability.get("unknown", ())]
             if closed:
                 raise ValueError(f"route stations unavailable: {closed}")
+            if unknown:
+                raise ValueError(f"route station availability unknown: {unknown}")
             budget_fatigue = (
                 int(fatigue_budget)
                 if fatigue_budget is not None
@@ -192,14 +225,19 @@ def resolve_daily_capability_prerequisites(
             evidence["fresh_trade_plan"] = PrerequisiteEvidence(
                 "fresh_trade_plan",
                 "SATISFIED",
-                "weekly_plan+station_registry",
+                "weekly_plan+" + str(availability.get("source", "UNKNOWN")),
                 trade_observed,
             )
         except (TypeError, ValueError, RuntimeError) as error:
+            availability_source = (
+                str(availability.get("source", "UNKNOWN"))
+                if isinstance(locals().get("availability"), dict)
+                else "UNKNOWN"
+            )
             evidence["fresh_trade_plan"] = PrerequisiteEvidence(
                 "fresh_trade_plan",
                 "BLOCKED",
-                "weekly_plan+station_registry",
+                "weekly_plan+" + availability_source,
                 trade_observed,
                 str(error),
             )
@@ -218,16 +256,38 @@ def resolve_daily_capability_prerequisites(
         completed = int(passenger_state.get("completed_carriages", 0))
         target = int(passenger_state.get("target_carriages", 0))
         reasons = []
+        evidence_status = "BLOCKED"
+        server_day_id = str(passenger_state.get("server_day_id", ""))
+        if not _aware(passenger_observed):
+            reasons.append("passenger_observation_timestamp_unknown")
+            evidence_status = "UNKNOWN"
+        elif server_day_id != SERVER_CLOCK.server_day_id(current):
+            reasons.append("passenger_observation_server_day_mismatch")
+            evidence_status = "UNKNOWN"
+        elif not timedelta(0) <= current - passenger_observed <= timedelta(minutes=15):
+            reasons.append("passenger_observation_stale")
         if status in {"completed", "complete"} or (target > 0 and completed >= target):
             reasons.append("nonrepeatable_build_already_complete")
         if passenger_state.get("premium_currency_required") is not False:
             reasons.append("premium_currency_safety_unknown")
         if passenger_state.get("automation_safe") is not True:
             reasons.append("automation_safety_unknown")
+        safety_source = str(passenger_state.get("automation_safety_source", ""))
+        safety_reason = str(passenger_state.get("automation_safety_reason", ""))
+        if safety_source not in {"game_observed", "verified_config"} or not safety_reason:
+            reasons.append("automation_safety_evidence_missing")
+        if (
+            passenger_state.get("evidence_config_revision")
+            != passenger_state.get("config_revision")
+            or passenger_state.get("evidence_target_carriages") != target
+            or passenger_state.get("evidence_completed_carriages") != completed
+            or str(passenger_state.get("evidence_status", "")).lower() != status
+        ):
+            reasons.append("passenger_safety_evidence_revision_mismatch")
         evidence["safe_build_available"] = PrerequisiteEvidence(
             "safe_build_available",
-            "BLOCKED" if reasons else "SATISFIED",
-            "passenger_build_plan",
+            evidence_status if reasons else "SATISFIED",
+            "passenger_build_plan+" + (safety_source or "UNKNOWN"),
             passenger_observed,
             ";".join(reasons),
         )
@@ -244,19 +304,23 @@ def select_daily_capabilities(
     strategy: RewardStrategy,
     *,
     satisfied_prerequisites: frozenset[str] = frozenset(),
+    daily_activity_enabled: bool = True,
+    travel_manual_enabled: bool = True,
 ) -> list[DailyCapability]:
     """Select one minimum-cost safe action, then require a fresh observation."""
 
     if strategy is RewardStrategy.CLAIM_ONLY:
         return []
-    if snapshot is None or snapshot.daily_activity_confidence.upper() == "UNKNOWN":
+    if snapshot is None or snapshot_unknown_for_enabled_channels(
+        snapshot, daily_activity_enabled, travel_manual_enabled
+    ):
         return []
-    activity_gap = None
-    handbook_gap = None
+    activity_gap = 0 if not daily_activity_enabled else None
+    handbook_gap = 0 if not travel_manual_enabled else None
     if snapshot is not None:
-        if snapshot.daily_activity_current is not None and snapshot.daily_activity_max is not None:
+        if daily_activity_enabled and snapshot.daily_activity_current is not None and snapshot.daily_activity_max is not None:
             activity_gap = max(0, snapshot.daily_activity_max - snapshot.daily_activity_current)
-        if snapshot.handbook_daily_tasks_completed is not None and snapshot.handbook_daily_tasks_total is not None:
+        if travel_manual_enabled and snapshot.handbook_daily_tasks_completed is not None and snapshot.handbook_daily_tasks_total is not None:
             handbook_gap = max(
                 0,
                 snapshot.handbook_daily_tasks_total - snapshot.handbook_daily_tasks_completed,
@@ -318,6 +382,8 @@ def plan_daily_reward_dependencies(
     now: datetime | None = None,
     satisfied_prerequisites: frozenset[str] = frozenset(),
     post_action_observation_required: bool = False,
+    daily_activity_enabled: bool = True,
+    travel_manual_enabled: bool = True,
 ) -> RewardDependencyPlan:
     """Choose one scheduler action while enforcing observation-first ordering."""
 
@@ -343,23 +409,32 @@ def plan_daily_reward_dependencies(
             RewardSchedulingStatus.UNKNOWN_RETRY,
             reason="fresh_post_action_observation_required",
         )
-    if snapshot.daily_activity_confidence.upper() == "UNKNOWN":
+    if snapshot_unknown_for_enabled_channels(
+        snapshot, daily_activity_enabled, travel_manual_enabled
+    ):
         return RewardDependencyPlan(
             RewardSchedulingStatus.UNKNOWN_RETRY, reason="snapshot_unknown"
         )
     if (
-        snapshot.daily_activity_unclaimed_tiers
-        or snapshot.handbook_rewards_unclaimed
+        (daily_activity_enabled and snapshot.daily_activity_unclaimed_tiers)
+        or (travel_manual_enabled and snapshot.handbook_rewards_unclaimed)
     ):
         return RewardDependencyPlan(RewardSchedulingStatus.CLAIM)
     if (
-        snapshot.daily_activity_current is not None
-        and snapshot.daily_activity_max is not None
-        and snapshot.daily_activity_current >= snapshot.daily_activity_max
-        and snapshot.handbook_daily_tasks_completed is not None
-        and snapshot.handbook_daily_tasks_total is not None
-        and snapshot.handbook_daily_tasks_completed
-        >= snapshot.handbook_daily_tasks_total
+        not daily_activity_enabled
+        or (
+            snapshot.daily_activity_current is not None
+            and snapshot.daily_activity_max is not None
+            and snapshot.daily_activity_current >= snapshot.daily_activity_max
+        )
+    ) and (
+        not travel_manual_enabled
+        or (
+            snapshot.handbook_daily_tasks_completed is not None
+            and snapshot.handbook_daily_tasks_total is not None
+            and snapshot.handbook_daily_tasks_completed
+            >= snapshot.handbook_daily_tasks_total
+        )
     ):
         return RewardDependencyPlan(RewardSchedulingStatus.COMPLETE)
     selected = select_daily_capabilities(
@@ -367,6 +442,8 @@ def plan_daily_reward_dependencies(
         snapshot,
         strategy,
         satisfied_prerequisites=satisfied_prerequisites,
+        daily_activity_enabled=daily_activity_enabled,
+        travel_manual_enabled=travel_manual_enabled,
     )
     if selected:
         return RewardDependencyPlan(

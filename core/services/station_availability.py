@@ -112,3 +112,40 @@ def unavailable_stations(
 ) -> list[str]:
     rules = _load_registry() if registry is None else registry
     return [name for name in stations if not is_station_available(name, at, registry=rules)]
+
+
+def station_availability_evidence(
+    stations,
+    at: datetime | None = None,
+    *,
+    registry: dict | None = None,
+    ttl: timedelta = timedelta(minutes=5),
+) -> dict[str, object]:
+    """Return timestamped registry evidence without conflating closed and unknown."""
+
+    now = _local_time(at)
+    rules = _load_registry() if registry is None else registry
+    available: list[str] = []
+    closed: list[str] = []
+    unknown: list[str] = []
+    for raw_station in stations:
+        station = str(raw_station)
+        reason = station_unavailable_reason(station, now, registry=rules)
+        if reason is None:
+            available.append(station)
+            continue
+        if any(
+            marker in reason
+            for marker in ("缺少", "配置无效", "未配置", "下一次开放时间未定")
+        ):
+            unknown.append(station)
+        else:
+            closed.append(station)
+    return {
+        "available": available,
+        "closed": closed,
+        "unknown": unknown,
+        "source": "station_registry",
+        "observed_at": now.isoformat(timespec="seconds"),
+        "valid_until": (now + ttl).isoformat(timespec="seconds"),
+    }

@@ -26,7 +26,13 @@ def _iso(value: datetime) -> str:
 
 
 def create_build_monitor_plan(
-    *, target_carriages: int, current_carriages: int, path: Path = BUILD_PLAN_PATH
+    *,
+    target_carriages: int,
+    current_carriages: int,
+    path: Path = BUILD_PLAN_PATH,
+    automation_safe: bool | None = None,
+    safety_source: str = "",
+    safety_reason: str = "",
 ) -> dict:
     """Create a durable sequential passenger-carriage construction plan."""
     target = min(8, max(1, int(target_carriages)))
@@ -41,7 +47,16 @@ def create_build_monitor_plan(
         "history": [],
         "premium_currency_required": False,
         "currency_type": "IRON",
-        "automation_safe": True,
+        # A local plan is not safety evidence. A production observer must fill
+        # these fields after verifying the in-game build action and currency.
+        "automation_safe": automation_safe is True,
+        "automation_safety_source": safety_source or "UNKNOWN",
+        "automation_safety_reason": safety_reason or "not_game_observed",
+        "config_revision": f"target:{target}:current:{current}",
+        "evidence_config_revision": "",
+        "evidence_target_carriages": None,
+        "evidence_completed_carriages": None,
+        "evidence_status": "",
         "observed_at": _iso(datetime.now().astimezone()),
     }
     save_build_monitor_plan(state, path)
