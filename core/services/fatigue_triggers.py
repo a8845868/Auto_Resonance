@@ -189,7 +189,11 @@ def notify_fatigue_event(
             data = _read(path)
             for item in data["actions"]:
                 if str(item.get("id", "")) in pending_ids:
-                    item["schedule_status"] = "ACTIVE"
+                    item["schedule_status"] = (
+                        "PENDING_SCHEDULE"
+                        if event == "recover_pending_schedule"
+                        else "ACTIVE"
+                    )
                     item["schedule_error"] = repr(error)
                     item["schedule_failed_at"] = SERVER_CLOCK.server_now().isoformat(
                         timespec="seconds"
