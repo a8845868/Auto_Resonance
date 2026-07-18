@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
@@ -296,8 +296,8 @@ class DailyTaskCard:
     current: int
     target: int
     completed: bool
-    claimable: bool
-    claimed: bool
+    claimable: bool | None
+    claimed: bool | None
     contribution: int | None
     page_fingerprint: str
 
@@ -324,8 +324,8 @@ class ManualTaskCard:
     current: int
     target: int
     completed: bool
-    claimable: bool
-    claimed: bool
+    claimable: bool | None
+    claimed: bool | None
     contribution: int | None
     page_fingerprint: str
 
@@ -346,6 +346,83 @@ class ManualLevelObservation:
     visible_claimed_levels: int
     track_scan_complete: bool
     confidence: str
+
+
+@dataclass(frozen=True)
+class PageScanEvidence:
+    movement_confirmed: bool
+    end_marker: bool
+    captured_at: datetime
+    displacement_px: int = 0
+    page_anchor_confirmed: bool = True
+
+
+@dataclass(frozen=True)
+class ManualTrackSegment:
+    level: int
+    slot: str
+    claimable: bool
+    claimed: bool
+    locked: bool
+
+
+class ManualRewardTrackScanner:
+    def __init__(
+        self,
+        *,
+        min_frame_separation: timedelta = timedelta(milliseconds=200),
+    ):
+        self.min_frame_separation = min_frame_separation
+        self._segments: dict[tuple[int, str], ManualTrackSegment] = {}
+        self._movement_seen = False
+        self._end_seen = False
+        self._last_captured_at: datetime | None = None
+        self._time_separated = True
+        self._anchor_valid = True
+
+    @property
+    def segments(self) -> tuple[ManualTrackSegment, ...]:
+        return tuple(self._segments.values())
+
+    @property
+    def complete(self) -> bool:
+        return (
+            self._movement_seen
+            and self._end_seen
+            and self._time_separated
+            and self._anchor_valid
+        )
+
+    @property
+    def claimable_level_rewards(self) -> int:
+        return sum(1 for segment in self.segments if segment.claimable)
+
+    def add_segments(
+        self,
+        segments: list[ManualTrackSegment],
+        evidence: PageScanEvidence,
+    ) -> None:
+        if self._last_captured_at is not None:
+            if evidence.captured_at - self._last_captured_at < self.min_frame_separation:
+                self._time_separated = False
+        self._last_captured_at = evidence.captured_at
+        self._anchor_valid = self._anchor_valid and evidence.page_anchor_confirmed
+        self._movement_seen = self._movement_seen or bool(
+            evidence.movement_confirmed and evidence.displacement_px > 0
+        )
+        self._end_seen = self._end_seen or bool(evidence.end_marker)
+        for segment in segments:
+            self._segments[(int(segment.level), str(segment.slot))] = segment
+
+    def observation(self) -> ManualLevelObservation:
+        return ManualLevelObservation(
+            current_level=max((item.level for item in self.segments), default=None),
+            claimable_level_rewards=self.claimable_level_rewards,
+            visible_locked_levels=sum(1 for item in self.segments if item.locked),
+            visible_claimed_levels=sum(1 for item in self.segments if item.claimed),
+            track_scan_complete=self.complete,
+            confidence="HIGH" if self.complete else "UNKNOWN",
+        )
 
 
 def _normalized_key(title: str) -> str:
@@ -446,6 +523,10 @@ class _CardScannerBase:
         self._pages = 0
         self._no_new = 0
         self.cancelled = False
+        self._evidence_mode = False
+        self._movement_seen = False
+        self._end_seen = False
+        self._anchor_valid = True
 
     @property
     def cards(self):
@@ -453,22 +534,124 @@ class _CardScannerBase:
 
     @property
     def complete(self) -> bool:
+        if self._evidence_mode:
+            return (
+                not self.cancelled
+                and self._movement_seen
+                and self._end_seen
+                and self._anchor_valid
+                and self._pages <= self.max_pages
+            )
         return not self.cancelled and self._no_new >= 2 and self._pages <= self.max_pages
 
-    def add_page(self, items: list[dict]) -> int:
+    @staticmethod
+    def _same_title(left: str, right: str) -> bool:
+        left_key, right_key = _normalized_key(left), _normalized_key(right)
+        return bool(
+            left_key == right_key
+            or min(len(left_key), len(right_key)) >= 4
+            and (left_key in right_key or right_key in left_key)
+        )
+
+    def _canonical_key(self, card: DailyTaskCard | ManualTaskCard) -> str:
+        for key, existing in self._cards.items():
+            if self._same_title(existing.title, card.title):
+                return key
+        return card.task_key
+
+    @staticmethod
+    def _merge_card(old, new):
+        contribution = old.contribution if new.contribution is None else new.contribution
+        if old.contribution is not None and new.contribution is not None and old.contribution != new.contribution:
+            contribution = old.contribution
+        conflict = (
+            old.claimable is True and new.claimed is True
+            or old.claimed is True and new.claimable is True
+            or old.claimable is None and old.claimed is None
+        )
+        if conflict:
+            claimable = claimed = None
+        else:
+            claimable = old.claimable is True or new.claimable is True
+            claimed = old.claimed is True or new.claimed is True
+        return replace(
+            old,
+            current=max(old.current, new.current),
+            target=max(old.target, new.target),
+            completed=old.completed or new.completed,
+            claimable=claimable,
+            claimed=claimed,
+            contribution=contribution,
+            page_fingerprint=new.page_fingerprint,
+            title=old.title if len(_normalized_key(old.title)) >= len(_normalized_key(new.title)) else new.title,
+        )
+
+    def add_cards(
+        self,
+        cards: list[DailyTaskCard | ManualTaskCard],
+        *,
+        evidence: PageScanEvidence | None = None,
+    ) -> int:
         if self.cancelled or self._pages >= self.max_pages:
             return 0
         self._pages += 1
-        parsed = _card_items(items, manual=self.manual)
+        if evidence is not None:
+            self._evidence_mode = True
+            self._anchor_valid = self._anchor_valid and evidence.page_anchor_confirmed
+            if not evidence.page_anchor_confirmed:
+                self.cancelled = True
+            self._movement_seen = self._movement_seen or bool(
+                evidence.movement_confirmed and evidence.displacement_px > 0
+            )
+            self._end_seen = self._end_seen or bool(evidence.end_marker)
         before = len(self._cards)
-        for card in parsed:
-            self._cards[card.task_key] = card
+        for card in cards:
+            key = self._canonical_key(card)
+            old = self._cards.get(key)
+            self._cards[key] = card if old is None else self._merge_card(old, card)
         added = len(self._cards) - before
         self._no_new = 0 if added else self._no_new + 1
         return added
 
+    def add_page(
+        self,
+        items: list[dict],
+        *,
+        evidence: PageScanEvidence | None = None,
+    ) -> int:
+        return self.add_cards(_card_items(items, manual=self.manual), evidence=evidence)
+
     def cancel(self) -> None:
         self.cancelled = True
+
+
+def _horizontal_displacement(
+    previous: list[dict], current: list[dict]
+) -> int | None:
+    """Return a verified shared-OCR horizontal displacement, not frame churn."""
+
+    def unique_x(items: list[dict]) -> dict[str, float]:
+        grouped: dict[str, list[float]] = {}
+        for item in items:
+            if not item.get("position"):
+                continue
+            key = _normalized_key(str(item.get("text", "")))
+            if len(key) < 2:
+                continue
+            grouped.setdefault(key, []).append(float(_center(item)[0]))
+        return {key: values[0] for key, values in grouped.items() if len(values) == 1}
+
+    before, after = unique_x(previous), unique_x(current)
+    deltas = [after[key] - before[key] for key in before.keys() & after.keys()]
+    if len(deltas) < 2:
+        return None
+    median = int(round(float(np.median(deltas))))
+    consistent = [value for value in deltas if abs(value - median) <= 20]
+    if len(consistent) < 2:
+        return None
+    if abs(median) < 10:
+        return 0
+    return median if abs(median) >= 30 else None
 
 
 class DailyCardScanner(_CardScannerBase):
@@ -493,9 +676,33 @@ class ManualCardScanner(_CardScannerBase):
         return sum(1 for card in self.cards if card.completed or card.claimed), len(self.cards)
 
 
-def _stable_visual_daily_current(frames: list[list[dict]]) -> int | None:
+def _image_daily_zero(image: np.ndarray | None) -> int | None:
+    if image is None or image.shape[0] < 225 or image.shape[1] < 260:
+        return None
+    roi = image[175:225, 190:260]
+    hsv = cv.cvtColor(roi, cv.COLOR_BGR2HSV)
+    mask = cv.inRange(hsv, (85, 60, 80), (140, 255, 255))
+    contours, hierarchy = cv.findContours(mask, cv.RETR_CCOMP, cv.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None:
+        return None
+    for index, contour in enumerate(contours):
+        _x, _y, width, height = cv.boundingRect(contour)
+        if 6 <= width <= 25 and 15 <= height <= 35 and hierarchy[0][index][2] >= 0:
+            return 0
+    return None
+
+
+def _stable_visual_daily_current(
+    frames: list[list[dict]],
+    *,
+    maximum: int | None,
+    images: list[np.ndarray] | None = None,
+) -> int | None:
     values = []
-    for items in frames:
+    for index, items in enumerate(frames):
+        if not _is_daily_activity_page(items):
+            values.append(None)
+            continue
         candidates = []
         for item in items:
             if not item.get("position"):
@@ -506,6 +713,18 @@ def _stable_visual_daily_current(frames: list[list[dict]]) -> int | None:
             match = re.search(r"(\d+)\s*/\s*(\d+)", str(item.get("text", "")))
             if match:
                 candidates.append(int(match.group(1)))
+                continue
+            text = str(item.get("text", "")).strip()
+            if re.fullmatch(r"\d{1,4}", text):
+                candidates.append(int(text))
+        if not candidates and images and index < len(images):
+            image_value = _image_daily_zero(images[index])
+            if image_value is not None:
+                candidates.append(image_value)
+        candidates = [
+            value for value in candidates
+            if maximum is not None and 0 <= value <= maximum
+        ]
         values.append(candidates[0] if len(candidates) == 1 else None)
     return values[0] if values and values[0] is not None and all(value == values[0] for value in values) else None
 
@@ -516,6 +735,7 @@ def observe_daily_activity_layout(
     scanner: DailyCardScanner | None = None,
     page_complete: bool | None = None,
     stage_rewards_claimable: int = 0,
+    images: list[np.ndarray] | None = None,
 ) -> DailyActivityPageObservation:
     threshold_sets = []
     for items in frames:
@@ -529,7 +749,7 @@ def observe_daily_activity_layout(
         threshold_sets.append(tuple(sorted(value for value in values if value > 0)))
     thresholds = threshold_sets[0] if threshold_sets and all(item == threshold_sets[0] for item in threshold_sets) else ()
     maximum = max(thresholds) if len(thresholds) >= 2 else None
-    visual = _stable_visual_daily_current(frames)
+    visual = _stable_visual_daily_current(frames, maximum=maximum, images=images)
     cards = tuple(scanner.cards) if scanner else tuple(_card_items(frames[-1] if frames else [], manual=False))
     complete = scanner.complete if scanner is not None else bool(page_complete)
     card_current = None
@@ -563,7 +783,9 @@ def observe_daily_activity_layout(
         task_rewards_claimable=sum(1 for card in cards if card.claimable),
         stage_rewards_claimable=max(0, int(stage_rewards_claimable)),
         page_complete=complete,
-        confidence="HIGH" if maximum is not None and current is not None and complete else "UNKNOWN",
+        # The total and thresholds are independent fixed-page facts. Card-list
+        # completeness is reported separately and only gates card inventory.
+        confidence="HIGH" if maximum is not None and current is not None else "UNKNOWN",
         observed_at=SERVER_CLOCK.server_now(),
         missing_evidence=tuple(missing),
     )
@@ -575,8 +797,14 @@ def observe_manual_level_layout(
     track_scan_complete: bool,
 ) -> ManualLevelObservation:
     snapshots = []
+    page_anchored = True
     for items in frames:
         texts = [str(item.get("text", "")).replace(" ", "") for item in items]
+        page_anchored = page_anchored and any(
+            _matches(text, marker)
+            for text in texts
+            for marker in ("环游手册", "等级奖励")
+        )
         levels = {
             int(match.group(1))
             for text in texts
@@ -593,7 +821,56 @@ def observe_manual_level_layout(
     current, claimable, locked, claimed = snapshots[0] if stable else (None, 0, 0, 0)
     return ManualLevelObservation(
         current, claimable, locked, claimed, bool(track_scan_complete),
-        "HIGH" if stable and track_scan_complete else "UNKNOWN",
+        "HIGH" if stable and track_scan_complete and page_anchored else "UNKNOWN",
+    )
+
+
+def _manual_track_segments(items: list[dict]) -> list[ManualTrackSegment]:
+    segments: list[ManualTrackSegment] = []
+    for item in items:
+        if not item.get("position"):
+            continue
+        x, y = _center(item)
+        text = str(item.get("text", "")).strip()
+        if not (105 <= y <= 190 and re.fullmatch(r"\d{1,3}", text)):
+            continue
+        level = int(text)
+        nearby = " ".join(
+            str(candidate.get("text", ""))
+            for candidate in items
+            if candidate.get("position")
+            and abs(_center(candidate)[0] - x) <= 80
+            and 180 <= _center(candidate)[1] <= 620
+        )
+        segments.append(
+            ManualTrackSegment(
+                level=level,
+                slot=f"x{round(x / 25) * 25}",
+                claimable=any(_matches(nearby, marker) for marker in ("可领取", "领取"))
+                and not _matches(nearby, "已领取"),
+                claimed=_matches(nearby, "已领取"),
+                locked=any(_matches(nearby, marker) for marker in ("未解锁", "锁定")),
+            )
+        )
+    return segments
+
+
+def _is_manual_task_inventory_page(items: list[dict]) -> bool:
+    return bool(
+        _manual_daily_progress_observation(items) is not None
+        or _card_items(items, manual=True)
+    )
+
+
+def _is_manual_track_page(items: list[dict]) -> bool:
+    texts = [str(item.get("text", "")) for item in items]
+    return bool(
+        _manual_track_segments(items)
+        and any(
+            _matches(text, marker)
+            for text in texts
+            for marker in ("环游手册", "等级奖励")
+        )
     )
 
 
@@ -918,28 +1195,54 @@ class RewardCollector:
             return None
         observations = []
         layout_frames: list[list[dict]] = []
+        layout_images: list[np.ndarray] = []
         for frame_index in range(max(2, stable_frames)):
             frame = self.driver.frame()
             items = frame.ocr()
             layout_frames.append(items)
+            layout_images.append(frame.image)
             progress = _daily_activity_progress(items)
             if progress is None:
                 scanner = DailyCardScanner()
                 stage_claimable = len(_daily_stage_boxes(frame.image))
+                scanner.add_page(
+                    items,
+                    evidence=PageScanEvidence(
+                        False, False, datetime.now().astimezone(),
+                        page_anchor_confirmed=_is_daily_activity_page(items),
+                    ),
+                )
+                previous_items = items
                 for page_index in range(12):
-                    page_items = layout_frames[-1]
-                    scanner.add_page(page_items)
                     if scanner.complete:
                         break
                     if hasattr(self.driver, "swipe_left"):
                         self.driver.swipe_left()
                     next_frame = self.driver.frame()
-                    layout_frames.append(next_frame.ocr())
+                    next_items = next_frame.ocr()
+                    displacement = _horizontal_displacement(previous_items, next_items)
+                    anchored = _is_daily_activity_page(next_items)
+                    scanner.add_page(
+                        next_items,
+                        evidence=PageScanEvidence(
+                            displacement is not None and abs(displacement) >= 30,
+                            displacement == 0,
+                            datetime.now().astimezone(),
+                            displacement_px=abs(displacement or 0),
+                            page_anchor_confirmed=anchored,
+                        ),
+                    )
+                    previous_items = next_items
+                    if scanner.cancelled:
+                        break
+                    layout_frames.append(next_items)
+                    layout_images.append(next_frame.image)
                     stage_claimable = max(stage_claimable, len(_daily_stage_boxes(next_frame.image)))
                 structured = observe_daily_activity_layout(
                     layout_frames,
                     scanner=scanner,
                     stage_rewards_claimable=stage_claimable,
+                    images=layout_images,
                 )
                 return {
                     "current": structured.current,
@@ -1014,15 +1317,37 @@ class RewardCollector:
         scanner = ManualCardScanner()
         for frame_index in range(max(2, stable_frames)):
             items = self.driver.texts()
-            scanner.add_page(items)
+            scanner.add_page(
+                items,
+                evidence=PageScanEvidence(
+                    False, False, datetime.now().astimezone(),
+                    page_anchor_confirmed=_is_manual_task_inventory_page(items),
+                ),
+            )
             observation = _manual_daily_progress_observation(items)
             if observation is None:
+                previous_items = items
                 for _ in range(12 - len(frames)):
                     if scanner.complete:
                         break
                     if hasattr(self.driver, "swipe_left"):
                         self.driver.swipe_left()
-                    scanner.add_page(self.driver.texts())
+                    next_items = self.driver.texts()
+                    displacement = _horizontal_displacement(previous_items, next_items)
+                    anchored = _is_manual_task_inventory_page(next_items)
+                    scanner.add_page(
+                        next_items,
+                        evidence=PageScanEvidence(
+                            displacement is not None and abs(displacement) >= 30,
+                            displacement == 0,
+                            datetime.now().astimezone(),
+                            displacement_px=abs(displacement or 0),
+                            page_anchor_confirmed=anchored,
+                        ),
+                    )
+                    previous_items = next_items
+                    if scanner.cancelled:
+                        break
                 summary = scanner.summary()
                 if summary is None:
                     return None
@@ -1030,10 +1355,37 @@ class RewardCollector:
                 task_rewards = sum(1 for card in scanner.cards if card.claimable)
                 if not self.driver.click_exact_text("环游手册", attempts=2):
                     return None
-                level_frames = [self.driver.texts() for _ in range(max(2, stable_frames))]
-                level = observe_manual_level_layout(
-                    level_frames, track_scan_complete=True
+                track = ManualRewardTrackScanner()
+                first_items = self.driver.texts()
+                track.add_segments(
+                    _manual_track_segments(first_items),
+                    PageScanEvidence(
+                        False, False, datetime.now().astimezone(),
+                        page_anchor_confirmed=_is_manual_track_page(first_items),
+                    ),
                 )
+                previous_items = first_items
+                for _ in range(12):
+                    self.driver.swipe_left()
+                    next_items = self.driver.texts()
+                    displacement = _horizontal_displacement(previous_items, next_items)
+                    anchored = _is_manual_track_page(next_items)
+                    track.add_segments(
+                        _manual_track_segments(next_items),
+                        PageScanEvidence(
+                            displacement is not None and abs(displacement) >= 30,
+                            displacement == 0,
+                            datetime.now().astimezone(),
+                            displacement_px=abs(displacement or 0),
+                            page_anchor_confirmed=anchored,
+                        ),
+                    )
+                    previous_items = next_items
+                    if not anchored:
+                        break
+                    if track.complete:
+                        break
+                level = track.observation()
                 return {
                     "completed": completed,
                     "total": total,
@@ -1070,8 +1422,42 @@ class RewardCollector:
         completed, total, _ratio_x, _ratio_y, task_rewards = frames[0]
         if not self.driver.click_exact_text("环游手册", attempts=2):
             return None
-        level_rewards = _observe_manual_level_rewards(
-            self.driver, stable_frames=stable_frames
+        track = ManualRewardTrackScanner()
+        try:
+            first_items = self.driver.texts()
+        except StopIteration:
+            return None
+        track.add_segments(
+            _manual_track_segments(first_items),
+            PageScanEvidence(
+                False, False, datetime.now().astimezone(),
+                page_anchor_confirmed=_is_manual_track_page(first_items),
+            ),
+        )
+        previous_items = first_items
+        for _ in range(12):
+            self.driver.swipe_left()
+            next_items = self.driver.texts()
+            displacement = _horizontal_displacement(previous_items, next_items)
+            anchored = _is_manual_track_page(next_items)
+            track.add_segments(
+                _manual_track_segments(next_items),
+                PageScanEvidence(
+                    displacement is not None and abs(displacement) >= 30,
+                    displacement == 0,
+                    datetime.now().astimezone(),
+                    displacement_px=abs(displacement or 0),
+                    page_anchor_confirmed=anchored,
+                ),
+            )
+            previous_items = next_items
+            if not anchored:
+                break
+            if track.complete:
+                break
+        level = track.observation()
+        level_rewards = (
+            level.claimable_level_rewards if level.track_scan_complete else None
         )
         if level_rewards is None:
             logger.warning("手册等级奖励页多帧证据不稳定，本次保持 UNKNOWN")
@@ -1081,6 +1467,8 @@ class RewardCollector:
             "total": total,
             "claimable_rewards": task_rewards + level_rewards,
             "unclaimed_rewards": task_rewards + level_rewards,
+            "track_scan_complete": level.track_scan_complete,
+            "confidence": level.confidence,
         }
 
     def run(self, daily_activity: bool = True, travel_manual: bool = True) -> dict[str, int]:
