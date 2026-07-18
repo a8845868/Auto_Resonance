@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2 as cv
+from loguru import logger
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,19 +65,42 @@ def _page_context() -> str:
     return " ".join(str(item.get("text", "")) for item in screenshot().ocr())
 
 
-def run_policy_canaries(guard: ReadOnlyActionGuard) -> None:
-    """Attempt prohibited actions at the policy boundary; no hardware runs."""
+def run_policy_canaries(_live_guard: ReadOnlyActionGuard) -> list[dict]:
+    """Exercise a detached policy guard so canaries never pollute live evidence."""
 
-    guard.tap("transaction_buy", (1000, 650), "exchange_buy")
-    guard.tap("reward_claim", (1000, 620), "daily_reward")
-    guard.tap("fatigue_confirm", (900, 600), "rest_area")
-
-
-def policy_report(guard: ReadOnlyActionGuard) -> dict:
-    return guard.report()
+    canary_guard = ReadOnlyActionGuard()
+    canary_guard.tap("transaction_buy", (1000, 650), "exchange_buy")
+    canary_guard.tap("reward_claim", (1000, 620), "daily_reward")
+    canary_guard.tap("fatigue_confirm", (900, 600), "rest_area")
+    return [asdict(entry) for entry in canary_guard.journal]
 
 
-def _run_probe(args, output: Path, guard: ReadOnlyActionGuard) -> dict:
+def policy_report(
+    guard: ReadOnlyActionGuard,
+    *,
+    policy_canary_results: list[dict] | None = None,
+) -> dict:
+    live = [asdict(entry) for entry in guard.journal]
+    actual = [entry for entry in live if not entry["allowed"]]
+    return {
+        "mode": "READ_ONLY",
+        "policy_canary_results": list(policy_canary_results or []),
+        "policy_canaries": list(policy_canary_results or []),
+        "live_action_journal": live,
+        "actual_blocked_production_actions": actual,
+        # Compatibility aliases remain truthful: only live entries appear.
+        "journal": live,
+        "blocked_actions": [entry["action_key"] for entry in actual],
+    }
+
+
+def _run_probe(
+    args,
+    output: Path,
+    guard: ReadOnlyActionGuard,
+    *,
+    policy_canaries: list[dict],
+) -> dict:
     driver = RewardDriver()
     collector = RewardCollector(driver)
     result = {
@@ -84,8 +108,7 @@ def _run_probe(args, output: Path, guard: ReadOnlyActionGuard) -> dict:
         "adb_port": args.adb_port,
         "captures": [],
     }
-    run_policy_canaries(guard)
-    if not driver.go_home():
+    if not driver.go_home(attempt_limit=8):
         raise RuntimeError("cannot reach game home safely")
     result["captures"].append(_capture(output, "home-before"))
 
@@ -117,9 +140,10 @@ def _run_probe(args, output: Path, guard: ReadOnlyActionGuard) -> dict:
         result["captures"].append(_capture(output, "manual-observation"))
         driver.go_home()
 
-    result.update(policy_report(guard))
-    # Compatibility field now derives from actual denied journal entries.
-    result["prohibited_actions_invoked"] = list(guard.blocked_actions)
+    result.update(policy_report(guard, policy_canary_results=policy_canaries))
+    result["prohibited_actions_invoked"] = [
+        entry["action_key"] for entry in result["actual_blocked_production_actions"]
+    ]
     return result
 
 
@@ -134,17 +158,34 @@ def main() -> int:
     if not connect_adb(args.adb_port):
         raise RuntimeError(f"cannot connect instance-0 ADB port {args.adb_port}")
 
+    # Raw OCR is private evidence and must not be echoed to terminal logs.
+    logger.disable("core.image.ocr")
     guard = ReadOnlyActionGuard(context_provider=_page_context)
-    with installed_read_only_guard(guard):
-        result = _run_probe(args, output, guard)
+    policy_canaries = run_policy_canaries(guard)
+    try:
+        with installed_read_only_guard(guard):
+            result = _run_probe(
+                args, output, guard, policy_canaries=policy_canaries
+            )
+        result["acceptance_status"] = "PASS"
+    except Exception as error:
+        result = {
+            "mode": "READ_ONLY",
+            "adb_port": args.adb_port,
+            "acceptance_status": "BLOCKED",
+            "blocked_reason": f"{type(error).__name__}: {error}",
+            "captures": [],
+            **policy_report(guard, policy_canary_results=policy_canaries),
+        }
     (output / "read-only-result.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
     print(json.dumps({
         "output": str(output),
-        "buy_success": bool(result["buy_navigation"].get("success")),
-        "sell_success": bool(result["sell_navigation"].get("success")),
+        "acceptance_status": result.get("acceptance_status", "UNKNOWN"),
+        "buy_success": bool(result.get("buy_navigation", {}).get("success")),
+        "sell_success": bool(result.get("sell_navigation", {}).get("success")),
         "daily_known": bool(result.get("daily_activity")),
         "manual_known": bool(result.get("manual")),
         "blocked_actions": result["blocked_actions"],

@@ -195,7 +195,9 @@ def test_startup_resumes_existing_travel_before_station_operations():
     ), patch.object(business.time, "sleep"):
         assert business._normalize_trade_startup_screen()
 
-    tap.assert_called_once_with((78, 38))
+    tap.assert_called_once()
+    assert tap.call_args.args == ((78, 38),)
+    assert tap.call_args.kwargs["intent"].action_key == "back"
 
 
 def test_false_arrival_is_ignored_while_transit_markers_remain():

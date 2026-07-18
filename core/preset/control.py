@@ -15,6 +15,7 @@ from loguru import logger
 from core.module.bgr import BGR
 
 from core.control.control import input_tap, screenshot
+from core.services.read_only_policy import ActionIntent
 from core.exception.exception_handling import get_excption
 from core.services.screen_state import (
     clarity_replenish_cancel_position,
@@ -66,6 +67,8 @@ def click_image(
     excursion_pos: Tuple[int, int] = (0, 0),
     trynum=10,
     check_err=True,
+    action_key: str = "unclassified_tap",
+    page_id: str = "template_page",
 ):
     """
     说明:
@@ -88,8 +91,14 @@ def click_image(
                 result.loc[0] + excursion_pos[0],
                 result.loc[1] + excursion_pos[1],
             )
-            input_tap(pos)
-            return True
+            return bool(input_tap(
+                pos,
+                intent=ActionIntent(
+                    action_key=action_key, page_id=page_id,
+                    anchor_key=Path(template).name if isinstance(template, (str, Path)) else "template",
+                    coordinate=pos, correlation_id=f"preset:{page_id}:template",
+                ),
+            ))
     if check_err:
         logger.error(f"未找到指定图片 => {template}")
         logger.info(get_excption())
@@ -155,6 +164,8 @@ def blurry_ocr_click(
     log=True,
     score=0.7,
     click_first=False,
+    action_key: str = "unclassified_tap",
+    page_id: str = "ocr_page",
 ):
     """
     模糊点击文本
@@ -185,7 +196,14 @@ def blurry_ocr_click(
                 coordinates = (center_x + excursion_pos[0], center_y + excursion_pos[1])
                 break
         if coordinates:
-            input_tap(coordinates)
+            input_tap(
+                coordinates,
+                intent=ActionIntent(
+                    action_key=action_key, page_id=page_id,
+                    anchor_key=text, coordinate=coordinates,
+                    correlation_id=f"preset:{page_id}:{text}",
+                ),
+            )
             return True
         time.sleep(1)
     if log:
@@ -247,32 +265,32 @@ def go_home():
         clarity_cancel = clarity_replenish_cancel_position(visible)
         if clarity_cancel is not None:
             logger.info("检测到澄明度补充提示，取消后继续返回主界面")
-            input_tap(clarity_cancel)
+            input_tap(clarity_cancel, intent=ActionIntent("navigation_anchor", "clarity_dialog", "cancel", clarity_cancel))
             startup_recovery = False
             time.sleep(1)
             continue
         if is_inventory_item_detail(visible):
             logger.info("识别到背包物品详情页，关闭详情后继续返回主界面")
-            input_tap((100, 650))
+            input_tap((100, 650), intent=ActionIntent("back", "inventory_detail", "close", (100, 650)))
             startup_recovery = False
             time.sleep(1)
             continue
         if is_inventory_screen(visible):
             logger.info("识别到背包列表页，点击左上角返回主界面")
-            input_tap((78, 38))
+            input_tap((78, 38), intent=ActionIntent("back", "inventory", "top_left_back", (78, 38)))
             startup_recovery = False
             time.sleep(1.5)
             continue
         startup_action = startup_screen_action(visible)
         if startup_action == "cancel_resource_repair":
             logger.warning("检测到资源完整性修复提示，取消修复")
-            input_tap((320, 500))
+            input_tap((320, 500), intent=ActionIntent("navigation_anchor", "resource_repair", "cancel", (320, 500)))
             startup_recovery = True
             time.sleep(1)
             continue
         if startup_action == "confirm_resource_download":
             logger.info("检测到登录前资源包更新提示，确认下载并等待完成")
-            input_tap(RESOURCE_DOWNLOAD_CONFIRM_TAP)
+            input_tap(RESOURCE_DOWNLOAD_CONFIRM_TAP, intent=ActionIntent("unclassified_tap", "resource_download", "confirm", RESOURCE_DOWNLOAD_CONFIRM_TAP))
             startup_recovery = True
             if not resource_download_seen:
                 attempt_limit = max(
@@ -284,13 +302,13 @@ def go_home():
             continue
         if startup_action == "enter_game":
             logger.info("检测到游戏登录页，点击安全区域进入游戏")
-            input_tap((640, 560))
+            input_tap((640, 560), intent=ActionIntent("navigation_anchor", "login", "enter_game", (640, 560)))
             startup_recovery = True
             time.sleep(4)
             continue
         if startup_action == "dismiss_startup_overlay":
             logger.info("关闭登录后的启动弹窗")
-            input_tap((100, 650))
+            input_tap((100, 650), intent=ActionIntent("navigation_anchor", "startup_overlay", "dismiss", (100, 650)))
             startup_recovery = True
             time.sleep(1)
             continue
@@ -311,10 +329,12 @@ def go_home():
             (260, 90),
             trynum=1,
             check_err=False,
+            action_key="back",
+            page_id="unknown_page",
         )
         if not clicked:
             # 1280x720 game layout: stable top-left back button fallback.
-            input_tap((78, 38))
+            input_tap((78, 38), intent=ActionIntent("back", "unknown_page", "top_left_back", (78, 38)))
         time.sleep(1.5)
     logger.error("返回主界面超时，已停止继续点击")
     return False

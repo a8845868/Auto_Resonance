@@ -93,7 +93,9 @@ def test_exit_warning_is_treated_as_resumable_sell_state():
     ) as tap, patch.object(sell.time, "sleep"):
         assert sell.is_sell_page()
 
-    tap.assert_called_once_with((319, 512))
+    tap.assert_called_once()
+    assert tap.call_args.args == ((319, 512),)
+    assert tap.call_args.kwargs["intent"].action_key == "navigation_anchor"
 
 
 def test_selected_cargo_sell_page_is_detected_without_ocr_labels():
@@ -118,7 +120,7 @@ def test_market_volatility_prompt_is_confirmed_until_settlement():
 def test_sell_all_retries_until_source_cargo_becomes_selected():
     image = FakeSellAllButton()
 
-    def select(_pos):
+    def select(_pos, **_semantic):
         image.selected = True
 
     with patch.object(sell, "screenshot", return_value=image), patch.object(
@@ -128,7 +130,9 @@ def test_sell_all_retries_until_source_cargo_becomes_selected():
     ), patch.object(sell.time, "sleep"):
         assert sell.select_all_sellable_cargo()
 
-    tap.assert_called_once_with((1187, 103))
+    tap.assert_called_once()
+    assert tap.call_args.args == ((1187, 103),)
+    assert tap.call_args.kwargs["intent"].action_key == "transaction_sell"
 
 
 def test_selected_button_with_delayed_quote_is_never_toggled_off():

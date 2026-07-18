@@ -194,7 +194,17 @@ def kill():
     control.kill()
 
 
-def input_swipe(pos1=(919, 617), pos2=(919, 908), swipe_time: int = 100):
+def input_swipe(
+    pos1=(919, 617),
+    pos2=(919, 908),
+    swipe_time: int = 100,
+    *,
+    intent=None,
+    permit=None,
+    page_id: str = "",
+    page_fingerprint: str = "",
+    anchor_key: str = "",
+):
     """
     滑动屏幕(可超出屏幕)
 
@@ -205,7 +215,10 @@ def input_swipe(pos1=(919, 617), pos2=(919, 908), swipe_time: int = 100):
     ensure_automation_allowed("滑动游戏界面")
     if STOP:
         raise StopExecution()
-    if _ACTION_POLICY is not None and not _ACTION_POLICY.authorize_swipe(pos1, pos2):
+    if _ACTION_POLICY is not None and not _ACTION_POLICY.authorize_swipe(
+        pos1, pos2, intent=intent, permit=permit, page_id=page_id,
+        page_fingerprint=page_fingerprint, anchor_key=anchor_key,
+    ):
         return False
     # 添加随机值
     pos_x1 = control.ratio * pos1[0] + random.randint(*EXCURSIONX)
@@ -323,7 +336,16 @@ def input_swipe(pos1=(919, 617), pos2=(919, 908), swipe_time: int = 100):
     )
 
 
-def input_tap(pos: Tuple[int, int] = (880, 362), random_offset: bool = True):
+def input_tap(
+    pos: Tuple[int, int] = (880, 362),
+    random_offset: bool = True,
+    *,
+    intent=None,
+    permit=None,
+    page_id: str = "",
+    page_fingerprint: str = "",
+    anchor_key: str = "",
+):
     """
     点击坐标
 
@@ -332,7 +354,10 @@ def input_tap(pos: Tuple[int, int] = (880, 362), random_offset: bool = True):
     ensure_automation_allowed("点击游戏界面")
     if STOP:
         raise StopExecution()
-    if _ACTION_POLICY is not None and not _ACTION_POLICY.authorize_coordinate(pos):
+    if _ACTION_POLICY is not None and not _ACTION_POLICY.authorize_coordinate(
+        pos, intent=intent, permit=permit, page_id=page_id,
+        page_fingerprint=page_fingerprint, anchor_key=anchor_key,
+    ):
         return False
     offset_x = random.randint(*EXCURSIONX) if random_offset else 0
     offset_y = random.randint(*EXCURSIONY) if random_offset else 0

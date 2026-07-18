@@ -26,10 +26,10 @@ def test_read_only_guard_blocks_fatigue_confirmation():
 
 def test_read_only_probe_reports_actual_blocked_actions():
     guard = ReadOnlyActionGuard(Mock())
-    probe.run_policy_canaries(guard)
-    report = probe.policy_report(guard)
-    assert set(report["blocked_actions"]) >= {"transaction_buy", "reward_claim", "fatigue_confirm"}
-    assert all(entry["allowed"] is False for entry in report["journal"])
+    canaries = probe.run_policy_canaries(guard)
+    report = probe.policy_report(guard, policy_canary_results=canaries)
+    assert {entry["action_key"] for entry in report["policy_canary_results"]} >= {"transaction_buy", "reward_claim", "fatigue_confirm"}
+    assert report["actual_blocked_production_actions"] == []
 
 
 def test_read_only_probe_has_no_direct_input_tap_bypass():
@@ -46,5 +46,12 @@ def test_navigation_anchor_is_allowed_but_buy_button_is_blocked():
 
 def test_transaction_page_still_allows_normalized_back_button():
     guard = ReadOnlyActionGuard()
-    assert guard.authorize_coordinate((80, 40), page_context="预计买入 买入总价") is True
+    permit = guard.issue_permit(
+        action_key="back", page_id="exchange", page_fingerprint="exchange-r1",
+        anchor_key="top_left_back", coordinate=(80, 40),
+    )
+    assert guard.authorize_coordinate(
+        (80, 40), page_context="预计买入 买入总价", permit=permit,
+        page_id="exchange", page_fingerprint="exchange-r1", anchor_key="top_left_back",
+    ) is True
     assert guard.journal[-1].action_key == "back"

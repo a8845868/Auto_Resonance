@@ -5,7 +5,8 @@ from typing import Literal, Optional
 
 from loguru import logger
 
-from core.control.control import input_tap, screenshot
+from core.control.control import input_tap as _raw_input_tap, screenshot
+from core.services.read_only_policy import ActionIntent
 from core.preset import go_outlets
 from core.preset.control import go_home
 from core.services.station_facilities import (
@@ -27,6 +28,23 @@ class RestAreaRecovery:
     fatigue: int
     status: RestAreaStatus
     used: int = 0
+
+
+def input_tap(
+    pos: tuple[int, int],
+    *,
+    action_key: str = "fatigue_confirm",
+    page_id: str = "fatigue_flow",
+    anchor_key: str = "fatigue_control",
+) -> object:
+    """Attach explicit fatigue semantics to every module-owned tap."""
+    return _raw_input_tap(
+        pos,
+        intent=ActionIntent(
+            action_key, page_id, anchor_key, pos,
+            correlation_id=f"fatigue:{page_id}:{anchor_key}",
+        ),
+    )
 
 
 def read_strength() -> Optional[Strength]:
@@ -125,15 +143,15 @@ def _ensure_drink_selection() -> bool:
 
 def exit_negotiation_safely() -> None:
     """Leave negotiation and resolve the reset-warning instead of stranding UI."""
-    input_tap((83, 36))
+    input_tap((83, 36), action_key="back", page_id="negotiation", anchor_key="top_left_back")
     time.sleep(1.5)
     if _screen_has("退出后议价幅度将重置", "是否继续"):
-        input_tap((768, 447))
+        input_tap((768, 447), action_key="navigation_anchor", page_id="negotiation_exit", anchor_key="confirm_exit")
         time.sleep(2)
 
 
 def _open_fatigue_panel() -> bool:
-    input_tap((970, 30))
+    input_tap((970, 30), action_key="open_detail", page_id="hud", anchor_key="fatigue_value")
     return _wait_text("恢复疲劳值方式", "FATIGUE", timeout=5)
 
 
