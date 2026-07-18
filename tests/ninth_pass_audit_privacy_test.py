@@ -130,6 +130,22 @@ def test_audit_journal_minimizes_account_telemetry():
     assert minimized["marker_hash"]
 
 
+def test_generated_digest_entropy_does_not_mask_ordinary_phone_values():
+    synthetic_phone = "".join(("13800", "138000"))
+    digest_hits, _ = audit._scan_text_payload(
+        json.dumps({"sanitized_target_tree_hash": f"abc{synthetic_phone}def"}),
+        suffix=".json",
+        filename="SHAREABLE-MANIFEST.json",
+    )
+    ordinary_hits, _ = audit._scan_text_payload(
+        json.dumps({"note": synthetic_phone}),
+        suffix=".json",
+        filename="SHAREABLE-MANIFEST.json",
+    )
+    assert "phone" not in digest_hits
+    assert "phone" in ordinary_hits
+
+
 def test_hash_manifest_rejects_unlisted_extra_file(tmp_path: Path):
     root = tmp_path / "package"
     root.mkdir()
