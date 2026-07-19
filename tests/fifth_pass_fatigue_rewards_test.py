@@ -140,6 +140,13 @@ def test_waypoint_reobserve_discovers_tiers_before_drinking(tmp_path):
 
     def observe(_station):
         sequence.append("observe")
+        if sequence.count("observe") > 1:
+            return {
+                "rest_area_available": False,
+                "soda_price_tiers": (),
+                "lunches_remaining": 0,
+                "lunch_total_recovery": 0,
+            }
         return {
             "rest_area_available": True,
             "soda_price_tiers": (free,),
@@ -154,7 +161,7 @@ def test_waypoint_reobserve_discovers_tiers_before_drinking(tmp_path):
     with patch("auto.fatigue_recovery.connect", return_value=True), patch(
         "auto.fatigue_recovery.get_station", return_value="B"
     ), patch("auto.fatigue_recovery._open_exchange_buy_page", return_value=True), patch(
-        "auto.fatigue_recovery._wait_strength", side_effect=[(60, 800), (10, 800), (10, 800)]
+        "auto.fatigue_recovery._wait_strength", side_effect=[(60, 800), (110, 800), (110, 800)]
     ), patch("auto.fatigue_recovery._route_context", return_value=route), patch(
         "auto.fatigue_recovery.observe_recovery_resources", side_effect=observe
     ), patch("auto.fatigue_recovery.execute_planned_recovery_action", side_effect=execute), patch(

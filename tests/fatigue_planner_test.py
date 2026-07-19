@@ -102,7 +102,7 @@ def test_daily_fatigue_task_is_independent_and_returns_explicit_result():
     ), patch.object(
         fatigue_recovery,
         "_wait_strength",
-        side_effect=[(612, 816), (562, 816), (562, 816)],
+        side_effect=[(612, 816), (662, 816), (662, 816)],
     ), patch.object(
         fatigue_recovery,
         "observe_recovery_resources",
@@ -128,7 +128,7 @@ def test_daily_fatigue_task_is_independent_and_returns_explicit_result():
     execute.assert_called_once()
     assert result["success"] is True
     assert result["before"] == 612
-    assert result["after"] == 562
+    assert result["after"] == 662
     assert result["restored"] == 50
     assert result["progress_made"] is True
     assert result["deferred"] is True
@@ -142,7 +142,7 @@ def test_daily_fatigue_task_uses_safe_lunches_at_station_without_rest_area():
     ), patch.object(
         fatigue_recovery,
         "_wait_strength",
-        side_effect=[(791, 816), (600, 816), (600, 816)],
+        side_effect=[(600, 816), (791, 816), (791, 816)],
     ), patch.object(
         fatigue_recovery,
         "observe_recovery_resources",
@@ -177,13 +177,13 @@ def test_daily_fatigue_task_uses_safe_lunches_at_station_without_rest_area():
     go_home.assert_called_once()
 
 
-def test_daily_fatigue_task_keeps_low_fatigue_plan_pending_at_no_rest_station():
+def test_daily_fatigue_task_keeps_near_cap_plan_pending_at_no_rest_station():
     with patch.object(fatigue_recovery, "connect", return_value=True), patch.object(
         fatigue_recovery, "get_station", return_value="武林源"
     ), patch.object(
         fatigue_recovery, "_open_exchange_buy_page", return_value=True
     ), patch.object(
-        fatigue_recovery, "_wait_strength", return_value=(12, 816)
+        fatigue_recovery, "_wait_strength", return_value=(800, 816)
     ), patch.object(
         fatigue_recovery,
         "observe_recovery_resources",
@@ -208,13 +208,13 @@ def test_daily_fatigue_task_keeps_low_fatigue_plan_pending_at_no_rest_station():
     go_home.assert_called_once()
 
 
-def test_daily_fatigue_task_defers_with_explicit_success_when_recovery_is_unneeded():
+def test_daily_fatigue_task_defers_with_explicit_success_without_headroom():
     with patch.object(fatigue_recovery, "connect", return_value=True), patch.object(
         fatigue_recovery, "get_station", return_value="test-station"
     ), patch.object(
         fatigue_recovery, "_open_exchange_buy_page", return_value=True
     ), patch.object(
-        fatigue_recovery, "_wait_strength", return_value=(12, 816)
+        fatigue_recovery, "_wait_strength", return_value=(800, 816)
     ), patch.object(
         fatigue_recovery,
         "observe_recovery_resources",
@@ -236,7 +236,7 @@ def test_daily_fatigue_task_defers_with_explicit_success_when_recovery_is_unneed
     assert result["deferred"] is True
     assert result["reason"].startswith("wait_for_zero_waste_threshold")
     assert result["station"] == "test-station"
-    assert result["before"] == 12
+    assert result["before"] == 800
     assert result["maximum"] == 816
     execute.assert_not_called()
     go_home.assert_called_once()

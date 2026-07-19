@@ -180,8 +180,22 @@ def _resolve_silver_prompt() -> bool:
     return False
 
 
-def _fatigue_after_drink(current: int, target: int) -> int:
+def _fatigue_after_drink(
+    current: int,
+    target: int,
+    *,
+    maximum_fatigue: int | None = None,
+) -> int:
     """Prefer a fresh HUD reading, falling back to the known 50-point recovery."""
+    if maximum_fatigue is not None:
+        estimated = min(maximum_fatigue, current + 50)
+        try:
+            observed = read_strength()
+        except (KeyError, TypeError, ValueError):
+            observed = None
+        if observed and current < observed[0] <= maximum_fatigue:
+            return observed[0]
+        return estimated
     estimated = max(target, current - 50)
     try:
         observed = read_strength()
@@ -196,6 +210,9 @@ def _use_free_rest_area(
     starting_fatigue: int,
     target_fatigue: int = 0,
     station_name: str | None = None,
+    *,
+    maximum_fatigue: int | None = None,
+    max_drinks: int | None = None,
 ) -> RestAreaRecovery:
     """Consume free or 500-iron drinks until fatigue is fully recovered.
 
@@ -219,7 +236,12 @@ def _use_free_rest_area(
         )
         return RestAreaRecovery(starting_fatigue, "unavailable")
 
-    if starting_fatigue - target_fatigue < 50:
+    recovery_fits = (
+        starting_fatigue + 50 <= maximum_fatigue
+        if maximum_fatigue is not None
+        else starting_fatigue - target_fatigue >= 50
+    )
+    if not recovery_fits:
         logger.info(
             f"当前疲劳 {starting_fatigue}，不足气泡水单次恢复量 50；"
             "为避免浪费，跳过气泡水"
@@ -242,8 +264,25 @@ def _use_free_rest_area(
     paid_used = 0
     # Max fatigue is currently below 1,000.  Derive the required number of
     # 50-point drinks and retain a defensive cap against a bad OCR value.
-    max_uses = min(24, max(0, (current - target_fatigue) // 50))
-    while used < max_uses and current - target_fatigue >= 50:
+    max_uses = min(
+        24,
+        max(
+            0,
+            (
+                (maximum_fatigue - current)
+                if maximum_fatigue is not None
+                else (current - target_fatigue)
+            )
+            // 50,
+        ),
+    )
+    if max_drinks is not None:
+        max_uses = min(max_uses, max(0, int(max_drinks)))
+    while used < max_uses and (
+        current + 50 <= maximum_fatigue
+        if maximum_fatigue is not None
+        else current - target_fatigue >= 50
+    ):
         if _silver_prompt_visible():
             if not _resolve_silver_prompt():
                 break
@@ -251,7 +290,11 @@ def _use_free_rest_area(
             _wait_text("喝一杯", "休息区", timeout=6)
             used += 1
             paid_used += 1
-            current = _fatigue_after_drink(current, target_fatigue)
+            current = _fatigue_after_drink(
+                current,
+                target_fatigue,
+                maximum_fatigue=maximum_fatigue,
+            )
             continue
         if not _ensure_drink_selection():
             logger.info("未能重新打开气泡水列表，停止连续恢复")
@@ -279,7 +322,11 @@ def _use_free_rest_area(
             paid_used += 1
         else:
             iron_or_free_used += 1
-        current = _fatigue_after_drink(current, target_fatigue)
+        current = _fatigue_after_drink(
+            current,
+            target_fatigue,
+            maximum_fatigue=maximum_fatigue,
+        )
         logger.info(
             f"休息区已饮用气泡水 {used} 次（免费/铁盟币 {iron_or_free_used}，"
             f"银枝 {paid_used}），"
@@ -416,22 +463,25 @@ def execute_planned_recovery_action(
     kind: str,
     *,
     station_name: str | None,
+    count: int = 1,
 ) -> dict[str, object]:
     """Execute exactly one planned recovery action and verify its effect."""
 
     before = read_strength()
     if before is None or not _open_fatigue_panel():
         return {"success": False, "reason": "fatigue_not_observed"}
-    current, _maximum = before
+    current, maximum = before
     if kind == "DRINK_SODA":
         result = _use_free_rest_area(
             current,
-            max(0, current - 50),
+            0,
             station_name,
+            maximum_fatigue=maximum,
+            max_drinks=count,
         )
         go_home()
         after = read_strength()
-        success = result.used == 1 and after is not None and after[0] < current
+        success = result.used == count and after is not None and after[0] > current
         return {
             "success": success,
             "kind": kind,
@@ -441,13 +491,17 @@ def execute_planned_recovery_action(
         }
     if kind == "USE_ALL_BENTOS":
         usage: dict[str, object] = {}
-        after_value = _use_all_safe_lunchboxes(current, usage)
+        after_value = _use_all_safe_lunchboxes(
+            current,
+            usage,
+            maximum_fatigue=maximum,
+        )
         go_home()
         return {
-            "success": after_value < current,
+            "success": after_value > current,
             "kind": kind,
-            "lunch_batches": 1 if after_value < current else 0,
-            "lunch_fatigue_restored": max(0, current - after_value),
+            "lunch_batches": 1 if after_value > current else 0,
+            "lunch_fatigue_restored": max(0, after_value - current),
             "lunches_remaining": usage.get("lunches_remaining"),
             "before": current,
             "after": after_value,
@@ -459,6 +513,8 @@ def execute_planned_recovery_action(
 def _use_all_safe_lunchboxes(
     current_fatigue: int,
     usage: dict[str, object] | None = None,
+    *,
+    maximum_fatigue: int | None = None,
 ) -> int:
     """Use the cabinet's batch action only when its full recovery cannot waste."""
     input_tap((1117, 607))  # 前往便当柜
@@ -480,7 +536,12 @@ def _use_all_safe_lunchboxes(
         logger.info("没有可批量使用的便当")
         input_tap((320, 503))
         return current_fatigue
-    if recovery > current_fatigue:
+    would_waste = (
+        current_fatigue + recovery > maximum_fatigue
+        if maximum_fatigue is not None
+        else recovery > current_fatigue
+    )
+    if would_waste:
         logger.info(
             f"全部便当可恢复 {recovery}，当前疲劳 {current_fatigue}，为避免浪费暂不使用"
         )
@@ -495,7 +556,11 @@ def _use_all_safe_lunchboxes(
     if usage is not None:
         usage["lunches_remaining"] = 0
     logger.info(f"已一次使用全部安全便当，恢复 {recovery} 疲劳")
-    return current_fatigue - recovery
+    return (
+        current_fatigue + recovery
+        if maximum_fatigue is not None
+        else current_fatigue - recovery
+    )
 
 
 def recover_strength(

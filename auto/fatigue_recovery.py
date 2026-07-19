@@ -266,6 +266,7 @@ def _run_daily_fatigue_recovery_impl(*, expected_waypoint: str | None = None) ->
         action_result = execute_planned_recovery_action(
             action.kind,
             station_name=station_name,
+            count=action.count,
         )
         if action_result.get("success") is not True:
             logger.warning(f"疲劳动作验证失败，重新规划前暂缓: {action_result}")
@@ -312,8 +313,8 @@ def _run_daily_fatigue_recovery_impl(*, expected_waypoint: str | None = None) ->
     if not deferred_actions and plan.status is FatiguePlanStatus.DEFER_UNTIL_FATIGUE:
         deferred_actions = [{
             "kind": "REPLAN",
-            "trigger_type": "FATIGUE_THRESHOLD",
-            "fatigue_threshold": int(plan.next_trigger.get("fatigue_at_least", 0)),
+            "trigger_type": "FATIGUE_HEADROOM",
+            "fatigue_threshold": int(plan.next_trigger.get("fatigue_at_most", 0)),
         }]
     elif not deferred_actions and plan.status is FatiguePlanStatus.DEFER_UNTIL_RELEASE:
         deferred_actions = [{
@@ -362,7 +363,7 @@ def _run_daily_fatigue_recovery_impl(*, expected_waypoint: str | None = None) ->
         "before": before[0],
         "after": after[0],
         "maximum": after[1],
-        "restored": max(0, before[0] - int(after[0])),
+        "restored": max(0, int(after[0]) - before[0]),
         "available": after[1] - after[0],
         "usage": daily_usage,
         "plan": _json_value(asdict(plan)),
