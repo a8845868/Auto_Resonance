@@ -159,6 +159,13 @@ class PageObservation:
     ui_layout_version: str = "legacy-1280x720-v1"
     capture_sequence: int = 0
     capture_nonce: str = ""
+    source_capture_id: str = ""
+    source_monotonic_sequence: int = 0
+    backend_generation: int = 0
+    instance_id: str = ""
+    adb_serial: str = ""
+    logical_resolution: tuple[int, int] = (LOGICAL_WIDTH, LOGICAL_HEIGHT)
+    content_marker_hash: str = ""
 
     @property
     def page_fingerprint(self) -> str:
@@ -169,13 +176,17 @@ class PageObservation:
 class PageObserver:
     """Reads a fresh screenshot/OCR-derived observation from a trusted adapter."""
 
-    def __init__(self, observe: Callable[[], PageObservation]):
+    def __init__(self, observe: Callable[[], PageObservation | TrustedFrameEvidence]):
         self._observe = observe
-        self._sequence = 0
         self._lock = threading.Lock()
+        self._seen_source_ids: set[str] = set()
+        self._last_source_sequence = 0
+        self._last_captured_at: datetime | None = None
 
     def observe(self) -> PageObservation:
         observation = self._observe()
+        if isinstance(observation, TrustedFrameEvidence):
+            observation = observation.as_observation()
         if not isinstance(observation, PageObservation):
             raise PermissionError("trusted page observation unavailable")
         if not observation.observation_id or not observation.screenshot_hash or not observation.page_type:
@@ -184,17 +195,73 @@ class PageObserver:
             raise PermissionError("trusted page observation timestamp must be timezone-aware")
         if observation.anchors_are_logical is not True:
             raise PermissionError("page anchors must use logical coordinates")
-        # The adapter may reuse immutable values, but every trusted capture call
-        # receives an issuer-local identity. This prevents a caller cache from
-        # making issue, consume and postcondition validation the same capture.
         with self._lock:
-            self._sequence += 1
-            sequence = self._sequence
+            source_id = str(observation.source_capture_id).strip()
+            source_sequence = int(observation.source_monotonic_sequence)
+            if not source_id or source_sequence <= 0:
+                raise PermissionError("backend-issued source capture evidence is required")
+            if source_id in self._seen_source_ids:
+                raise PermissionError("source capture id reuse is forbidden")
+            if source_sequence <= self._last_source_sequence:
+                raise PermissionError("source capture sequence must strictly increase")
+            if (
+                self._last_captured_at is not None
+                and observation.captured_at <= self._last_captured_at
+            ):
+                raise PermissionError("source capture timestamp must strictly increase")
+            if observation.logical_resolution != (LOGICAL_WIDTH, LOGICAL_HEIGHT):
+                raise PermissionError("source capture logical resolution mismatch")
+            self._seen_source_ids.add(source_id)
+            self._last_source_sequence = source_sequence
+            self._last_captured_at = observation.captured_at
+        return observation
+
+
+@dataclass(frozen=True)
+class TrustedFrameEvidence:
+    """Capture-backend evidence; freshness is never invented by PageObserver."""
+
+    source_capture_id: str
+    source_monotonic_sequence: int
+    raw_frame_hash: str
+    captured_at: datetime
+    backend_generation: int
+    instance_id: str
+    adb_serial: str
+    logical_resolution: tuple[int, int]
+    observation: PageObservation
+
+    def as_observation(self) -> PageObservation:
         return replace(
-            observation,
-            capture_sequence=sequence,
-            capture_nonce=secrets.token_hex(16),
+            self.observation,
+            screenshot_hash=self.raw_frame_hash,
+            captured_at=self.captured_at,
+            source_capture_id=self.source_capture_id,
+            source_monotonic_sequence=self.source_monotonic_sequence,
+            backend_generation=self.backend_generation,
+            instance_id=self.instance_id,
+            adb_serial=self.adb_serial,
+            logical_resolution=self.logical_resolution,
         )
+
+
+@dataclass(frozen=True)
+class BoundDeviceIdentity:
+    emulator_backend: str
+    instance_id: str
+    adb_serial: str
+    backend_generation: int
+    backend_object_identity: str
+    display_geometry_revision: str
+    connected_at: datetime
+
+    def __post_init__(self) -> None:
+        if not self.emulator_backend or not self.instance_id or not self.adb_serial:
+            raise ValueError("bound device identity is incomplete")
+        if int(self.backend_generation) <= 0 or not self.backend_object_identity:
+            raise ValueError("bound backend identity is incomplete")
+        if self.connected_at.tzinfo is None or self.connected_at.utcoffset() is None:
+            raise ValueError("bound device connected_at must be timezone-aware")
 
 
 class AnchorResolver:
@@ -244,6 +311,7 @@ class ReadOnlyPolicySpec:
     forbidden_markers: tuple[str, ...] = ("注销", "退出登录", "account_logout")
     allowed_region: tuple[int, int, int, int] | None = None
     postcondition: str = "page_identity_must_change_or_remain_safe"
+    allowed_post_page_types: frozenset[str] = frozenset()
     minimum_displacement: int = 40
     maximum_vertical_ratio: float = 0.20
     allowed_swipe_directions: frozenset[str] = frozenset({"LEFT", "RIGHT"})
@@ -254,27 +322,32 @@ class ReadOnlyPolicySpec:
 DEFAULT_POLICY_SPECS = {
     "reward_back": ReadOnlyPolicySpec(
         "reward_back", frozenset({"daily_activity", "travel_manual", "manual_tasks", "manual_track"}),
-        "top_left_back",
+        "top_left_back", allowed_post_page_types=frozenset({"home", "hud", "startup_overlay"}),
     ),
     "page_back": ReadOnlyPolicySpec(
         "page_back",
         frozenset({"home", "daily_activity", "travel_manual", "manual_tasks", "manual_track", "exchange_buy", "exchange_sell", "inventory", "fatigue_info"}),
-        "top_left_back",
+        "top_left_back", allowed_post_page_types=frozenset({"home", "hud", "station", "exchange", "daily_activity", "travel_manual", "manual_tasks", "manual_track", "inventory"}),
     ),
     "manual_tab": ReadOnlyPolicySpec(
         "manual_tab", frozenset({"travel_manual", "manual_tasks", "manual_track"}), "manual_tab",
+        allowed_post_page_types=frozenset({"travel_manual", "manual_tasks", "manual_track"}),
     ),
     "manual_tasks_tab": ReadOnlyPolicySpec(
         "manual_tasks_tab", frozenset({"travel_manual", "manual_tasks", "manual_track"}), "manual_tasks_tab",
+        allowed_post_page_types=frozenset({"manual_tasks"}),
     ),
     "manual_track_tab": ReadOnlyPolicySpec(
         "manual_track_tab", frozenset({"travel_manual", "manual_tasks"}), "manual_track_tab",
+        allowed_post_page_types=frozenset({"manual_track"}),
     ),
     "daily_page_open": ReadOnlyPolicySpec(
         "daily_page_open", frozenset({"home"}), "daily_shortcut",
+        allowed_post_page_types=frozenset({"daily_activity"}),
     ),
     "manual_page_open": ReadOnlyPolicySpec(
         "manual_page_open", frozenset({"home"}), "manual_shortcut",
+        allowed_post_page_types=frozenset({"travel_manual", "manual_tasks"}),
     ),
     "daily_horizontal_scroll": ReadOnlyPolicySpec(
         "daily_horizontal_scroll", frozenset({"daily_activity"}), "daily_content",
@@ -288,15 +361,19 @@ DEFAULT_POLICY_SPECS = {
     ),
     "exchange_buy_navigation": ReadOnlyPolicySpec(
         "exchange_buy_navigation", frozenset({"station", "exchange"}), "buy_navigation",
+        allowed_post_page_types=frozenset({"exchange_buy"}),
     ),
     "exchange_sell_navigation": ReadOnlyPolicySpec(
         "exchange_sell_navigation", frozenset({"station", "exchange"}), "sell_navigation",
+        allowed_post_page_types=frozenset({"exchange_sell"}),
     ),
     "fatigue_info_open": ReadOnlyPolicySpec(
         "fatigue_info_open", frozenset({"home", "hud"}), "fatigue_value",
+        allowed_post_page_types=frozenset({"fatigue_info"}),
     ),
     "dialog_cancel": ReadOnlyPolicySpec(
         "dialog_cancel", frozenset({"clarity_dialog", "resource_repair", "startup_overlay"}), "cancel",
+        allowed_post_page_types=frozenset({"home", "hud", "login", "startup_overlay"}),
     ),
     "enter_game": ReadOnlyPolicySpec(
         "enter_game", frozenset({"login"}), "enter_game",
@@ -327,6 +404,9 @@ class _PermitRecord:
     page_classifier: str
     markers: tuple[str, ...]
     issue_capture_sequence: int
+    issue_source_capture_id: str
+    issue_source_monotonic_sequence: int
+    issue_captured_at: datetime
     anchor_id: str
     anchor_text_hash: str
     anchor_bbox: tuple[int, int, int, int]
@@ -347,6 +427,11 @@ class _PermitRecord:
     physical_height: int
     process_id: int
     session_id: str
+    emulator_backend: str
+    instance_id: str
+    adb_serial: str
+    backend_generation: int
+    backend_object_identity: str
 
 
 @dataclass
@@ -354,6 +439,8 @@ class _RegistryEntry:
     record: _PermitRecord
     uses: int = 0
     consume_capture_sequence: int = 0
+    consume_observation: PageObservation | None = None
+    post_observation: PageObservation | None = None
 
 
 class ReadOnlyPermitIssuer:
@@ -366,6 +453,8 @@ class ReadOnlyPermitIssuer:
         now: Callable[[], datetime] = _now,
         observation_ttl: timedelta = timedelta(seconds=5),
         registry_limit: int = 256,
+        bound_device_identity: BoundDeviceIdentity | None = None,
+        identity_provider: Callable[[], BoundDeviceIdentity] | None = None,
     ):
         self.observer = observer
         self.resolver = resolver
@@ -378,6 +467,7 @@ class ReadOnlyPermitIssuer:
                 forbidden_markers=tuple(value.forbidden_markers),
                 allowed_region=(tuple(value.allowed_region) if value.allowed_region else None),
                 allowed_swipe_directions=frozenset(value.allowed_swipe_directions),
+                allowed_post_page_types=frozenset(value.allowed_post_page_types),
             )
             for key, value in source.items()
         })
@@ -389,6 +479,25 @@ class ReadOnlyPermitIssuer:
         self._registry_limit = max(1, int(registry_limit))
         self._process_id = os.getpid()
         self._session_id = secrets.token_hex(16)
+        default_identity = BoundDeviceIdentity(
+            emulator_backend="TEST_BACKEND",
+            instance_id="test-instance-0",
+            adb_serial="test-adb-0",
+            backend_generation=1,
+            backend_object_identity="test-backend-object",
+            display_geometry_revision=DisplayGeometry().geometry_revision,
+            connected_at=now(),
+        )
+        self._identity_is_explicit = bound_device_identity is not None
+        self._bound_device_identity = bound_device_identity or default_identity
+        self._identity_provider = identity_provider or (lambda: self._bound_device_identity)
+
+    def _assert_device_identity(self, stage: str) -> BoundDeviceIdentity:
+        current = self._identity_provider()
+        if current != self._bound_device_identity:
+            self.revoke_all()
+            raise PermissionError(f"bound_device_identity_changed_at_{stage}")
+        return current
 
     def _fresh_observation(self) -> PageObservation:
         observation = self.observer.observe()
@@ -438,6 +547,7 @@ class ReadOnlyPermitIssuer:
             spec.allowed_region, spec.postcondition, spec.minimum_displacement,
             spec.maximum_vertical_ratio, sorted(spec.allowed_swipe_directions),
             spec.minimum_duration_ms, spec.maximum_duration_ms,
+            sorted(spec.allowed_post_page_types),
         ))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
@@ -474,6 +584,7 @@ class ReadOnlyPermitIssuer:
         duration_ms: int = 0,
         requested_action_kind: ActionKind | None = None,
     ) -> ReadOnlyPermitHandle:
+        identity = self._assert_device_identity("issue")
         spec = self._policies.get(str(intent.action_key))
         if spec is None:
             raise PermissionError("action is not a specific read-only policy")
@@ -484,9 +595,16 @@ class ReadOnlyPermitIssuer:
             raise PermissionError("final logical trajectory is required")
         self._validate_modality(spec, trajectory, int(duration_ms))
         observation = self._fresh_observation()
+        self._assert_observation_identity(observation, identity)
+        self._assert_device_identity("issue_capture")
         active_geometry = geometry or observation.display_geometry or DisplayGeometry()
         if not active_geometry.is_uniform:
             raise PermissionError("non_uniform_display_geometry")
+        if (
+            self._identity_is_explicit
+            and active_geometry.geometry_revision != identity.display_geometry_revision
+        ):
+            raise PermissionError("bound_display_geometry_revision_mismatch")
         if (
             observation.display_geometry is not None
             and observation.display_geometry.geometry_revision != active_geometry.geometry_revision
@@ -508,7 +626,10 @@ class ReadOnlyPermitIssuer:
             screenshot_hash=observation.screenshot_hash,
             page_classifier=observation.page_type,
             markers=tuple(str(marker) for marker in observation.markers),
-            issue_capture_sequence=int(observation.capture_sequence),
+            issue_capture_sequence=int(observation.source_monotonic_sequence),
+            issue_source_capture_id=observation.source_capture_id,
+            issue_source_monotonic_sequence=observation.source_monotonic_sequence,
+            issue_captured_at=observation.captured_at,
             anchor_id=anchor.anchor_id,
             anchor_text_hash=hashlib.sha256(
                 (anchor.text if isinstance(anchor, OcrObservedAnchor) else anchor.anchor_id).encode("utf-8")
@@ -531,6 +652,11 @@ class ReadOnlyPermitIssuer:
             logical_height=active_geometry.logical_height,
             process_id=self._process_id,
             session_id=self._session_id,
+            emulator_backend=identity.emulator_backend,
+            instance_id=identity.instance_id,
+            adb_serial=identity.adb_serial,
+            backend_generation=identity.backend_generation,
+            backend_object_identity=identity.backend_object_identity,
         )
         with self._registry_lock:
             self.cleanup_expired()
@@ -581,12 +707,57 @@ class ReadOnlyPermitIssuer:
         with self._registry_lock:
             return self._registry.pop(str(getattr(permit, "opaque_token", "")), None) is not None
 
+    def revoke_all(self) -> int:
+        with self._registry_lock:
+            count = len(self._registry)
+            self._registry.clear()
+            return count
+
+    @staticmethod
+    def _assert_observation_identity(
+        observation: PageObservation, identity: BoundDeviceIdentity
+    ) -> None:
+        if (
+            observation.backend_generation != identity.backend_generation
+            or observation.instance_id != identity.instance_id
+            or observation.adb_serial != identity.adb_serial
+        ):
+            raise PermissionError("capture_device_identity_mismatch")
+
+    def issue_observation(self, permit: ReadOnlyPermitHandle) -> PageObservation | None:
+        with self._registry_lock:
+            entry = self._registry.get(str(getattr(permit, "opaque_token", "")))
+            if entry is None:
+                return None
+            record = entry.record
+            return PageObservation(
+                observation_id=record.observation_id,
+                screenshot_hash=record.screenshot_hash,
+                page_type=record.page_classifier,
+                markers=record.markers,
+                anchors=(),
+                captured_at=record.issue_captured_at,
+                source_capture_id=record.issue_source_capture_id,
+                source_monotonic_sequence=record.issue_source_monotonic_sequence,
+                backend_generation=record.backend_generation,
+                instance_id=record.instance_id,
+                adb_serial=record.adb_serial,
+            )
+
+    def consume_observation(self, permit: ReadOnlyPermitHandle) -> PageObservation | None:
+        with self._registry_lock:
+            entry = self._registry.get(str(getattr(permit, "opaque_token", "")))
+            return entry.consume_observation if entry is not None else None
+
     def _observation_matches(
         self, observation: PageObservation, record: _PermitRecord
     ) -> bool:
         if observation.page_type != record.page_classifier:
             return False
-        if observation.capture_sequence == record.issue_capture_sequence:
+        if (
+            observation.source_capture_id == record.issue_source_capture_id
+            or observation.source_monotonic_sequence <= record.issue_source_monotonic_sequence
+        ):
             return False
         marker_text = self._marker_text(observation)
         spec = self._policies.get(record.action_key)
@@ -638,12 +809,25 @@ class ReadOnlyPermitIssuer:
             hook()
         logical = tuple(_point(point) for point in trajectory)
         with self._registry_lock:
+            try:
+                identity = self._assert_device_identity("consume")
+            except PermissionError as error:
+                return False, str(error), None, ()
             entry = self._registry.get(str(getattr(permit, "opaque_token", "")))
             if entry is None:
                 return False, "permit_not_issued_by_registry", None, ()
             record = entry.record
             if record.process_id != os.getpid() or record.session_id != self._session_id:
                 return False, "permit_process_or_session_mismatch", record, ()
+            if (
+                record.emulator_backend != identity.emulator_backend
+                or record.instance_id != identity.instance_id
+                or record.adb_serial != identity.adb_serial
+                or record.backend_generation != identity.backend_generation
+                or record.backend_object_identity != identity.backend_object_identity
+            ):
+                self.revoke_all()
+                return False, "permit_bound_device_identity_mismatch", record, ()
             if record.action_kind is not action_kind:
                 return False, "action_kind_mismatch", record, ()
             spec = self._policies.get(record.action_key)
@@ -684,6 +868,8 @@ class ReadOnlyPermitIssuer:
                 return False, "display_geometry_dimensions_changed", record, ()
             try:
                 observation = self._fresh_observation()
+                self._assert_observation_identity(observation, identity)
+                self._assert_device_identity("consume_capture")
                 if not self._observation_matches(observation, record):
                     return False, "page_observation_changed_or_stale", record, ()
                 anchor, source, allowed_region = self._validate_spec(
@@ -703,36 +889,61 @@ class ReadOnlyPermitIssuer:
             except PermissionError as error:
                 return False, str(error), record, ()
             entry.uses += 1
-            entry.consume_capture_sequence = observation.capture_sequence
+            entry.consume_capture_sequence = observation.source_monotonic_sequence
+            entry.consume_observation = observation
             return True, "valid_trusted_read_only_permit", record, physical
 
     def verify_postcondition(
         self, permit: ReadOnlyPermitHandle, record: _PermitRecord
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, PageObservation | None]:
         with self._registry_lock:
             entry = self._registry.get(str(getattr(permit, "opaque_token", "")))
             if entry is None:
-                return False, "postcondition_permit_missing"
+                return False, "postcondition_permit_missing", None
             try:
+                identity = self._assert_device_identity("postcapture")
                 observation = self._fresh_observation()
+                self._assert_observation_identity(observation, identity)
+                self._assert_device_identity("postcapture_complete")
             except PermissionError as error:
-                return False, str(error)
-            if observation.capture_sequence <= entry.consume_capture_sequence:
-                return False, "postcondition_capture_not_independent"
+                return False, str(error), None
+            if observation.source_monotonic_sequence <= entry.consume_capture_sequence:
+                return False, "postcondition_capture_not_independent", observation
+            if (
+                entry.consume_observation is not None
+                and observation.source_monotonic_sequence
+                <= entry.consume_observation.source_monotonic_sequence
+            ):
+                return False, "postcondition_source_capture_not_independent", observation
             marker_text = self._marker_text(observation)
             spec = self._policies.get(record.action_key)
             if spec is None or any(marker.casefold() in marker_text for marker in spec.forbidden_markers):
-                return False, "postcondition_forbidden_marker"
-            predicates = {
-                "daily_anchor_remains_valid": lambda: self._observation_matches(observation, record),
-                "manual_anchor_remains_valid": lambda: self._observation_matches(observation, record),
-                "page_identity_must_change_or_remain_safe": lambda: observation.page_type != "unknown",
-                "top_level_hud_or_safe_startup_transition": lambda: observation.page_type in {"login", "home", "hud", "startup_overlay"},
-            }
-            predicate = predicates.get(record.postcondition)
-            if predicate is None:
-                return False, "postcondition_predicate_unregistered"
-            return (True, "postcondition_verified") if predicate() else (False, "postcondition_failed")
+                return False, "postcondition_forbidden_marker", observation
+            dangerous = {"account_settings", "payment", "confirm", "depart"}
+            if observation.page_type in dangerous:
+                return False, "postcondition_dangerous_page", observation
+            if record.postcondition in {"daily_anchor_remains_valid", "manual_anchor_remains_valid"}:
+                same_context = self._observation_matches(observation, record)
+                consume = entry.consume_observation
+                shifted = bool(
+                    consume is not None
+                    and observation.content_marker_hash
+                    and consume.content_marker_hash
+                    and observation.content_marker_hash != consume.content_marker_hash
+                )
+                verified = same_context and shifted
+            elif record.postcondition == "top_level_hud_or_safe_startup_transition":
+                verified = observation.page_type in {"login", "home", "hud", "startup_overlay"}
+            elif record.postcondition == "page_identity_must_change_or_remain_safe":
+                verified = observation.page_type in spec.allowed_post_page_types
+            else:
+                verified = bool(spec.allowed_post_page_types and observation.page_type in spec.allowed_post_page_types)
+            entry.post_observation = observation
+            return (
+                (True, "postcondition_verified", observation)
+                if verified
+                else (False, "postcondition_failed", observation)
+            )
 
 
 @dataclass(frozen=True)
@@ -762,9 +973,16 @@ class ActionJournalEntry:
     permit_max_uses: int = 0
     stage: str = "DENIED"
     action_kind: str = ""
+    observation_role: str = ""
+    source_capture_digest: str = ""
+    source_capture_sequence: int = 0
+    observation_captured_at: str = ""
+    content_marker_hash: str = ""
+    side_effect_occurred: bool = False
 
 
 class JournalStage(str, Enum):
+    PRECONDITION_OBSERVED = "PRECONDITION_OBSERVED"
     AUTHORIZED = "AUTHORIZED"
     EXECUTION_STARTED = "EXECUTION_STARTED"
     EXECUTED = "EXECUTED"
@@ -772,6 +990,7 @@ class JournalStage(str, Enum):
     EXECUTION_FAILED = "EXECUTION_FAILED"
     POSTCONDITION_FAILED = "POSTCONDITION_FAILED"
     DENIED = "DENIED"
+    SESSION_CLOSED = "SESSION_CLOSED"
 
 
 class TrustedInputExecutor(Protocol):
@@ -793,7 +1012,22 @@ class _CallableTapExecutor:
         raise RuntimeError("trusted swipe executor unavailable")
 
 
+@dataclass(frozen=True)
+class _SessionComponents:
+    executor: TrustedInputExecutor | None
+    issuer: ReadOnlyPermitIssuer | None
+    action_lock: threading.RLock
+
+
+_SESSION_COMPONENTS: dict[str, _SessionComponents] = {}
+_SESSION_COMPONENTS_LOCK = threading.RLock()
+
+
 class ReadOnlyActionGuard:
+    __slots__ = (
+        "_session_token", "now", "_journal", "_journal_lock", "_closed",
+        "__weakref__",
+    )
     BLOCKED_ACTIONS = {
         "transaction_buy", "transaction_sell", "all_buy", "all_sell",
         "haggle_confirm", "raise_price_confirm", "use_item", "use_book",
@@ -802,9 +1036,11 @@ class ReadOnlyActionGuard:
     }
 
     def __setattr__(self, name, value):
-        if name == "_executor" and "_executor" in self.__dict__:
-            raise AttributeError("trusted executor is immutable after guard initialization")
-        super().__setattr__(name, value)
+        if name in {"trusted_executor", "permit_issuer", "executor", "issuer"}:
+            raise AttributeError("sealed safety-session component is not public")
+        if name in self.__slots__ and hasattr(self, name):
+            raise AttributeError("safety-session fields are immutable after initialization")
+        object.__setattr__(self, name, value)
 
     def __init__(
         self,
@@ -813,18 +1049,29 @@ class ReadOnlyActionGuard:
         permit_issuer: ReadOnlyPermitIssuer | None = None,
         now: Callable[[], datetime] = _now,
         context_provider: Callable[[], str] | None = None,
+        device_action_lock=None,
     ):
         if trusted_executor is not None and callable(trusted_executor) and not hasattr(trusted_executor, "tap"):
             trusted_executor = _CallableTapExecutor(trusted_executor)
-        self._executor = trusted_executor
-        self.permit_issuer = permit_issuer
+        token = secrets.token_urlsafe(32)
+        self._session_token = token
         self.now = now
         self._journal: list[ActionJournalEntry] = []
         self._journal_lock = threading.Lock()
+        self._closed = False
+        with _SESSION_COMPONENTS_LOCK:
+            _SESSION_COMPONENTS[token] = _SessionComponents(
+                trusted_executor,
+                permit_issuer,
+                device_action_lock or threading.RLock(),
+            )
 
-    @property
-    def trusted_executor(self) -> TrustedInputExecutor | None:
-        return self._executor
+    def _components(self) -> _SessionComponents:
+        with _SESSION_COMPONENTS_LOCK:
+            components = _SESSION_COMPONENTS.get(self._session_token)
+        if components is None or self._closed:
+            raise PermissionError("read_only_safety_session_closed")
+        return components
 
     @property
     def journal(self) -> tuple[ActionJournalEntry, ...]:
@@ -847,11 +1094,18 @@ class ReadOnlyActionGuard:
         action_kind: ActionKind | None = None,
         permit: ReadOnlyPermitHandle | None = None,
         record: _PermitRecord | None = None,
+        observation: PageObservation | None = None,
+        observation_role: str = "",
+        side_effect_occurred: bool = False,
     ) -> bool:
         authoritative = record
+        try:
+            issuer = self._components().issuer
+        except PermissionError:
+            issuer = None
         digest = (
-            self.permit_issuer.permit_digest(permit)
-            if self.permit_issuer is not None
+            issuer.permit_digest(permit)
+            if issuer is not None
             else ReadOnlyPermitIssuer.permit_digest(permit)
         )
         marker_hash = ""
@@ -860,8 +1114,16 @@ class ReadOnlyActionGuard:
             marker_hash = hashlib.sha256(
                 f"{authoritative.page_classifier}|{authoritative.anchor_text_hash}".encode("utf-8")
             ).hexdigest()[:16]
-            if self.permit_issuer is not None and permit is not None:
-                permit_status = self.permit_issuer.permit_status(permit)
+            if issuer is not None and permit is not None:
+                permit_status = issuer.permit_status(permit)
+        source_digest = ""
+        if observation is not None and observation.source_capture_id:
+            source_digest = hashlib.sha256(
+                observation.source_capture_id.encode("utf-8")
+            ).hexdigest()[:16]
+            marker_hash = hashlib.sha256(
+                "|".join((observation.page_type, *sorted(observation.markers))).encode("utf-8")
+            ).hexdigest()[:16]
         entry = ActionJournalEntry(
             timestamp=self.now().isoformat(timespec="milliseconds"),
             action_key=str(authoritative.action_key if authoritative else action_key),
@@ -870,9 +1132,18 @@ class ReadOnlyActionGuard:
             correlation_id=authoritative.correlation_id if authoritative else "",
             permit_id=digest,
             permit_digest=digest,
-            observation_id=authoritative.observation_id if authoritative else "",
-            screenshot_hash=authoritative.screenshot_hash if authoritative else "",
-            page_classifier=authoritative.page_classifier if authoritative else "",
+            observation_id=(
+                observation.observation_id if observation is not None
+                else authoritative.observation_id if authoritative else ""
+            ),
+            screenshot_hash=(
+                observation.screenshot_hash if observation is not None
+                else authoritative.screenshot_hash if authoritative else ""
+            ),
+            page_classifier=(
+                observation.page_type if observation is not None
+                else authoritative.page_classifier if authoritative else ""
+            ),
             marker_hash=marker_hash,
             anchor_key=authoritative.anchor_id if authoritative else "",
             anchor_bbox=authoritative.anchor_bbox if authoritative else None,
@@ -887,6 +1158,17 @@ class ReadOnlyActionGuard:
             permit_max_uses=int(permit_status.get("max_uses", 0)),
             stage=stage.value,
             action_kind=(authoritative.action_kind.value if authoritative else (action_kind.value if action_kind else "")),
+            observation_role=str(observation_role),
+            source_capture_digest=source_digest,
+            source_capture_sequence=(
+                int(observation.source_monotonic_sequence) if observation else 0
+            ),
+            observation_captured_at=(
+                observation.captured_at.isoformat(timespec="microseconds")
+                if observation else ""
+            ),
+            content_marker_hash=(observation.content_marker_hash if observation else ""),
+            side_effect_occurred=bool(side_effect_occurred),
         )
         with self._journal_lock:
             self._journal.append(entry)
@@ -910,16 +1192,21 @@ class ReadOnlyActionGuard:
         action_kind: ActionKind,
         duration_ms: int,
     ) -> bool:
-        key = str(intent.action_key if intent is not None else self.permit_issuer.action_key(permit) if self.permit_issuer is not None else "unclassified_action")
+        try:
+            components = self._components()
+        except PermissionError as error:
+            return self._record("unclassified_action", trajectory, allowed=False, reason=str(error))
+        issuer, executor = components.issuer, components.executor
+        key = str(intent.action_key if intent is not None else issuer.action_key(permit) if issuer is not None else "unclassified_action")
         if key in self.BLOCKED_ACTIONS:
             return self._record(key, trajectory, allowed=False, reason="action_prohibited_in_read_only_mode", stage=JournalStage.DENIED, action_kind=action_kind, permit=permit)
-        if self._executor is None:
+        if executor is None:
             return self._record(key, trajectory, allowed=False, reason="trusted_executor_unavailable", stage=JournalStage.DENIED, action_kind=action_kind, permit=permit)
         if permit is None and intent is not None:
-            if self.permit_issuer is None:
+            if issuer is None:
                 return self._record(key, trajectory, allowed=False, reason="trusted_permit_issuer_unavailable")
             try:
-                permit = self.permit_issuer.issue(
+                permit = issuer.issue(
                     intent, trajectory, geometry=geometry, duration_ms=duration_ms,
                     requested_action_kind=action_kind,
                 )
@@ -927,40 +1214,45 @@ class ReadOnlyActionGuard:
                 return self._record(key, trajectory, allowed=False, reason=str(error), stage=JournalStage.DENIED, action_kind=action_kind)
         if permit is None:
             return self._record(key, trajectory, allowed=False, reason="read_only_permit_required", stage=JournalStage.DENIED, action_kind=action_kind)
-        if self.permit_issuer is None:
+            issue_observation = issuer.issue_observation(permit)
+            self._record(
+                key, trajectory, allowed=True, reason="precondition_observed",
+                stage=JournalStage.PRECONDITION_OBSERVED,
+                action_kind=action_kind, permit=permit,
+                observation=issue_observation, observation_role="PRE",
+            )
+        if issuer is None:
             return self._record(key, trajectory, allowed=False, reason="trusted_permit_issuer_unavailable", stage=JournalStage.DENIED, action_kind=action_kind, permit=permit)
-        allowed, reason, record, physical = self.permit_issuer.consume(
-            permit, trajectory, geometry=geometry, action_kind=action_kind, duration_ms=duration_ms
-        )
-        self._record(
-            key,
-            trajectory,
-            physical_trajectory=physical,
-            allowed=allowed,
-            reason=reason,
-            stage=JournalStage.AUTHORIZED if allowed else JournalStage.DENIED,
-            action_kind=action_kind,
-            permit=permit,
-            record=record,
-        )
-        if not allowed:
-            return False
-        self._record(key, trajectory, physical_trajectory=physical, allowed=True, reason="execution_started", stage=JournalStage.EXECUTION_STARTED, action_kind=action_kind, permit=permit, record=record)
-        try:
-            if action_kind is ActionKind.TAP:
-                self._executor.tap(physical[0])
-            else:
-                self._executor.swipe(physical, duration_ms)
-        except Exception:
-            self._record(key, trajectory, physical_trajectory=physical, allowed=False, reason="execution_failed", stage=JournalStage.EXECUTION_FAILED, action_kind=action_kind, permit=permit, record=record)
-            raise
-        self._record(key, trajectory, physical_trajectory=physical, allowed=True, reason="hardware_execution_completed", stage=JournalStage.EXECUTED, action_kind=action_kind, permit=permit, record=record)
-        verified, post_reason = self.permit_issuer.verify_postcondition(permit, record)
-        if not verified:
-            self._record(key, trajectory, physical_trajectory=physical, allowed=False, reason=post_reason, stage=JournalStage.POSTCONDITION_FAILED, action_kind=action_kind, permit=permit, record=record)
-            return False
-        self._record(key, trajectory, physical_trajectory=physical, allowed=True, reason=post_reason, stage=JournalStage.POSTCONDITION_VERIFIED, action_kind=action_kind, permit=permit, record=record)
-        return True
+        with components.action_lock:
+            allowed, reason, record, physical = issuer.consume(
+                permit, trajectory, geometry=geometry, action_kind=action_kind, duration_ms=duration_ms
+            )
+            consume_observation = issuer.consume_observation(permit)
+            self._record(
+                key, trajectory, physical_trajectory=physical, allowed=allowed,
+                reason=reason,
+                stage=JournalStage.AUTHORIZED if allowed else JournalStage.DENIED,
+                action_kind=action_kind, permit=permit, record=record,
+                observation=consume_observation, observation_role="CONSUME",
+            )
+            if not allowed:
+                return False
+            self._record(key, trajectory, physical_trajectory=physical, allowed=True, reason="execution_started", stage=JournalStage.EXECUTION_STARTED, action_kind=action_kind, permit=permit, record=record)
+            try:
+                if action_kind is ActionKind.TAP:
+                    executor.tap(physical[0])
+                else:
+                    executor.swipe(physical, duration_ms)
+            except Exception:
+                self._record(key, trajectory, physical_trajectory=physical, allowed=False, reason="execution_failed", stage=JournalStage.EXECUTION_FAILED, action_kind=action_kind, permit=permit, record=record, side_effect_occurred=True)
+                raise
+            self._record(key, trajectory, physical_trajectory=physical, allowed=True, reason="hardware_execution_completed", stage=JournalStage.EXECUTED, action_kind=action_kind, permit=permit, record=record, side_effect_occurred=True)
+            verified, post_reason, post_observation = issuer.verify_postcondition(permit, record)
+            if not verified:
+                self._record(key, trajectory, physical_trajectory=physical, allowed=False, reason=post_reason, stage=JournalStage.POSTCONDITION_FAILED, action_kind=action_kind, permit=permit, record=record, observation=post_observation, observation_role="POST", side_effect_occurred=True)
+                return False
+            self._record(key, trajectory, physical_trajectory=physical, allowed=True, reason=post_reason, stage=JournalStage.POSTCONDITION_VERIFIED, action_kind=action_kind, permit=permit, record=record, observation=post_observation, observation_role="POST", side_effect_occurred=True)
+            return True
 
     def authorize_coordinate(
         self,
@@ -1006,23 +1298,75 @@ class ReadOnlyActionGuard:
             "journal": [asdict(entry) for entry in self.journal],
         }
 
+    def request_tap(
+        self, intent: ActionIntent, coordinate: tuple[int, int], *,
+        geometry: DisplayGeometry | None = None,
+    ) -> bool:
+        return self.authorize_coordinate(coordinate, intent=intent, geometry=geometry)
+
+    def request_swipe(
+        self, intent: ActionIntent, trajectory: tuple[tuple[int, int], ...],
+        duration_ms: int, *, geometry: DisplayGeometry | None = None,
+    ) -> bool:
+        return self.authorize_swipe(
+            trajectory[0], trajectory[-1], trajectory=trajectory,
+            intent=intent, geometry=geometry, duration_ms=duration_ms,
+        )
+
+    def close(self) -> None:
+        components = self._components()
+        revoked = components.issuer.revoke_all() if components.issuer is not None else 0
+        self._record(
+            "session_close", (), allowed=True,
+            reason=f"session_closed_permits_revoked={revoked}",
+            stage=JournalStage.SESSION_CLOSED,
+        )
+        with _SESSION_COMPONENTS_LOCK:
+            _SESSION_COMPONENTS.pop(self._session_token, None)
+        object.__setattr__(self, "_closed", True)
+
 
 @contextmanager
 def installed_read_only_guard(guard: ReadOnlyActionGuard) -> Iterator[ReadOnlyActionGuard]:
-    from core.control.control import install_action_policy
+    from core.control.control import activate_action_policy, remove_action_policy
 
-    previous = install_action_policy(guard)
+    owner_token = activate_action_policy(guard)
     try:
         yield guard
     finally:
-        install_action_policy(previous)
+        remove_action_policy(owner_token)
+
+
+class ReadOnlySafetySession(ReadOnlyActionGuard):
+    """Production policy type accepted by the low-level input session gate."""
+
+
+def create_test_read_only_session(
+    observer: PageObserver,
+    executor: TrustedInputExecutor | Callable[[tuple[int, int]], object] | None,
+    *,
+    policies: dict[str, ReadOnlyPolicySpec] | None = None,
+    now: Callable[[], datetime] = _now,
+    resolver: AnchorResolver | None = None,
+) -> tuple[ReadOnlySafetySession, ReadOnlyPermitIssuer]:
+    """Explicit test-only injection path; production uses the control factory."""
+
+    issuer = ReadOnlyPermitIssuer(
+        observer, resolver or AnchorResolver(), policies=policies, now=now
+    )
+    return (
+        ReadOnlySafetySession(executor, permit_issuer=issuer, now=now),
+        issuer,
+    )
 
 
 __all__ = [
     "ActionIntent", "ActionJournalEntry", "ActionKind", "AnchorResolver",
+    "BoundDeviceIdentity",
     "CalibratedStaticRegion", "CoordinateSpace", "DisplayGeometry",
     "ObservedAnchor", "OcrObservedAnchor", "PageObservation", "PageObserver",
     "JournalStage", "ReadOnlyActionGuard", "ReadOnlyPermit", "ReadOnlyPermitHandle",
-    "ReadOnlyPermitIssuer", "ReadOnlyPolicySpec", "TrustedInputExecutor",
-    "installed_read_only_guard",
+    "ReadOnlyPermitIssuer", "ReadOnlyPolicySpec", "ReadOnlySafetySession",
+    "TrustedFrameEvidence", "TrustedInputExecutor",
+    "create_test_read_only_session", "installed_read_only_guard",
 ]
