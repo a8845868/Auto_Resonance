@@ -8,8 +8,6 @@ import inspect
 import json
 import re
 import sys
-import time
-from itertools import count
 from dataclasses import asdict, is_dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -27,11 +25,12 @@ from auto.module.strength import read_strength  # noqa: E402
 from auto.reward_collection import RewardCollector, RewardDriver  # noqa: E402
 from core.control.control import (  # noqa: E402
     connect_adb,
+    capture_envelope,
     create_read_only_safety_session,
-    current_bound_device_identity,
     current_display_geometry,
     screenshot,
 )
+from core.image.image import Image  # noqa: E402
 from core.preset import get_station  # noqa: E402
 from core.services.read_only_policy import (  # noqa: E402
     AnchorResolver,
@@ -49,9 +48,6 @@ from core.services.read_only_policy import (  # noqa: E402
 from core.services.station_facilities import rest_area_availability  # noqa: E402
 
 
-_SOURCE_CAPTURE_SEQUENCE = count(1)
-
-
 def _jsonable(value):
     if is_dataclass(value):
         return _jsonable(asdict(value))
@@ -65,7 +61,8 @@ def _jsonable(value):
 
 
 def _capture(output: Path, name: str) -> dict:
-    frame = screenshot()
+    envelope = capture_envelope()
+    frame = Image(envelope.frame)
     image_path = output / f"{name}.png"
     cv.imwrite(str(image_path), frame.image)
     payload = {
@@ -124,6 +121,17 @@ def _classify_page(texts: list[str]) -> tuple[str, list[str]]:
         return "manual_track", ["manual_track"]
     if any(marker in joined for marker in ("我要买", "我要卖")):
         return "exchange", ["exchange_menu"]
+    if any(marker in joined for marker in ("你想要什么", "研究报告", "什么都行")):
+        return "npc_dialogue", ["npc_dialogue"]
+    city_context = sum(
+        marker in joined
+        for marker in ("当前城市", "城市设施", "城市手册", "城市发展度", "CITY")
+    )
+    city_facilities = sum(
+        marker in joined for marker in ("交易所", "商会", "休息区")
+    )
+    if city_context >= 2 and city_facilities >= 1:
+        return "city_map", ["city_map"]
     if any(marker in joined for marker in ("访问城市", "启程", "作战终端")):
         return "home", ["top_level_hud"]
     if any(marker in joined for marker in ("进入游戏", "启动游戏")):
@@ -154,7 +162,8 @@ def _static_region(
 def _trusted_observation() -> TrustedFrameEvidence:
     """Build only safety facts from a fresh frame; never persist raw OCR here."""
 
-    frame = screenshot()
+    envelope = capture_envelope()
+    frame = Image(envelope.frame)
     items = list(frame.ocr())
     texts = [str(item.get("text", "")).replace(" ", "") for item in items]
     joined = "|".join(texts)
@@ -171,7 +180,10 @@ def _trusted_observation() -> TrustedFrameEvidence:
             "reward_back", "page_identity_must_change_or_remain_safe",
             geometry.geometry_revision,
         ))
-    if page_type in {"home", "daily_activity", "manual_tasks", "manual_track", "exchange_buy", "exchange_sell"}:
+    if page_type in {
+        "home", "daily_activity", "manual_tasks", "manual_track",
+        "city_map", "npc_dialogue", "exchange", "exchange_buy", "exchange_sell",
+    }:
         static_regions.append(_static_region(
             "top_left_back", (20, 10, 130, 85), page_type,
             "page_back", "page_identity_must_change_or_remain_safe",
@@ -194,6 +206,12 @@ def _trusted_observation() -> TrustedFrameEvidence:
             _static_region("daily_shortcut", (998, 32, 1098, 132), page_type, "daily_page_open", "page_identity_must_change_or_remain_safe", geometry.geometry_revision),
             _static_region("manual_shortcut", (1082, 32, 1182, 132), page_type, "manual_page_open", "page_identity_must_change_or_remain_safe", geometry.geometry_revision),
         ))
+    if page_type == "city_map":
+        static_regions.append(_static_region(
+            "outlet_list", (180, 120, 1080, 650), page_type,
+            "outlet_list_scroll", "city_map_content_changed",
+            geometry.geometry_revision,
+        ))
     if page_type == "login":
         static_regions.append(_static_region(
             "enter_game", (560, 500, 720, 620), page_type,
@@ -209,6 +227,10 @@ def _trusted_observation() -> TrustedFrameEvidence:
             anchors.append(ObservedAnchor("buy_navigation", text_value, bounds))
         if "我要卖" in text_value:
             anchors.append(ObservedAnchor("sell_navigation", text_value, bounds))
+        if "访问城市" in text_value:
+            anchors.append(ObservedAnchor("city_entry", text_value, bounds))
+        if page_type == "city_map" and "交易所" in text_value:
+            anchors.append(ObservedAnchor("交易所", text_value, bounds))
         if text_value == "任务列表":
             anchors.append(ObservedAnchor("manual_tasks_tab", text_value, bounds))
         if text_value == "环游手册":
@@ -219,16 +241,13 @@ def _trusted_observation() -> TrustedFrameEvidence:
         if match and bounds[1] < 100 and 500 <= int(match.group(2)) <= 2000:
             anchors.append(ObservedAnchor("fatigue_value", "fatigue_ratio", bounds))
 
-    screenshot_hash = hashlib.sha256(frame.image.tobytes()).hexdigest()
+    screenshot_hash = envelope.raw_frame_hash
     observation_id = hashlib.sha256(
         f"{screenshot_hash}|{page_type}|{'|'.join(sorted(markers))}".encode("utf-8")
     ).hexdigest()[:24]
-    source_sequence = next(_SOURCE_CAPTURE_SEQUENCE)
-    identity = current_bound_device_identity()
-    captured_at = datetime.now().astimezone()
-    source_capture_id = hashlib.sha256(
-        f"{identity.backend_object_identity}|{source_sequence}|{time.time_ns()}".encode("utf-8")
-    ).hexdigest()
+    source_sequence = envelope.backend_monotonic_sequence
+    captured_at = envelope.captured_at
+    source_capture_id = envelope.backend_capture_id
     content_marker_hash = hashlib.sha256(
         "|".join(
             sorted(
@@ -249,9 +268,9 @@ def _trusted_observation() -> TrustedFrameEvidence:
         capture_sequence=source_sequence,
         source_capture_id=source_capture_id,
         source_monotonic_sequence=source_sequence,
-        backend_generation=identity.backend_generation,
-        instance_id=identity.instance_id,
-        adb_serial=identity.adb_serial,
+        backend_generation=envelope.backend_generation,
+        instance_id=envelope.instance_id,
+        adb_serial=envelope.adb_serial,
         content_marker_hash=content_marker_hash,
     )
     return TrustedFrameEvidence(
@@ -259,12 +278,38 @@ def _trusted_observation() -> TrustedFrameEvidence:
         source_monotonic_sequence=source_sequence,
         raw_frame_hash=screenshot_hash,
         captured_at=captured_at,
-        backend_generation=identity.backend_generation,
-        instance_id=identity.instance_id,
-        adb_serial=identity.adb_serial,
+        backend_generation=envelope.backend_generation,
+        instance_id=envelope.instance_id,
+        adb_serial=envelope.adb_serial,
         logical_resolution=(1280, 720),
         observation=observation,
     )
+
+
+def _return_home_safely(driver: RewardDriver, *, attempt_limit: int = 8) -> bool:
+    """Return through classified safe pages and independently verify HOME."""
+
+    safe_back_pages = {
+        "daily_activity", "manual_tasks", "manual_track", "city_map",
+        "npc_dialogue", "exchange", "exchange_buy", "exchange_sell",
+        "inventory", "fatigue_info",
+    }
+    for attempt in range(max(1, int(attempt_limit))):
+        page_type = _trusted_observation().observation.page_type
+        if page_type in {"home", "hud"}:
+            return True
+        if page_type not in safe_back_pages:
+            return False
+        try:
+            driver.tap(
+                (82, 36), action_key="page_back",
+                page_id=page_type, anchor_key="top_left_back",
+            )
+        except PermissionError:
+            return False
+        if attempt + 1 < int(attempt_limit):
+            driver.sleep(0.8)
+    return False
 
 
 def run_policy_canaries(_live_guard: ReadOnlyActionGuard) -> list[dict]:
@@ -416,7 +461,7 @@ def _run_probe(
         "adb_port": args.adb_port,
         "captures": [],
     }
-    if not driver.go_home(attempt_limit=8):
+    if not _return_home_safely(driver, attempt_limit=8):
         raise RuntimeError("cannot reach game home safely")
     result["captures"].append(_capture(output, "home-before"))
 
@@ -424,6 +469,17 @@ def _run_probe(
         exchange_navigation.ExchangeAction.BUY, read_only=True
     )
     result["buy_navigation"] = _jsonable(buy)
+    if not buy.success:
+        result.update({
+            "acceptance_status": "BLOCKED",
+            "blocked_stage": "buy_navigation",
+            "blocked_reason": buy.reason or "buy_navigation_failed",
+        })
+        result.update(policy_report(guard, policy_canary_results=policy_canaries))
+        result["prohibited_actions_invoked"] = [
+            entry["action_key"] for entry in result["actual_blocked_production_actions"]
+        ]
+        return result
     if buy.success:
         result["buy_strength"] = _jsonable(read_strength())
         result["captures"].append(_capture(output, "exchange-buy"))
@@ -438,6 +494,17 @@ def _run_probe(
         exchange_navigation.ExchangeAction.SELL, read_only=True
     )
     result["sell_navigation"] = _jsonable(sell)
+    if not sell.success:
+        result.update({
+            "acceptance_status": "BLOCKED",
+            "blocked_stage": "sell_navigation",
+            "blocked_reason": sell.reason or "sell_navigation_failed",
+        })
+        result.update(policy_report(guard, policy_canary_results=policy_canaries))
+        result["prohibited_actions_invoked"] = [
+            entry["action_key"] for entry in result["actual_blocked_production_actions"]
+        ]
+        return result
     if sell.success:
         result["captures"].append(_capture(output, "exchange-sell"))
         driver.tap(
@@ -458,7 +525,21 @@ def _run_probe(
         result["captures"].append(_capture(output, "manual-observation"))
         driver.go_home()
 
+    result["home_returned"] = _return_home_safely(driver, attempt_limit=8)
+    if not result["home_returned"]:
+        result.update({
+            "acceptance_status": "BLOCKED",
+            "blocked_stage": "safe_return_home",
+            "blocked_reason": "cannot_reach_home_safely",
+        })
+        result.update(policy_report(guard, policy_canary_results=policy_canaries))
+        result["prohibited_actions_invoked"] = [
+            entry["action_key"] for entry in result["actual_blocked_production_actions"]
+        ]
+        return result
+
     result.update(policy_report(guard, policy_canary_results=policy_canaries))
+    result["acceptance_status"] = "PASS"
     result["prohibited_actions_invoked"] = [
         entry["action_key"] for entry in result["actual_blocked_production_actions"]
     ]
@@ -486,7 +567,7 @@ def main() -> int:
             result = _run_probe(
                 args, output, guard, policy_canaries=policy_canaries
             )
-        result["acceptance_status"] = "PASS"
+        result.setdefault("acceptance_status", "PASS")
     except Exception as error:
         result = {
             "mode": "READ_ONLY",

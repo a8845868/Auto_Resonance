@@ -105,7 +105,7 @@ def test_one_use_permit_is_consumed_atomically_by_concurrent_callers(monkeypatch
         thread.join(timeout=10)
 
     assert sorted(results) == [False, True]
-    denied = [entry.reason for entry in guard.journal if entry.stage == "DENIED"]
+    denied = [entry.reason for entry in guard.journal if entry.stage == "CONSUME_DENIED"]
     assert denied == ["permit_already_consumed"]
 
 
@@ -225,7 +225,17 @@ def test_exchange_buy_classifier_precedes_generic_exchange_menu(monkeypatch):
     frame = SimpleNamespace(
         image=np.zeros((720, 1280, 3), dtype=np.uint8), ocr=lambda: items
     )
-    monkeypatch.setattr(probe, "screenshot", lambda: frame)
+    monkeypatch.setattr(probe, "capture_envelope", lambda: SimpleNamespace(
+        frame=frame.image,
+        raw_frame_hash="b" * 64,
+        backend_monotonic_sequence=1,
+        backend_capture_id="test-capture-red",
+        captured_at=datetime.now().astimezone(),
+        backend_generation=1,
+        instance_id="test-instance-0",
+        adb_serial="test-adb-0",
+    ))
+    monkeypatch.setattr(probe, "Image", lambda _image: frame)
 
     assert probe._trusted_observation().as_observation().page_type == "exchange_buy"
 

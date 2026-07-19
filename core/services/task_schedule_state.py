@@ -14,6 +14,10 @@ STATE_PATH = Path("config/task_schedule.json")
 TASK_KEY_RUN_BUSINESS = "run_business"
 _STATE_LOCK = threading.RLock()
 SCHEMA_VERSION = 1
+DATETIME_FIELDS = frozenset({
+    "next_run", "last_run", "last_attempt", "completed_at", "progress_at",
+})
+TASK_STATUSES = frozenset({"completed", "deferred", "failed_or_stopped"})
 
 
 class TaskScheduleStateCorrupt(RuntimeError):
@@ -55,6 +59,18 @@ def _validate_task_timing(task_key: str, entry: object) -> None:
     for field in string_fields:
         if field in entry and not isinstance(entry[field], str):
             raise ValueError(f"tasks.{task_key}.{field} must be a string")
+    for field in DATETIME_FIELDS:
+        value = entry.get(field, "")
+        if value:
+            try:
+                datetime.fromisoformat(value)
+            except ValueError as error:
+                raise ValueError(
+                    f"tasks.{task_key}.{field} must be an ISO datetime"
+                ) from error
+    status = entry.get("status", "")
+    if status and status not in TASK_STATUSES:
+        raise ValueError(f"tasks.{task_key}.status is unsupported")
     if "force_verify" in entry and not isinstance(entry["force_verify"], bool):
         raise ValueError(f"tasks.{task_key}.force_verify must be a boolean")
     if "result" in entry and not _is_json_value(entry["result"]):
@@ -70,6 +86,18 @@ def _validate_completed_entry(index: int, entry: object) -> None:
     ):
         if field in entry and not isinstance(entry[field], str):
             raise ValueError(f"completed.{index}.{field} must be a string")
+    for field in DATETIME_FIELDS:
+        value = entry.get(field, "")
+        if value:
+            try:
+                datetime.fromisoformat(value)
+            except ValueError as error:
+                raise ValueError(
+                    f"completed.{index}.{field} must be an ISO datetime"
+                ) from error
+    status = entry.get("status", "")
+    if status and status not in TASK_STATUSES:
+        raise ValueError(f"completed.{index}.status is unsupported")
     if "force_verify" in entry and not isinstance(entry["force_verify"], bool):
         raise ValueError(f"completed.{index}.force_verify must be a boolean")
     if "result" in entry and not _is_json_value(entry["result"]):
@@ -175,18 +203,15 @@ def is_task_due(task_key: str, now: datetime | None = None, path: Path = STATE_P
     next_run = task_timing(task_key, path).get("next_run")
     if not next_run:
         return True
-    try:
-        target = datetime.fromisoformat(next_run)
-        current = now or datetime.now(target.tzinfo)
-        if target.tzinfo is not None and current.tzinfo is None:
-            current = current.replace(
-                tzinfo=_system_local_timezone()
-            ).astimezone(target.tzinfo)
-        elif target.tzinfo is None and current.tzinfo is not None:
-            current = current.astimezone(_system_local_timezone()).replace(tzinfo=None)
-        return target <= current
-    except (TypeError, ValueError):
-        return True
+    target = datetime.fromisoformat(next_run)
+    current = now or datetime.now(target.tzinfo)
+    if target.tzinfo is not None and current.tzinfo is None:
+        current = current.replace(
+            tzinfo=_system_local_timezone()
+        ).astimezone(target.tzinfo)
+    elif target.tzinfo is None and current.tzinfo is not None:
+        current = current.astimezone(_system_local_timezone()).replace(tzinfo=None)
+    return target <= current
 
 
 def next_daily_reset(now: datetime | None = None) -> datetime:

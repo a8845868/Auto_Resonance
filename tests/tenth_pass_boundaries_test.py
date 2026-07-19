@@ -272,7 +272,17 @@ def _probe_observation(monkeypatch, texts: list[str]) -> PageObservation:
     frame = SimpleNamespace(
         image=np.zeros((720, 1280, 3), dtype=np.uint8), ocr=lambda: items
     )
-    monkeypatch.setattr(probe, "screenshot", lambda: frame)
+    monkeypatch.setattr(probe, "capture_envelope", lambda: SimpleNamespace(
+        frame=frame.image,
+        raw_frame_hash="a" * 64,
+        backend_monotonic_sequence=1,
+        backend_capture_id="test-capture-boundary",
+        captured_at=datetime.now().astimezone(),
+        backend_generation=1,
+        instance_id="test-instance-0",
+        adb_serial="test-adb-0",
+    ))
+    monkeypatch.setattr(probe, "Image", lambda _image: frame)
     monkeypatch.setattr(probe, "current_display_geometry", DisplayGeometry)
     return probe._trusted_observation().as_observation()
 

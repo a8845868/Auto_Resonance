@@ -5,7 +5,10 @@ LastEditTime: 2025-02-11 19:26:36
 LastEditors: Night-stars-1 nujj1042633805@gmail.com
 """
 
+import hashlib
 import time
+from dataclasses import dataclass
+from enum import Enum
 from typing import Callable, Dict, Optional, Tuple
 
 from loguru import logger
@@ -13,10 +16,13 @@ from loguru import logger
 from core.control.control import (
     input_swipe,
     input_tap,
+    is_stopped,
     screenshot,
     screenshot_image,
     wait_stopped,
 )
+from core.exception.exceptions import StopExecution
+from core.image.utils import match_template
 from core.module.bgr import BGR
 from core.image.ocr import predict
 from core.preset import blurry_ocr_click, go_home
@@ -29,6 +35,60 @@ from .control import click_image
 from .station import STATION
 
 FIGHT_TIME = 1000
+
+
+class CityNavigationState(str, Enum):
+    HOME = "HOME"
+    HUD = "HUD"
+    CITY_ENTRY_AVAILABLE = "CITY_ENTRY_AVAILABLE"
+    CITY_MAP = "CITY_MAP"
+    NPC_DIALOGUE = "NPC_DIALOGUE"
+    EXCHANGE_MENU = "EXCHANGE_MENU"
+    EXCHANGE_BUY = "EXCHANGE_BUY"
+    EXCHANGE_SELL = "EXCHANGE_SELL"
+    STARTUP_OVERLAY = "STARTUP_OVERLAY"
+    UNKNOWN = "UNKNOWN"
+    READ_ONLY_DENIED = "READ_ONLY_DENIED"
+    CANCELLED = "CANCELLED"
+    TIMEOUT = "TIMEOUT"
+    STALLED = "STALLED"
+
+
+@dataclass(frozen=True)
+class CityFrameObservation:
+    state: CityNavigationState
+    page_fingerprint: str
+    last_template_score: float
+    city_entry_anchor: tuple[int, int, int, int] | None = None
+    diagnostics: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CityNavigationResult:
+    success: bool
+    state: CityNavigationState
+    attempts: int
+    elapsed_seconds: float
+    last_template_score: float
+    page_fingerprint: str
+    actions_attempted: tuple[str, ...]
+    actions_executed: tuple[str, ...]
+    blocked_reason: str
+    diagnostics: tuple[str, ...]
+
+    def __bool__(self) -> bool:
+        return self.success
+
+
+@dataclass(frozen=True)
+class OutletNavigationResult:
+    success: bool
+    stage: str
+    reason: str = ""
+    city: CityNavigationResult | None = None
+
+    def __bool__(self) -> bool:
+        return self.success
 
 STATION_NAME2PNG: Dict[str, str] = read_json(RESOURCES_PATH / "stations/name2id.json")
 
@@ -453,51 +513,213 @@ def get_station(is_go_home: bool = True):
     return result[0]["text"]
 
 
-def go_city():
+def _ocr_bbox(item: dict) -> tuple[int, int, int, int] | None:
+    points = item.get("position") or ()
+    if len(points) < 3:
+        return None
+    xs = [int(point[0]) for point in points]
+    ys = [int(point[1]) for point in points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _city_frame_observation(frame) -> CityFrameObservation:
+    items = list(frame.ocr())
+    texts = [str(item.get("text", "")).replace(" ", "") for item in items]
+    joined = "|".join(texts)
+    diagnostics: list[str] = []
+    anchors = [
+        bounds for item, text in zip(items, texts)
+        if "访问城市" in text and (bounds := _ocr_bbox(item)) is not None
+    ]
+    anchor = anchors[0] if len(anchors) == 1 else None
+    if len(anchors) > 1:
+        diagnostics.append("visit_city_anchor_not_unique")
+
+    buy_markers = sum(marker in joined for marker in ("预计买入", "买入总价", "全部买入", "载货量"))
+    sell_markers = sum(marker in joined for marker in ("预计卖出", "卖出总价", "全部卖出", "载货量"))
+    if buy_markers >= 2 and sell_markers >= 2:
+        state = CityNavigationState.UNKNOWN
+        diagnostics.append("conflicting_exchange_markers")
+    elif buy_markers >= 2:
+        state = CityNavigationState.EXCHANGE_BUY
+    elif sell_markers >= 2:
+        state = CityNavigationState.EXCHANGE_SELL
+    elif "我要买" in joined and "我要卖" in joined:
+        state = CityNavigationState.EXCHANGE_MENU
+    elif any(marker in joined for marker in ("你想要什么", "研究报告", "什么都行")):
+        state = CityNavigationState.NPC_DIALOGUE
+    elif (
+        sum(marker in joined for marker in (
+            "当前城市", "城市设施", "城市手册", "城市发展度", "CITY",
+        )) >= 2
+        and sum(marker in joined for marker in (
+            "交易所", "商会", "休息区",
+        )) >= 1
+    ):
+        state = CityNavigationState.CITY_MAP
+    elif anchor is not None and any(marker in joined for marker in ("启程", "作战终端", "整备列车")):
+        state = CityNavigationState.HOME
+    elif any(marker in joined for marker in ("启程", "作战终端", "整备列车")):
+        state = CityNavigationState.HUD
+    elif any(marker in joined for marker in ("每日签到奖励", "资讯", "公告")):
+        state = CityNavigationState.STARTUP_OVERLAY
+    else:
+        state = CityNavigationState.UNKNOWN
+
+    template_result = match_template(
+        frame.image, RESOURCES_PATH / "fame.png",
+        cropped_pos1=(25, 634), cropped_pos2=(99, 707), threshold=0.95,
+    )
+    score = float(template_result.score)
+    if template_result.status and state in {CityNavigationState.HOME, CityNavigationState.HUD}:
+        diagnostics.append("template_ocr_conflict")
+        state = CityNavigationState.UNKNOWN
+    material = "|".join(
+        sorted(f"{text}@{_ocr_bbox(item)}" for item, text in zip(items, texts))
+    )
+    fingerprint = hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+    return CityFrameObservation(state, fingerprint, score, anchor, tuple(diagnostics))
+
+
+def go_city(
+    *, frame_provider: Callable[[], object] = screenshot,
+    frame_analyzer: Callable[[object], CityFrameObservation] = _city_frame_observation,
+    tap: Callable[..., object] = input_tap,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    cancellation: Callable[[], bool] | None = None,
+    max_attempts: int = 6, timeout: float = 20.0, stall_frames: int = 2,
+):
     """
     说明:
         进入城市界面
     """
-    while (
-        screenshot()
-        .crop_image(cropped_pos1=(25, 634), cropped_pos2=(99, 707))
-        .match_template(RESOURCES_PATH / "fame.png", 0.95)
-        == False
-    ):
-        input_tap(
-            (1270, 494),
+    started = monotonic()
+    deadline = started + max(0.0, float(timeout))
+    attempts = 0
+    attempted: list[str] = []
+    executed: list[str] = []
+    diagnostics: list[str] = []
+    last_score = 0.0
+    last_fingerprint = ""
+    stable_frames = 0
+    awaiting_city_map = False
+
+    def finish(state: CityNavigationState, success: bool, reason: str):
+        return CityNavigationResult(
+            success, state, attempts, max(0.0, monotonic() - started),
+            last_score, last_fingerprint, tuple(attempted), tuple(executed),
+            reason, tuple(diagnostics),
+        )
+
+    while attempts < max(1, int(max_attempts)) and monotonic() < deadline:
+        if is_stopped() or (cancellation is not None and cancellation()):
+            return finish(CityNavigationState.CANCELLED, False, "cancelled")
+        try:
+            frame = frame_provider()
+        except StopExecution:
+            return finish(CityNavigationState.CANCELLED, False, "stop_requested")
+        attempts += 1
+        evidence = frame_analyzer(frame)
+        state = CityNavigationState(str(getattr(evidence.state, "value", evidence.state)))
+        last_score = float(evidence.last_template_score)
+        fingerprint = str(evidence.page_fingerprint)
+        diagnostics.extend(str(item) for item in getattr(evidence, "diagnostics", ()))
+        stable_frames = stable_frames + 1 if fingerprint == last_fingerprint else 1
+        last_fingerprint = fingerprint
+
+        if state is CityNavigationState.CITY_MAP:
+            return finish(state, True, "city_map_verified")
+        if state in {
+            CityNavigationState.NPC_DIALOGUE, CityNavigationState.EXCHANGE_MENU,
+            CityNavigationState.EXCHANGE_BUY, CityNavigationState.EXCHANGE_SELL,
+            CityNavigationState.STARTUP_OVERLAY, CityNavigationState.UNKNOWN,
+        }:
+            return finish(state, False, f"unsafe_or_unexpected_state:{state.value}")
+        if awaiting_city_map and stable_frames >= max(2, int(stall_frames)):
+            return finish(CityNavigationState.STALLED, False, "page_fingerprint_unchanged_after_action")
+        if awaiting_city_map:
+            # A city-entry tap is a one-shot transition request.  OCR jitter can
+            # change the fingerprint while the animation is still on HOME/HUD;
+            # it must never authorize a second tap.
+            sleep(min(1.0, max(0.0, deadline - monotonic())))
+            continue
+
+        anchor = getattr(evidence, "city_entry_anchor", None)
+        if state not in {CityNavigationState.HOME, CityNavigationState.HUD} or anchor is None:
+            return finish(CityNavigationState.UNKNOWN, False, "visit_city_anchor_not_unique")
+        x1, y1, x2, y2 = anchor
+        point = (int(round((x1 + x2) / 2)), int(round((y1 + y2) / 2)))
+        attempted.append("city_entry_navigation")
+        allowed = tap(
+            point,
             intent=ActionIntent(
                 "city_entry_navigation", "city_entry", "preset:home:city-entry",
             ),
         )
-        time.sleep(2.0)
+        if allowed is False:
+            return finish(CityNavigationState.READ_ONLY_DENIED, False, "guard_denied_city_entry")
+        executed.append("city_entry_navigation")
+        awaiting_city_map = True
+        if is_stopped() or (cancellation is not None and cancellation()):
+            return finish(CityNavigationState.CANCELLED, False, "cancelled")
+        sleep(min(1.0, max(0.0, deadline - monotonic())))
+    return finish(CityNavigationState.TIMEOUT, False, "navigation_deadline_or_attempt_limit")
 
 
-def go_outlets(name: str):
+def go_outlets(
+    name: str, *, deadline: float | None = None,
+    cancellation: Callable[[], bool] | None = None,
+    city_navigator: Callable[..., CityNavigationResult] = go_city,
+    ocr_click: Callable[..., object] = blurry_ocr_click,
+    swipe: Callable[..., object] = input_swipe,
+    monotonic: Callable[[], float] = time.monotonic,
+):
     """
     前往指定门店
 
     :param name: 门店名称
     """
-    go_city()
+    remaining = 20.0 if deadline is None else max(0.0, deadline - monotonic())
+    city = city_navigator(timeout=remaining, cancellation=cancellation)
+    if not city.success:
+        return OutletNavigationResult(False, "city_navigation", city.blocked_reason, city)
     logger.info(f"前往 => {name}")
     # New stations append their local market name (for example
     # "交易所-武林市集").  Matching "交易所" against the whole label needs a
     # lower length ratio than the legacy 0.7 default.
-    if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False, score=0.3, action_key="navigation_anchor", page_id="city_outlets"):
-        return result
-    input_swipe((457, 340), (457, 369), swipe_time=500, intent=ActionIntent("outlet_list_scroll", "outlet_list", "preset:outlet:scroll-1"))
-    if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False, score=0.3, action_key="navigation_anchor", page_id="city_outlets"):
-        return result
-    input_swipe((400, 340), (457, 340), swipe_time=500, intent=ActionIntent("outlet_list_scroll", "outlet_list", "preset:outlet:scroll-2"))
-    if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False, score=0.3, action_key="navigation_anchor", page_id="city_outlets"):
-        return result
-    input_swipe((969, 369), (457, 340), swipe_time=500, intent=ActionIntent("outlet_list_scroll", "outlet_list", "preset:outlet:scroll-3"))
-    if result := blurry_ocr_click(name, excursion_pos=(0, 80), log=False, score=0.3, action_key="navigation_anchor", page_id="city_outlets"):
-        return result
-    input_swipe((641, 246), (637, 615), swipe_time=500, intent=ActionIntent("outlet_list_scroll", "outlet_list", "preset:outlet:scroll-4"))
-    if result := blurry_ocr_click(name, excursion_pos=(0, 80), score=0.3, action_key="navigation_anchor", page_id="city_outlets"):
-        return result
+    swipe_paths = (
+        ((457, 340), (457, 440), "scroll-1"),
+        ((400, 340), (457, 340), "scroll-2"),
+        ((969, 369), (457, 340), "scroll-3"),
+        ((641, 246), (637, 615), "scroll-4"),
+    )
+    for index in range(len(swipe_paths) + 1):
+        if is_stopped() or (cancellation is not None and cancellation()):
+            return OutletNavigationResult(False, "outlet_search", "cancelled", city)
+        if deadline is not None and monotonic() >= deadline:
+            return OutletNavigationResult(False, "outlet_search", "overall_deadline_exceeded", city)
+        result = ocr_click(
+            name,
+            cropped_pos1=(160, 40), cropped_pos2=(1000, 500),
+            excursion_pos=(0, 80), log=False, score=0.3,
+            action_key="navigation_anchor", page_id="city_outlets",
+            trynum=1,
+        )
+        if result:
+            return OutletNavigationResult(True, "outlet_selected", "", city)
+        if index == len(swipe_paths):
+            break
+        start, end, suffix = swipe_paths[index]
+        allowed = swipe(
+            start, end, swipe_time=500,
+            intent=ActionIntent(
+                "outlet_list_scroll", "outlet_list", f"preset:outlet:{suffix}",
+            ),
+        )
+        if allowed is False:
+            return OutletNavigationResult(False, "outlet_scroll", "read_only_denied", city)
+    return OutletNavigationResult(False, "outlet_search", "outlet_not_found", city)
 
 def go_shop():
     """

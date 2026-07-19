@@ -30,6 +30,8 @@ class ExchangeNavigationResult:
     clicked: tuple[int, int] | None = None
     verified_frames: int = 0
     diagnostic_path: str = ""
+    stage: str = ""
+    elapsed_seconds: float = 0.0
 
 
 MENU_MARKERS = ("交易所", "我要买", "我要卖", "交易品投资", "私人仓库")
@@ -91,12 +93,16 @@ class ExchangeNavigator:
         *,
         diagnostic: Callable[[object, ExchangeAction, str], str] | None = None,
         cancellation: Callable[[], bool] | None = None,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ):
         self.frame_provider = frame_provider
         self.tap = tap
         self.sleep = sleep
         self.diagnostic = diagnostic
         self.cancellation = cancellation or (lambda: False)
+        self.deadline = deadline
+        self.monotonic = monotonic
 
     def _failure(
         self,
@@ -120,7 +126,9 @@ class ExchangeNavigator:
         verify_frames: int = 2,
     ) -> ExchangeNavigationResult:
         selected = _action(action)
-        if self.cancellation():
+        if self.cancellation() or (
+            self.deadline is not None and self.monotonic() >= self.deadline
+        ):
             return ExchangeNavigationResult(False, selected, reason="cancelled")
         lobby_frame = self.frame_provider()
         lobby_items = _items(lobby_frame)
@@ -131,7 +139,8 @@ class ExchangeNavigator:
         if len(anchors) != 1:
             return self._failure(selected, "action_anchor_not_unique", lobby_frame)
         clicked = _center(anchors[0])
-        self.tap(clicked)
+        if self.tap(clicked) is False:
+            return self._failure(selected, "read_only_denied", lobby_frame, clicked=clicked)
         if verify_frames < 2:
             return self._failure(selected, "multiframe_verification_required", lobby_frame, clicked=clicked)
         verified = 0
@@ -142,6 +151,8 @@ class ExchangeNavigator:
         for _ in range(max(6, int(verify_frames) * 4)):
             if self.cancellation():
                 return self._failure(selected, "cancelled", last, clicked=clicked, verified_frames=verified)
+            if self.deadline is not None and self.monotonic() >= self.deadline:
+                return self._failure(selected, "overall_deadline_exceeded", last, clicked=clicked, verified_frames=verified)
             self.sleep(0.35)
             last = self.frame_provider()
             if not exchange_page_matches(_items(last), selected):
@@ -176,12 +187,23 @@ def open_exchange_action(
     *,
     read_only: bool = False,
     cancellation: Callable[[], bool] | None = None,
+    timeout: float = 30.0,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> ExchangeNavigationResult:
     """Open a verified action page; never clicks any transaction control."""
 
     selected = _action(action)
+    started = monotonic()
+    deadline = started + max(0.0, float(timeout))
 
-    def safe_anchor_tap(pos: tuple[int, int]) -> None:
+    def deadline_failure(stage: str, reason: str = "overall_deadline_exceeded"):
+        return ExchangeNavigationResult(
+            False, selected, reason=reason, stage=stage,
+            elapsed_seconds=max(0.0, monotonic() - started),
+        )
+
+    def safe_anchor_tap(pos: tuple[int, int]):
         action_key = (
             "exchange_buy_navigation"
             if selected is ExchangeAction.BUY
@@ -189,20 +211,48 @@ def open_exchange_action(
         )
         target = "buy_navigation" if selected is ExchangeAction.BUY else "sell_navigation"
         label = "我要买" if selected is ExchangeAction.BUY else "我要卖"
-        input_tap(
+        return input_tap(
             pos,
             intent=ActionIntent(
                 action_key, target,
                 f"exchange:{selected.value.lower()}:anchor",
             ),
         )
+    if monotonic() >= deadline:
+        return deadline_failure("initial_capture")
     frame = screenshot()
     if not exchange_menu_matches(_items(frame)):
         from core.preset import go_outlets
         from core.preset.control import go_home
 
-        if not go_home() or not go_outlets("交易所"):
-            return ExchangeNavigationResult(False, selected, reason="exchange_navigation_failed")
+        try:
+            home_ok = go_home(deadline=deadline, cancellation=cancellation)
+        except TypeError as error:
+            if "unexpected keyword" not in str(error):
+                raise
+            home_ok = go_home()
+        if not home_ok:
+            reason = (
+                "overall_deadline_exceeded"
+                if monotonic() >= deadline else "home_navigation_failed"
+            )
+            return deadline_failure("home_navigation", reason)
+        if monotonic() >= deadline:
+            return deadline_failure("home_navigation")
+        try:
+            outlet = go_outlets(
+                "交易所", deadline=deadline, cancellation=cancellation,
+                monotonic=monotonic,
+            )
+        except TypeError as error:
+            if "unexpected keyword" not in str(error):
+                raise
+            outlet = go_outlets("交易所")
+        if not outlet:
+            return deadline_failure(
+                "outlet_navigation",
+                getattr(outlet, "reason", "exchange_navigation_failed"),
+            )
         # ``go_outlets`` returns after selecting the NPC, while the dialogue
         # panel is still animating on slower emulators.  Wait for the actual
         # exchange menu instead of treating that transition frame as a hard
@@ -211,7 +261,9 @@ def open_exchange_action(
         for _ in range(12):
             if cancellation and cancellation():
                 return ExchangeNavigationResult(False, selected, reason="cancelled")
-            time.sleep(0.5)
+            if monotonic() >= deadline:
+                return deadline_failure("exchange_menu_wait")
+            sleep(min(0.5, max(0.0, deadline - monotonic())))
             candidate = screenshot()
             if exchange_menu_matches(_items(candidate)):
                 frame = candidate
@@ -220,9 +272,11 @@ def open_exchange_action(
             return ExchangeNavigator(
                 lambda: candidate,
                 safe_anchor_tap,
-                time.sleep,
+                sleep,
                 diagnostic=_save_diagnostic,
                 cancellation=cancellation,
+                deadline=deadline,
+                monotonic=monotonic,
             )._failure(selected, "exchange_menu_not_confirmed", candidate)
     first_frame = frame
     first_pending = True
@@ -237,9 +291,11 @@ def open_exchange_action(
     result = ExchangeNavigator(
         next_frame,
         safe_anchor_tap,
-        time.sleep,
+        sleep,
         diagnostic=_save_diagnostic,
         cancellation=cancellation,
+        deadline=deadline,
+        monotonic=monotonic,
     ).open(selected)
     logger.info(
         "交易所导航 action={} read_only={} success={} source={} reason={}".format(

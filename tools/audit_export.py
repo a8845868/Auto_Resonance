@@ -606,6 +606,7 @@ def build_reversible_audit_package(
     evidence_allowlist: tuple[str, ...] = (),
     image_privacy_manifests: dict[str, dict] | None = None,
     image_ocr_provider: Callable[[Path], Iterable[str]] | None = None,
+    manifest_metadata: dict[str, object] | None = None,
     create_zip: bool = False,
 ) -> Path:
     """Publish one squashed text patch between two independently safe trees."""
@@ -713,6 +714,28 @@ def build_reversible_audit_package(
                 "patches": patch_scan,
             },
         }
+        metadata = dict(manifest_metadata or {})
+        live_status = str(metadata.get("current_live_status", "UNKNOWN"))
+        if live_status not in {"PASS", "BLOCKED", "UNKNOWN"}:
+            raise SensitiveDataError("current live status is invalid")
+        report_path = safe_target / "AUDIT-REPORT.md"
+        live_relative = str(metadata.get("live_addendum_path", "")).strip()
+        live_path = safe_target / live_relative if live_relative else None
+        if live_path is not None and safe_target not in live_path.resolve().parents:
+            raise SensitiveDataError("live addendum path escapes sanitized target")
+        manifest.update({
+            "current_live_status": live_status,
+            "frozen_report_hash": (
+                _hash_file(report_path) if report_path.is_file() else ""
+            ),
+            "live_addendum_hash": (
+                _hash_file(live_path) if live_path is not None and live_path.is_file() else ""
+            ),
+            "failing_pass_matrix": metadata.get("failing_pass_matrix", {}),
+            "images": len(baseline_inventory["images"]) + len(target_inventory["images"]),
+            "runtime_artifacts": 0,
+            "binary_patches": 0,
+        })
         (staging / "SHAREABLE-MANIFEST.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8", newline="\n",
@@ -829,6 +852,7 @@ def build_frozen_reversible_audit_package(
     evidence_allowlist: tuple[str, ...] = (),
     image_privacy_manifests: dict[str, dict] | None = None,
     image_ocr_provider: Callable[[Path], Iterable[str]] | None = None,
+    manifest_metadata: dict[str, object] | None = None,
     create_zip: bool = True,
 ) -> Path:
     """Write the report before freezing, then independently verify final ZIP."""
@@ -853,6 +877,7 @@ def build_frozen_reversible_audit_package(
                 evidence_allowlist=evidence_allowlist,
                 image_privacy_manifests=image_privacy_manifests,
                 image_ocr_provider=image_ocr_provider,
+                manifest_metadata=manifest_metadata,
                 create_zip=create_zip,
             )
             _verify_frozen_reversible_package(
