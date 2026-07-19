@@ -690,9 +690,9 @@ def go_outlets(
     # lower length ratio than the legacy 0.7 default.
     swipe_paths = (
         ((457, 340), (457, 440), "scroll-1"),
-        ((400, 340), (457, 340), "scroll-2"),
-        ((969, 369), (457, 340), "scroll-3"),
-        ((641, 246), (637, 615), "scroll-4"),
+        ((457, 440), (457, 340), "scroll-2"),
+        ((969, 369), (457, 369), "scroll-3"),
+        ((457, 369), (969, 369), "scroll-4"),
     )
     for index in range(len(swipe_paths) + 1):
         if is_stopped() or (cancellation is not None and cancellation()):
