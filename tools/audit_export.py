@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import difflib
 import json
+import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import zipfile
@@ -571,9 +573,15 @@ def _apply_text_patch(source_tree: Path, patch: Path, output: Path, *, reverse: 
     if reverse:
         command.append("--reverse")
     command.append(str(patch))
+    environment = dict(os.environ)
+    # A verifier may run underneath the source repository. Force git-apply to
+    # treat the copied tree as standalone; otherwise it silently discovers the
+    # parent .git directory and can leave the requested output unchanged.
+    environment["GIT_DIR"] = os.devnull
     completed = subprocess.run(
         command, cwd=output, text=True, encoding="utf-8", errors="replace",
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        env=environment,
     )
     if completed.returncode:
         raise SensitiveDataError(
@@ -736,6 +744,128 @@ def build_reversible_audit_package(
         raise
 
 
+def _verify_frozen_reversible_package(
+    package_root: Path, *, zip_path: Path | None = None
+) -> dict[str, str]:
+    """Independently recompute final trees; never reuse builder hash state."""
+
+    package_root = Path(package_root).resolve()
+    verification_root = package_root
+    with tempfile.TemporaryDirectory(prefix="audit-final-verify-") as verify_temp:
+        verify_temp_path = Path(verify_temp)
+        if zip_path is not None:
+            with zipfile.ZipFile(zip_path) as archive:
+                if archive.testzip() is not None:
+                    raise SensitiveDataError("final ZIP CRC validation failed")
+                archive.extractall(verify_temp_path)
+            children = list(verify_temp_path.iterdir())
+            if len(children) != 1 or not children[0].is_dir():
+                raise SensitiveDataError("final ZIP root layout is invalid")
+            verification_root = children[0]
+            if not verify_zip_exact_set(zip_path):
+                raise SensitiveDataError("final ZIP exact-set validation failed")
+
+        manifest = json.loads(
+            (verification_root / "SHAREABLE-MANIFEST.json").read_text(encoding="utf-8")
+        )
+        baseline = verification_root / "sanitized-baseline"
+        target = verification_root / "sanitized-target"
+        patch = verification_root / "patches" / "full-safe-tree.diff"
+        forward = verify_temp_path / "independent-forward"
+        reverse = verify_temp_path / "independent-reverse"
+        _apply_text_patch(baseline, patch, forward, reverse=False)
+        _apply_text_patch(target, patch, reverse, reverse=True)
+        actual = {
+            "baseline": _tree_hash(baseline),
+            "target": _tree_hash(target),
+            "forward": _tree_hash(forward),
+            "reverse": _tree_hash(reverse),
+        }
+        expected = {
+            "baseline": manifest["sanitized_baseline_tree"]["tree_hash"],
+            "target": manifest["sanitized_target_tree"]["tree_hash"],
+            "forward": manifest["forward_tree_hash"],
+            "reverse": manifest["reverse_tree_hash"],
+        }
+        if actual != expected or actual["forward"] != actual["target"] or actual["reverse"] != actual["baseline"]:
+            raise SensitiveDataError(
+                f"final frozen tree hash mismatch: actual={actual}, expected={expected}"
+            )
+        if not verify_hash_manifest(verification_root):
+            raise SensitiveDataError("final SHA256 exact-set validation failed")
+        hits, _stats = scan_sensitive_tree(verification_root)
+        if hits:
+            raise SensitiveDataError("final sensitive scan failed: " + ", ".join(hits))
+
+        pycache = verify_temp_path / "pycache"
+        environment = dict(os.environ)
+        environment["PYTHONPYCACHEPREFIX"] = str(pycache)
+        completed = subprocess.run(
+            [sys.executable, "-m", "compileall", "-q", str(target)],
+            cwd=verify_temp_path,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if completed.returncode:
+            raise SensitiveDataError("final sanitized target compileall failed")
+        if any(target.rglob("__pycache__")):
+            raise SensitiveDataError("compileall modified the frozen target")
+        return actual
+
+
+def build_frozen_reversible_audit_package(
+    baseline_source: Path,
+    target_source: Path,
+    destination: Path,
+    *,
+    audit_report_text: str,
+    uid_values: tuple[str, ...] = (),
+    image_masks: tuple[tuple[int, int, int, int], ...] = (),
+    evidence_allowlist: tuple[str, ...] = (),
+    image_privacy_manifests: dict[str, dict] | None = None,
+    image_ocr_provider: Callable[[Path], Iterable[str]] | None = None,
+    create_zip: bool = True,
+) -> Path:
+    """Write the report before freezing, then independently verify final ZIP."""
+
+    destination = Path(destination).resolve()
+    zip_path = destination.with_suffix(".zip")
+    with tempfile.TemporaryDirectory(prefix="audit-frozen-target-") as target_temp:
+        frozen_target = Path(target_temp) / "target"
+        shutil.copytree(Path(target_source).resolve(), frozen_target)
+        (frozen_target / "AUDIT-REPORT.md").write_text(
+            str(audit_report_text).replace("\r\n", "\n"),
+            encoding="utf-8",
+            newline="\n",
+        )
+        try:
+            result = build_reversible_audit_package(
+                baseline_source,
+                frozen_target,
+                destination,
+                uid_values=uid_values,
+                image_masks=image_masks,
+                evidence_allowlist=evidence_allowlist,
+                image_privacy_manifests=image_privacy_manifests,
+                image_ocr_provider=image_ocr_provider,
+                create_zip=create_zip,
+            )
+            _verify_frozen_reversible_package(
+                result, zip_path=zip_path if create_zip else None
+            )
+            return result
+        except Exception:
+            if destination.exists():
+                shutil.rmtree(destination)
+            zip_path.unlink(missing_ok=True)
+            raise
+
+
 def build_shareable_audit(
     source: Path,
     destination: Path,
@@ -827,6 +957,7 @@ def build_shareable_audit(
 __all__ = [
     "SensitiveDataError",
     "build_reversible_audit_package",
+    "build_frozen_reversible_audit_package",
     "build_shareable_audit",
     "scan_sensitive_text",
     "scan_sensitive_tree",
