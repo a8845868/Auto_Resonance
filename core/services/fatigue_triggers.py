@@ -267,7 +267,7 @@ def replace_deferred_fatigue_plan(
             if payload.get("waypoint_id"):
                 trigger_type = "WAYPOINT"
             elif payload.get("fatigue_threshold") is not None:
-                trigger_type = "FATIGUE_THRESHOLD"
+                trigger_type = "FATIGUE_HEADROOM"
             elif payload.get("run_at"):
                 trigger_type = "REOBSERVE_AT"
             else:
@@ -365,6 +365,12 @@ def notify_fatigue_event(
                     event == "fatigue_threshold"
                     and fatigue_used is not None
                     and int(fatigue_used) >= int(item.get("fatigue_threshold", 0))
+                )
+            elif trigger_type == "FATIGUE_HEADROOM":
+                is_match = (
+                    event == "fatigue_threshold"
+                    and fatigue_used is not None
+                    and int(fatigue_used) <= int(item.get("fatigue_threshold", 0))
                 )
             elif trigger_type in {"BENTO_RELEASE_AT", "REOBSERVE_AT"}:
                 expected_event = "bento_release" if trigger_type == "BENTO_RELEASE_AT" else "reobserve"

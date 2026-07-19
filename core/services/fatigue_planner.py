@@ -167,16 +167,20 @@ def _immediate_sequences(
 ) -> list[tuple[tuple[FatigueAction, ...], int, dict[str, int]]]:
     sequences = []
     for order in (("bento", "soda"), ("soda", "bento")):
-        fatigue = max(0, snapshot.fatigue_used)
+        fatigue = max(0, min(snapshot.fatigue_cap, snapshot.fatigue_used))
         actions: list[FatigueAction] = []
         soda_used = 0
         bento_used = 0
         for resource in order:
             if resource == "bento":
                 reduction = max(0, snapshot.bento_total_reduction_available)
-                if snapshot.bento_batches_available > 0 and reduction and fatigue >= reduction:
+                if (
+                    snapshot.bento_batches_available > 0
+                    and reduction
+                    and fatigue + reduction <= snapshot.fatigue_cap
+                ):
                     actions.append(FatigueAction("USE_ALL_BENTOS", reduction=reduction))
-                    fatigue -= reduction
+                    fatigue += reduction
                     bento_used = snapshot.bento_batches_available
             elif (
                 "REST_AREA" in snapshot.current_amenities
@@ -186,7 +190,8 @@ def _immediate_sequences(
                 safe = min(
                     max(0, snapshot.soda_uses_remaining or 0),
                     _allowed_soda_uses(snapshot, allow_premium_soda, max_iron_soda_cost),
-                    fatigue // snapshot.soda_reduction_per_use,
+                    (snapshot.fatigue_cap - fatigue)
+                    // snapshot.soda_reduction_per_use,
                 )
                 if safe:
                     reduction = safe * snapshot.soda_reduction_per_use
@@ -198,12 +203,12 @@ def _immediate_sequences(
                             reobserve_after_each=True,
                         )
                     )
-                    fatigue -= reduction
+                    fatigue += reduction
                     soda_used = safe
         sequences.append(
             (
                 tuple(actions),
-                snapshot.fatigue_used - fatigue,
+                fatigue - snapshot.fatigue_used,
                 {"soda_uses": soda_used, "bento_batches": bento_used},
             )
         )
@@ -251,9 +256,8 @@ def plan_fatigue_recovery(
     actions, reduced, usage = max(
         _immediate_sequences(snapshot, allow_premium_soda, max_iron_soda_cost),
         key=lambda item: (
-            item[2].get("soda_uses", 0),
-            bool(item[0] and item[0][0].kind == "DRINK_SODA"),
             item[1],
+            bool(item[0] and item[0][0].kind == "DRINK_SODA"),
             len(item[0]),
         ),
     )
@@ -311,7 +315,9 @@ def plan_fatigue_recovery(
             if (
                 "REST_AREA" in leg.destination_amenities
                 and soda_could_remain_today
-                and fatigue >= snapshot.soda_reduction_per_use > 0
+                and snapshot.soda_reduction_per_use > 0
+                and fatigue + snapshot.soda_reduction_per_use
+                <= snapshot.fatigue_cap
                 and (
                     current_soda_facility_available is False
                     or soda_remaining_unknown
@@ -337,12 +343,15 @@ def plan_fatigue_recovery(
             soda_ready = (
                 "REST_AREA" in leg.destination_amenities
                 and (snapshot.soda_uses_remaining or 0) > 0
-                and fatigue >= snapshot.soda_reduction_per_use
+                and fatigue + snapshot.soda_reduction_per_use
+                <= snapshot.fatigue_cap
                 and _allowed_soda_uses(snapshot, allow_premium_soda, max_iron_soda_cost) > 0
             )
             bento_ready = (
                 snapshot.bento_batches_available > 0
-                and fatigue >= snapshot.bento_total_reduction_available > 0
+                and snapshot.bento_total_reduction_available > 0
+                and fatigue + snapshot.bento_total_reduction_available
+                <= snapshot.fatigue_cap
             )
             if soda_ready or bento_ready:
                 kind = "DRINK_SODA" if soda_ready else "USE_ALL_BENTOS"
@@ -350,7 +359,8 @@ def plan_fatigue_recovery(
                     min(
                         snapshot.soda_uses_remaining or 0,
                         _allowed_soda_uses(snapshot, allow_premium_soda, max_iron_soda_cost),
-                        fatigue // snapshot.soda_reduction_per_use,
+                        (snapshot.fatigue_cap - fatigue)
+                        // snapshot.soda_reduction_per_use,
                     )
                     if soda_ready
                     else 1
@@ -362,7 +372,10 @@ def plan_fatigue_recovery(
                     expected,
                     {},
                     0,
-                    {"waypoint_id": leg.destination, "fatigue_at_least": threshold or 0},
+                    {
+                        "waypoint_id": leg.destination,
+                        "fatigue_at_most": snapshot.fatigue_cap - (threshold or 0),
+                    },
                     FatiguePlanStatus.DEFER_UNTIL_WAYPOINT,
                     "route_reaches_zero_waste_recovery_threshold",
                 )
@@ -391,7 +404,7 @@ def plan_fatigue_recovery(
             expected,
             {},
             0,
-            {"fatigue_at_least": threshold},
+            {"fatigue_at_most": snapshot.fatigue_cap - threshold},
             FatiguePlanStatus.DEFER_UNTIL_FATIGUE,
             reason,
         )

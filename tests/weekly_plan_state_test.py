@@ -7,7 +7,7 @@ import core.services.weekly_plan_state as weekly_state
 
 def test_expired_weekly_plan_rolls_forward_and_resets_only_progress(tmp_path):
     path = tmp_path / "weekly_plan.json"
-    this_week = date.today() - timedelta(days=date.today().weekday())
+    this_week = date.fromisoformat(weekly_state.current_week_start())
     previous_week = this_week - timedelta(days=7)
     path.write_text(
         json.dumps(

@@ -50,7 +50,7 @@ def test_empty_queue_never_starts_or_closes_resources():
     assert events == []
 
 
-def test_task_failure_still_cleans_and_keeps_following_task_behavior():
+def test_unexpected_task_failure_cleans_and_stops_following_tasks():
     events = []
     lifecycle = FakeLifecycle(events)
     outcomes = []
@@ -72,8 +72,9 @@ def test_task_failure_still_cleans_and_keeps_following_task_behavior():
 
     worker.run()
 
-    assert events == ["prepare", "fail", "continue", "cleanup"]
-    assert outcomes == [("失败", False), ("继续", True)]
+    assert events == ["prepare", "fail", "cleanup"]
+    assert outcomes == [("失败", False)]
+    assert worker.halted_for_repair is True
 
 
 def test_manual_stop_during_task_cleans_without_starting_remaining_tasks():

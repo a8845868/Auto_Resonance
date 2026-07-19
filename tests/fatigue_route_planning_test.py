@@ -43,11 +43,13 @@ def _snapshot(**overrides):
     return FatigueSnapshot(**values)
 
 
-def test_44_fatigue_defers_soda_instead_of_finishing_day():
+def test_44_fatigue_uses_all_zero_waste_resources_now():
     plan = plan_fatigue_recovery(_snapshot())
-    assert plan.status is FatiguePlanStatus.DEFER_UNTIL_FATIGUE
-    assert plan.immediate_actions == ()
-    assert plan.next_trigger["fatigue_at_least"] == 50
+    assert plan.status is FatiguePlanStatus.ACTION_NOW
+    assert [action.kind for action in plan.immediate_actions] == [
+        "DRINK_SODA",
+        "USE_ALL_BENTOS",
+    ]
 
 
 def test_drinks_maximum_non_wasting_sodas_at_current_station():
@@ -60,11 +62,11 @@ def test_drinks_maximum_non_wasting_sodas_at_current_station():
     assert plan.immediate_actions[0].reobserve_after_each is True
 
 
-def test_275_fatigue_uses_five_sodas_not_six():
+def test_275_fatigue_uses_six_sodas_when_all_fit():
     plan = plan_fatigue_recovery(
         _snapshot(fatigue_used=275, bento_total_reduction_available=0)
     )
-    assert plan.immediate_actions[0].count == 5
+    assert plan.immediate_actions[0].count == 6
 
 
 def test_route_inserts_soda_action_at_first_eligible_waypoint():
@@ -76,7 +78,13 @@ def test_route_inserts_soda_action_at_first_eligible_waypoint():
         ),
     )
     plan = plan_fatigue_recovery(
-        _snapshot(current_amenities=frozenset(), current_city_id="岚心城"), route
+        _snapshot(
+            current_amenities=frozenset(),
+            current_city_id="岚心城",
+            bento_batches_available=0,
+            bento_total_reduction_available=0,
+        ),
+        route,
     )
     assert plan.status is FatiguePlanStatus.DEFER_UNTIL_WAYPOINT
     assert plan.deferred_actions[0].waypoint_id == "修格里城"
@@ -89,7 +97,13 @@ def test_route_without_bar_is_reported_as_deferred():
         legs=(RouteLeg("岚心城", "汇流塔", 60, frozenset()),),
     )
     plan = plan_fatigue_recovery(
-        _snapshot(current_amenities=frozenset(), current_city_id="岚心城"), route
+        _snapshot(
+            current_amenities=frozenset(),
+            current_city_id="岚心城",
+            bento_batches_available=0,
+            bento_total_reduction_available=0,
+        ),
+        route,
     )
     assert plan.status in {
         FatiguePlanStatus.DEFER_UNTIL_FATIGUE,
@@ -99,10 +113,12 @@ def test_route_without_bar_is_reported_as_deferred():
     assert all(action.kind != "DRINK_SODA" for action in plan.deferred_actions)
 
 
-def test_bento_all_use_waits_until_no_waste():
-    plan = plan_fatigue_recovery(_snapshot(soda_uses_remaining=0))
+def test_bento_all_use_waits_until_headroom_is_available():
+    plan = plan_fatigue_recovery(
+        _snapshot(fatigue_used=760, soda_uses_remaining=0)
+    )
     assert plan.immediate_actions == ()
-    assert plan.next_trigger["fatigue_at_least"] == 72
+    assert plan.next_trigger["fatigue_at_most"] == 744
 
 
 def test_soda_and_bento_order_maximizes_free_reduction_without_waste():
