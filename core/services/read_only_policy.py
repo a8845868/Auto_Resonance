@@ -413,6 +413,25 @@ DEFAULT_POLICY_SPECS = {
     ),
 }
 
+# Production sessions always use this immutable, versioned snapshot. Test
+# callers may still inject policies into ReadOnlyPermitIssuer, but those
+# issuers can only be attached to ReadOnlyTestSession objects.
+PRODUCTION_POLICY_SPECS = MappingProxyType({
+    key: replace(
+        value,
+        allowed_page_types=frozenset(value.allowed_page_types),
+        required_markers=tuple(value.required_markers),
+        forbidden_markers=tuple(value.forbidden_markers),
+        allowed_region=tuple(value.allowed_region) if value.allowed_region else None,
+        allowed_swipe_directions=frozenset(value.allowed_swipe_directions),
+        allowed_post_page_types=frozenset(value.allowed_post_page_types),
+    )
+    for key, value in DEFAULT_POLICY_SPECS.items()
+})
+PRODUCTION_POLICY_REVISION = hashlib.sha256(
+    repr(tuple(sorted(PRODUCTION_POLICY_SPECS.items()))).encode("utf-8")
+).hexdigest()[:16]
+
 
 @dataclass(frozen=True, slots=True)
 class ReadOnlyPermitHandle:
@@ -429,6 +448,8 @@ ReadOnlyPermit = ReadOnlyPermitHandle
 class _PermitRecord:
     action_key: str
     action_kind: ActionKind
+    dominant_axis: str
+    swipe_direction: str
     policy_revision: str
     requested_target: str
     observation_id: str
@@ -491,7 +512,7 @@ class ReadOnlyPermitIssuer:
     ):
         self.observer = observer
         self.resolver = resolver
-        source = policies or DEFAULT_POLICY_SPECS
+        source = PRODUCTION_POLICY_SPECS if policies is None else policies
         self._policies = MappingProxyType({
             str(key): replace(
                 value,
@@ -596,24 +617,33 @@ class ReadOnlyPermitIssuer:
         spec: ReadOnlyPolicySpec,
         trajectory: tuple[tuple[int, int], ...],
         duration_ms: int,
-    ) -> None:
+    ) -> tuple[str, str]:
         if spec.action_kind is ActionKind.TAP:
             if len(trajectory) != 1:
                 raise PermissionError("action_kind_mismatch")
-            return
+            return "POINT", "TAP"
         if len(set(trajectory)) < 2:
             raise PermissionError("scroll_trajectory_requires_distinct_points")
         dx = trajectory[-1][0] - trajectory[0][0]
         dy = trajectory[-1][1] - trajectory[0][1]
-        if abs(dx) < int(spec.minimum_displacement):
+        ratio = max(float(spec.maximum_vertical_ratio), 1e-9)
+        if abs(dx) >= abs(dy) / ratio:
+            dominant_axis = "HORIZONTAL"
+            displacement = abs(dx)
+            direction = "RIGHT" if dx > 0 else "LEFT"
+        elif abs(dy) >= abs(dx) / ratio:
+            dominant_axis = "VERTICAL"
+            displacement = abs(dy)
+            direction = "DOWN" if dy > 0 else "UP"
+        else:
+            raise PermissionError("scroll_direction_diagonally_ambiguous")
+        if displacement < int(spec.minimum_displacement):
             raise PermissionError("scroll_minimum_displacement_not_met")
-        if abs(dy) > max(2, int(round(abs(dx) * float(spec.maximum_vertical_ratio)))):
-            raise PermissionError("scroll_must_be_near_horizontal")
-        direction = "RIGHT" if dx > 0 else "LEFT"
         if direction not in spec.allowed_swipe_directions:
             raise PermissionError("scroll_direction_not_allowed")
         if not (spec.minimum_duration_ms <= int(duration_ms) <= spec.maximum_duration_ms):
             raise PermissionError("scroll_duration_out_of_bounds")
+        return dominant_axis, direction
 
     def issue(
         self,
@@ -633,7 +663,9 @@ class ReadOnlyPermitIssuer:
         trajectory = tuple(_point(point) for point in final_trajectory)
         if not trajectory:
             raise PermissionError("final logical trajectory is required")
-        self._validate_modality(spec, trajectory, int(duration_ms))
+        dominant_axis, swipe_direction = self._validate_modality(
+            spec, trajectory, int(duration_ms)
+        )
         observation = self._fresh_observation()
         self._assert_observation_identity(observation, identity)
         self._assert_device_identity("issue_capture")
@@ -660,6 +692,8 @@ class ReadOnlyPermitIssuer:
         record = _PermitRecord(
             action_key=spec.action_key,
             action_kind=spec.action_kind,
+            dominant_axis=dominant_axis,
+            swipe_direction=swipe_direction,
             policy_revision=self._policy_revision(spec),
             requested_target=str(intent.requested_target),
             observation_id=observation.observation_id,
@@ -732,6 +766,13 @@ class ReadOnlyPermitIssuer:
         with self._registry_lock:
             entry = self._registry.get(str(getattr(permit, "opaque_token", "")))
             return entry.record.action_key if entry else "unclassified_action"
+
+    def permit_correlation_id(self, permit: ReadOnlyPermitHandle | None) -> str:
+        """Return the non-secret action correlation ID for journal linkage."""
+
+        with self._registry_lock:
+            entry = self._registry.get(str(getattr(permit, "opaque_token", "")))
+            return entry.record.correlation_id if entry else ""
 
     def cleanup_expired(self) -> int:
         current = self.now()
@@ -1050,6 +1091,8 @@ class ActionJournalEntry:
     observation_captured_at: str = ""
     content_marker_hash: str = ""
     side_effect_occurred: bool = False
+    dominant_axis: str = ""
+    swipe_direction: str = ""
 
 
 class JournalStage(str, Enum):
@@ -1153,6 +1196,10 @@ class ReadOnlyActionGuard:
             return tuple(self._journal)
 
     @property
+    def closed(self) -> bool:
+        return bool(self._closed)
+
+    @property
     def blocked_actions(self) -> tuple[str, ...]:
         return tuple(entry.action_key for entry in self.journal if not entry.allowed)
 
@@ -1182,6 +1229,13 @@ class ReadOnlyActionGuard:
             if issuer is not None
             else ReadOnlyPermitIssuer.permit_digest(permit)
         )
+        correlation_id = (
+            authoritative.correlation_id
+            if authoritative is not None
+            else issuer.permit_correlation_id(permit)
+            if issuer is not None
+            else ""
+        )
         marker_hash = ""
         permit_status: dict[str, object] = {}
         if authoritative is not None:
@@ -1203,7 +1257,7 @@ class ReadOnlyActionGuard:
             action_key=str(authoritative.action_key if authoritative else action_key),
             allowed=bool(allowed),
             reason=str(reason),
-            correlation_id=authoritative.correlation_id if authoritative else "",
+            correlation_id=correlation_id,
             permit_id=digest,
             permit_digest=digest,
             observation_id=(
@@ -1247,6 +1301,8 @@ class ReadOnlyActionGuard:
             ),
             content_marker_hash=(observation.content_marker_hash if observation else ""),
             side_effect_occurred=bool(side_effect_occurred),
+            dominant_axis=(authoritative.dominant_axis if authoritative else ""),
+            swipe_direction=(authoritative.swipe_direction if authoritative else ""),
         )
         with self._journal_lock:
             self._journal.append(entry)
@@ -1416,6 +1472,12 @@ class ReadOnlyActionGuard:
         with _SESSION_COMPONENTS_LOCK:
             _SESSION_COMPONENTS.pop(self._session_token, None)
         object.__setattr__(self, "_closed", True)
+        try:
+            from core.control.control import _revoke_production_session
+
+            _revoke_production_session(self)
+        except ImportError:
+            pass
 
 
 @contextmanager
@@ -1429,8 +1491,17 @@ def installed_read_only_guard(guard: ReadOnlyActionGuard) -> Iterator[ReadOnlyAc
         remove_action_policy(owner_token)
 
 
-class ReadOnlySafetySession(ReadOnlyActionGuard):
-    """Production policy type accepted by the low-level input session gate."""
+class ReadOnlyTestSession(ReadOnlyActionGuard):
+    """Injectable unit-test guard that can never enter the production gate."""
+
+
+class ProductionReadOnlySafetySession(ReadOnlyActionGuard):
+    """Production-shaped session; constructor alone grants no provenance."""
+
+
+# Compatibility name. Direct construction intentionally lacks the control-side
+# registry entry required by activate_action_policy.
+ReadOnlySafetySession = ProductionReadOnlySafetySession
 
 
 def create_test_read_only_session(
@@ -1440,14 +1511,14 @@ def create_test_read_only_session(
     policies: dict[str, ReadOnlyPolicySpec] | None = None,
     now: Callable[[], datetime] = _now,
     resolver: AnchorResolver | None = None,
-) -> tuple[ReadOnlySafetySession, ReadOnlyPermitIssuer]:
+) -> tuple[ReadOnlyTestSession, ReadOnlyPermitIssuer]:
     """Explicit test-only injection path; production uses the control factory."""
 
     issuer = ReadOnlyPermitIssuer(
         observer, resolver or AnchorResolver(), policies=policies, now=now
     )
     return (
-        ReadOnlySafetySession(executor, permit_issuer=issuer, now=now),
+        ReadOnlyTestSession(executor, permit_issuer=issuer, now=now),
         issuer,
     )
 
@@ -1459,6 +1530,8 @@ __all__ = [
     "ObservedAnchor", "OcrObservedAnchor", "PageObservation", "PageObserver",
     "JournalStage", "ReadOnlyActionGuard", "ReadOnlyPermit", "ReadOnlyPermitHandle",
     "ReadOnlyPermitIssuer", "ReadOnlyPolicySpec", "ReadOnlySafetySession",
+    "ReadOnlyTestSession", "ProductionReadOnlySafetySession",
+    "PRODUCTION_POLICY_SPECS", "PRODUCTION_POLICY_REVISION",
     "TrustedFrameEvidence", "TrustedInputExecutor",
     "create_test_read_only_session", "installed_read_only_guard",
 ]

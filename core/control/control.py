@@ -10,6 +10,7 @@ import random
 import secrets
 import threading
 import time
+import weakref
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Tuple
@@ -44,6 +45,20 @@ _ACTION_POLICY_LOCK = threading.RLock()
 _ACTION_POLICY_OWNERS: dict[str, object] = {}
 _ACTION_POLICY_ORDER: list[str] = []
 _READ_ONLY_FAIL_CLOSED = False
+
+
+@dataclass(frozen=True)
+class _ProductionSessionProvenance:
+    session_id: str
+    backend_object_identity: str
+    backend_generation: int
+    instance_id: str
+    adb_serial: str
+    policy_revision: str
+
+
+_PRODUCTION_SESSION_REGISTRY: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_PRODUCTION_SESSION_REGISTRY_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -86,13 +101,52 @@ def _create_bound_input_executor(backend: IADB):
     return _BoundControlInputExecutor(backend)
 
 
+def _register_production_session(policy, identity, policy_revision: str) -> None:
+    with _PRODUCTION_SESSION_REGISTRY_LOCK:
+        _PRODUCTION_SESSION_REGISTRY[policy] = _ProductionSessionProvenance(
+            session_id=secrets.token_urlsafe(24),
+            backend_object_identity=identity.backend_object_identity,
+            backend_generation=int(identity.backend_generation),
+            instance_id=str(identity.instance_id),
+            adb_serial=str(identity.adb_serial),
+            policy_revision=str(policy_revision),
+        )
+
+
+def _revoke_production_session(policy) -> None:
+    with _PRODUCTION_SESSION_REGISTRY_LOCK:
+        _PRODUCTION_SESSION_REGISTRY.pop(policy, None)
+
+
+def _validate_production_session(policy) -> _ProductionSessionProvenance:
+    from core.services.read_only_policy import (
+        PRODUCTION_POLICY_REVISION,
+        ProductionReadOnlySafetySession,
+    )
+
+    if not isinstance(policy, ProductionReadOnlySafetySession):
+        raise TypeError("production session provenance required")
+    with _PRODUCTION_SESSION_REGISTRY_LOCK:
+        provenance = _PRODUCTION_SESSION_REGISTRY.get(policy)
+    if provenance is None or policy.closed:
+        raise PermissionError("production session provenance is not registered")
+    identity = current_bound_device_identity()
+    if (
+        provenance.backend_object_identity != identity.backend_object_identity
+        or provenance.backend_generation != identity.backend_generation
+        or provenance.instance_id != identity.instance_id
+        or provenance.adb_serial != identity.adb_serial
+        or provenance.policy_revision != PRODUCTION_POLICY_REVISION
+    ):
+        _revoke_production_session(policy)
+        raise PermissionError("production session provenance changed")
+    return provenance
+
+
 def activate_action_policy(policy) -> str:
     """Install an owner-token policy without previous/restore races."""
 
-    from core.services.read_only_policy import ReadOnlySafetySession
-
-    if not isinstance(policy, ReadOnlySafetySession):
-        raise TypeError("only a sealed ReadOnlySafetySession may guard device input")
+    _validate_production_session(policy)
     token = secrets.token_urlsafe(24)
     global _READ_ONLY_FAIL_CLOSED
     with _BACKEND_LOCK:
@@ -207,13 +261,15 @@ def capture_envelope() -> CaptureEnvelope:
         )
 
 
-def create_read_only_safety_session(observer, *, resolver=None, policies=None, now=None):
+def _create_production_read_only_safety_session(observer, *, resolver=None, now=None):
     """Production factory that seals the exact backend and identity snapshot."""
 
     from core.services.read_only_policy import (
         AnchorResolver,
+        PRODUCTION_POLICY_REVISION,
+        PRODUCTION_POLICY_SPECS,
+        ProductionReadOnlySafetySession,
         ReadOnlyPermitIssuer,
-        ReadOnlySafetySession,
     )
 
     with _BACKEND_LOCK:
@@ -222,17 +278,19 @@ def create_read_only_safety_session(observer, *, resolver=None, policies=None, n
         issuer = ReadOnlyPermitIssuer(
             observer,
             resolver or AnchorResolver(),
-            policies=policies,
+            policies=PRODUCTION_POLICY_SPECS,
             now=now or (lambda: datetime.now().astimezone()),
             bound_device_identity=identity,
             identity_provider=current_bound_device_identity,
         )
-        return ReadOnlySafetySession(
+        session = ProductionReadOnlySafetySession(
             _create_bound_input_executor(backend),
             permit_issuer=issuer,
             now=now or (lambda: datetime.now().astimezone()),
             device_action_lock=_BACKEND_LOCK,
         )
+        _register_production_session(session, identity, PRODUCTION_POLICY_REVISION)
+        return session
 
 
 def set_runtime_device(device: EmulatorInfo | None) -> None:
@@ -289,6 +347,8 @@ def _activate_backend(candidate: IADB) -> None:
         if previous is not candidate:
             _BACKEND_GENERATION += 1
             _BACKEND_CONNECTED_AT = datetime.now().astimezone()
+            with _PRODUCTION_SESSION_REGISTRY_LOCK:
+                _PRODUCTION_SESSION_REGISTRY.clear()
             _close_backend(previous, "旧控制后端")
 
 
@@ -595,6 +655,7 @@ def _input_swipe_locked(
             page_id=page_id, page_fingerprint=page_fingerprint,
             anchor_key=anchor_key,
         )
+    _validate_production_session(action_policy)
     ensure_automation_allowed("滑动游戏界面")
     if STOP:
         raise StopExecution()
@@ -651,6 +712,7 @@ def _input_tap_locked(
             page_id=page_id, page_fingerprint=page_fingerprint,
             anchor_key=anchor_key,
         )
+    _validate_production_session(action_policy)
     ensure_automation_allowed("点击游戏界面")
     if STOP:
         raise StopExecution()
