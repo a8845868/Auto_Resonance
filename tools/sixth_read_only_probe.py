@@ -8,8 +8,8 @@ import json
 import re
 import sys
 import time
-from dataclasses import asdict, is_dataclass
-from datetime import datetime
+from dataclasses import asdict, is_dataclass, replace
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import cv2 as cv
@@ -23,14 +23,16 @@ if str(ROOT) not in sys.path:
 from auto import exchange_navigation  # noqa: E402
 from auto.module.strength import read_strength  # noqa: E402
 from auto.reward_collection import RewardCollector, RewardDriver  # noqa: E402
-from core.control.control import connect_adb, screenshot  # noqa: E402
+from core.control.control import connect_adb, current_display_geometry, screenshot  # noqa: E402
 from core.preset import get_station  # noqa: E402
 from core.services.read_only_policy import (  # noqa: E402
     AnchorResolver,
+    CalibratedStaticRegion,
     ObservedAnchor,
     PageObservation,
     PageObserver,
     ReadOnlyActionGuard,
+    ReadOnlyPermit,
     ReadOnlyPermitIssuer,
     installed_read_only_guard,
 )
@@ -77,6 +79,65 @@ def _bbox(item: dict) -> tuple[int, int, int, int] | None:
     return min(xs), min(ys), max(xs), max(ys)
 
 
+def _classify_page(texts: list[str]) -> tuple[str, list[str]]:
+    """Classify specific transactional pages before their generic menu shell."""
+
+    joined = "|".join(texts)
+    buy_features = {
+        marker for marker in ("预计买入", "买入总价", "载货量", "买入")
+        if marker in joined
+    }
+    sell_features = {
+        marker for marker in ("预计卖出", "卖出总价", "载货量", "卖出")
+        if marker in joined
+    }
+    buy_strong = len(buy_features) >= 3 and bool(
+        {"预计买入", "买入总价"} & buy_features
+    )
+    sell_strong = len(sell_features) >= 3 and bool(
+        {"预计卖出", "卖出总价"} & sell_features
+    )
+    if buy_strong and sell_strong:
+        return "unknown", ["conflicting_exchange_markers", "unknown"]
+    if buy_strong:
+        return "exchange_buy", ["exchange_buy"]
+    if sell_strong:
+        return "exchange_sell", ["exchange_sell"]
+    if "每日活跃" in joined or ("完成进度" in joined and "活跃度" in joined):
+        return "daily_activity", ["daily_activity"]
+    if "环游手册" in joined and "任务列表" in joined:
+        return "manual_tasks", ["manual_tasks"]
+    if "环游手册" in joined:
+        return "manual_track", ["manual_track"]
+    if any(marker in joined for marker in ("我要买", "我要卖")):
+        return "exchange", ["exchange_menu"]
+    if any(marker in joined for marker in ("访问城市", "启程", "作战终端")):
+        return "home", ["top_level_hud"]
+    if any(marker in joined for marker in ("进入游戏", "启动游戏")):
+        return "login", ["login"]
+    if "取消" in joined:
+        return "clarity_dialog", ["safe_cancel_dialog"]
+    return "unknown", ["unknown"]
+
+
+def _static_region(
+    anchor_id: str,
+    bbox: tuple[int, int, int, int],
+    page_type: str,
+    action_key: str,
+    postcondition: str,
+    geometry_revision: str,
+) -> CalibratedStaticRegion:
+    return CalibratedStaticRegion(
+        anchor_id=anchor_id,
+        bbox=bbox,
+        page_classifier=page_type,
+        allowed_action=action_key,
+        postcondition=postcondition,
+        geometry_revision=geometry_revision,
+    )
+
+
 def _trusted_observation() -> PageObservation:
     """Build only safety facts from a fresh frame; never persist raw OCR here."""
 
@@ -84,55 +145,48 @@ def _trusted_observation() -> PageObservation:
     items = list(frame.ocr())
     texts = [str(item.get("text", "")).replace(" ", "") for item in items]
     joined = "|".join(texts)
-    markers: list[str] = []
+    page_type, markers = _classify_page(texts)
     anchors: list[ObservedAnchor] = []
+    geometry = current_display_geometry()
+    static_regions: list[CalibratedStaticRegion] = []
 
     if any(marker in joined for marker in ("注销", "退出登录", "账号设置")):
         markers.append("account_logout")
-    if "每日活跃" in joined or ("完成进度" in joined and "活跃度" in joined):
-        page_type = "daily_activity"
-        markers.append("daily_activity")
-        anchors.append(ObservedAnchor("daily_content", "daily_content", (150, 180, 1180, 650)))
-    elif "环游手册" in joined and "任务列表" in joined:
-        page_type = "manual_tasks"
-        markers.append("manual_tasks")
-        anchors.append(ObservedAnchor("manual_content", "manual_content", (150, 100, 1180, 650)))
-    elif "环游手册" in joined:
-        page_type = "manual_track"
-        markers.append("manual_track")
-        anchors.append(ObservedAnchor("manual_content", "manual_content", (150, 100, 1180, 650)))
-    elif any(marker in joined for marker in ("我要买", "我要卖")):
-        page_type = "exchange"
-        markers.append("exchange_menu")
-    elif any(marker in joined for marker in ("预计买入", "买入总价")):
-        page_type = "exchange_buy"
-        markers.append("exchange_buy")
-    elif any(marker in joined for marker in ("预计卖出", "卖出总价")):
-        page_type = "exchange_sell"
-        markers.append("exchange_sell")
-    elif any(marker in joined for marker in ("访问城市", "启程", "作战终端")):
-        page_type = "home"
-        markers.append("top_level_hud")
-    elif any(marker in joined for marker in ("进入游戏", "启动游戏")):
-        page_type = "login"
-        markers.append("login")
-    elif "取消" in joined:
-        page_type = "clarity_dialog"
-        markers.append("safe_cancel_dialog")
-    else:
-        page_type = "unknown"
-        markers.append("unknown")
-
-    # Fixed top-left back is usable only on a page that was independently
-    # classified above; UNKNOWN is rejected by every policy spec.
-    anchors.append(ObservedAnchor("top_left_back", "top_left_back", (20, 10, 130, 85)))
+    if page_type in {"daily_activity", "manual_tasks", "manual_track"}:
+        static_regions.append(_static_region(
+            "top_left_back", (20, 10, 130, 85), page_type,
+            "reward_back", "page_identity_must_change_or_remain_safe",
+            geometry.geometry_revision,
+        ))
+    if page_type in {"home", "daily_activity", "manual_tasks", "manual_track", "exchange_buy", "exchange_sell"}:
+        static_regions.append(_static_region(
+            "top_left_back", (20, 10, 130, 85), page_type,
+            "page_back", "page_identity_must_change_or_remain_safe",
+            geometry.geometry_revision,
+        ))
+    if page_type == "daily_activity":
+        static_regions.append(_static_region(
+            "daily_content", (150, 180, 1180, 650), page_type,
+            "daily_horizontal_scroll", "daily_anchor_remains_valid",
+            geometry.geometry_revision,
+        ))
+    if page_type in {"manual_tasks", "manual_track"}:
+        static_regions.append(_static_region(
+            "manual_content", (150, 100, 1180, 650), page_type,
+            "manual_horizontal_scroll", "manual_anchor_remains_valid",
+            geometry.geometry_revision,
+        ))
     if page_type == "home":
-        anchors.extend((
-            ObservedAnchor("daily_shortcut", "daily_shortcut", (998, 32, 1098, 132)),
-            ObservedAnchor("manual_shortcut", "manual_shortcut", (1082, 32, 1182, 132)),
+        static_regions.extend((
+            _static_region("daily_shortcut", (998, 32, 1098, 132), page_type, "daily_page_open", "page_identity_must_change_or_remain_safe", geometry.geometry_revision),
+            _static_region("manual_shortcut", (1082, 32, 1182, 132), page_type, "manual_page_open", "page_identity_must_change_or_remain_safe", geometry.geometry_revision),
         ))
     if page_type == "login":
-        anchors.append(ObservedAnchor("enter_game", "enter_game", (560, 500, 720, 620)))
+        static_regions.append(_static_region(
+            "enter_game", (560, 500, 720, 620), page_type,
+            "enter_game", "top_level_hud_or_safe_startup_transition",
+            geometry.geometry_revision,
+        ))
     for item in items:
         text_value = str(item.get("text", "")).replace(" ", "")
         bounds = _bbox(item)
@@ -163,6 +217,8 @@ def _trusted_observation() -> PageObservation:
         markers=tuple(markers),
         anchors=tuple(anchors),
         captured_at=datetime.now().astimezone(),
+        display_geometry=geometry,
+        static_regions=tuple(static_regions),
     )
 
 
@@ -191,7 +247,72 @@ def run_policy_canaries(_live_guard: ReadOnlyActionGuard) -> list[dict]:
     canary_guard.tap("transaction_buy", (1000, 650), "exchange_buy")
     canary_guard.tap("reward_claim", (1000, 620), "daily_reward")
     canary_guard.tap("fatigue_confirm", (900, 600), "rest_area")
-    return [asdict(entry) for entry in canary_guard.journal]
+    results = [asdict(entry) for entry in canary_guard.journal]
+    issuer = _live_guard.permit_issuer
+    if issuer is None:
+        return results
+    try:
+        observation = issuer.observer.observe()
+        forged = ReadOnlyPermit(
+            permit_id="CANARY-FORGED-NOT-REGISTRY-ISSUED",
+            action_key="reward_back",
+            requested_target="top_left_back",
+            observation_id=observation.observation_id,
+            screenshot_hash=observation.screenshot_hash,
+            page_classifier=observation.page_type,
+            page_fingerprint=observation.page_fingerprint,
+            anchor_id="top_left_back",
+            anchor_text_hash="CANARY-PLACEHOLDER",
+            anchor_bbox=(0, 0, 1280, 720),
+            allowed_region=(0, 0, 1280, 720),
+            final_trajectory=((1000, 650),),
+            issued_at=datetime.now().astimezone(),
+            expires_at=datetime.now().astimezone() + timedelta(seconds=5),
+            max_uses=1,
+            correlation_id="canary-forged",
+            postcondition="CANARY-PLACEHOLDER",
+        )
+        forged_guard = ReadOnlyActionGuard(permit_issuer=issuer)
+        forged_guard.authorize_coordinate((1000, 650), permit=forged)
+        entry = asdict(forged_guard.journal[-1])
+        entry["canary"] = "directly_constructed_permit"
+        results.append(entry)
+
+        policy_by_page = {
+            "home": ("page_back", "top_left_back", (82, 36)),
+            "daily_activity": ("reward_back", "top_left_back", (82, 36)),
+            "manual_tasks": ("reward_back", "top_left_back", (82, 36)),
+            "manual_track": ("reward_back", "top_left_back", (82, 36)),
+            "exchange_buy": ("page_back", "top_left_back", (82, 36)),
+            "exchange_sell": ("page_back", "top_left_back", (82, 36)),
+            "login": ("enter_game", "enter_game", (640, 560)),
+        }
+        candidate = policy_by_page.get(observation.page_type)
+        if candidate is not None:
+            action_key, target, coordinate = candidate
+            permit = issuer.issue(
+                ActionIntent(action_key, target, "canary-mutation"),
+                (coordinate,),
+                geometry=observation.display_geometry,
+            )
+            mutated = replace(permit, allowed_region=(0, 0, 1280, 720))
+            mutation_guard = ReadOnlyActionGuard(permit_issuer=issuer)
+            mutation_guard.authorize_coordinate(
+                coordinate,
+                permit=mutated,
+                geometry=observation.display_geometry,
+            )
+            entry = asdict(mutation_guard.journal[-1])
+            entry["canary"] = "mutated_permit_fields"
+            results.append(entry)
+    except Exception as error:
+        results.append({
+            "canary": "permit_authenticity_setup",
+            "action_key": "permit_authenticity_canary",
+            "allowed": False,
+            "reason": f"canary_setup_blocked:{type(error).__name__}",
+        })
+    return results
 
 
 def policy_report(
@@ -238,7 +359,12 @@ def _run_probe(
     if buy.success:
         result["buy_strength"] = _jsonable(read_strength())
         result["captures"].append(_capture(output, "exchange-buy"))
-    driver.go_home()
+        driver.tap(
+            (82, 36), action_key="page_back",
+            page_id="exchange_buy", anchor_key="top_left_back",
+        )
+    else:
+        driver.go_home()
 
     sell = exchange_navigation.open_exchange_action(
         exchange_navigation.ExchangeAction.SELL, read_only=True
@@ -246,7 +372,12 @@ def _run_probe(
     result["sell_navigation"] = _jsonable(sell)
     if sell.success:
         result["captures"].append(_capture(output, "exchange-sell"))
-    driver.go_home()
+        driver.tap(
+            (82, 36), action_key="page_back",
+            page_id="exchange_sell", anchor_key="top_left_back",
+        )
+    else:
+        driver.go_home()
 
     if not args.navigation_only:
         station = get_station()
