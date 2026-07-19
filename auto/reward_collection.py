@@ -354,6 +354,7 @@ class ManualTaskCard:
 class CardClaimState(str, Enum):
     UNKNOWN = "UNKNOWN"
     CLAIMABLE = "CLAIMABLE"
+    SETTLEMENT_CANDIDATE = "SETTLEMENT_CANDIDATE"
     CLAIMED_SETTLED = "CLAIMED_SETTLED"
     NO_REWARD_APPLICABLE_CONFIRMED = "NO_REWARD_APPLICABLE_CONFIRMED"
     NOT_YET_CLAIMABLE = "NOT_YET_CLAIMABLE"
@@ -369,7 +370,7 @@ def _claim_state(claimable: bool | None, claimed: bool | None) -> CardClaimState
     if claimable is True and claimed is False:
         return CardClaimState.CLAIMABLE
     if claimable is False and claimed is True:
-        return CardClaimState.CLAIMED_SETTLED
+        return CardClaimState.SETTLEMENT_CANDIDATE
     if claimable is False and claimed is False:
         return CardClaimState.NOT_YET_CLAIMABLE
     if claimable is None and claimed is None:
@@ -641,8 +642,9 @@ def _card_items(items: list[dict], *, manual: bool) -> list[DailyTaskCard | Manu
         claim_state_evidence = None
         settlement_candidate = False
         if "已领取" in status_text:
-            claimable, claimed = False, True
-            claim_state_evidence = CardClaimState.CLAIMED_SETTLED
+            claimable, claimed = None, None
+            claim_state_evidence = CardClaimState.SETTLEMENT_CANDIDATE
+            settlement_candidate = True
         elif "按钮禁用" in status_text:
             claimable = claimed = None
             claim_state_evidence = CardClaimState.DISABLED_UNKNOWN
@@ -755,7 +757,7 @@ class _CardScannerBase:
         contribution = old.contribution if new.contribution is None else new.contribution
         if old.contribution is not None and new.contribution is not None and old.contribution != new.contribution:
             contribution = old.contribution
-        settlement_frames = 0
+        settlement_frames = old.settlement_evidence_frames
         if old.settlement_candidate and new.settlement_candidate:
             settlement_frames = old.settlement_evidence_frames + 1
             new_state = (
@@ -770,10 +772,35 @@ class _CardScannerBase:
                 claim_state_evidence=new_state,
                 settlement_evidence_frames=settlement_frames,
             )
+        elif new.settlement_candidate:
+            settlement_frames = max(1, new.settlement_evidence_frames)
+            new = replace(
+                new,
+                claimable=None,
+                claimed=None,
+                claim_state_evidence=CardClaimState.SETTLEMENT_CANDIDATE,
+                settlement_evidence_frames=settlement_frames,
+            )
+        elif old.settlement_candidate:
+            new = replace(
+                new,
+                claimable=None,
+                claimed=None,
+                claim_state_evidence=CardClaimState.SETTLEMENT_CANDIDATE,
+                settlement_candidate=True,
+                settlement_evidence_frames=old.settlement_evidence_frames,
+            )
         old_state, new_state = old.claim_state, new.claim_state
         if key in self._claim_conflicts:
             claimable = claimed = None
             claim_state_evidence = CardClaimState.CONFLICT
+        elif (
+            old_state is CardClaimState.SETTLEMENT_CANDIDATE
+            and new_state is CardClaimState.CLAIMED_SETTLED
+            and new.settlement_evidence_frames >= 2
+        ):
+            claimable, claimed = False, True
+            claim_state_evidence = CardClaimState.CLAIMED_SETTLED
         elif new_state is CardClaimState.UNKNOWN:
             claimable, claimed = old.claimable, old.claimed
             claim_state_evidence = old.claim_state_evidence
@@ -817,9 +844,7 @@ class _CardScannerBase:
             claimed=claimed,
             claim_state_evidence=claim_state_evidence,
             settlement_candidate=new.settlement_candidate,
-            settlement_evidence_frames=(
-                new.settlement_evidence_frames if new.settlement_candidate else 0
-            ),
+            settlement_evidence_frames=new.settlement_evidence_frames,
             contribution=contribution,
             page_fingerprint=new.page_fingerprint,
             title=old.title if len(_normalized_key(old.title)) >= len(_normalized_key(new.title)) else new.title,
@@ -1367,7 +1392,10 @@ class RewardDriver:
             if action == "wait_for_game" or startup_recovery:
                 self.sleep(2)
                 continue
-            self.tap((82, 36), action_key="back", page_id="unknown_page", anchor_key="top_left_back")
+            self.tap(
+                (82, 36), action_key="page_back",
+                page_id="unknown_page", anchor_key="top_left_back",
+            )
             self.sleep(0.8)
         return False
 
