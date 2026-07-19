@@ -17,7 +17,7 @@ from typing import Any, Callable, Iterable
 
 from core.services.runtime_control import RUNTIME_DIR
 from core.services.server_calendar import SERVER_CLOCK
-from core.services.task_schedule_state import set_next_run
+from core.services.task_schedule_state import TASK_KEY_RUN_BUSINESS, set_next_run
 
 
 STATE_PATH = RUNTIME_DIR / "fatigue-waypoints.json"
@@ -360,17 +360,90 @@ def recover_pending_fatigue_schedules(
     path: Path = STATE_PATH,
     schedule: Callable[[], None] | None = None,
 ) -> bool:
-    """Finish a scheduling transaction left pending by a process crash."""
+    """Finish fatigue scheduling and business-handoff transactions after startup."""
 
     with _LOCK:
         data = _read(path)
-        if not any(
+        has_fatigue_pending = any(
             item.get("schedule_status") == "PENDING_SCHEDULE"
             and _state(item) not in _TERMINAL_STATES
             for item in data["actions"]
-        ):
-            return False
-    return notify_fatigue_event("recover_pending_schedule", path=path, schedule=schedule)
+        )
+        has_business_pending = any(
+            (item.get("scheduler_handoff") or {}).get("state") in {"PENDING", "FAILED_RETRYABLE"}
+            for item in data["actions"]
+        )
+    recovered = False
+    if has_fatigue_pending:
+        recovered = notify_fatigue_event(
+            "recover_pending_schedule", path=path, schedule=schedule
+        )
+    if has_business_pending:
+        recovered = deliver_pending_business_handoffs(path=path) or recovered
+    return recovered
+
+
+def _pending_business_handoff() -> dict[str, Any]:
+    return {
+        "task_key": TASK_KEY_RUN_BUSINESS,
+        "state": "PENDING",
+        "requested_at": SERVER_CLOCK.server_now().isoformat(timespec="seconds"),
+        "attempts": 0,
+    }
+
+
+def deliver_pending_business_handoffs(
+    *,
+    path: Path = STATE_PATH,
+    schedule: Callable[[str], None] | None = None,
+) -> bool:
+    """Deliver persisted run-business handoffs without undoing checkpoint state."""
+
+    from core.services.task_schedule_state import request_immediate_run
+
+    callback = schedule or request_immediate_run
+    with _LOCK:
+        data = _read(path)
+        pending_ids = [
+            str(item.get("id", ""))
+            for item in data["actions"]
+            if (item.get("scheduler_handoff") or {}).get("state")
+            in {"PENDING", "FAILED_RETRYABLE"}
+        ]
+    delivered = False
+    for action_id in pending_ids:
+        try:
+            callback(TASK_KEY_RUN_BUSINESS)
+        except Exception as error:
+            with _LOCK:
+                data = _read(path)
+                item = next(
+                    (entry for entry in data["actions"] if str(entry.get("id")) == action_id),
+                    None,
+                )
+                if item is not None:
+                    handoff = item.setdefault("scheduler_handoff", _pending_business_handoff())
+                    handoff["state"] = "FAILED_RETRYABLE"
+                    handoff["attempts"] = int(handoff.get("attempts", 0)) + 1
+                    handoff["last_error"] = f"{type(error).__name__}: {error}"
+                    handoff["last_attempt_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
+                    _write(path, data)
+            continue
+        with _LOCK:
+            data = _read(path)
+            item = next(
+                (entry for entry in data["actions"] if str(entry.get("id")) == action_id),
+                None,
+            )
+            if item is not None:
+                handoff = item.setdefault("scheduler_handoff", _pending_business_handoff())
+                handoff["state"] = "DELIVERED"
+                handoff["attempts"] = int(handoff.get("attempts", 0)) + 1
+                handoff["delivered_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
+                handoff.pop("last_error", None)
+                _write(path, data)
+        delivered = True
+    return delivered
 
 
 def cancel_deferred_fatigue_actions(*, path: Path = STATE_PATH) -> None:
@@ -638,6 +711,7 @@ def complete_fatigue_checkpoint_processing(
             item["acknowledged_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
             item["processing_outcome"] = outcome.value
             item["source_result"] = dict(result)
+            item["scheduler_handoff"] = _pending_business_handoff()
             _write(path, data)
             return {"outcome": outcome.value, "acknowledged": True, "checkpoint": dict(item)}
 
@@ -698,6 +772,7 @@ def complete_fatigue_checkpoint_processing(
             item["superseded_by"] = replacement_id
             item["processing_outcome"] = CheckpointProcessingOutcome.TRANSFER_TO_NEW_CHECKPOINT.value
             item["source_result"] = dict(result)
+            item["scheduler_handoff"] = _pending_business_handoff()
             replacement["transfer_validated_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
             _write(path, data)
             return {
@@ -762,6 +837,7 @@ def skip_fatigue_checkpoint(
     reason: str,
     actor: str,
     path: Path = STATE_PATH,
+    schedule_business: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     if not reason.strip() or not actor.strip():
         raise ValueError("checkpoint skip requires actor and reason")
@@ -777,7 +853,12 @@ def skip_fatigue_checkpoint(
             "reason": reason.strip(),
             "at": SERVER_CLOCK.server_now().isoformat(timespec="seconds"),
         }
+        item["scheduler_handoff"] = _pending_business_handoff()
         _write(path, data)
+    deliver_pending_business_handoffs(path=path, schedule=schedule_business)
+    with _LOCK:
+        data = _read(path)
+        item = next(entry for entry in data["actions"] if str(entry.get("id")) == str(action_id))
         return dict(item)
 
 
