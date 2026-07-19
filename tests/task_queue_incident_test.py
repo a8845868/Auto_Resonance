@@ -36,7 +36,7 @@ def test_incident_is_dispatched_only_after_resource_cleanup():
     assert events == ["prepare", "task", "cleanup", "report"]
     assert worker.halted_for_repair is True
     assert incidents[0]["task_key"] == "failure"
-    assert incidents[0]["failure_kind"] == "exception"
+    assert incidents[0]["failure_kind"] == "fatal_automation_error"
     assert "RuntimeError: screen never changed" in incidents[0]["traceback"]
 
 
