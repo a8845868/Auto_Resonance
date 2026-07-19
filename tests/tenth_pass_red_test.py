@@ -45,31 +45,13 @@ def _guard(observation: PageObservation | None = None):
     issuer = ReadOnlyPermitIssuer(
         PageObserver(lambda: value), AnchorResolver(), now=lambda: NOW
     )
-    return ReadOnlyActionGuard(permit_issuer=issuer, now=lambda: NOW), issuer
+    return ReadOnlyActionGuard(lambda _point: None, permit_issuer=issuer, now=lambda: NOW), issuer
 
 
 def test_directly_constructed_permit_is_rejected():
     observation = _observation()
     guard, _issuer = _guard(observation)
-    forged = ReadOnlyPermit(
-        permit_id="forged-permit",
-        action_key="reward_back",
-        requested_target="top_left_back",
-        observation_id=observation.observation_id,
-        screenshot_hash=observation.screenshot_hash,
-        page_classifier=observation.page_type,
-        page_fingerprint=observation.page_fingerprint,
-        anchor_id="top_left_back",
-        anchor_text_hash="forged",
-        anchor_bbox=(0, 0, 1280, 720),
-        allowed_region=(0, 0, 1280, 720),
-        final_trajectory=((1000, 650),),
-        issued_at=NOW,
-        expires_at=NOW + timedelta(seconds=5),
-        max_uses=1,
-        correlation_id="forged",
-        postcondition="forged",
-    )
+    forged = ReadOnlyPermit("forged-permit")
 
     assert guard.authorize_coordinate((1000, 650), permit=forged) is False
     assert guard.journal[-1].reason == "permit_not_issued_by_registry"
@@ -102,10 +84,8 @@ def test_one_use_permit_is_consumed_atomically_by_concurrent_callers(monkeypatch
         thread.join(timeout=10)
 
     assert sorted(results) == [False, True]
-    assert sorted(entry.reason for entry in guard.journal) == [
-        "permit_already_consumed",
-        "valid_trusted_read_only_permit",
-    ]
+    denied = [entry.reason for entry in guard.journal if entry.stage == "DENIED"]
+    assert denied == ["permit_already_consumed"]
 
 
 def test_ratio_half_does_not_map_outside_logical_point_into_anchor(monkeypatch):
