@@ -42,6 +42,14 @@ def install_action_policy(policy):
     return previous
 
 
+def current_display_geometry():
+    """Return the deterministic logical-to-device geometry for guarded input."""
+
+    from core.services.read_only_policy import DisplayGeometry
+
+    return DisplayGeometry.from_ratio(float(getattr(control, "ratio", 1.0)))
+
+
 def set_runtime_device(device: EmulatorInfo | None) -> None:
     """Freeze the target used by an active queue independently of GUI config."""
 
@@ -405,18 +413,28 @@ def input_swipe(
     ensure_automation_allowed("滑动游戏界面")
     if STOP:
         raise StopExecution()
-    # Read-only mode determines every physical point before authorization and
-    # deliberately disables random offsets and post-authorization segmentation.
-    start = (int(round(control.ratio * pos1[0])), int(round(control.ratio * pos1[1])))
-    end = (int(round(control.ratio * pos2[0])), int(round(control.ratio * pos2[1])))
+    # Read-only authorization is exclusively logical. The guard atomically
+    # consumes the capability, transforms the full path once, then invokes the
+    # hardware callback with that exact physical path.
+    start = (int(pos1[0]), int(pos1[1]))
+    end = (int(pos2[0]), int(pos2[1]))
     trajectory = _linear_trajectory(start, end)
+
+    def execute(physical_trajectory):
+        physical_start = physical_trajectory[0]
+        physical_end = physical_trajectory[-1]
+        control.input_swipe(
+            physical_start[0], physical_start[1],
+            physical_end[0], physical_end[1], swipe_time,
+        )
+
     if not _ACTION_POLICY.authorize_swipe(
         start, end, trajectory=trajectory, intent=intent, permit=permit,
+        geometry=current_display_geometry(), _execute=execute,
         page_id=page_id, page_fingerprint=page_fingerprint,
         anchor_key=anchor_key,
     ):
         return False
-    control.input_swipe(start[0], start[1], end[0], end[1], swipe_time)
     return True
 
 
@@ -439,15 +457,17 @@ def input_tap(
     ensure_automation_allowed("点击游戏界面")
     if STOP:
         raise StopExecution()
-    # The guard authorizes the exact physical coordinate.  No random offset is
-    # permitted after this point in read-only mode.
-    physical = (int(round(control.ratio * pos[0])), int(round(control.ratio * pos[1])))
+    logical = (int(pos[0]), int(pos[1]))
+
+    def execute(physical_trajectory):
+        control.input_tap(*physical_trajectory[0])
+
     if not _ACTION_POLICY.authorize_coordinate(
-        physical, intent=intent, permit=permit, page_id=page_id,
+        logical, intent=intent, permit=permit,
+        geometry=current_display_geometry(), _execute=execute, page_id=page_id,
         page_fingerprint=page_fingerprint, anchor_key=anchor_key,
     ):
         return False
-    control.input_tap(*physical)
     return True
 
 
