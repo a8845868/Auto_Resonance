@@ -16,4 +16,3 @@ def test_production_runtime_import_chain_loads_without_suppression():
     assert callable(run_daily_fatigue_recovery)
     assert callable(RewardCollector)
     assert callable(run_with_recovery)
-
