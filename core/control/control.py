@@ -6,7 +6,10 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 """
 
 import random
+import secrets
+import threading
 import time
+from datetime import datetime
 from typing import Optional, Tuple
 
 import cv2 as cv
@@ -30,14 +33,23 @@ MAX_SWIPE_SEGMENTS = 100
 control: IADB = ADB()
 _runtime_device: EmulatorInfo | None = None
 _runtime_auto_start_emulator: bool | None = None
-_ACTION_POLICY = None
+_BACKEND_LOCK = threading.RLock()
+_BACKEND_GENERATION = 1
+_BACKEND_CONNECTED_AT = datetime.now().astimezone()
+_ACTION_POLICY_LOCK = threading.RLock()
+_ACTION_POLICY_OWNERS: dict[str, object] = {}
+_ACTION_POLICY_ORDER: list[str] = []
+_READ_ONLY_FAIL_CLOSED = False
 
 
-class TrustedControlInputExecutor:
+class _BoundControlInputExecutor:
     """The only production bridge from a read-only guard to device input."""
 
+    def __init__(self, backend: IADB):
+        self.__backend = backend
+
     def tap(self, physical_point: tuple[int, int]):
-        control.input_tap(int(physical_point[0]), int(physical_point[1]))
+        self.__backend.input_tap(int(physical_point[0]), int(physical_point[1]))
 
     def swipe(
         self,
@@ -45,18 +57,66 @@ class TrustedControlInputExecutor:
         duration_ms: int,
     ):
         start, end = physical_trajectory[0], physical_trajectory[-1]
-        control.input_swipe(
+        self.__backend.input_swipe(
             int(start[0]), int(start[1]), int(end[0]), int(end[1]), int(duration_ms)
         )
 
 
-def install_action_policy(policy):
-    """Install a process-local action boundary and return the previous one."""
+def _create_bound_input_executor(backend: IADB):
+    """Internal/test factory; the returned bridge is never stored on a session."""
 
-    global _ACTION_POLICY
-    previous = _ACTION_POLICY
-    _ACTION_POLICY = policy
-    return previous
+    return _BoundControlInputExecutor(backend)
+
+
+def activate_action_policy(policy) -> str:
+    """Install an owner-token policy without previous/restore races."""
+
+    from core.services.read_only_policy import ReadOnlySafetySession
+
+    if not isinstance(policy, ReadOnlySafetySession):
+        raise TypeError("only a sealed ReadOnlySafetySession may guard device input")
+    token = secrets.token_urlsafe(24)
+    global _READ_ONLY_FAIL_CLOSED
+    with _BACKEND_LOCK:
+        with _ACTION_POLICY_LOCK:
+            _ACTION_POLICY_OWNERS[token] = policy
+            _ACTION_POLICY_ORDER.append(token)
+            _READ_ONLY_FAIL_CLOSED = True
+    return token
+
+
+def remove_action_policy(token: str, *, close_session: bool = True) -> bool:
+    """Remove only the matching owner; out-of-order exits preserve newer owners."""
+
+    global _READ_ONLY_FAIL_CLOSED
+    with _BACKEND_LOCK:
+        with _ACTION_POLICY_LOCK:
+            policy = _ACTION_POLICY_OWNERS.pop(str(token), None)
+            if policy is None:
+                return False
+            _ACTION_POLICY_ORDER[:] = [item for item in _ACTION_POLICY_ORDER if item != token]
+            if close_session:
+                policy.close()
+            if not _ACTION_POLICY_OWNERS and close_session:
+                _READ_ONLY_FAIL_CLOSED = False
+            return True
+
+
+def current_action_policy():
+    with _ACTION_POLICY_LOCK:
+        while _ACTION_POLICY_ORDER and _ACTION_POLICY_ORDER[-1] not in _ACTION_POLICY_OWNERS:
+            _ACTION_POLICY_ORDER.pop()
+        return _ACTION_POLICY_OWNERS.get(_ACTION_POLICY_ORDER[-1]) if _ACTION_POLICY_ORDER else None
+
+
+def close_orphaned_action_policy(policy) -> None:
+    """Explicitly close a fail-closed session after owner metadata was lost."""
+
+    global _READ_ONLY_FAIL_CLOSED
+    policy.close()
+    with _ACTION_POLICY_LOCK:
+        if not _ACTION_POLICY_OWNERS:
+            _READ_ONLY_FAIL_CLOSED = False
 
 
 def current_display_geometry():
@@ -64,7 +124,56 @@ def current_display_geometry():
 
     from core.services.read_only_policy import DisplayGeometry
 
-    return DisplayGeometry.from_ratio(float(getattr(control, "ratio", 1.0)))
+    with _BACKEND_LOCK:
+        return DisplayGeometry.from_ratio(float(getattr(control, "ratio", 1.0)))
+
+
+def current_bound_device_identity():
+    from core.services.read_only_policy import BoundDeviceIdentity
+
+    with _BACKEND_LOCK:
+        device = get_runtime_device()
+        geometry = current_display_geometry()
+        instance_id = str(getattr(device, "index", "0"))
+        port = getattr(device, "port", None)
+        adb_serial = f"127.0.0.1:{port}" if port is not None else "backend-local"
+        return BoundDeviceIdentity(
+            emulator_backend=type(control).__name__,
+            instance_id=instance_id,
+            adb_serial=adb_serial,
+            backend_generation=_BACKEND_GENERATION,
+            backend_object_identity=f"{type(control).__name__}:{id(control):x}",
+            display_geometry_revision=geometry.geometry_revision,
+            connected_at=_BACKEND_CONNECTED_AT,
+        )
+
+
+def create_read_only_safety_session(observer, *, resolver=None, policies=None, now=None):
+    """Production factory that seals the exact backend and identity snapshot."""
+
+    from core.services.read_only_policy import (
+        AnchorResolver,
+        ReadOnlyPermitIssuer,
+        ReadOnlySafetySession,
+    )
+
+    with _BACKEND_LOCK:
+        backend = control
+        identity = current_bound_device_identity()
+        issuer = ReadOnlyPermitIssuer(
+            observer,
+            resolver or AnchorResolver(),
+            policies=policies,
+            now=now or (lambda: datetime.now().astimezone()),
+            bound_device_identity=identity,
+            identity_provider=current_bound_device_identity,
+        )
+        return ReadOnlySafetySession(
+            _create_bound_input_executor(backend),
+            permit_issuer=issuer,
+            now=now or (lambda: datetime.now().astimezone()),
+            device_action_lock=_BACKEND_LOCK,
+        )
 
 
 def set_runtime_device(device: EmulatorInfo | None) -> None:
@@ -114,11 +223,14 @@ def _close_backend(candidate: IADB, name: str) -> None:
 
 
 def _activate_backend(candidate: IADB) -> None:
-    global control
-    previous = control
-    control = candidate
-    if previous is not candidate:
-        _close_backend(previous, "旧控制后端")
+    global control, _BACKEND_GENERATION, _BACKEND_CONNECTED_AT
+    with _BACKEND_LOCK:
+        previous = control
+        control = candidate
+        if previous is not candidate:
+            _BACKEND_GENERATION += 1
+            _BACKEND_CONNECTED_AT = datetime.now().astimezone()
+            _close_backend(previous, "旧控制后端")
 
 
 def _known_nemu_unavailable(error: BaseException) -> bool:
@@ -191,10 +303,14 @@ def connect(adb_port: Optional[int] = None):
 def connect_adb(adb_port: Optional[int] = None):
     """Force the TCP ADB transport for workflows that require shell evidence."""
     ensure_automation_allowed("连接 ADB")
-    global control
     device = get_runtime_device()
-    control = ADB()
-    return control.connect(adb_port if adb_port is not None else device.port)
+    candidate = ADB()
+    status = candidate.connect(adb_port if adb_port is not None else device.port)
+    if status:
+        _activate_backend(candidate)
+    else:
+        _close_backend(candidate, "ADB")
+    return status
 
 
 def stop():
@@ -240,11 +356,6 @@ def _legacy_input_swipe(
     ensure_automation_allowed("滑动游戏界面")
     if STOP:
         raise StopExecution()
-    if _ACTION_POLICY is not None and not _ACTION_POLICY.authorize_swipe(
-        pos1, pos2, intent=intent, permit=permit, page_id=page_id,
-        page_fingerprint=page_fingerprint, anchor_key=anchor_key,
-    ):
-        return False
     # 添加随机值
     pos_x1 = control.ratio * pos1[0] + random.randint(*EXCURSIONX)
     pos_y1 = control.ratio * pos1[1] + random.randint(*EXCURSIONY)
@@ -379,11 +490,6 @@ def _legacy_input_tap(
     ensure_automation_allowed("点击游戏界面")
     if STOP:
         raise StopExecution()
-    if _ACTION_POLICY is not None and not _ACTION_POLICY.authorize_coordinate(
-        pos, intent=intent, permit=permit, page_id=page_id,
-        page_fingerprint=page_fingerprint, anchor_key=anchor_key,
-    ):
-        return False
     offset_x = random.randint(*EXCURSIONX) if random_offset else 0
     offset_y = random.randint(*EXCURSIONY) if random_offset else 0
     control.input_tap(
@@ -410,7 +516,7 @@ def _linear_trajectory(
     )
 
 
-def input_swipe(
+def _input_swipe_locked(
     pos1=(919, 617),
     pos2=(919, 908),
     swipe_time: int = 100,
@@ -421,7 +527,10 @@ def input_swipe(
     page_fingerprint: str = "",
     anchor_key: str = "",
 ):
-    if _ACTION_POLICY is None:
+    action_policy = current_action_policy()
+    if action_policy is None:
+        if _READ_ONLY_FAIL_CLOSED:
+            raise PermissionError("read_only_session_policy_unavailable")
         return _legacy_input_swipe(
             pos1, pos2, swipe_time, intent=intent, permit=permit,
             page_id=page_id, page_fingerprint=page_fingerprint,
@@ -436,11 +545,62 @@ def input_swipe(
     end = (int(pos2[0]), int(pos2[1]))
     trajectory = _linear_trajectory(start, end)
 
-    if not _ACTION_POLICY.authorize_swipe(
-        start, end, trajectory=trajectory, intent=intent, permit=permit,
-        geometry=current_display_geometry(), duration_ms=swipe_time,
-        page_id=page_id, page_fingerprint=page_fingerprint,
-        anchor_key=anchor_key,
+    if intent is None:
+        return False
+    if not action_policy.request_swipe(
+        intent, trajectory, swipe_time, geometry=current_display_geometry()
+    ):
+        return False
+    return True
+
+
+def input_swipe(
+    pos1=(919, 617),
+    pos2=(919, 908),
+    swipe_time: int = 100,
+    *,
+    intent=None,
+    permit=None,
+    page_id: str = "",
+    page_fingerprint: str = "",
+    anchor_key: str = "",
+):
+    with _BACKEND_LOCK:
+        return _input_swipe_locked(
+            pos1, pos2, swipe_time, intent=intent, permit=permit,
+            page_id=page_id, page_fingerprint=page_fingerprint,
+            anchor_key=anchor_key,
+        )
+
+
+def _input_tap_locked(
+    pos: Tuple[int, int] = (880, 362),
+    random_offset: bool = True,
+    *,
+    intent=None,
+    permit=None,
+    page_id: str = "",
+    page_fingerprint: str = "",
+    anchor_key: str = "",
+):
+    action_policy = current_action_policy()
+    if action_policy is None:
+        if _READ_ONLY_FAIL_CLOSED:
+            raise PermissionError("read_only_session_policy_unavailable")
+        return _legacy_input_tap(
+            pos, random_offset=random_offset, intent=intent, permit=permit,
+            page_id=page_id, page_fingerprint=page_fingerprint,
+            anchor_key=anchor_key,
+        )
+    ensure_automation_allowed("点击游戏界面")
+    if STOP:
+        raise StopExecution()
+    logical = (int(pos[0]), int(pos[1]))
+
+    if intent is None:
+        return False
+    if not action_policy.request_tap(
+        intent, logical, geometry=current_display_geometry()
     ):
         return False
     return True
@@ -456,24 +616,12 @@ def input_tap(
     page_fingerprint: str = "",
     anchor_key: str = "",
 ):
-    if _ACTION_POLICY is None:
-        return _legacy_input_tap(
+    with _BACKEND_LOCK:
+        return _input_tap_locked(
             pos, random_offset=random_offset, intent=intent, permit=permit,
             page_id=page_id, page_fingerprint=page_fingerprint,
             anchor_key=anchor_key,
         )
-    ensure_automation_allowed("点击游戏界面")
-    if STOP:
-        raise StopExecution()
-    logical = (int(pos[0]), int(pos[1]))
-
-    if not _ACTION_POLICY.authorize_coordinate(
-        logical, intent=intent, permit=permit,
-        geometry=current_display_geometry(), page_id=page_id,
-        page_fingerprint=page_fingerprint, anchor_key=anchor_key,
-    ):
-        return False
-    return True
 
 
 def screenshot() -> Image:

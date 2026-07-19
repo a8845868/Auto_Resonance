@@ -304,6 +304,10 @@ class DailyTaskCard:
     contribution: int | None
     page_fingerprint: str
     claim_state_evidence: CardClaimState | None = None
+    progress_conflict: bool = False
+    progress_evidence_frames: int = 1
+    settlement_candidate: bool = False
+    settlement_evidence_frames: int = 0
 
     @property
     def claim_state(self) -> "CardClaimState":
@@ -337,6 +341,10 @@ class ManualTaskCard:
     contribution: int | None
     page_fingerprint: str
     claim_state_evidence: CardClaimState | None = None
+    progress_conflict: bool = False
+    progress_evidence_frames: int = 1
+    settlement_candidate: bool = False
+    settlement_evidence_frames: int = 0
 
     @property
     def claim_state(self) -> "CardClaimState":
@@ -346,18 +354,24 @@ class ManualTaskCard:
 class CardClaimState(str, Enum):
     UNKNOWN = "UNKNOWN"
     CLAIMABLE = "CLAIMABLE"
-    CLAIMED = "CLAIMED"
-    NONE_CONFIRMED = "NONE_CONFIRMED"
+    CLAIMED_SETTLED = "CLAIMED_SETTLED"
+    NO_REWARD_APPLICABLE_CONFIRMED = "NO_REWARD_APPLICABLE_CONFIRMED"
+    NOT_YET_CLAIMABLE = "NOT_YET_CLAIMABLE"
+    DISABLED_UNKNOWN = "DISABLED_UNKNOWN"
     CONFLICT = "CONFLICT"
+    # Compatibility aliases for historical reports/tests. New production
+    # decisions use the explicit names above.
+    CLAIMED = "CLAIMED_SETTLED"
+    NONE_CONFIRMED = "NO_REWARD_APPLICABLE_CONFIRMED"
 
 
 def _claim_state(claimable: bool | None, claimed: bool | None) -> CardClaimState:
     if claimable is True and claimed is False:
         return CardClaimState.CLAIMABLE
     if claimable is False and claimed is True:
-        return CardClaimState.CLAIMED
+        return CardClaimState.CLAIMED_SETTLED
     if claimable is False and claimed is False:
-        return CardClaimState.NONE_CONFIRMED
+        return CardClaimState.NOT_YET_CLAIMABLE
     if claimable is None and claimed is None:
         return CardClaimState.UNKNOWN
     return CardClaimState.CONFLICT
@@ -624,13 +638,26 @@ def _card_items(items: list[dict], *, manual: bool) -> list[DailyTaskCard | Manu
                 contribution = int(numbers[-1])
                 break
         status_text = " ".join(str(item.get("text", "")) for item in status_candidates)
+        claim_state_evidence = None
+        settlement_candidate = False
         if "已领取" in status_text:
             claimable, claimed = False, True
-        elif any(
-            marker in status_text
-            for marker in ("无可领取", "不可领取", "奖励已结清", "按钮禁用")
-        ):
+            claim_state_evidence = CardClaimState.CLAIMED_SETTLED
+        elif "按钮禁用" in status_text:
+            claimable = claimed = None
+            claim_state_evidence = CardClaimState.DISABLED_UNKNOWN
+        elif "不可领取" in status_text:
             claimable = claimed = False
+            claim_state_evidence = CardClaimState.NOT_YET_CLAIMABLE
+        elif "奖励已结清" in status_text:
+            claimable = claimed = None
+            claim_state_evidence = CardClaimState.UNKNOWN
+            settlement_candidate = True
+        elif "无可领取" in status_text:
+            # A card-local substring cannot prove the page-global absence of
+            # rewards. Keep it unknown until an authoritative page predicate.
+            claimable = claimed = None
+            claim_state_evidence = CardClaimState.UNKNOWN
         elif "可领取" in status_text or (
             manual and "领取" in status_text and "已领取" not in status_text
         ):
@@ -645,6 +672,9 @@ def _card_items(items: list[dict], *, manual: bool) -> list[DailyTaskCard | Manu
                 task_key=_normalized_key(title), title=title, current=current, target=target,
                 completed=current >= target, claimable=claimable, claimed=claimed,
                 contribution=contribution, page_fingerprint=fingerprint,
+                claim_state_evidence=claim_state_evidence,
+                settlement_candidate=settlement_candidate,
+                settlement_evidence_frames=1 if settlement_candidate else 0,
             )
         )
     return result
@@ -694,7 +724,10 @@ class _CardScannerBase:
         if not completed:
             return bool(self.complete)
         return all(
-            card.claim_state in (CardClaimState.CLAIMED, CardClaimState.NONE_CONFIRMED)
+            card.claim_state in (
+                CardClaimState.CLAIMED_SETTLED,
+                CardClaimState.NO_REWARD_APPLICABLE_CONFIRMED,
+            )
             for card in completed
         )
 
@@ -722,6 +755,21 @@ class _CardScannerBase:
         contribution = old.contribution if new.contribution is None else new.contribution
         if old.contribution is not None and new.contribution is not None and old.contribution != new.contribution:
             contribution = old.contribution
+        settlement_frames = 0
+        if old.settlement_candidate and new.settlement_candidate:
+            settlement_frames = old.settlement_evidence_frames + 1
+            new_state = (
+                CardClaimState.CLAIMED_SETTLED
+                if settlement_frames >= 2
+                else CardClaimState.UNKNOWN
+            )
+            new = replace(
+                new,
+                claimable=False if settlement_frames >= 2 else None,
+                claimed=True if settlement_frames >= 2 else None,
+                claim_state_evidence=new_state,
+                settlement_evidence_frames=settlement_frames,
+            )
         old_state, new_state = old.claim_state, new.claim_state
         if key in self._claim_conflicts:
             claimable = claimed = None
@@ -739,14 +787,39 @@ class _CardScannerBase:
             self._claim_conflicts.add(key)
             claimable = claimed = None
             claim_state_evidence = CardClaimState.CONFLICT
+        if old.progress_conflict:
+            if old.current == new.current and old.target == new.target:
+                progress_frames = old.progress_evidence_frames + 1
+                progress_conflict = progress_frames < 2
+                current, target = new.current, new.target
+                completed = bool(new.completed and not progress_conflict)
+            else:
+                progress_frames = 1
+                progress_conflict = True
+                current, target, completed = new.current, new.target, False
+        elif old.current == new.current and old.target == new.target:
+            progress_frames = old.progress_evidence_frames + 1
+            progress_conflict = False
+            current, target = new.current, new.target
+            completed = bool(new.completed and progress_frames >= 2)
+        else:
+            progress_frames = 1
+            progress_conflict = True
+            current, target, completed = new.current, new.target, False
         return replace(
             old,
-            current=max(old.current, new.current),
-            target=max(old.target, new.target),
-            completed=old.completed or new.completed,
+            current=current,
+            target=target,
+            completed=completed,
+            progress_conflict=progress_conflict,
+            progress_evidence_frames=progress_frames,
             claimable=claimable,
             claimed=claimed,
             claim_state_evidence=claim_state_evidence,
+            settlement_candidate=new.settlement_candidate,
+            settlement_evidence_frames=(
+                new.settlement_evidence_frames if new.settlement_candidate else 0
+            ),
             contribution=contribution,
             page_fingerprint=new.page_fingerprint,
             title=old.title if len(_normalized_key(old.title)) >= len(_normalized_key(new.title)) else new.title,
@@ -786,7 +859,10 @@ class _CardScannerBase:
         for card in cards:
             key = self._canonical_key(card)
             old = self._cards.get(key)
-            self._cards[key] = card if old is None else self._merge_card(key, old, card)
+            self._cards[key] = (
+                replace(card, completed=False, progress_evidence_frames=1)
+                if old is None else self._merge_card(key, old, card)
+            )
         added = len(self._cards) - before
         self._no_new = 0 if added else self._no_new + 1
         return added
