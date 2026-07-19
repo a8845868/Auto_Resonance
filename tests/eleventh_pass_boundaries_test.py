@@ -136,6 +136,9 @@ def test_trusted_executor_cannot_receive_a_different_trajectory(monkeypatch):
         "ratio": 1.0,
         "input_swipe": staticmethod(lambda x1,y1,x2,y2,d: calls.append((x1,y1,x2,y2,d))),
     })())
+    monkeypatch.setattr(
+        control_module, "_validate_production_session", lambda _policy: None
+    )
     executor = control_module._create_bound_input_executor(control_module.control)
     captures = [
         replace(_obs(), content_marker_hash="before"),

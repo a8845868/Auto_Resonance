@@ -140,6 +140,9 @@ def test_random_offset_cannot_escape_permit_bounds(monkeypatch):
     device = SimpleNamespace(ratio=1, input_tap=lambda x, y: calls.append((x, y)))
     calls = []
     monkeypatch.setattr(control_module, "control", device)
+    monkeypatch.setattr(
+        control_module, "_validate_production_session", lambda _policy: None
+    )
     guard, _issuer, _state = _guard(
         executor=control_module._create_bound_input_executor(device)
     )

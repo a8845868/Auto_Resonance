@@ -11,6 +11,7 @@ import time
 import json
 import re
 import inspect
+import hashlib
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from enum import Enum
@@ -292,6 +293,13 @@ def _is_daily_activity_page(items: list[dict]) -> bool:
     )
 
 
+class CardProgressState(str, Enum):
+    UNKNOWN = "UNKNOWN"
+    STABLE_INCOMPLETE = "STABLE_INCOMPLETE"
+    STABLE_COMPLETE = "STABLE_COMPLETE"
+    CONFLICT = "CONFLICT"
+
+
 @dataclass(frozen=True)
 class DailyTaskCard:
     task_key: str
@@ -308,6 +316,10 @@ class DailyTaskCard:
     progress_evidence_frames: int = 1
     settlement_candidate: bool = False
     settlement_evidence_frames: int = 0
+    progress_state: CardProgressState = CardProgressState.UNKNOWN
+    progress_evidence_capture_ids: tuple[str, ...] = ()
+    claim_evidence_capture_ids: tuple[str, ...] = ()
+    page_revision: str = ""
 
     @property
     def claim_state(self) -> "CardClaimState":
@@ -345,6 +357,10 @@ class ManualTaskCard:
     progress_evidence_frames: int = 1
     settlement_candidate: bool = False
     settlement_evidence_frames: int = 0
+    progress_state: CardProgressState = CardProgressState.UNKNOWN
+    progress_evidence_capture_ids: tuple[str, ...] = ()
+    claim_evidence_capture_ids: tuple[str, ...] = ()
+    page_revision: str = ""
 
     @property
     def claim_state(self) -> "CardClaimState":
@@ -427,6 +443,7 @@ class PageScanEvidence:
     end_candidate_sequence: int = 0
     end_confirmed_after_last_move: bool = False
     movement_state: MovementState = MovementState.UNKNOWN
+    capture_id: str = ""
 
 
 def _evidence_movement_state(evidence: PageScanEvidence) -> MovementState:
@@ -677,6 +694,8 @@ def _card_items(items: list[dict], *, manual: bool) -> list[DailyTaskCard | Manu
                 claim_state_evidence=claim_state_evidence,
                 settlement_candidate=settlement_candidate,
                 settlement_evidence_frames=1 if settlement_candidate else 0,
+                progress_state=CardProgressState.UNKNOWN,
+                page_revision=fingerprint,
             )
         )
     return result
@@ -719,10 +738,32 @@ class _CardScannerBase:
         return not self.cancelled and self._no_new >= 2 and self._pages <= self.max_pages
 
     @property
+    def progress_states_complete(self) -> bool:
+        if not self.cards:
+            return bool(self.complete and self._authoritative_no_task_evidence)
+        return bool(
+            self.complete
+            and all(
+                card.progress_state
+                in {
+                    CardProgressState.STABLE_INCOMPLETE,
+                    CardProgressState.STABLE_COMPLETE,
+                }
+                for card in self.cards
+            )
+        )
+
+    @property
     def claim_states_complete(self) -> bool:
         if not self.cards:
             return bool(self.complete and self._authoritative_no_task_evidence)
-        completed = [card for card in self.cards if card.completed]
+        if not self.progress_states_complete:
+            return False
+        completed = [
+            card
+            for card in self.cards
+            if card.progress_state is CardProgressState.STABLE_COMPLETE
+        ]
         if not completed:
             return bool(self.complete)
         return all(
@@ -814,25 +855,34 @@ class _CardScannerBase:
             self._claim_conflicts.add(key)
             claimable = claimed = None
             claim_state_evidence = CardClaimState.CONFLICT
-        if old.progress_conflict:
-            if old.current == new.current and old.target == new.target:
-                progress_frames = old.progress_evidence_frames + 1
-                progress_conflict = progress_frames < 2
-                current, target = new.current, new.target
-                completed = bool(new.completed and not progress_conflict)
-            else:
-                progress_frames = 1
-                progress_conflict = True
-                current, target, completed = new.current, new.target, False
-        elif old.current == new.current and old.target == new.target:
-            progress_frames = old.progress_evidence_frames + 1
-            progress_conflict = False
-            current, target = new.current, new.target
-            completed = bool(new.completed and progress_frames >= 2)
-        else:
-            progress_frames = 1
+        progress_ids = tuple(dict.fromkeys(
+            (*old.progress_evidence_capture_ids, *new.progress_evidence_capture_ids)
+        ))
+        claim_ids = tuple(dict.fromkeys(
+            (*old.claim_evidence_capture_ids, *new.claim_evidence_capture_ids)
+        ))
+        if (
+            old.progress_state is CardProgressState.CONFLICT
+            or old.current != new.current
+            or old.target != new.target
+        ):
+            progress_state = CardProgressState.CONFLICT
             progress_conflict = True
             current, target, completed = new.current, new.target, False
+        elif len(progress_ids) >= 2:
+            progress_state = (
+                CardProgressState.STABLE_COMPLETE
+                if new.current >= new.target
+                else CardProgressState.STABLE_INCOMPLETE
+            )
+            progress_conflict = False
+            current, target = new.current, new.target
+            completed = progress_state is CardProgressState.STABLE_COMPLETE
+        else:
+            progress_state = CardProgressState.UNKNOWN
+            progress_conflict = False
+            current, target, completed = new.current, new.target, False
+        progress_frames = len(progress_ids)
         return replace(
             old,
             current=current,
@@ -840,6 +890,9 @@ class _CardScannerBase:
             completed=completed,
             progress_conflict=progress_conflict,
             progress_evidence_frames=progress_frames,
+            progress_state=progress_state,
+            progress_evidence_capture_ids=progress_ids,
+            claim_evidence_capture_ids=claim_ids,
             claimable=claimable,
             claimed=claimed,
             claim_state_evidence=claim_state_evidence,
@@ -847,6 +900,7 @@ class _CardScannerBase:
             settlement_evidence_frames=new.settlement_evidence_frames,
             contribution=contribution,
             page_fingerprint=new.page_fingerprint,
+            page_revision=new.page_revision or new.page_fingerprint,
             title=old.title if len(_normalized_key(old.title)) >= len(_normalized_key(new.title)) else new.title,
         )
 
@@ -859,6 +913,17 @@ class _CardScannerBase:
         if self.cancelled or self._pages >= self.max_pages:
             return 0
         self._pages += 1
+        capture_id = (
+            str(evidence.capture_id).strip()
+            if evidence is not None and str(evidence.capture_id).strip()
+            else hashlib.sha256(
+                (
+                    evidence.captured_at.isoformat(timespec="microseconds")
+                    if evidence is not None
+                    else f"scanner-page:{self._pages}"
+                ).encode("utf-8")
+            ).hexdigest()[:16]
+        )
         if evidence is not None:
             self._evidence_mode = True
             if self._last_evidence_at is not None and evidence.captured_at <= self._last_evidence_at:
@@ -882,10 +947,24 @@ class _CardScannerBase:
                 self._end_seen = True
         before = len(self._cards)
         for card in cards:
+            claim_ids = (
+                (capture_id,)
+                if card.claim_state
+                not in {CardClaimState.UNKNOWN, CardClaimState.DISABLED_UNKNOWN}
+                else ()
+            )
+            card = replace(
+                card,
+                progress_state=CardProgressState.UNKNOWN,
+                progress_evidence_frames=1,
+                progress_evidence_capture_ids=(capture_id,),
+                claim_evidence_capture_ids=claim_ids,
+                page_revision=card.page_revision or card.page_fingerprint,
+            )
             key = self._canonical_key(card)
             old = self._cards.get(key)
             self._cards[key] = (
-                replace(card, completed=False, progress_evidence_frames=1)
+                replace(card, completed=False)
                 if old is None else self._merge_card(key, old, card)
             )
         added = len(self._cards) - before
@@ -1031,7 +1110,7 @@ class ManualCardScanner(_CardScannerBase):
         )
 
     def summary(self) -> tuple[int, int] | None:
-        if not self.complete:
+        if not self.progress_states_complete:
             return None
         return sum(1 for card in self.cards if card.completed or card.claimed), len(self.cards)
 
@@ -1723,10 +1802,15 @@ class RewardCollector:
                     "missing_evidence": list(structured.missing_evidence),
                     "task_cards": [asdict(card) for card in structured.task_cards],
                     "page_complete": structured.page_complete,
-                    "task_inventory_complete": structured.page_complete,
+                    "task_inventory_complete": bool(
+                        structured.page_complete and scanner.progress_states_complete
+                    ),
                     "stage_track_complete": structured.page_complete,
                     "claim_state_confidence": (
-                        "HIGH" if structured.page_complete and scanner.claim_states_complete
+                        "HIGH"
+                        if structured.page_complete
+                        and scanner.progress_states_complete
+                        and scanner.claim_states_complete
                         else "UNKNOWN"
                     ),
                     "scan_revision": _items_fingerprint(layout_frames[-1]),
@@ -1881,11 +1965,13 @@ class RewardCollector:
                     "unclaimed_rewards": task_rewards + level.claimable_level_rewards,
                     "task_cards": [asdict(card) for card in scanner.cards],
                     "track_scan_complete": level.track_scan_complete,
-                    "task_inventory_complete": scanner.complete,
+                    "task_inventory_complete": scanner.progress_states_complete,
                     "level_track_complete": level.track_scan_complete,
                     "claim_state_confidence": (
                         "HIGH"
-                        if level.claimability_complete and scanner.complete and scanner.claim_states_complete
+                        if level.claimability_complete
+                        and scanner.progress_states_complete
+                        and scanner.claim_states_complete
                         else "UNKNOWN"
                     ),
                     "scan_revision": _items_fingerprint(first_items),

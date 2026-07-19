@@ -184,6 +184,9 @@ def test_concurrent_permit_use_causes_exactly_one_hardware_tap(monkeypatch):
 
 
 def test_ratio_greater_than_one_preserves_valid_logical_tap(monkeypatch):
+    monkeypatch.setattr(
+        control_module, "_validate_production_session", lambda _policy: None
+    )
     for ratio in (1.0, 1.25, 1.5, 2.0):
         taps: list[tuple[int, int]] = []
         backend = SimpleNamespace(ratio=ratio, input_tap=lambda x, y: taps.append((x, y)))
@@ -209,6 +212,9 @@ def test_ratio_greater_than_one_preserves_valid_logical_tap(monkeypatch):
 
 
 def test_swipe_full_trajectory_uses_one_coordinate_space(monkeypatch):
+    monkeypatch.setattr(
+        control_module, "_validate_production_session", lambda _policy: None
+    )
     swipes: list[tuple[int, int, int, int, int]] = []
     ratio = 1.25
     backend = SimpleNamespace(
