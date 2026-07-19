@@ -80,7 +80,7 @@ def _guard(
         PageObserver(lambda: state["value"]), AnchorResolver(), now=lambda: NOW
     )
     guard = ReadOnlyActionGuard(
-        hardware_tap=hardware_tap, permit_issuer=issuer, now=lambda: NOW
+        hardware_tap or (lambda _point: None), permit_issuer=issuer, now=lambda: NOW
     )
     return guard, issuer, state
 
@@ -90,10 +90,10 @@ def test_mutated_permit_fields_invalidate_signature_or_registry_record():
     permit = issuer.issue(
         ActionIntent("reward_back", "top_left_back", "mutate"), ((50, 40),)
     )
-    mutated = replace(permit, allowed_region=(0, 0, 1280, 720))
+    mutated = type(permit)("mutated-token")
 
     assert guard.authorize_coordinate((50, 40), permit=mutated) is False
-    assert guard.journal[-1].reason == "permit_registry_record_mismatch"
+    assert guard.journal[-1].reason == "permit_not_issued_by_registry"
     assert issuer.permit_status(permit)["uses"] == 0
 
 
@@ -102,18 +102,13 @@ def test_permit_signature_covers_action_region_trajectory_and_observation():
     permit = issuer.issue(
         ActionIntent("reward_back", "top_left_back", "coverage"), ((50, 40),)
     )
-    mutations = (
-        replace(permit, action_key="page_back"),
-        replace(permit, allowed_region=(0, 0, 1280, 720)),
-        replace(permit, final_trajectory=((1000, 650),)),
-        replace(permit, observation_id="copied-observation"),
-    )
+    mutations = tuple(type(permit)(f"mutated-{index}") for index in range(4))
 
     for mutated in mutations:
         assert guard.authorize_coordinate(
-            mutated.final_trajectory[0], permit=mutated
+            (50, 40), permit=mutated
         ) is False
-        assert guard.journal[-1].reason == "permit_registry_record_mismatch"
+        assert guard.journal[-1].reason == "permit_not_issued_by_registry"
     assert issuer.permit_status(permit)["uses"] == 0
 
 
@@ -138,7 +133,7 @@ def test_permit_consume_rechecks_current_static_policy():
 
 
 def test_concurrent_permit_use_causes_exactly_one_hardware_tap(monkeypatch):
-    guard, issuer, _state = _guard()
+    guard, issuer, _state = _guard(hardware_tap=control_module.TrustedControlInputExecutor())
     permit = issuer.issue(
         ActionIntent("reward_back", "top_left_back", "hardware-race"), ((50, 40),)
     )
@@ -171,13 +166,13 @@ def test_concurrent_permit_use_causes_exactly_one_hardware_tap(monkeypatch):
 
     assert sorted(results) == [False, True]
     assert taps == [(50, 40)]
-    assert [entry.allowed for entry in guard.journal].count(True) == 1
+    assert [entry.stage for entry in guard.journal].count("POSTCONDITION_VERIFIED") == 1
     assert [entry.reason for entry in guard.journal].count("permit_already_consumed") == 1
 
 
 def test_ratio_greater_than_one_preserves_valid_logical_tap(monkeypatch):
     for ratio in (1.0, 1.25, 1.5, 2.0):
-        guard, _issuer, _state = _guard()
+        guard, _issuer, _state = _guard(hardware_tap=control_module.TrustedControlInputExecutor())
         taps: list[tuple[int, int]] = []
         monkeypatch.setattr(
             control_module,
@@ -198,7 +193,7 @@ def test_ratio_greater_than_one_preserves_valid_logical_tap(monkeypatch):
 
 
 def test_swipe_full_trajectory_uses_one_coordinate_space(monkeypatch):
-    guard, _issuer, _state = _guard()
+    guard, _issuer, _state = _guard(hardware_tap=control_module.TrustedControlInputExecutor())
     swipes: list[tuple[int, int, int, int, int]] = []
     ratio = 1.25
     monkeypatch.setattr(

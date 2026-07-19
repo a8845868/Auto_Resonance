@@ -33,6 +33,23 @@ _runtime_auto_start_emulator: bool | None = None
 _ACTION_POLICY = None
 
 
+class TrustedControlInputExecutor:
+    """The only production bridge from a read-only guard to device input."""
+
+    def tap(self, physical_point: tuple[int, int]):
+        control.input_tap(int(physical_point[0]), int(physical_point[1]))
+
+    def swipe(
+        self,
+        physical_trajectory: tuple[tuple[int, int], ...],
+        duration_ms: int,
+    ):
+        start, end = physical_trajectory[0], physical_trajectory[-1]
+        control.input_swipe(
+            int(start[0]), int(start[1]), int(end[0]), int(end[1]), int(duration_ms)
+        )
+
+
 def install_action_policy(policy):
     """Install a process-local action boundary and return the previous one."""
 
@@ -413,24 +430,15 @@ def input_swipe(
     ensure_automation_allowed("滑动游戏界面")
     if STOP:
         raise StopExecution()
-    # Read-only authorization is exclusively logical. The guard atomically
-    # consumes the capability, transforms the full path once, then invokes the
-    # hardware callback with that exact physical path.
+    # Read-only authorization is exclusively logical. The guard owns the
+    # trusted executor and submits the exact transformed trajectory itself.
     start = (int(pos1[0]), int(pos1[1]))
     end = (int(pos2[0]), int(pos2[1]))
     trajectory = _linear_trajectory(start, end)
 
-    def execute(physical_trajectory):
-        physical_start = physical_trajectory[0]
-        physical_end = physical_trajectory[-1]
-        control.input_swipe(
-            physical_start[0], physical_start[1],
-            physical_end[0], physical_end[1], swipe_time,
-        )
-
     if not _ACTION_POLICY.authorize_swipe(
         start, end, trajectory=trajectory, intent=intent, permit=permit,
-        geometry=current_display_geometry(), _execute=execute,
+        geometry=current_display_geometry(), duration_ms=swipe_time,
         page_id=page_id, page_fingerprint=page_fingerprint,
         anchor_key=anchor_key,
     ):
@@ -459,12 +467,9 @@ def input_tap(
         raise StopExecution()
     logical = (int(pos[0]), int(pos[1]))
 
-    def execute(physical_trajectory):
-        control.input_tap(*physical_trajectory[0])
-
     if not _ACTION_POLICY.authorize_coordinate(
         logical, intent=intent, permit=permit,
-        geometry=current_display_geometry(), _execute=execute, page_id=page_id,
+        geometry=current_display_geometry(), page_id=page_id,
         page_fingerprint=page_fingerprint, anchor_key=anchor_key,
     ):
         return False

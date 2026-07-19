@@ -54,11 +54,11 @@ def _observation(
     )
 
 
-def _guard(observation: PageObservation | None = None):
+def _guard(observation: PageObservation | None = None, *, executor=None):
     state = {"value": observation or _observation()}
     observer = PageObserver(lambda: state["value"])
     issuer = ReadOnlyPermitIssuer(observer, AnchorResolver(), now=lambda: NOW)
-    return ReadOnlyActionGuard(permit_issuer=issuer, now=lambda: NOW), issuer, state
+    return ReadOnlyActionGuard(executor or (lambda _point: None), permit_issuer=issuer, now=lambda: NOW), issuer, state
 
 
 def test_caller_cannot_self_issue_read_only_permit():
@@ -111,10 +111,10 @@ def test_anchor_bbox_must_cover_authorized_coordinate():
 
 
 def test_random_offset_cannot_escape_permit_bounds(monkeypatch):
-    guard, _issuer, _state = _guard()
     device = SimpleNamespace(ratio=1, input_tap=lambda x, y: calls.append((x, y)))
     calls = []
     monkeypatch.setattr(control_module, "control", device)
+    guard, _issuer, _state = _guard(executor=control_module.TrustedControlInputExecutor())
     monkeypatch.setattr(control_module.random, "randint", lambda *_args: 999)
     previous = control_module.install_action_policy(guard)
     try:
@@ -133,10 +133,11 @@ def test_read_only_mode_disables_post_authorization_randomization(monkeypatch):
 
 def test_swipe_end_outside_region_is_rejected():
     _guard_value, issuer, _state = _guard()
-    with pytest.raises(PermissionError, match="trajectory|region"):
+    with pytest.raises(PermissionError, match="trajectory|region|scroll"):
         issuer.issue(
             ActionIntent("daily_horizontal_scroll", "daily_content", "swipe-end"),
             ((900, 350), (1200, 700)),
+            duration_ms=650,
         )
 
 
@@ -146,6 +147,7 @@ def test_swipe_segment_outside_region_is_rejected():
         issuer.issue(
             ActionIntent("daily_horizontal_scroll", "daily_content", "swipe-segment"),
             ((900, 350), (50, 50), (400, 350)),
+            duration_ms=650,
         )
 
 

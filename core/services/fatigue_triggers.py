@@ -724,8 +724,9 @@ def complete_fatigue_checkpoint_processing(
                     raise ValueError("fatigue checkpoint transfer cycle mismatch")
                 if old_day != intent.cycle_server_day:
                     raise ValueError("fatigue checkpoint transfer server day mismatch")
-                if intent.cycle_server_day != str(data.get("server_day_id", "")):
-                    raise ValueError("fatigue checkpoint transfer is not in the active server day")
+                # The journal day may roll at 05:00 while a claimed route cycle
+                # is still in flight. Authority comes from the frozen checkpoint
+                # cycle, not from the current observation/journal day.
             except ValueError as error:
                 _set_state(item, FatigueActionState.FAILED_RETRYABLE)
                 item["processing_outcome"] = CheckpointProcessingOutcome.RETRY_ON_EVENT.value

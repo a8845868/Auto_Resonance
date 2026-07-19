@@ -626,15 +626,15 @@ def _card_items(items: list[dict], *, manual: bool) -> list[DailyTaskCard | Manu
         status_text = " ".join(str(item.get("text", "")) for item in status_candidates)
         if "已领取" in status_text:
             claimable, claimed = False, True
-        elif "可领取" in status_text or (
-            manual and "领取" in status_text and "已领取" not in status_text
-        ):
-            claimable, claimed = True, False
         elif any(
             marker in status_text
             for marker in ("无可领取", "不可领取", "奖励已结清", "按钮禁用")
         ):
             claimable = claimed = False
+        elif "可领取" in status_text or (
+            manual and "领取" in status_text and "已领取" not in status_text
+        ):
+            claimable, claimed = True, False
         else:
             # Absence of OCR status text is missing evidence, not proof that
             # the card has no reward.
@@ -667,6 +667,7 @@ class _CardScannerBase:
         self._distinct_evidence_times = True
         self._anchor_valid = True
         self._claim_conflicts: set[str] = set()
+        self._authoritative_no_task_evidence = False
 
     @property
     def cards(self):
@@ -687,11 +688,20 @@ class _CardScannerBase:
 
     @property
     def claim_states_complete(self) -> bool:
+        if not self.cards:
+            return bool(self.complete and self._authoritative_no_task_evidence)
         completed = [card for card in self.cards if card.completed]
-        return bool(completed) and all(
+        if not completed:
+            return bool(self.complete)
+        return all(
             card.claim_state in (CardClaimState.CLAIMED, CardClaimState.NONE_CONFIRMED)
             for card in completed
         )
+
+    def mark_authoritative_no_tasks(self, confirmed: bool = True) -> None:
+        """Record an anchored, authoritative empty-inventory observation."""
+
+        self._authoritative_no_task_evidence = bool(confirmed)
 
     @staticmethod
     def _same_title(left: str, right: str) -> bool:

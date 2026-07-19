@@ -456,6 +456,14 @@ def run_daily_fatigue_recovery(
             path=path,
         )
     if checkpoint is not None:
+        transfer = result.get("transfer_intent")
+        if isinstance(transfer, dict):
+            transfer = dict(transfer)
+            transfer["cycle_id"] = str(checkpoint.get("cycle_id", transfer.get("cycle_id", "")))
+            transfer["cycle_server_day"] = str(
+                checkpoint.get("cycle_server_day", transfer.get("cycle_server_day", ""))
+            )
+            result["transfer_intent"] = transfer
         transaction = complete_fatigue_checkpoint_processing(
             str(checkpoint["id"]), result,
             owner_id=owner_id, lease_token=lease_token, path=path
