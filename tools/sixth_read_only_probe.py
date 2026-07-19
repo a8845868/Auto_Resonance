@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import re
 import sys
 import time
-from dataclasses import asdict, is_dataclass, replace
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -23,10 +24,16 @@ if str(ROOT) not in sys.path:
 from auto import exchange_navigation  # noqa: E402
 from auto.module.strength import read_strength  # noqa: E402
 from auto.reward_collection import RewardCollector, RewardDriver  # noqa: E402
-from core.control.control import connect_adb, current_display_geometry, screenshot  # noqa: E402
+from core.control.control import (  # noqa: E402
+    TrustedControlInputExecutor,
+    connect_adb,
+    current_display_geometry,
+    screenshot,
+)
 from core.preset import get_station  # noqa: E402
 from core.services.read_only_policy import (  # noqa: E402
     AnchorResolver,
+    ActionIntent,
     CalibratedStaticRegion,
     ObservedAnchor,
     PageObservation,
@@ -222,24 +229,6 @@ def _trusted_observation() -> PageObservation:
     )
 
 
-def _cached_trusted_observer(window_seconds: float = 0.15):
-    """Keep the issuer's one action observation stable through authorization."""
-
-    cache: dict[str, object] = {}
-
-    def observe() -> PageObservation:
-        now = time.monotonic()
-        value = cache.get("observation")
-        if isinstance(value, PageObservation) and now <= float(cache.get("expires", 0.0)):
-            return value
-        value = _trusted_observation()
-        cache["observation"] = value
-        cache["expires"] = time.monotonic() + max(0.01, float(window_seconds))
-        return value
-
-    return observe
-
-
 def run_policy_canaries(_live_guard: ReadOnlyActionGuard) -> list[dict]:
     """Exercise a detached policy guard so canaries never pollute live evidence."""
 
@@ -248,31 +237,86 @@ def run_policy_canaries(_live_guard: ReadOnlyActionGuard) -> list[dict]:
     canary_guard.tap("reward_claim", (1000, 620), "daily_reward")
     canary_guard.tap("fatigue_confirm", (900, 600), "rest_area")
     results = [asdict(entry) for entry in canary_guard.journal]
+    results.append({
+        "canary": "caller_executor_callback_absent",
+        "action_key": "guard_public_api",
+        "allowed": False,
+        "reason": "api_absent" if all(
+            "_execute" not in inspect.signature(method).parameters
+            for method in (
+                ReadOnlyActionGuard.authorize_coordinate,
+                ReadOnlyActionGuard.authorize_swipe,
+            )
+        ) else "api_present",
+    })
+
+    captured_at = datetime.now().astimezone()
+    daily = PageObservation(
+        observation_id="canary-daily",
+        screenshot_hash="c" * 64,
+        page_type="daily_activity",
+        markers=("daily_activity",),
+        anchors=(
+            ObservedAnchor("top_left_back", "返回", (20, 10, 130, 85)),
+            ObservedAnchor("daily_content", "任务列表", (150, 180, 1180, 650)),
+        ),
+        captured_at=captured_at,
+    )
+    detached_issuer = ReadOnlyPermitIssuer(
+        PageObserver(lambda: daily), AnchorResolver(), now=lambda: captured_at
+    )
+    detached_guard = ReadOnlyActionGuard(
+        lambda _point: None, permit_issuer=detached_issuer, now=lambda: captured_at
+    )
+    detached_guard.authorize_coordinate(
+        (1000, 620),
+        intent=ActionIntent("daily_horizontal_scroll", "daily_content", "canary-kind"),
+    )
+    kind_entry = asdict(detached_guard.journal[-1])
+    kind_entry["canary"] = "scroll_policy_via_coordinate_api"
+    results.append(kind_entry)
+
+    captures = iter((daily, daily, PageObservation(
+        "canary-unknown", "d" * 64, "unknown", ("unknown",), (), captured_at,
+    )))
+    post_issuer = ReadOnlyPermitIssuer(
+        PageObserver(lambda: next(captures)), AnchorResolver(), now=lambda: captured_at
+    )
+    post_guard = ReadOnlyActionGuard(
+        lambda _point: None, permit_issuer=post_issuer, now=lambda: captured_at
+    )
+    post_guard.authorize_coordinate(
+        (50, 40), intent=ActionIntent("reward_back", "top_left_back", "canary-post")
+    )
+    post_entry = asdict(post_guard.journal[-1])
+    post_entry["canary"] = "postcondition_failure_stops"
+    results.append(post_entry)
+
+    def failing_executor(_point):
+        raise RuntimeError("canary device write failed")
+
+    failure_issuer = ReadOnlyPermitIssuer(
+        PageObserver(lambda: daily), AnchorResolver(), now=lambda: captured_at
+    )
+    failure_guard = ReadOnlyActionGuard(
+        failing_executor, permit_issuer=failure_issuer, now=lambda: captured_at
+    )
+    try:
+        failure_guard.authorize_coordinate(
+            (50, 40), intent=ActionIntent("reward_back", "top_left_back", "canary-executor")
+        )
+    except RuntimeError:
+        pass
+    failure_entry = asdict(failure_guard.journal[-1])
+    failure_entry["canary"] = "executor_failure_not_success"
+    results.append(failure_entry)
     issuer = _live_guard.permit_issuer
     if issuer is None:
         return results
     try:
         observation = issuer.observer.observe()
-        forged = ReadOnlyPermit(
-            permit_id="CANARY-FORGED-NOT-REGISTRY-ISSUED",
-            action_key="reward_back",
-            requested_target="top_left_back",
-            observation_id=observation.observation_id,
-            screenshot_hash=observation.screenshot_hash,
-            page_classifier=observation.page_type,
-            page_fingerprint=observation.page_fingerprint,
-            anchor_id="top_left_back",
-            anchor_text_hash="CANARY-PLACEHOLDER",
-            anchor_bbox=(0, 0, 1280, 720),
-            allowed_region=(0, 0, 1280, 720),
-            final_trajectory=((1000, 650),),
-            issued_at=datetime.now().astimezone(),
-            expires_at=datetime.now().astimezone() + timedelta(seconds=5),
-            max_uses=1,
-            correlation_id="canary-forged",
-            postcondition="CANARY-PLACEHOLDER",
-        )
-        forged_guard = ReadOnlyActionGuard(permit_issuer=issuer)
+        forged = ReadOnlyPermit("CANARY-FORGED-NOT-REGISTRY-ISSUED")
+        forged_guard = ReadOnlyActionGuard(lambda _point: None, permit_issuer=issuer)
         forged_guard.authorize_coordinate((1000, 650), permit=forged)
         entry = asdict(forged_guard.journal[-1])
         entry["canary"] = "directly_constructed_permit"
@@ -295,8 +339,9 @@ def run_policy_canaries(_live_guard: ReadOnlyActionGuard) -> list[dict]:
                 (coordinate,),
                 geometry=observation.display_geometry,
             )
-            mutated = replace(permit, allowed_region=(0, 0, 1280, 720))
-            mutation_guard = ReadOnlyActionGuard(permit_issuer=issuer)
+            mutated = ReadOnlyPermit(permit.opaque_token)
+            object.__setattr__(mutated, "opaque_token", "CANARY-MUTATED-TOKEN")
+            mutation_guard = ReadOnlyActionGuard(lambda _point: None, permit_issuer=issuer)
             mutation_guard.authorize_coordinate(
                 coordinate,
                 permit=mutated,
@@ -410,9 +455,11 @@ def main() -> int:
 
     # Raw OCR is private evidence and must not be echoed to terminal logs.
     logger.disable("core.image.ocr")
-    observer = PageObserver(_cached_trusted_observer())
+    observer = PageObserver(_trusted_observation)
     issuer = ReadOnlyPermitIssuer(observer, AnchorResolver())
-    guard = ReadOnlyActionGuard(permit_issuer=issuer)
+    guard = ReadOnlyActionGuard(
+        TrustedControlInputExecutor(), permit_issuer=issuer
+    )
     policy_canaries = run_policy_canaries(guard)
     try:
         with installed_read_only_guard(guard):
