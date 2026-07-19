@@ -26,7 +26,7 @@ from auto.reward_collection import RewardCollector, RewardDriver  # noqa: E402
 from core.control.control import (  # noqa: E402
     connect_adb,
     capture_envelope,
-    create_read_only_safety_session,
+    _create_production_read_only_safety_session,
     current_display_geometry,
     screenshot,
 )
@@ -46,6 +46,10 @@ from core.services.read_only_policy import (  # noqa: E402
     installed_read_only_guard,
 )
 from core.services.station_facilities import rest_area_availability  # noqa: E402
+from tools.audit_export import (  # noqa: E402
+    build_live_validation_result,
+    render_live_validation_addendum,
+)
 
 
 def _jsonable(value):
@@ -560,7 +564,9 @@ def main() -> int:
     # Raw OCR is private evidence and must not be echoed to terminal logs.
     logger.disable("core.image.ocr")
     observer = PageObserver(_trusted_observation)
-    guard = create_read_only_safety_session(observer, resolver=AnchorResolver())
+    guard = _create_production_read_only_safety_session(
+        observer, resolver=AnchorResolver()
+    )
     policy_canaries = run_policy_canaries(guard)
     try:
         with installed_read_only_guard(guard):
@@ -577,6 +583,27 @@ def main() -> int:
             "captures": [],
             **policy_report(guard, policy_canary_results=policy_canaries),
         }
+    if result.get("acceptance_status") == "PASS":
+        try:
+            live_result = build_live_validation_result(
+                result.get("journal", ()),
+                instance_id="instance-0",
+                session_id=f"guard:{id(guard)}:{datetime.now().astimezone().isoformat()}",
+            )
+            (output / "LIVE-VALIDATION-RESULT.json").write_text(
+                json.dumps(live_result, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            (output / "LIVE-VALIDATION-ADDENDUM.md").write_text(
+                render_live_validation_addendum(live_result), encoding="utf-8"
+            )
+            result["machine_readable_live_result"] = "LIVE-VALIDATION-RESULT.json"
+            result["generated_live_addendum"] = "LIVE-VALIDATION-ADDENDUM.md"
+        except Exception as error:
+            result["acceptance_status"] = "BLOCKED"
+            result["blocked_reason"] = (
+                f"shareable_live_evidence_failed:{type(error).__name__}:{error}"
+            )
     (output / "read-only-result.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
