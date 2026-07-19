@@ -11,6 +11,7 @@ from app.view import dashboard_interface
 from core.services import station_availability, weekly_plan_state
 from core.services.daily_capabilities import resolve_daily_capability_prerequisites
 from core.services.fatigue_triggers import recover_pending_fatigue_schedules
+from core.services.server_calendar import SERVER_CLOCK
 
 
 NOW = datetime(2026, 7, 18, 12, 0, tzinfo=timezone(timedelta(hours=8)))
@@ -158,7 +159,8 @@ def test_prerequisite_log_reports_actual_registry_source(monkeypatch):
     assert result.evidence["fresh_trade_plan"].source == "weekly_plan+station_registry"
 
 
-def _pending_payload(server_day_id="2026-07-18"):
+def _pending_payload(server_day_id=None):
+    server_day_id = server_day_id or SERVER_CLOCK.server_day_id()
     return {
         "server_day_id": server_day_id,
         "actions": [{

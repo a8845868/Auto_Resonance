@@ -84,9 +84,15 @@ def test_manual_blocked_checkpoint_still_defers_business(tmp_path):
 def test_user_explicit_skip_is_audited_before_unblock(tmp_path):
     path = _checkpoint(tmp_path)
     action = list_fatigue_actions(path=path)[0]
-    skipped = skip_fatigue_checkpoint(action["id"], reason="operator_confirmed", actor="user", path=path)
+    schedule = Mock()
+    skipped = skip_fatigue_checkpoint(
+        action["id"], reason="operator_confirmed", actor="user", path=path,
+        schedule_business=schedule,
+    )
     assert skipped["state"] == FatigueActionState.CANCELLED.value
     assert skipped["skip_audit"]["actor"] == "user"
+    assert skipped["scheduler_handoff"]["state"] == "DELIVERED"
+    schedule.assert_called_once_with("run_business")
     assert fatigue_checkpoint_deferral("B", path=path) is None
 
 
@@ -96,7 +102,7 @@ def test_ack_requests_business_resume_after_worker_yield(tmp_path, monkeypatch):
     monkeypatch.setattr("core.services.task_schedule_state.request_immediate_run", requested)
     result = _run_result(monkeypatch, path, {"success": True, "status": "COMPLETE_FOR_DAY"})
     assert result["checkpoint_acknowledged"] is True
-    requested.assert_called_once_with("business")
+    requested.assert_called_once_with("run_business")
 
 
 def test_checkpoint_result_and_persisted_state_are_atomic(tmp_path, monkeypatch):
