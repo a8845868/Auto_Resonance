@@ -196,13 +196,13 @@ def blurry_ocr_click(
                 coordinates = (center_x + excursion_pos[0], center_y + excursion_pos[1])
                 break
         if coordinates:
-            input_tap(
+            allowed = input_tap(
                 coordinates,
                 intent=ActionIntent(
                     action_key, text, f"preset:{page_id}:{text}",
                 ),
             )
-            return True
+            return allowed is not False
         time.sleep(1)
     if log:
         logger.error(f"未找到指定文本 => {text}")
@@ -240,7 +240,8 @@ def find_text(
     return None, image
 
 
-def go_home():
+def go_home(*, attempt_limit: int = 45, deadline: float | None = None,
+            cancellation=None):
     """
     返回主界面
     """
@@ -251,8 +252,13 @@ def go_home():
     startup_recovery = False
     resource_download_seen = False
     attempt = 0
-    attempt_limit = 45
+    attempt_limit = max(1, int(attempt_limit))
     while attempt < attempt_limit:
+        if (deadline is not None and time.monotonic() >= deadline) or (
+            cancellation is not None and cancellation()
+        ):
+            logger.warning("return-home stopped by deadline or cancellation")
+            return False
         attempt += 1
         image = screenshot()
         start_button = image.get_bgr((1200, 680))
