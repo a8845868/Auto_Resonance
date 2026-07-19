@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -21,6 +22,23 @@ import cv2 as cv
 
 class SensitiveDataError(RuntimeError):
     pass
+
+
+LIVE_RESULT_FIELDS = frozenset({
+    "schema_version", "instance_id", "session_id_digest", "action_id",
+    "action_kind", "permit_digest", "pre_capture_sequence",
+    "pre_capture_digest", "pre_page_type", "consume_capture_sequence",
+    "consume_capture_digest", "consume_page_type", "post_capture_sequence",
+    "post_capture_digest", "post_page_type", "stage", "result",
+    "reason_code", "irreversible_action_count", "sequence_failure_count",
+    "incomplete_success_count",
+})
+IRREVERSIBLE_ACTIONS = frozenset({
+    "transaction_buy", "transaction_sell", "all_buy", "all_sell",
+    "haggle_confirm", "raise_price_confirm", "use_item", "use_book",
+    "reward_claim", "fatigue_confirm", "bento_confirm", "depart",
+    "account_settings",
+})
 
 
 TEXT_SUFFIXES = {
@@ -422,6 +440,151 @@ def verify_zip_exact_set(zip_path: Path) -> bool:
         return False
 
 
+def build_live_validation_result(
+    journal: Iterable[dict], *, instance_id: str, session_id: str
+) -> dict[str, object]:
+    """Reduce a private action journal to the strict shareable live schema."""
+
+    grouped: dict[str, list[dict]] = {}
+    order: list[str] = []
+    irreversible = 0
+    for raw in journal:
+        entry = dict(raw)
+        action_kind = str(entry.get("action_key", ""))
+        if bool(entry.get("side_effect_occurred")) and action_kind in IRREVERSIBLE_ACTIONS:
+            irreversible += 1
+        action_id = str(entry.get("correlation_id", "")).strip()
+        if not action_id:
+            continue
+        if action_id not in grouped:
+            grouped[action_id] = []
+            order.append(action_id)
+        grouped[action_id].append(entry)
+
+    rows: list[dict[str, object]] = []
+    incomplete = 0
+    sequence_failures = 0
+    last_sequence = 0
+    for action_id in order:
+        entries = grouped[action_id]
+        by_stage = {str(entry.get("stage", "")): entry for entry in entries}
+        post = by_stage.get("POSTCONDITION_VERIFIED")
+        if post is None or not bool(post.get("allowed")):
+            continue
+        pre = by_stage.get("PRECONDITION_OBSERVED")
+        consume = by_stage.get("CONSUME_OBSERVED")
+        if pre is None or consume is None:
+            incomplete += 1
+            continue
+        sequences = tuple(
+            int(item.get("source_capture_sequence", 0))
+            for item in (pre, consume, post)
+        )
+        if not (0 < sequences[0] < sequences[1] < sequences[2]):
+            sequence_failures += 1
+        if any(sequence <= last_sequence for sequence in sequences):
+            sequence_failures += 1
+        last_sequence = max(last_sequence, *sequences)
+        rows.append({
+            "action_id": hashlib.sha256(action_id.encode("utf-8")).hexdigest()[:16],
+            "action_kind": str(post.get("action_key", "")),
+            "permit_digest": str(post.get("permit_digest", "")),
+            "pre_capture_sequence": sequences[0],
+            "pre_capture_digest": str(pre.get("source_capture_digest", "")),
+            "pre_page_type": str(pre.get("page_type", "")),
+            "consume_capture_sequence": sequences[1],
+            "consume_capture_digest": str(consume.get("source_capture_digest", "")),
+            "consume_page_type": str(consume.get("page_type", "")),
+            "post_capture_sequence": sequences[2],
+            "post_capture_digest": str(post.get("source_capture_digest", "")),
+            "post_page_type": str(post.get("page_type", "")),
+            "stage": "PRE_CONSUME_POST",
+            "result": "PASS",
+            "reason_code": str(post.get("reason", "postcondition_verified")),
+        })
+
+    result: dict[str, object] = {
+        "schema_version": 1,
+        "instance_id": "instance-0" if str(instance_id) in {"0", "instance-0"} else "instance-generic",
+        "session_id_digest": hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()[:16],
+        "irreversible_action_count": irreversible,
+        "sequence_failure_count": sequence_failures,
+        "incomplete_success_count": incomplete,
+    }
+    vector_fields = tuple(next(iter(rows)).keys()) if rows else (
+        "action_id", "action_kind", "permit_digest", "pre_capture_sequence",
+        "pre_capture_digest", "pre_page_type", "consume_capture_sequence",
+        "consume_capture_digest", "consume_page_type", "post_capture_sequence",
+        "post_capture_digest", "post_page_type", "stage", "result", "reason_code",
+    )
+    for key in vector_fields:
+        result[key] = [row[key] for row in rows]
+    validate_live_validation_result(result)
+    return result
+
+
+def validate_live_validation_result(result: dict[str, object]) -> None:
+    """Fail closed on schema drift, private fields, or incomplete live evidence."""
+
+    if set(result) != LIVE_RESULT_FIELDS:
+        raise SensitiveDataError("live result fields are not allowlisted")
+    if result.get("schema_version") != 1:
+        raise SensitiveDataError("live result schema version is invalid")
+    vector_names = sorted(LIVE_RESULT_FIELDS - {
+        "schema_version", "instance_id", "session_id_digest",
+        "irreversible_action_count", "sequence_failure_count",
+        "incomplete_success_count",
+    })
+    lengths = {
+        len(result[name])
+        for name in vector_names
+        if isinstance(result.get(name), list)
+    }
+    if len(lengths) != 1 or any(not isinstance(result.get(name), list) for name in vector_names):
+        raise SensitiveDataError("live result vector lengths are inconsistent")
+    count = next(iter(lengths), 0)
+    flattened: list[int] = []
+    for index in range(count):
+        pre = int(result["pre_capture_sequence"][index])
+        consume = int(result["consume_capture_sequence"][index])
+        post = int(result["post_capture_sequence"][index])
+        if not (0 < pre < consume < post):
+            raise SensitiveDataError("live result capture sequence is not ordered")
+        flattened.extend((pre, consume, post))
+    if any(right <= left for left, right in zip(flattened, flattened[1:])):
+        raise SensitiveDataError("live result capture sequence is not globally increasing")
+    if int(result["sequence_failure_count"]) or int(result["incomplete_success_count"]):
+        raise SensitiveDataError("live result successful actions are incomplete")
+    if int(result["irreversible_action_count"]):
+        raise SensitiveDataError("live result contains irreversible actions")
+    serialized = json.dumps(result, ensure_ascii=False, sort_keys=True)
+    if any(pattern.search(serialized) for pattern in SENSITIVE_PATTERNS.values()):
+        raise SensitiveDataError("live result contains sensitive data")
+    for forbidden in ("screenshot", "raw_ocr", "registry", "permit raw", "adb token"):
+        if forbidden in serialized.casefold():
+            raise SensitiveDataError("live result contains forbidden evidence")
+
+
+def render_live_validation_addendum(result: dict[str, object]) -> str:
+    """Render all shareable live statistics from the validated JSON only."""
+
+    validate_live_validation_result(result)
+    action_count = len(result["action_id"])
+    return (
+        "# AutoResonance Live Validation Addendum\n\n"
+        "- LIVE_READ_ONLY_NAVIGATION=PASS\n"
+        "- LIVE_DAILY_REWARD_OBSERVATION=NOT_RUN\n"
+        "- LIVE_FATIGUE_ROUTE_PLANNING=NOT_RUN\n"
+        "- LIVE_WEEKLY_TRADE_RECONCILIATION=NOT_RUN\n"
+        "- LIVE_IRREVERSIBLE=PROHIBITED_NOT_RUN\n"
+        "- PRODUCT_END_TO_END=PARTIAL\n\n"
+        f"Successful read-only actions: {action_count}\n\n"
+        f"irreversible actions: {int(result['irreversible_action_count'])}\n\n"
+        f"sequence failures: {int(result['sequence_failure_count'])}\n\n"
+        f"incomplete successes: {int(result['incomplete_success_count'])}\n"
+    )
+
+
 def _replace_with_retry(source: Path, destination: Path, *, attempts: int = 5) -> None:
     """Publish an artifact despite short-lived Windows scanner file locks."""
 
@@ -534,6 +697,98 @@ def _tree_hash(root: Path) -> str:
         digest.update(relative)
         digest.update(bytes.fromhex(_hash_file(path)))
     return digest.hexdigest()
+
+
+def _package_verifier_source() -> str:
+    """Return a dependency-free verifier shipped inside every frozen package."""
+
+    return '''from __future__ import annotations
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+
+def file_hash(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def tree_hash(root):
+    digest = hashlib.sha256()
+    root = Path(root)
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(bytes.fromhex(file_hash(path)))
+    return digest.hexdigest()
+
+def exact_set(root):
+    root = Path(root)
+    lines = (root / "SHA256SUMS.txt").read_text(encoding="utf-8").splitlines()
+    listed = {}
+    for line in lines:
+        expected, relative = line.split("  ", 1)
+        if not relative or "\\\\" in relative or relative.startswith("/") or ".." in Path(relative).parts:
+            raise RuntimeError("unsafe checksum path")
+        if relative.casefold() in {item.casefold() for item in listed}:
+            raise RuntimeError("duplicate checksum path")
+        listed[relative] = expected
+    actual = {path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file() and path.name != "SHA256SUMS.txt"}
+    if set(listed) != actual:
+        raise RuntimeError("checksum exact set mismatch")
+    if any(file_hash(root / relative) != expected for relative, expected in listed.items()):
+        raise RuntimeError("checksum digest mismatch")
+
+def apply_patch(source, patch, output, reverse=False):
+    import shutil
+    shutil.copytree(source, output)
+    command = ["git", "apply", "--no-index", "--whitespace=nowarn"]
+    if reverse:
+        command.append("--reverse")
+    command.append(str(patch))
+    environment = dict(os.environ)
+    environment["GIT_DIR"] = os.devnull
+    completed = subprocess.run(command, cwd=output, env=environment, text=True, capture_output=True)
+    if completed.returncode:
+        raise RuntimeError("safe-tree patch application failed")
+    for path in sorted(item for item in Path(output).rglob("*") if item.is_file()):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        path.write_text(text, encoding="utf-8", newline="\\n")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", required=True)
+    root = Path(parser.parse_args().root).resolve()
+    exact_set(root)
+    manifest = json.loads((root / "SHAREABLE-MANIFEST.json").read_text(encoding="utf-8"))
+    if manifest.get("shareable") is not True or manifest.get("final_verifier", {}).get("status") != "PASS":
+        raise RuntimeError("package was not finally verified")
+    baseline = root / "sanitized-baseline"
+    target = root / "sanitized-target"
+    patch = root / "patches" / "full-safe-tree.diff"
+    with tempfile.TemporaryDirectory(prefix="package-self-verify-") as temporary:
+        forward = Path(temporary) / "forward"
+        reverse = Path(temporary) / "reverse"
+        apply_patch(baseline, patch, forward)
+        apply_patch(target, patch, reverse, reverse=True)
+        actual = {"baseline": tree_hash(baseline), "target": tree_hash(target), "forward": tree_hash(forward), "reverse": tree_hash(reverse)}
+    expected = {"baseline": manifest["sanitized_baseline_tree"]["tree_hash"], "target": manifest["sanitized_target_tree"]["tree_hash"], "forward": manifest["forward_tree_hash"], "reverse": manifest["reverse_tree_hash"]}
+    if actual != expected or actual["forward"] != actual["target"] or actual["reverse"] != actual["baseline"]:
+        raise RuntimeError("final frozen tree hash mismatch")
+    print("PASS")
+
+if __name__ == "__main__":
+    main()
+'''
 
 
 def _text_tree_diff(baseline: Path, target: Path) -> str:
@@ -694,8 +949,13 @@ def build_reversible_audit_package(
         if patch_hits:
             raise SensitiveDataError("safe-tree patch sensitive data gate failed")
 
+        (staging / "VERIFY-PACKAGE.py").write_text(
+            _package_verifier_source(), encoding="utf-8", newline="\n"
+        )
+        metadata = dict(manifest_metadata or {})
+        deferred_publication = bool(metadata.pop("_defer_shareable", False))
         manifest = {
-            "schema_version": 4, "shareable": True,
+            "schema_version": 4, "shareable": not deferred_publication,
             "patch_model": "sanitized baseline -> 1 text audit patch -> sanitized target",
             "sanitized_baseline_tree": {"path": "sanitized-baseline", "tree_hash": baseline_hash, "sensitive_hits": 0, **baseline_scan, **baseline_media_scan},
             "sanitized_target_tree": {"path": "sanitized-target", "tree_hash": target_hash, "sensitive_hits": 0, **target_scan, **target_media_scan},
@@ -714,15 +974,23 @@ def build_reversible_audit_package(
                 "patches": patch_scan,
             },
         }
-        metadata = dict(manifest_metadata or {})
         live_status = str(metadata.get("current_live_status", "UNKNOWN"))
         if live_status not in {"PASS", "BLOCKED", "UNKNOWN"}:
             raise SensitiveDataError("current live status is invalid")
         report_path = safe_target / "AUDIT-REPORT.md"
         live_relative = str(metadata.get("live_addendum_path", "")).strip()
         live_path = safe_target / live_relative if live_relative else None
+        live_result_relative = str(metadata.get("live_result_path", "")).strip()
+        live_result_path = (
+            safe_target / live_result_relative if live_result_relative else None
+        )
         if live_path is not None and safe_target not in live_path.resolve().parents:
             raise SensitiveDataError("live addendum path escapes sanitized target")
+        if (
+            live_result_path is not None
+            and safe_target not in live_result_path.resolve().parents
+        ):
+            raise SensitiveDataError("live result path escapes sanitized target")
         manifest.update({
             "current_live_status": live_status,
             "frozen_report_hash": (
@@ -731,10 +999,20 @@ def build_reversible_audit_package(
             "live_addendum_hash": (
                 _hash_file(live_path) if live_path is not None and live_path.is_file() else ""
             ),
+            "live_result_hash": (
+                _hash_file(live_result_path)
+                if live_result_path is not None and live_result_path.is_file()
+                else ""
+            ),
             "failing_pass_matrix": metadata.get("failing_pass_matrix", {}),
             "images": len(baseline_inventory["images"]) + len(target_inventory["images"]),
             "runtime_artifacts": 0,
             "binary_patches": 0,
+            "final_verifier": {
+                "status": "PENDING" if deferred_publication else "NOT_APPLICABLE",
+                "verified_at": "",
+                "source": "fresh_zip_extraction",
+            },
         })
         (staging / "SHAREABLE-MANIFEST.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
@@ -773,6 +1051,8 @@ def _verify_frozen_reversible_package(
     """Independently recompute final trees; never reuse builder hash state."""
 
     package_root = Path(package_root).resolve()
+    if not verify_hash_manifest(package_root):
+        raise SensitiveDataError("final directory SHA256 exact-set validation failed")
     verification_root = package_root
     with tempfile.TemporaryDirectory(prefix="audit-final-verify-") as verify_temp:
         verify_temp_path = Path(verify_temp)
@@ -838,6 +1118,22 @@ def _verify_frozen_reversible_package(
             raise SensitiveDataError("final sanitized target compileall failed")
         if any(target.rglob("__pycache__")):
             raise SensitiveDataError("compileall modified the frozen target")
+        if manifest.get("final_verifier", {}).get("status") == "PASS":
+            self_verifier = verification_root / "VERIFY-PACKAGE.py"
+            if not self_verifier.is_file():
+                raise SensitiveDataError("package self-verifier is missing")
+            self_check = subprocess.run(
+                [sys.executable, str(self_verifier), "--root", str(verification_root)],
+                cwd=verify_temp_path,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if self_check.returncode or "PASS" not in self_check.stdout:
+                raise SensitiveDataError("package self-verifier failed")
         return actual
 
 
@@ -855,12 +1151,17 @@ def build_frozen_reversible_audit_package(
     manifest_metadata: dict[str, object] | None = None,
     create_zip: bool = True,
 ) -> Path:
-    """Write the report before freezing, then independently verify final ZIP."""
+    """Freeze privately, verify fresh ZIP bytes, then publish one artifact group."""
 
     destination = Path(destination).resolve()
     zip_path = destination.with_suffix(".zip")
-    with tempfile.TemporaryDirectory(prefix="audit-frozen-target-") as target_temp:
-        frozen_target = Path(target_temp) / "target"
+    sha_path = destination.with_suffix(".SHA256.txt")
+    with tempfile.TemporaryDirectory(prefix="audit-frozen-group-") as group_temp:
+        group_root = Path(group_temp)
+        frozen_target = group_root / "target"
+        candidate = group_root / destination.name
+        candidate_zip = candidate.with_suffix(".zip")
+        candidate_sha = candidate.with_suffix(".SHA256.txt")
         shutil.copytree(Path(target_source).resolve(), frozen_target)
         (frozen_target / "AUDIT-REPORT.md").write_text(
             str(audit_report_text).replace("\r\n", "\n"),
@@ -868,26 +1169,79 @@ def build_frozen_reversible_audit_package(
             newline="\n",
         )
         try:
+            metadata = dict(manifest_metadata or {})
+            metadata["_defer_shareable"] = True
             result = build_reversible_audit_package(
                 baseline_source,
                 frozen_target,
-                destination,
+                candidate,
                 uid_values=uid_values,
                 image_masks=image_masks,
                 evidence_allowlist=evidence_allowlist,
                 image_privacy_manifests=image_privacy_manifests,
                 image_ocr_provider=image_ocr_provider,
-                manifest_metadata=manifest_metadata,
+                manifest_metadata=metadata,
                 create_zip=create_zip,
             )
+            # Provisional verification happens entirely in private staging.
             _verify_frozen_reversible_package(
-                result, zip_path=zip_path if create_zip else None
+                result, zip_path=candidate_zip if create_zip else None
             )
-            return result
+
+            manifest_path = result / "SHAREABLE-MANIFEST.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["shareable"] = True
+            manifest["final_verifier"] = {
+                "status": "PASS",
+                "verified_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "source": "fresh_zip_extraction",
+            }
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            _write_hash_manifest(result)
+            if create_zip:
+                candidate_zip.unlink(missing_ok=True)
+                with zipfile.ZipFile(
+                    candidate_zip, "w", compression=zipfile.ZIP_DEFLATED
+                ) as archive:
+                    for path in sorted(
+                        item for item in result.rglob("*") if item.is_file()
+                    ):
+                        archive.write(
+                            path,
+                            (Path(destination.name) / path.relative_to(result)).as_posix(),
+                        )
+            # This is the authoritative final verification of the exact bytes
+            # that will be published; it also runs the verifier shipped in ZIP.
+            _verify_frozen_reversible_package(
+                result, zip_path=candidate_zip if create_zip else None
+            )
+            if create_zip:
+                candidate_sha.write_text(
+                    f"{_hash_file(candidate_zip)} *{zip_path.name}\n",
+                    encoding="utf-8",
+                    newline="\n",
+                )
+
+            # Logical group transaction: no public path exists until every
+            # candidate has passed; any replacement failure removes the group.
+            if destination.exists():
+                shutil.rmtree(destination)
+            zip_path.unlink(missing_ok=True)
+            sha_path.unlink(missing_ok=True)
+            _replace_with_retry(result, destination)
+            if create_zip:
+                _replace_with_retry(candidate_zip, zip_path)
+                _replace_with_retry(candidate_sha, sha_path)
+            return destination
         except Exception:
             if destination.exists():
                 shutil.rmtree(destination)
             zip_path.unlink(missing_ok=True)
+            sha_path.unlink(missing_ok=True)
             raise
 
 
@@ -984,6 +1338,9 @@ __all__ = [
     "build_reversible_audit_package",
     "build_frozen_reversible_audit_package",
     "build_shareable_audit",
+    "build_live_validation_result",
+    "validate_live_validation_result",
+    "render_live_validation_addendum",
     "scan_sensitive_text",
     "scan_sensitive_tree",
     "scan_media_tree",
