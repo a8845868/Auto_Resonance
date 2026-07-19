@@ -80,7 +80,10 @@ def test_fatigue_checkpoint_ack_allows_next_leg_resume(tmp_path):
     path = _checkpoint(tmp_path)
     notify_fatigue_event("arrival", "B", path=path, schedule=Mock())
     action = claim_fatigue_checkpoint(expected_waypoint="B", path=path)
-    acknowledge_fatigue_checkpoint(action["id"], path=path)
+    acknowledge_fatigue_checkpoint(
+        action["id"], owner_id=action["owner_id"],
+        lease_token=action["lease_token"], path=path,
+    )
     assert fatigue_checkpoint_deferral("B", path=path) is None
 
 
@@ -88,7 +91,10 @@ def test_failed_checkpoint_remains_retryable_and_does_not_depart(tmp_path):
     path = _checkpoint(tmp_path)
     notify_fatigue_event("arrival", "B", path=path, schedule=Mock())
     action = claim_fatigue_checkpoint(expected_waypoint="B", path=path)
-    fail_fatigue_checkpoint(action["id"], "ocr_unstable", path=path)
+    fail_fatigue_checkpoint(
+        action["id"], "ocr_unstable", owner_id=action["owner_id"],
+        lease_token=action["lease_token"], path=path,
+    )
     assert list_fatigue_actions(path=path)[0]["state"] == FatigueActionState.FAILED_RETRYABLE.value
     assert fatigue_checkpoint_deferral("B", path=path)["deferred"] is True
 

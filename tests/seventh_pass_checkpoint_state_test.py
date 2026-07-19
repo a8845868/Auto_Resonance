@@ -69,7 +69,10 @@ def test_retry_exhaustion_enters_manual_blocked(tmp_path):
     path = _checkpoint(tmp_path)
     for _ in range(3):
         action = claim_fatigue_checkpoint(expected_waypoint="B", path=path)
-        failed = fail_fatigue_checkpoint(action["id"], "ocr_unknown", path=path)
+        failed = fail_fatigue_checkpoint(
+            action["id"], "ocr_unknown", owner_id=action["owner_id"],
+            lease_token=action["lease_token"], path=path,
+        )
     assert failed["state"] == FatigueActionState.MANUAL_BLOCKED.value
 
 
@@ -77,7 +80,10 @@ def test_manual_blocked_checkpoint_still_defers_business(tmp_path):
     path = _checkpoint(tmp_path)
     for _ in range(3):
         action = claim_fatigue_checkpoint(expected_waypoint="B", path=path)
-        fail_fatigue_checkpoint(action["id"], "ocr_unknown", path=path)
+        fail_fatigue_checkpoint(
+            action["id"], "ocr_unknown", owner_id=action["owner_id"],
+            lease_token=action["lease_token"], path=path,
+        )
     assert fatigue_checkpoint_deferral("B", path=path)["checkpoint_state"] == "MANUAL_BLOCKED"
 
 

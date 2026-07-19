@@ -35,6 +35,7 @@ from core.services.read_only_policy import (
     PageObservation,
     PageObserver,
     ReadOnlyActionGuard,
+    ReadOnlySafetySession,
     ReadOnlyPermitIssuer,
 )
 from core.services.server_calendar import SERVER_CLOCK
@@ -75,11 +76,31 @@ def _guard(
     *,
     hardware_tap=None,
 ):
-    state = {"value": observation or _observation()}
+    initial = observation or _observation()
+    state = {"value": initial, "post_value": None, "sequence": 0}
+    def observe():
+        state["sequence"] += 1
+        sequence = state["sequence"]
+        if sequence % 3 == 0:
+            base = state["post_value"] or PageObservation(
+                "post-home", "c" * 64, "home", ("home",), (), NOW
+            )
+        else:
+            base = state["value"]
+        return replace(
+            base,
+            captured_at=NOW + timedelta(microseconds=sequence),
+            capture_sequence=sequence,
+            source_capture_id=f"tenth-boundary-{id(state)}-{sequence}",
+            source_monotonic_sequence=sequence,
+            backend_generation=1,
+            instance_id="test-instance-0",
+            adb_serial="test-adb-0",
+        )
     issuer = ReadOnlyPermitIssuer(
-        PageObserver(lambda: state["value"]), AnchorResolver(), now=lambda: NOW
+        PageObserver(observe), AnchorResolver(), now=lambda: NOW
     )
-    guard = ReadOnlyActionGuard(
+    guard = ReadOnlySafetySession(
         hardware_tap or (lambda _point: None), permit_issuer=issuer, now=lambda: NOW
     )
     return guard, issuer, state
@@ -133,36 +154,28 @@ def test_permit_consume_rechecks_current_static_policy():
 
 
 def test_concurrent_permit_use_causes_exactly_one_hardware_tap(monkeypatch):
-    guard, issuer, _state = _guard(hardware_tap=control_module.TrustedControlInputExecutor())
+    taps: list[tuple[int, int]] = []
+    backend = SimpleNamespace(ratio=1.0, input_tap=lambda x, y: taps.append((x, y)))
+    monkeypatch.setattr(control_module, "control", backend)
+    guard, issuer, _state = _guard(
+        hardware_tap=control_module._create_bound_input_executor(backend)
+    )
     permit = issuer.issue(
         ActionIntent("reward_back", "top_left_back", "hardware-race"), ((50, 40),)
     )
-    barrier = threading.Barrier(2)
-    issuer._before_consume = lambda: barrier.wait(timeout=5)
-    taps: list[tuple[int, int]] = []
-    monkeypatch.setattr(
-        control_module,
-        "control",
-        SimpleNamespace(ratio=1.0, input_tap=lambda x, y: taps.append((x, y))),
-    )
-    previous = control_module.install_action_policy(guard)
     results: list[bool] = []
-    try:
-        threads = [
-            threading.Thread(
-                target=lambda: results.append(
-                    control_module.input_tap((50, 40), permit=permit)
-                )
+    threads = [
+        threading.Thread(
+            target=lambda: results.append(
+                guard.authorize_coordinate((50, 40), permit=permit)
             )
-            for _ in range(2)
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=10)
-    finally:
-        issuer._before_consume = None
-        control_module.install_action_policy(previous)
+        )
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
 
     assert sorted(results) == [False, True]
     assert taps == [(50, 40)]
@@ -172,41 +185,45 @@ def test_concurrent_permit_use_causes_exactly_one_hardware_tap(monkeypatch):
 
 def test_ratio_greater_than_one_preserves_valid_logical_tap(monkeypatch):
     for ratio in (1.0, 1.25, 1.5, 2.0):
-        guard, _issuer, _state = _guard(hardware_tap=control_module.TrustedControlInputExecutor())
         taps: list[tuple[int, int]] = []
-        monkeypatch.setattr(
-            control_module,
-            "control",
-            SimpleNamespace(ratio=ratio, input_tap=lambda x, y: taps.append((x, y))),
+        backend = SimpleNamespace(ratio=ratio, input_tap=lambda x, y: taps.append((x, y)))
+        monkeypatch.setattr(control_module, "control", backend)
+        guard, _issuer, _state = _guard(
+            hardware_tap=control_module._create_bound_input_executor(backend)
         )
-        previous = control_module.install_action_policy(guard)
+        owner = control_module.activate_action_policy(guard)
         try:
             assert control_module.input_tap(
                 (50, 40),
                 intent=ActionIntent("reward_back", "top_left_back", f"ratio-{ratio}"),
             ) is True
         finally:
-            control_module.install_action_policy(previous)
+            control_module.remove_action_policy(owner)
         assert taps == [(round(50 * ratio), round(40 * ratio))]
-        assert guard.journal[-1].logical_trajectory == ((50, 40),)
-        assert guard.journal[-1].physical_trajectory == tuple(taps)
+        executed = next(
+            entry for entry in reversed(guard.journal)
+            if entry.stage == "POSTCONDITION_VERIFIED"
+        )
+        assert executed.logical_trajectory == ((50, 40),)
+        assert executed.physical_trajectory == tuple(taps)
 
 
 def test_swipe_full_trajectory_uses_one_coordinate_space(monkeypatch):
-    guard, _issuer, _state = _guard(hardware_tap=control_module.TrustedControlInputExecutor())
     swipes: list[tuple[int, int, int, int, int]] = []
     ratio = 1.25
-    monkeypatch.setattr(
-        control_module,
-        "control",
-        SimpleNamespace(
+    backend = SimpleNamespace(
             ratio=ratio,
             input_swipe=lambda x1, y1, x2, y2, duration: swipes.append(
                 (x1, y1, x2, y2, duration)
             ),
-        ),
+        )
+    monkeypatch.setattr(control_module, "control", backend)
+    guard, _issuer, state = _guard(
+        hardware_tap=control_module._create_bound_input_executor(backend)
     )
-    previous = control_module.install_action_policy(guard)
+    state["value"] = replace(state["value"], content_marker_hash="before")
+    state["post_value"] = replace(state["value"], content_marker_hash="after")
+    owner = control_module.activate_action_policy(guard)
     try:
         assert control_module.input_swipe(
             (900, 350),
@@ -217,7 +234,7 @@ def test_swipe_full_trajectory_uses_one_coordinate_space(monkeypatch):
             ),
         ) is True
     finally:
-        control_module.install_action_policy(previous)
+        control_module.remove_action_policy(owner)
 
     assert swipes == [(1125, 438, 500, 438, 650)]
     entry = guard.journal[-1]
@@ -257,7 +274,7 @@ def _probe_observation(monkeypatch, texts: list[str]) -> PageObservation:
     )
     monkeypatch.setattr(probe, "screenshot", lambda: frame)
     monkeypatch.setattr(probe, "current_display_geometry", DisplayGeometry)
-    return probe._trusted_observation()
+    return probe._trusted_observation().as_observation()
 
 
 def test_exchange_sell_classifier_precedes_generic_exchange_menu(monkeypatch):

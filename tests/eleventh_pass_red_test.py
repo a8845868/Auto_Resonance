@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -40,8 +41,22 @@ def _observation() -> PageObservation:
 
 def _guard(*, execute=None):
     observation = _observation()
+    state = {"sequence": 0}
+    def observe():
+        state["sequence"] += 1
+        sequence = state["sequence"]
+        return replace(
+            observation,
+            captured_at=NOW + timedelta(microseconds=sequence),
+            capture_sequence=sequence,
+            source_capture_id=f"eleventh-red-{sequence}",
+            source_monotonic_sequence=sequence,
+            backend_generation=1,
+            instance_id="test-instance-0",
+            adb_serial="test-adb-0",
+        )
     issuer = ReadOnlyPermitIssuer(
-        PageObserver(lambda: observation), AnchorResolver(), now=lambda: NOW
+        PageObserver(observe), AnchorResolver(), now=lambda: NOW
     )
     return ReadOnlyActionGuard(
         execute or (lambda _point: None), permit_issuer=issuer, now=lambda: NOW
@@ -185,8 +200,8 @@ def test_not_claimable_text_is_not_claimable():
 def test_no_claimable_text_is_not_claimable():
     card = rewards._card_items(_card_frame("无可领取"), manual=False)[0]
 
-    assert card.claimable is False
-    assert card.claimed is False
+    assert card.claimable is None
+    assert card.claimed is None
 
 
 def test_corrupt_task_schedule_is_preserved_and_not_overwritten(tmp_path):

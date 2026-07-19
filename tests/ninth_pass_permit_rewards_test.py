@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -27,6 +28,7 @@ from core.services.read_only_policy import (
     PageObservation,
     PageObserver,
     ReadOnlyActionGuard,
+    ReadOnlySafetySession,
     ReadOnlyPermitIssuer,
 )
 
@@ -55,10 +57,34 @@ def _observation(
 
 
 def _guard(observation: PageObservation | None = None, *, executor=None):
-    state = {"value": observation or _observation()}
-    observer = PageObserver(lambda: state["value"])
+    state = {"value": observation or _observation(), "sequence": 0}
+    def observe():
+        state["sequence"] += 1
+        sequence = state["sequence"]
+        if sequence % 3 == 0 and state["value"].captured_at == NOW:
+            base = PageObservation(
+                "post-home", "c" * 64, "home", ("home",), (), NOW
+            )
+        else:
+            base = state["value"]
+        captured_at = (
+            base.captured_at
+            if base.captured_at != NOW
+            else NOW + timedelta(microseconds=sequence)
+        )
+        return replace(
+            base,
+            captured_at=captured_at,
+            capture_sequence=sequence,
+            source_capture_id=f"ninth-{id(state)}-{sequence}",
+            source_monotonic_sequence=sequence,
+            backend_generation=1,
+            instance_id="test-instance-0",
+            adb_serial="test-adb-0",
+        )
+    observer = PageObserver(observe)
     issuer = ReadOnlyPermitIssuer(observer, AnchorResolver(), now=lambda: NOW)
-    return ReadOnlyActionGuard(executor or (lambda _point: None), permit_issuer=issuer, now=lambda: NOW), issuer, state
+    return ReadOnlySafetySession(executor or (lambda _point: None), permit_issuer=issuer, now=lambda: NOW), issuer, state
 
 
 def test_caller_cannot_self_issue_read_only_permit():
@@ -114,16 +140,18 @@ def test_random_offset_cannot_escape_permit_bounds(monkeypatch):
     device = SimpleNamespace(ratio=1, input_tap=lambda x, y: calls.append((x, y)))
     calls = []
     monkeypatch.setattr(control_module, "control", device)
-    guard, _issuer, _state = _guard(executor=control_module.TrustedControlInputExecutor())
+    guard, _issuer, _state = _guard(
+        executor=control_module._create_bound_input_executor(device)
+    )
     monkeypatch.setattr(control_module.random, "randint", lambda *_args: 999)
-    previous = control_module.install_action_policy(guard)
+    owner = control_module.activate_action_policy(guard)
     try:
         assert control_module.input_tap(
             (50, 40), random_offset=True,
             intent=ActionIntent("reward_back", "top_left_back", "offset"),
         ) is True
     finally:
-        control_module.install_action_policy(previous)
+        control_module.remove_action_policy(owner)
     assert calls == [(50, 40)]
 
 

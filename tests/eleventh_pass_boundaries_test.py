@@ -19,6 +19,7 @@ from core.services.read_only_policy import (
     PageObservation,
     PageObserver,
     ReadOnlyActionGuard,
+    ReadOnlySafetySession,
     ReadOnlyPermitHandle,
     ReadOnlyPermitIssuer,
     ReadOnlyPolicySpec,
@@ -61,20 +62,30 @@ class Executor:
 
 
 def _guard(values=None, *, executor=None, policies=None, now=lambda: NOW, limit=256):
-    values = list(values or [_obs()])
+    values = list(values or [_obs(), _obs(), _obs("home", anchor=False)])
     state = {"index": 0}
 
     def observe():
         value = values[min(state["index"], len(values) - 1)]
         state["index"] += 1
-        return value
+        sequence = state["index"]
+        return replace(
+            value,
+            captured_at=now() + timedelta(microseconds=sequence),
+            capture_sequence=sequence,
+            source_capture_id=f"eleventh-boundary-{id(state)}-{sequence}",
+            source_monotonic_sequence=sequence,
+            backend_generation=1,
+            instance_id="test-instance-0",
+            adb_serial="test-adb-0",
+        )
 
     issuer = ReadOnlyPermitIssuer(
         PageObserver(observe), AnchorResolver(), policies=policies,
         now=now, registry_limit=limit,
     )
     executor = executor or Executor()
-    return ReadOnlyActionGuard(executor, permit_issuer=issuer, now=now), issuer, executor
+    return ReadOnlySafetySession(executor, permit_issuer=issuer, now=now), issuer, executor
 
 
 def _tap_intent(correlation="tap"):
@@ -125,19 +136,25 @@ def test_trusted_executor_cannot_receive_a_different_trajectory(monkeypatch):
         "ratio": 1.0,
         "input_swipe": staticmethod(lambda x1,y1,x2,y2,d: calls.append((x1,y1,x2,y2,d))),
     })())
-    executor = control_module.TrustedControlInputExecutor()
-    guard, _issuer, _unused = _guard(executor=executor)
-    previous = control_module.install_action_policy(guard)
+    executor = control_module._create_bound_input_executor(control_module.control)
+    captures = [
+        replace(_obs(), content_marker_hash="before"),
+        replace(_obs(), content_marker_hash="before"),
+        replace(_obs(), content_marker_hash="after"),
+    ]
+    guard, _issuer, _unused = _guard(values=captures, executor=executor)
+    owner = control_module.activate_action_policy(guard)
     try:
         assert control_module.input_swipe(
             (900, 350), (400, 350), 650,
             intent=ActionIntent("daily_horizontal_scroll", "daily_content"),
         ) is True
     finally:
-        control_module.install_action_policy(previous)
+        control_module.remove_action_policy(owner)
     assert calls == [(900, 350, 400, 350, 650)]
-    assert guard.journal[-1].physical_trajectory[0] == (900, 350)
-    assert guard.journal[-1].physical_trajectory[-1] == (400, 350)
+    executed = next(entry for entry in reversed(guard.journal) if entry.stage == "POSTCONDITION_VERIFIED")
+    assert executed.physical_trajectory[0] == (900, 350)
+    assert executed.physical_trajectory[-1] == (400, 350)
 
 
 def test_permit_handle_mutation_cannot_change_registry_record():
@@ -261,7 +278,17 @@ def test_registry_expiry_cleanup_and_revoke_are_bounded():
     expired = issuer.issue(_tap_intent("expired"), ((50,40),))
     clock["now"] += timedelta(seconds=6)
     assert issuer.cleanup_expired() == 1
-    issuer.observer._observe = lambda: replace(_obs(), captured_at=clock["now"])
+    sequence = {"value": 100}
+    def fresh():
+        sequence["value"] += 1
+        return replace(
+            _obs(), captured_at=clock["now"] + timedelta(microseconds=sequence["value"]),
+            capture_sequence=sequence["value"],
+            source_capture_id=f"expiry-{sequence['value']}",
+            source_monotonic_sequence=sequence["value"],
+            backend_generation=1, instance_id="test-instance-0", adb_serial="test-adb-0",
+        )
+    issuer.observer._observe = fresh
     active = issuer.issue(_tap_intent("active"), ((50,40),))
     with pytest.raises(PermissionError, match="capacity"):
         issuer.issue(_tap_intent("overflow"), ((50,40),))

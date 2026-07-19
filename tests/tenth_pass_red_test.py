@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -21,6 +22,7 @@ from core.services.read_only_policy import (
     PageObservation,
     PageObserver,
     ReadOnlyActionGuard,
+    ReadOnlySafetySession,
     ReadOnlyPermit,
     ReadOnlyPermitIssuer,
 )
@@ -42,10 +44,29 @@ def _observation(*, anchor_bbox=(20, 10, 130, 85)) -> PageObservation:
 
 def _guard(observation: PageObservation | None = None):
     value = observation or _observation()
+    state = {"sequence": 0}
+    def observe():
+        state["sequence"] += 1
+        sequence = state["sequence"]
+        base = (
+            PageObservation(
+                "post-home", "c" * 64, "home", ("home",), (), NOW
+            ) if sequence % 3 == 0 else value
+        )
+        return replace(
+            base,
+            captured_at=NOW + timedelta(microseconds=sequence),
+            capture_sequence=sequence,
+            source_capture_id=f"tenth-red-{id(state)}-{sequence}",
+            source_monotonic_sequence=sequence,
+            backend_generation=1,
+            instance_id="test-instance-0",
+            adb_serial="test-adb-0",
+        )
     issuer = ReadOnlyPermitIssuer(
-        PageObserver(lambda: value), AnchorResolver(), now=lambda: NOW
+        PageObserver(observe), AnchorResolver(), now=lambda: NOW
     )
-    return ReadOnlyActionGuard(lambda _point: None, permit_issuer=issuer, now=lambda: NOW), issuer
+    return ReadOnlySafetySession(lambda _point: None, permit_issuer=issuer, now=lambda: NOW), issuer
 
 
 def test_directly_constructed_permit_is_rejected():
@@ -96,14 +117,14 @@ def test_ratio_half_does_not_map_outside_logical_point_into_anchor(monkeypatch):
         "control",
         SimpleNamespace(ratio=0.5, input_tap=lambda x, y: taps.append((x, y))),
     )
-    previous = control_module.install_action_policy(guard)
+    owner = control_module.activate_action_policy(guard)
     try:
         allowed = control_module.input_tap(
             (150, 100),
             intent=ActionIntent("reward_back", "top_left_back", "ratio-half"),
         )
     finally:
-        control_module.install_action_policy(previous)
+        control_module.remove_action_policy(owner)
 
     assert allowed is False
     assert taps == []
@@ -206,7 +227,7 @@ def test_exchange_buy_classifier_precedes_generic_exchange_menu(monkeypatch):
     )
     monkeypatch.setattr(probe, "screenshot", lambda: frame)
 
-    assert probe._trusted_observation().page_type == "exchange_buy"
+    assert probe._trusted_observation().as_observation().page_type == "exchange_buy"
 
 
 def _digit_image(digit: str) -> np.ndarray:
