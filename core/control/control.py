@@ -5,10 +5,12 @@ LastEditTime: 2025-02-11 16:56:45
 LastEditors: Night-stars-1 nujj1042633805@gmail.com
 """
 
+import hashlib
 import random
 import secrets
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Tuple
 
@@ -36,10 +38,26 @@ _runtime_auto_start_emulator: bool | None = None
 _BACKEND_LOCK = threading.RLock()
 _BACKEND_GENERATION = 1
 _BACKEND_CONNECTED_AT = datetime.now().astimezone()
+_CAPTURE_SESSION_GENERATION = _BACKEND_GENERATION
+_CAPTURE_SEQUENCE = 0
 _ACTION_POLICY_LOCK = threading.RLock()
 _ACTION_POLICY_OWNERS: dict[str, object] = {}
 _ACTION_POLICY_ORDER: list[str] = []
 _READ_ONLY_FAIL_CLOSED = False
+
+
+@dataclass(frozen=True)
+class CaptureEnvelope:
+    frame: cv.typing.MatLike
+    backend_capture_id: str
+    backend_monotonic_sequence: int
+    captured_at: datetime
+    raw_frame_hash: str
+    backend_generation: int
+    backend_object_identity: str
+    instance_id: str
+    adb_serial: str
+    geometry_revision: str
 
 
 class _BoundControlInputExecutor:
@@ -145,6 +163,47 @@ def current_bound_device_identity():
             backend_object_identity=f"{type(control).__name__}:{id(control):x}",
             display_geometry_revision=geometry.geometry_revision,
             connected_at=_BACKEND_CONNECTED_AT,
+        )
+
+
+def capture_envelope() -> CaptureEnvelope:
+    """Perform one real backend capture and mint freshness at the boundary."""
+
+    global _CAPTURE_SESSION_GENERATION, _CAPTURE_SEQUENCE
+    ensure_automation_allowed("读取游戏画面")
+    with _BACKEND_LOCK:
+        if STOP:
+            raise StopExecution()
+        if _CAPTURE_SESSION_GENERATION != _BACKEND_GENERATION:
+            _CAPTURE_SESSION_GENERATION = _BACKEND_GENERATION
+            _CAPTURE_SEQUENCE = 0
+        raw = control.screenshot()
+        frame = cv.resize(raw, control.dsize, interpolation=cv.INTER_AREA)
+        _CAPTURE_SEQUENCE += 1
+        sequence = _CAPTURE_SEQUENCE
+        captured_at = datetime.now().astimezone()
+        raw_hash = hashlib.sha256(raw.tobytes()).hexdigest()
+        identity = current_bound_device_identity()
+        capture_id = hashlib.sha256(
+            "|".join((
+                identity.backend_object_identity,
+                str(identity.backend_generation),
+                str(sequence),
+                captured_at.isoformat(timespec="microseconds"),
+                raw_hash,
+            )).encode("utf-8")
+        ).hexdigest()
+        return CaptureEnvelope(
+            frame=frame,
+            backend_capture_id=capture_id,
+            backend_monotonic_sequence=sequence,
+            captured_at=captured_at,
+            raw_frame_hash=raw_hash,
+            backend_generation=identity.backend_generation,
+            backend_object_identity=identity.backend_object_identity,
+            instance_id=identity.instance_id,
+            adb_serial=identity.adb_serial,
+            geometry_revision=identity.display_geometry_revision,
         )
 
 
@@ -640,13 +699,7 @@ def screenshot_image() -> cv.typing.MatLike:
     """
     截图并返回图片对象
     """
-    ensure_automation_allowed("读取游戏画面")
-    if STOP:
-        raise StopExecution()
-
-    screenshot = control.screenshot()
-    screenshot = cv.resize(screenshot, control.dsize, interpolation=cv.INTER_AREA)
-    return screenshot
+    return capture_envelope().frame
 
 def wait_stopped(threshold=7100000, timeout=15.0):
     """

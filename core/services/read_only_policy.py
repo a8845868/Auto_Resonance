@@ -6,6 +6,7 @@ import hashlib
 import os
 import secrets
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
@@ -317,6 +318,9 @@ class ReadOnlyPolicySpec:
     allowed_swipe_directions: frozenset[str] = frozenset({"LEFT", "RIGHT"})
     minimum_duration_ms: int = 100
     maximum_duration_ms: int = 2000
+    postcondition_attempts: int = 1
+    postcondition_interval_seconds: float = 0.0
+    anchor_bbox_tolerance: int = 0
 
 
 DEFAULT_POLICY_SPECS = {
@@ -326,8 +330,9 @@ DEFAULT_POLICY_SPECS = {
     ),
     "page_back": ReadOnlyPolicySpec(
         "page_back",
-        frozenset({"home", "daily_activity", "travel_manual", "manual_tasks", "manual_track", "exchange_buy", "exchange_sell", "inventory", "fatigue_info"}),
-        "top_left_back", allowed_post_page_types=frozenset({"home", "hud", "station", "exchange", "daily_activity", "travel_manual", "manual_tasks", "manual_track", "inventory"}),
+        frozenset({"home", "daily_activity", "travel_manual", "manual_tasks", "manual_track", "city_map", "npc_dialogue", "exchange", "exchange_buy", "exchange_sell", "inventory", "fatigue_info"}),
+        "top_left_back", allowed_post_page_types=frozenset({"home", "hud", "station", "city_map", "npc_dialogue", "exchange", "daily_activity", "travel_manual", "manual_tasks", "manual_track", "inventory"}),
+        postcondition_attempts=5, postcondition_interval_seconds=0.35,
     ),
     "manual_tab": ReadOnlyPolicySpec(
         "manual_tab", frozenset({"travel_manual", "manual_tasks", "manual_track"}), "manual_tab",
@@ -362,10 +367,37 @@ DEFAULT_POLICY_SPECS = {
     "exchange_buy_navigation": ReadOnlyPolicySpec(
         "exchange_buy_navigation", frozenset({"station", "exchange"}), "buy_navigation",
         allowed_post_page_types=frozenset({"exchange_buy"}),
+        postcondition_attempts=5, postcondition_interval_seconds=0.35,
+        anchor_bbox_tolerance=8,
     ),
     "exchange_sell_navigation": ReadOnlyPolicySpec(
         "exchange_sell_navigation", frozenset({"station", "exchange"}), "sell_navigation",
         allowed_post_page_types=frozenset({"exchange_sell"}),
+        postcondition_attempts=5, postcondition_interval_seconds=0.35,
+        anchor_bbox_tolerance=8,
+    ),
+    "city_entry_navigation": ReadOnlyPolicySpec(
+        "city_entry_navigation", frozenset({"home", "hud"}), "city_entry",
+        required_markers=("top_level_hud",),
+        postcondition="city_map_verified",
+        allowed_post_page_types=frozenset({"city_map"}),
+        postcondition_attempts=5, postcondition_interval_seconds=0.35,
+        anchor_bbox_tolerance=8,
+    ),
+    "navigation_anchor": ReadOnlyPolicySpec(
+        "navigation_anchor", frozenset({"city_map"}), "交易所",
+        allowed_region=(820, 235, 990, 400),
+        allowed_post_page_types=frozenset({"npc_dialogue", "exchange"}),
+        postcondition_attempts=5, postcondition_interval_seconds=0.35,
+        anchor_bbox_tolerance=8,
+    ),
+    "outlet_list_scroll": ReadOnlyPolicySpec(
+        "outlet_list_scroll", frozenset({"city_map"}), "outlet_list",
+        action_kind=ActionKind.SWIPE,
+        allowed_region=(180, 120, 1080, 650),
+        postcondition="city_map_content_changed",
+        allowed_post_page_types=frozenset({"city_map"}),
+        allowed_swipe_directions=frozenset({"UP", "DOWN", "LEFT", "RIGHT"}),
     ),
     "fatigue_info_open": ReadOnlyPolicySpec(
         "fatigue_info_open", frozenset({"home", "hud"}), "fatigue_value",
@@ -455,6 +487,7 @@ class ReadOnlyPermitIssuer:
         registry_limit: int = 256,
         bound_device_identity: BoundDeviceIdentity | None = None,
         identity_provider: Callable[[], BoundDeviceIdentity] | None = None,
+        postcondition_sleep: Callable[[float], None] = time.sleep,
     ):
         self.observer = observer
         self.resolver = resolver
@@ -491,6 +524,7 @@ class ReadOnlyPermitIssuer:
         self._identity_is_explicit = bound_device_identity is not None
         self._bound_device_identity = bound_device_identity or default_identity
         self._identity_provider = identity_provider or (lambda: self._bound_device_identity)
+        self._postcondition_sleep = postcondition_sleep
 
     def _assert_device_identity(self, stage: str) -> BoundDeviceIdentity:
         current = self._identity_provider()
@@ -533,7 +567,11 @@ class ReadOnlyPermitIssuer:
             postcondition=spec.postcondition,
         )
         allowed_region = tuple(map(int, spec.allowed_region or anchor.bbox))
-        if len(trajectory) == 1 and not _inside(trajectory[0], anchor.bbox):
+        if (
+            len(trajectory) == 1
+            and spec.allowed_region is None
+            and not _inside(trajectory[0], anchor.bbox)
+        ):
             raise PermissionError("authorized logical coordinate is outside the trusted anchor bbox")
         if any(not _inside(point, allowed_region) for point in trajectory):
             raise PermissionError("final logical trajectory leaves the safe region")
@@ -548,6 +586,8 @@ class ReadOnlyPermitIssuer:
             spec.maximum_vertical_ratio, sorted(spec.allowed_swipe_directions),
             spec.minimum_duration_ms, spec.maximum_duration_ms,
             sorted(spec.allowed_post_page_types),
+            spec.postcondition_attempts, spec.postcondition_interval_seconds,
+            spec.anchor_bbox_tolerance,
         ))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
@@ -774,11 +814,20 @@ class ReadOnlyPermitIssuer:
         anchor_hash = hashlib.sha256(
             (anchor.text if isinstance(anchor, OcrObservedAnchor) else anchor.anchor_id).encode("utf-8")
         ).hexdigest()[:16]
+        observed_bbox = tuple(map(int, anchor.bbox))
+        bbox_matches = all(
+            abs(left - right) <= max(0, int(spec.anchor_bbox_tolerance))
+            for left, right in zip(observed_bbox, record.anchor_bbox)
+        )
+        region_matches = (
+            region == record.allowed_region if spec.allowed_region is not None
+            else bbox_matches
+        )
         return bool(
             source == record.anchor_source
-            and tuple(map(int, anchor.bbox)) == record.anchor_bbox
+            and bbox_matches
             and anchor_hash == record.anchor_text_hash
-            and region == record.allowed_region
+            and region_matches
         )
 
     def revalidate(self, permit: ReadOnlyPermitHandle) -> bool:
@@ -878,11 +927,20 @@ class ReadOnlyPermitIssuer:
                 anchor_hash = hashlib.sha256(
                     (anchor.text if isinstance(anchor, OcrObservedAnchor) else anchor.anchor_id).encode("utf-8")
                 ).hexdigest()[:16]
+                observed_bbox = tuple(map(int, anchor.bbox))
+                bbox_matches = all(
+                    abs(left - right) <= max(0, int(spec.anchor_bbox_tolerance))
+                    for left, right in zip(observed_bbox, record.anchor_bbox)
+                )
+                region_matches = (
+                    allowed_region == record.allowed_region
+                    if spec.allowed_region is not None else bbox_matches
+                )
                 if (
                     source != record.anchor_source
-                    or tuple(map(int, anchor.bbox)) != record.anchor_bbox
+                    or not bbox_matches
                     or anchor_hash != record.anchor_text_hash
-                    or allowed_region != record.allowed_region
+                    or not region_matches
                 ):
                     return False, "trusted_anchor_or_policy_changed", record, ()
                 physical = tuple(active_geometry.logical_to_physical(point) for point in logical)
@@ -900,50 +958,62 @@ class ReadOnlyPermitIssuer:
             entry = self._registry.get(str(getattr(permit, "opaque_token", "")))
             if entry is None:
                 return False, "postcondition_permit_missing", None
-            try:
-                identity = self._assert_device_identity("postcapture")
-                observation = self._fresh_observation()
-                self._assert_observation_identity(observation, identity)
-                self._assert_device_identity("postcapture_complete")
-            except PermissionError as error:
-                return False, str(error), None
-            if observation.source_monotonic_sequence <= entry.consume_capture_sequence:
-                return False, "postcondition_capture_not_independent", observation
-            if (
-                entry.consume_observation is not None
-                and observation.source_monotonic_sequence
-                <= entry.consume_observation.source_monotonic_sequence
-            ):
-                return False, "postcondition_source_capture_not_independent", observation
-            marker_text = self._marker_text(observation)
             spec = self._policies.get(record.action_key)
-            if spec is None or any(marker.casefold() in marker_text for marker in spec.forbidden_markers):
-                return False, "postcondition_forbidden_marker", observation
-            dangerous = {"account_settings", "payment", "confirm", "depart"}
-            if observation.page_type in dangerous:
-                return False, "postcondition_dangerous_page", observation
-            if record.postcondition in {"daily_anchor_remains_valid", "manual_anchor_remains_valid"}:
-                same_context = self._observation_matches(observation, record)
-                consume = entry.consume_observation
-                shifted = bool(
-                    consume is not None
-                    and observation.content_marker_hash
-                    and consume.content_marker_hash
-                    and observation.content_marker_hash != consume.content_marker_hash
-                )
-                verified = same_context and shifted
-            elif record.postcondition == "top_level_hud_or_safe_startup_transition":
-                verified = observation.page_type in {"login", "home", "hud", "startup_overlay"}
-            elif record.postcondition == "page_identity_must_change_or_remain_safe":
-                verified = observation.page_type in spec.allowed_post_page_types
-            else:
-                verified = bool(spec.allowed_post_page_types and observation.page_type in spec.allowed_post_page_types)
-            entry.post_observation = observation
-            return (
-                (True, "postcondition_verified", observation)
-                if verified
-                else (False, "postcondition_failed", observation)
-            )
+            if spec is None:
+                return False, "postcondition_policy_missing", None
+            attempts = max(1, int(spec.postcondition_attempts))
+            for attempt in range(attempts):
+                try:
+                    identity = self._assert_device_identity("postcapture")
+                    observation = self._fresh_observation()
+                    self._assert_observation_identity(observation, identity)
+                    self._assert_device_identity("postcapture_complete")
+                except PermissionError as error:
+                    return False, str(error), None
+                entry.post_observation = observation
+                if observation.source_monotonic_sequence <= entry.consume_capture_sequence:
+                    return False, "postcondition_capture_not_independent", observation
+                if (
+                    entry.consume_observation is not None
+                    and observation.source_monotonic_sequence
+                    <= entry.consume_observation.source_monotonic_sequence
+                ):
+                    return False, "postcondition_source_capture_not_independent", observation
+                marker_text = self._marker_text(observation)
+                if any(marker.casefold() in marker_text for marker in spec.forbidden_markers):
+                    return False, "postcondition_forbidden_marker", observation
+                dangerous = {"account_settings", "payment", "confirm", "depart"}
+                if observation.page_type in dangerous:
+                    return False, "postcondition_dangerous_page", observation
+                if record.postcondition in {"daily_anchor_remains_valid", "manual_anchor_remains_valid"}:
+                    same_context = self._observation_matches(observation, record)
+                    consume = entry.consume_observation
+                    shifted = bool(
+                        consume is not None
+                        and observation.content_marker_hash
+                        and consume.content_marker_hash
+                        and observation.content_marker_hash != consume.content_marker_hash
+                    )
+                    verified = same_context and shifted
+                elif record.postcondition == "top_level_hud_or_safe_startup_transition":
+                    verified = observation.page_type in {"login", "home", "hud", "startup_overlay"}
+                else:
+                    verified = bool(
+                        spec.allowed_post_page_types
+                        and observation.page_type in spec.allowed_post_page_types
+                    )
+                if verified:
+                    return True, "postcondition_verified", observation
+                # Retry only while the device remains on the exact safe source
+                # page class.  Dialogue, unknown overlays, and every other
+                # unexpected state fail closed on their first observation.
+                if observation.page_type not in spec.allowed_page_types:
+                    return False, "postcondition_failed", observation
+                if attempt + 1 < attempts:
+                    self._postcondition_sleep(
+                        max(0.0, float(spec.postcondition_interval_seconds))
+                    )
+            return False, "postcondition_failed", entry.post_observation
 
 
 @dataclass(frozen=True)
@@ -958,6 +1028,7 @@ class ActionJournalEntry:
     observation_id: str = ""
     screenshot_hash: str = ""
     page_classifier: str = ""
+    page_type: str = ""
     marker_hash: str = ""
     anchor_key: str = ""
     anchor_bbox: tuple[int, int, int, int] | None = None
@@ -982,8 +1053,11 @@ class ActionJournalEntry:
 
 
 class JournalStage(str, Enum):
+    ISSUE_DENIED = "ISSUE_DENIED"
     PRECONDITION_OBSERVED = "PRECONDITION_OBSERVED"
     AUTHORIZED = "AUTHORIZED"
+    CONSUME_OBSERVED = "CONSUME_OBSERVED"
+    CONSUME_DENIED = "CONSUME_DENIED"
     EXECUTION_STARTED = "EXECUTION_STARTED"
     EXECUTED = "EXECUTED"
     POSTCONDITION_VERIFIED = "POSTCONDITION_VERIFIED"
@@ -1144,6 +1218,10 @@ class ReadOnlyActionGuard:
                 observation.page_type if observation is not None
                 else authoritative.page_classifier if authoritative else ""
             ),
+            page_type=(
+                observation.page_type if observation is not None
+                else authoritative.page_classifier if authoritative else ""
+            ),
             marker_hash=marker_hash,
             anchor_key=authoritative.anchor_id if authoritative else "",
             anchor_bbox=authoritative.anchor_bbox if authoritative else None,
@@ -1211,32 +1289,46 @@ class ReadOnlyActionGuard:
                     requested_action_kind=action_kind,
                 )
             except PermissionError as error:
-                return self._record(key, trajectory, allowed=False, reason=str(error), stage=JournalStage.DENIED, action_kind=action_kind)
+                return self._record(
+                    key, trajectory, allowed=False, reason=str(error),
+                    stage=JournalStage.ISSUE_DENIED, action_kind=action_kind,
+                )
         if permit is None:
-            return self._record(key, trajectory, allowed=False, reason="read_only_permit_required", stage=JournalStage.DENIED, action_kind=action_kind)
-            issue_observation = issuer.issue_observation(permit)
+            return self._record(key, trajectory, allowed=False, reason="read_only_permit_required", stage=JournalStage.ISSUE_DENIED, action_kind=action_kind)
+        if issuer is None:
+            return self._record(key, trajectory, allowed=False, reason="trusted_permit_issuer_unavailable", stage=JournalStage.DENIED, action_kind=action_kind, permit=permit)
+        issue_observation = issuer.issue_observation(permit)
+        if issue_observation is not None:
             self._record(
                 key, trajectory, allowed=True, reason="precondition_observed",
                 stage=JournalStage.PRECONDITION_OBSERVED,
                 action_kind=action_kind, permit=permit,
                 observation=issue_observation, observation_role="PRE",
             )
-        if issuer is None:
-            return self._record(key, trajectory, allowed=False, reason="trusted_permit_issuer_unavailable", stage=JournalStage.DENIED, action_kind=action_kind, permit=permit)
         with components.action_lock:
             allowed, reason, record, physical = issuer.consume(
                 permit, trajectory, geometry=geometry, action_kind=action_kind, duration_ms=duration_ms
             )
             consume_observation = issuer.consume_observation(permit)
+            if not allowed:
+                self._record(
+                    key, trajectory, physical_trajectory=physical, allowed=False,
+                    reason=reason, stage=JournalStage.CONSUME_DENIED,
+                    action_kind=action_kind, permit=permit, record=record,
+                    observation=consume_observation, observation_role="CONSUME",
+                )
+                return False
             self._record(
-                key, trajectory, physical_trajectory=physical, allowed=allowed,
-                reason=reason,
-                stage=JournalStage.AUTHORIZED if allowed else JournalStage.DENIED,
+                key, trajectory, physical_trajectory=physical, allowed=True,
+                reason=reason, stage=JournalStage.AUTHORIZED,
+                action_kind=action_kind, permit=permit, record=record,
+            )
+            self._record(
+                key, trajectory, physical_trajectory=physical, allowed=True,
+                reason="consume_observed", stage=JournalStage.CONSUME_OBSERVED,
                 action_kind=action_kind, permit=permit, record=record,
                 observation=consume_observation, observation_role="CONSUME",
             )
-            if not allowed:
-                return False
             self._record(key, trajectory, physical_trajectory=physical, allowed=True, reason="execution_started", stage=JournalStage.EXECUTION_STARTED, action_kind=action_kind, permit=permit, record=record)
             try:
                 if action_kind is ActionKind.TAP:
