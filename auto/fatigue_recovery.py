@@ -406,6 +406,7 @@ def run_daily_fatigue_recovery(
         STATE_PATH,
         claim_fatigue_checkpoint,
         complete_fatigue_checkpoint_processing,
+        deliver_pending_business_handoffs,
         fail_fatigue_checkpoint,
     )
 
@@ -465,10 +466,12 @@ def run_daily_fatigue_recovery(
         replacement = transaction.get("replacement")
         if replacement is not None:
             result["replacement_checkpoint_id"] = replacement["id"]
-        if transaction["acknowledged"]:
-            # This only updates scheduler state.  It does not run business on
-            # the fatigue worker's stack, so screen ownership is yielded first.
-            from core.services.task_schedule_state import request_immediate_run
-
-            request_immediate_run("business")
+        if transaction["outcome"] in {
+            "ACKNOWLEDGE", "TRANSFER_TO_NEW_CHECKPOINT"
+        }:
+            # Completion/transfer is already durable. A failed handoff remains
+            # FAILED_RETRYABLE in the checkpoint journal for startup recovery.
+            result["scheduler_handoff_delivered"] = (
+                deliver_pending_business_handoffs(path=path)
+            )
     return result

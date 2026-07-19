@@ -10,6 +10,7 @@ from typing import Any
 
 
 STATE_PATH = Path("config/task_schedule.json")
+TASK_KEY_RUN_BUSINESS = "run_business"
 _STATE_LOCK = threading.RLock()
 
 

@@ -926,19 +926,48 @@ class ManualCardScanner(_CardScannerBase):
 
 
 def _image_daily_zero(image: np.ndarray | None) -> int | None:
+    """Conservatively recognize only a uniquely closed, symmetric zero glyph.
+
+    A hole alone is not evidence of zero: 6/8/9 and decorative rings all have
+    holes. Ambiguous images deliberately remain UNKNOWN (``None``).
+    """
+
     if image is None or image.shape[0] < 225 or image.shape[1] < 260:
         return None
     roi = image[175:225, 190:260]
     hsv = cv.cvtColor(roi, cv.COLOR_BGR2HSV)
     mask = cv.inRange(hsv, (85, 60, 80), (140, 255, 255))
+    mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, np.ones((2, 2), np.uint8))
     contours, hierarchy = cv.findContours(mask, cv.RETR_CCOMP, cv.CHAIN_APPROX_SIMPLE)
     if hierarchy is None:
         return None
+    candidates = []
     for index, contour in enumerate(contours):
-        _x, _y, width, height = cv.boundingRect(contour)
-        if 6 <= width <= 25 and 15 <= height <= 35 and hierarchy[0][index][2] >= 0:
-            return 0
-    return None
+        if hierarchy[0][index][3] >= 0:
+            continue
+        x, y, width, height = cv.boundingRect(contour)
+        if not (6 <= width <= 30 and 14 <= height <= 40):
+            continue
+        if not (0.42 <= width / height <= 0.90):
+            continue
+        children = [
+            child_index for child_index in range(len(contours))
+            if hierarchy[0][child_index][3] == index
+        ]
+        if len(children) != 1:
+            continue
+        hole = contours[children[0]]
+        moments = cv.moments(hole)
+        if moments["m00"] <= 0:
+            continue
+        hole_center_y = moments["m01"] / moments["m00"]
+        normalized_y = (hole_center_y - y) / height
+        outer_area = max(cv.contourArea(contour), 1.0)
+        hole_ratio = cv.contourArea(hole) / outer_area
+        if not (0.40 <= normalized_y <= 0.60 and 0.18 <= hole_ratio <= 0.48):
+            continue
+        candidates.append((x, y, width, height))
+    return 0 if len(candidates) == 1 else None
 
 
 def _stable_visual_daily_current(
