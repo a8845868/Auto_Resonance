@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import threading
 import uuid
 from datetime import datetime, timedelta
@@ -14,17 +15,44 @@ TASK_KEY_RUN_BUSINESS = "run_business"
 _STATE_LOCK = threading.RLock()
 
 
+class TaskScheduleStateCorrupt(RuntimeError):
+    """The persisted task schedule cannot be trusted or safely overwritten."""
+
+
+def _preserve_corrupt_schedule(path: Path) -> Path | None:
+    if not path.is_file():
+        return None
+    stamp = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%f")
+    backup = path.with_name(
+        f"{path.name}.corrupt.{stamp}.{uuid.uuid4().hex[:8]}"
+    )
+    shutil.copy2(path, backup)
+    return backup
+
+
 def _system_local_timezone():
     return datetime.now().astimezone().tzinfo
 
 
 def _load_unlocked(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"tasks": {}, "completed": []}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
+    except (OSError, json.JSONDecodeError, TypeError) as error:
+        backup = _preserve_corrupt_schedule(path)
+        raise TaskScheduleStateCorrupt(
+            f"task schedule unreadable; preserved={backup}: {type(error).__name__}"
+        ) from error
+    if (
+        not isinstance(data, dict)
+        or not isinstance(data.get("tasks", {}), dict)
+        or not isinstance(data.get("completed", []), list)
+    ):
+        backup = _preserve_corrupt_schedule(path)
+        raise TaskScheduleStateCorrupt(
+            f"task schedule invalid schema; preserved={backup}"
+        )
     data.setdefault("tasks", {})
     data.setdefault("completed", [])
     return data

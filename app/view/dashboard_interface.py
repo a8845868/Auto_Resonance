@@ -459,6 +459,9 @@ class DashboardInterface(ScrollArea):
 
     def _runDueTasks(self):
         """Wake scheduled tasks without keeping the queue worker blocked."""
+        # Retry durable FAILED_RETRYABLE handoffs on every bounded scheduler
+        # tick, so a transient schedule write failure does not require restart.
+        recover_startup_fatigue_schedules()
         if self.queueWorker is not None:
             return
         if bool(cfg.enableCodexSelfHealing.value):
