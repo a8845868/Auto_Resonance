@@ -13,6 +13,7 @@ from typing import Any
 STATE_PATH = Path("config/task_schedule.json")
 TASK_KEY_RUN_BUSINESS = "run_business"
 _STATE_LOCK = threading.RLock()
+SCHEMA_VERSION = 1
 
 
 class TaskScheduleStateCorrupt(RuntimeError):
@@ -34,9 +35,72 @@ def _system_local_timezone():
     return datetime.now().astimezone().tzinfo
 
 
+def _is_json_value(value: object) -> bool:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return True
+    if isinstance(value, list):
+        return all(_is_json_value(item) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _is_json_value(item) for key, item in value.items())
+    return False
+
+
+def _validate_task_timing(task_key: str, entry: object) -> None:
+    if not isinstance(entry, dict):
+        raise ValueError(f"tasks.{task_key} must be an object")
+    string_fields = {
+        "key", "name", "next_run", "last_run", "last_attempt",
+        "completed_at", "progress_at", "status",
+    }
+    for field in string_fields:
+        if field in entry and not isinstance(entry[field], str):
+            raise ValueError(f"tasks.{task_key}.{field} must be a string")
+    if "force_verify" in entry and not isinstance(entry["force_verify"], bool):
+        raise ValueError(f"tasks.{task_key}.force_verify must be a boolean")
+    if "result" in entry and not _is_json_value(entry["result"]):
+        raise ValueError(f"tasks.{task_key}.result must be JSON-safe")
+
+
+def _validate_completed_entry(index: int, entry: object) -> None:
+    if not isinstance(entry, dict):
+        raise ValueError(f"completed.{index} must be an object")
+    for field in (
+        "key", "name", "next_run", "last_run", "last_attempt",
+        "completed_at", "progress_at", "status",
+    ):
+        if field in entry and not isinstance(entry[field], str):
+            raise ValueError(f"completed.{index}.{field} must be a string")
+    if "force_verify" in entry and not isinstance(entry["force_verify"], bool):
+        raise ValueError(f"completed.{index}.force_verify must be a boolean")
+    if "result" in entry and not _is_json_value(entry["result"]):
+        raise ValueError(f"completed.{index}.result must be JSON-safe")
+
+
+def _validate_schedule_schema(data: object) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ValueError("schedule root must be an object")
+    version = data.get("schema_version", SCHEMA_VERSION)
+    if type(version) is not int or version != SCHEMA_VERSION:
+        raise ValueError("task schedule schema version is unsupported")
+    tasks = data.get("tasks", {})
+    completed = data.get("completed", [])
+    if not isinstance(tasks, dict) or not isinstance(completed, list):
+        raise ValueError("task schedule root collections are invalid")
+    for key, entry in tasks.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError("task schedule key must be a non-empty string")
+        _validate_task_timing(key, entry)
+    for index, entry in enumerate(completed):
+        _validate_completed_entry(index, entry)
+    data["schema_version"] = SCHEMA_VERSION
+    data.setdefault("tasks", {})
+    data.setdefault("completed", [])
+    return data
+
+
 def _load_unlocked(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return {"tasks": {}, "completed": []}
+        return {"schema_version": SCHEMA_VERSION, "tasks": {}, "completed": []}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, TypeError) as error:
@@ -44,21 +108,17 @@ def _load_unlocked(path: Path) -> dict[str, Any]:
         raise TaskScheduleStateCorrupt(
             f"task schedule unreadable; preserved={backup}: {type(error).__name__}"
         ) from error
-    if (
-        not isinstance(data, dict)
-        or not isinstance(data.get("tasks", {}), dict)
-        or not isinstance(data.get("completed", []), list)
-    ):
+    try:
+        return _validate_schedule_schema(data)
+    except (TypeError, ValueError) as error:
         backup = _preserve_corrupt_schedule(path)
         raise TaskScheduleStateCorrupt(
-            f"task schedule invalid schema; preserved={backup}"
-        )
-    data.setdefault("tasks", {})
-    data.setdefault("completed", [])
-    return data
+            f"task schedule invalid schema; preserved={backup}: {error}"
+        ) from error
 
 
 def _save_unlocked(state: dict[str, Any], path: Path) -> None:
+    _validate_schedule_schema(state)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(
         f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"

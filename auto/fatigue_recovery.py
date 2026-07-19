@@ -437,6 +437,8 @@ def run_daily_fatigue_recovery(
             fail_fatigue_checkpoint(
                 str(checkpoint["id"]),
                 f"{type(error).__name__}: {error}",
+                owner_id=owner_id,
+                lease_token=lease_token,
                 path=path,
             )
         raise

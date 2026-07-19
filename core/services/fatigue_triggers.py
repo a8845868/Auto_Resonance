@@ -22,6 +22,7 @@ from core.services.task_schedule_state import TASK_KEY_RUN_BUSINESS, set_next_ru
 
 STATE_PATH = RUNTIME_DIR / "fatigue-waypoints.json"
 _LOCK = threading.RLock()
+SCHEMA_VERSION = 1
 
 
 class FatigueActionState(str, Enum):
@@ -110,19 +111,77 @@ def _set_state(item: dict[str, Any], state: FatigueActionState) -> None:
     item["superseded"] = state is FatigueActionState.SUPERSEDED
 
 
+def _validate_checkpoint_action(index: int, item: object) -> None:
+    if not isinstance(item, dict):
+        raise ValueError(f"actions.{index} must be an object")
+    if not isinstance(item.get("id"), str) or not str(item.get("id", "")).strip():
+        raise ValueError(f"actions.{index}.id must be a non-empty string")
+    state = _state(item)
+    if state not in {value.value for value in FatigueActionState}:
+        raise ValueError(f"actions.{index}.state is unsupported")
+    string_fields = {
+        "trigger_type", "waypoint_id", "plan_revision", "source_plan_revision",
+        "cycle_id", "cycle_server_day", "owner_id", "lease_token", "claimed_at",
+        "lease_expires_at", "superseded_by", "parent_checkpoint_id",
+        "replaces_checkpoint_id", "schedule_status", "processing_outcome",
+    }
+    for field in string_fields:
+        if field in item and not isinstance(item[field], str):
+            raise ValueError(f"actions.{index}.{field} must be a string")
+    for field in ("claim_attempt", "revision"):
+        if field in item and type(item[field]) is not int:
+            raise ValueError(f"actions.{index}.{field} must be an integer")
+    for field in ("fired", "cancelled", "superseded"):
+        if field in item and not isinstance(item[field], bool):
+            raise ValueError(f"actions.{index}.{field} must be a boolean")
+    if "action_payload" in item and not isinstance(item["action_payload"], dict):
+        raise ValueError(f"actions.{index}.action_payload must be an object")
+    handoff = item.get("scheduler_handoff")
+    if handoff is not None:
+        if not isinstance(handoff, dict):
+            raise ValueError(f"actions.{index}.scheduler_handoff must be an object")
+        if not isinstance(handoff.get("state", ""), str):
+            raise ValueError(f"actions.{index}.scheduler_handoff.state must be a string")
+        if "attempts" in handoff and type(handoff["attempts"]) is not int:
+            raise ValueError(f"actions.{index}.scheduler_handoff.attempts must be an integer")
+    if state == FatigueActionState.CLAIMED.value:
+        for field in ("owner_id", "lease_token", "lease_expires_at"):
+            if not isinstance(item.get(field), str) or not str(item[field]).strip():
+                raise ValueError(f"actions.{index}.{field} is required while CLAIMED")
+
+
+def _validate_checkpoint_schema(data: object) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ValueError("checkpoint root must be an object")
+    version = data.get("schema_version", SCHEMA_VERSION)
+    if type(version) is not int or version != SCHEMA_VERSION:
+        raise ValueError("checkpoint schema version is unsupported")
+    actions = data.get("actions", [])
+    if not isinstance(actions, list):
+        raise ValueError("checkpoint actions must be a list")
+    if "server_day_id" in data and not isinstance(data["server_day_id"], str):
+        raise ValueError("checkpoint server_day_id must be a string")
+    for index, item in enumerate(actions):
+        _validate_checkpoint_action(index, item)
+    data["schema_version"] = SCHEMA_VERSION
+    data.setdefault("server_day_id", SERVER_CLOCK.server_day_id())
+    data.setdefault("actions", [])
+    return data
+
+
 def _read(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return {"server_day_id": SERVER_CLOCK.server_day_id(), "actions": []}
+        return {"schema_version": SCHEMA_VERSION, "server_day_id": SERVER_CLOCK.server_day_id(), "actions": []}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, TypeError, ValueError) as error:
         _preserve_corrupt_state(path)
         raise CheckpointStateCorrupt(f"checkpoint state unreadable: {type(error).__name__}") from error
-    if not isinstance(data, dict) or not isinstance(data.get("actions", []), list):
+    try:
+        data = _validate_checkpoint_schema(data)
+    except (TypeError, ValueError) as error:
         _preserve_corrupt_state(path)
-        raise CheckpointStateCorrupt("checkpoint state has invalid schema")
-    data.setdefault("server_day_id", SERVER_CLOCK.server_day_id())
-    data.setdefault("actions", [])
+        raise CheckpointStateCorrupt(f"checkpoint state has invalid schema: {error}") from error
     current_day = SERVER_CLOCK.server_day_id()
     if data["server_day_id"] != current_day:
         previous_day = str(data["server_day_id"])
@@ -165,6 +224,7 @@ def _preserve_corrupt_state(path: Path) -> Path | None:
 
 
 def _write(path: Path, data: dict[str, Any]) -> None:
+    _validate_checkpoint_schema(data)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     with temporary.open("w", encoding="utf-8") as stream:
@@ -593,12 +653,35 @@ def recover_stale_claim(
         return dict(item)
 
 
-def acknowledge_fatigue_checkpoint(action_id: str, *, path: Path = STATE_PATH) -> dict[str, Any]:
+def _require_active_lease(
+    item: dict[str, Any], *, owner_id: str, lease_token: str
+) -> None:
+    if not owner_id or not lease_token:
+        raise RuntimeError("checkpoint transition requires owner and lease token")
+    if _state(item) != FatigueActionState.CLAIMED.value:
+        raise RuntimeError("checkpoint transition requires CLAIMED state")
+    if str(item.get("owner_id", "")) != str(owner_id):
+        raise RuntimeError("fatigue checkpoint owner mismatch")
+    if str(item.get("lease_token", "")) != str(lease_token):
+        raise RuntimeError("fatigue checkpoint lease token mismatch")
+    try:
+        expires = datetime.fromisoformat(str(item.get("lease_expires_at", "")))
+    except ValueError as error:
+        raise RuntimeError("fatigue checkpoint lease expiry is invalid") from error
+    if SERVER_CLOCK.server_now() > expires:
+        raise RuntimeError("fatigue checkpoint lease expired; explicit recovery required")
+
+
+def acknowledge_fatigue_checkpoint(
+    action_id: str, *, owner_id: str, lease_token: str,
+    path: Path = STATE_PATH,
+) -> dict[str, Any]:
     with _LOCK:
         data = _read(path)
         item = next((item for item in data["actions"] if str(item.get("id")) == str(action_id)), None)
-        if item is None or _state(item) != FatigueActionState.CLAIMED.value:
-            raise RuntimeError("only a claimed fatigue checkpoint can be acknowledged")
+        if item is None:
+            raise RuntimeError("fatigue checkpoint not found")
+        _require_active_lease(item, owner_id=owner_id, lease_token=lease_token)
         _set_state(item, FatigueActionState.ACKNOWLEDGED)
         item["acknowledged_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
         _write(path, data)
@@ -609,6 +692,8 @@ def fail_fatigue_checkpoint(
     action_id: str,
     reason: str,
     *,
+    owner_id: str,
+    lease_token: str,
     max_attempts: int = 3,
     path: Path = STATE_PATH,
 ) -> dict[str, Any]:
@@ -617,6 +702,7 @@ def fail_fatigue_checkpoint(
         item = next((item for item in data["actions"] if str(item.get("id")) == str(action_id)), None)
         if item is None:
             raise RuntimeError("fatigue checkpoint not found")
+        _require_active_lease(item, owner_id=owner_id, lease_token=lease_token)
         attempts = int(item.get("claim_attempt", 0))
         if attempts >= max(1, int(max_attempts)):
             _set_state(item, FatigueActionState.MANUAL_BLOCKED)
@@ -628,6 +714,41 @@ def fail_fatigue_checkpoint(
         item["failed_at"] = SERVER_CLOCK.server_now().isoformat(timespec="seconds")
         _write(path, data)
         return dict(item)
+
+
+def complete_checkpoint(
+    action_id: str, result: dict[str, Any], *, owner_id: str,
+    lease_token: str, path: Path = STATE_PATH,
+) -> dict[str, Any]:
+    return complete_fatigue_checkpoint_processing(
+        action_id, result, owner_id=owner_id, lease_token=lease_token, path=path
+    )
+
+
+def fail_checkpoint(
+    action_id: str, reason: str, *, owner_id: str, lease_token: str,
+    max_attempts: int = 3, path: Path = STATE_PATH,
+) -> dict[str, Any]:
+    return fail_fatigue_checkpoint(
+        action_id, reason, owner_id=owner_id, lease_token=lease_token,
+        max_attempts=max_attempts, path=path,
+    )
+
+
+def transfer_checkpoint(
+    action_id: str, intent: CheckpointTransferIntent | dict[str, Any], *,
+    owner_id: str, lease_token: str, path: Path = STATE_PATH,
+) -> dict[str, Any]:
+    raw = asdict(intent) if isinstance(intent, CheckpointTransferIntent) else dict(intent)
+    result = {
+        "success": True,
+        "deferred": True,
+        "status": "DEFER_UNTIL_WAYPOINT",
+        "transfer_intent": raw,
+    }
+    return complete_fatigue_checkpoint_processing(
+        action_id, result, owner_id=owner_id, lease_token=lease_token, path=path
+    )
 
 
 def checkpoint_processing_outcome(result: dict[str, Any]) -> CheckpointProcessingOutcome:
