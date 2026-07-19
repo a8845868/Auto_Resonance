@@ -60,9 +60,11 @@ def test_probe_canaries_are_not_reported_as_live_blocked_actions():
     guard = read_only_policy.ReadOnlyActionGuard(Mock())
     canaries = probe.run_policy_canaries(guard)
     report = probe.policy_report(guard, policy_canary_results=canaries)
-    assert {item["action_key"] for item in report["policy_canary_results"]} == {
-        "transaction_buy", "reward_claim", "fatigue_confirm",
-    }
+    keys = {item["action_key"] for item in report["policy_canary_results"]}
+    assert {"transaction_buy", "reward_claim", "fatigue_confirm"} <= keys
+    assert {
+        "guard_public_api", "daily_horizontal_scroll", "reward_back"
+    } <= keys
     assert report["live_action_journal"] == []
     assert report["actual_blocked_production_actions"] == []
 
