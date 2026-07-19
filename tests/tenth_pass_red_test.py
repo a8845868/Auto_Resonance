@@ -110,6 +110,9 @@ def test_one_use_permit_is_consumed_atomically_by_concurrent_callers(monkeypatch
 
 
 def test_ratio_half_does_not_map_outside_logical_point_into_anchor(monkeypatch):
+    monkeypatch.setattr(
+        control_module, "_validate_production_session", lambda _policy: None
+    )
     guard, _issuer = _guard(_observation(anchor_bbox=(20, 10, 130, 85)))
     taps: list[tuple[int, int]] = []
     monkeypatch.setattr(

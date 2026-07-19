@@ -295,8 +295,11 @@ def test_executor_is_bound_to_exact_backend_object(monkeypatch):
     assert backend_b.taps == []
 
 
-def test_out_of_order_policy_context_exit_cannot_disable_active_guard():
+def test_out_of_order_policy_context_exit_cannot_disable_active_guard(monkeypatch):
     assert hasattr(control_module, "activate_action_policy")
+    monkeypatch.setattr(
+        control_module, "_validate_production_session", lambda _policy: None
+    )
     a, _ia, _ea = _legacy_guard([_observation("a")])
     b, _ib, _eb = _legacy_guard([_observation("b")])
     token_a = control_module.activate_action_policy(a)
@@ -310,6 +313,9 @@ def test_out_of_order_policy_context_exit_cannot_disable_active_guard():
 
 def test_read_only_mode_never_falls_back_to_legacy_input(monkeypatch):
     assert hasattr(control_module, "activate_action_policy")
+    monkeypatch.setattr(
+        control_module, "_validate_production_session", lambda _policy: None
+    )
     backend = _Executor()
     monkeypatch.setattr(control_module, "control", backend)
     guard, _issuer, _executor = _legacy_guard([_observation("a")])
