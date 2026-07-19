@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "source": "sanitized live-state replay; no image or account identifiers",
+  "frames": [
+    {
+      "state": "HOME",
+      "fingerprint": "home-visit-city-v1",
+      "fame_score": 0.800,
+      "ocr": [
+        {"text": "访问城市", "bbox": [1080, 450, 1260, 535]},
+        {"text": "启程", "bbox": [1140, 630, 1270, 715]},
+        {"text": "作战终端", "bbox": [1090, 360, 1260, 445]}
+      ]
+    },
+    {
+      "state": "NPC_DIALOGUE",
+      "fingerprint": "npc-dialogue-v1",
+      "fame_score": 0.801,
+      "ocr": [
+        {"text": "你想要什么？", "bbox": [190, 375, 570, 535]}
+      ]
+    },
+    {
+      "state": "CITY_MAP",
+      "fingerprint": "city-map-v1",
+      "fame_score": 0.802,
+      "ocr": [
+        {"text": "当前城市", "bbox": [80, 60, 260, 120]},
+        {"text": "交易所", "bbox": [760, 180, 950, 260]},
+        {"text": "商会", "bbox": [760, 300, 950, 380]}
+      ]
+    }
+  ]
+}
