@@ -125,8 +125,11 @@ def minimize_audit_journal(entry: dict) -> dict:
     marker_hash = hashlib.sha256(context.encode("utf-8")).hexdigest()[:16]
     allowed = {
         "timestamp", "action_key", "observation_id", "screenshot_hash",
-        "page_classifier", "anchor_key", "anchor_bbox", "permit_id",
-        "correlation_id", "coordinate", "final_trajectory", "allowed", "reason",
+        "page_classifier", "anchor_key", "anchor_bbox", "anchor_source",
+        "permit_id", "permit_digest", "correlation_id", "coordinate",
+        "final_trajectory", "logical_trajectory", "physical_trajectory",
+        "coordinate_space", "geometry_revision", "registry_registered",
+        "permit_uses", "permit_max_uses", "allowed", "reason",
     }
     minimized = {key: value for key, value in entry.items() if key in allowed}
     minimized["marker_hash"] = str(entry.get("marker_hash") or marker_hash)
