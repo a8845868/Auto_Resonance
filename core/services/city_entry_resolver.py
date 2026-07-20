@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from enum import Enum
 from typing import Callable, Iterable
@@ -64,6 +64,20 @@ class CityEntryTraceEvent:
 
 
 @dataclass(frozen=True)
+class CityEntryActionRecord:
+    action_id: str
+    correlation_id: str
+    action_key: str
+    requested: bool
+    approved: bool
+    executed: bool
+    observed: bool
+    verified: bool
+    guard_result: str
+    final_reason: str
+
+
+@dataclass(frozen=True)
 class CityEntryResult:
     state: CityEntryState
     status: str
@@ -76,12 +90,16 @@ class CityEntryResult:
     page_fingerprint: str
     trace: tuple[CityEntryTraceEvent, ...]
     correlation_id: str
+    action_journal: tuple[CityEntryActionRecord, ...]
     irreversible_actions: int = 0
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
         payload["state"] = self.state.value
         payload["trace"] = [asdict(event) for event in self.trace]
+        payload["action_journal"] = [
+            asdict(record) for record in self.action_journal
+        ]
         return payload
 
 
@@ -172,6 +190,8 @@ def observe_city_entry_frame(
         dangerous_reason = "PURCHASE_PAGE_BLOCKED"
     elif _contains(texts, ("使用道具", "确认消耗", "使用便当", "使用气泡水")):
         dangerous_reason = "CONSUMABLE_PAGE_BLOCKED"
+    elif _contains(texts, ("活动详情", "活动说明", "活动窗口", "活动公告")):
+        dangerous_reason = "OVERLAY_BLOCKED"
     elif _contains(texts, ("触碰空白区域退出", "未知弹窗")):
         dangerous_reason = "UNKNOWN_OVERLAY_BLOCKED"
     elif _contains(texts, ("你想要什么", "什么都行", "NPC对话")):
@@ -275,6 +295,7 @@ class CityEntryResolver:
             "PURCHASE_PAGE_BLOCKED",
             "CONSUMABLE_PAGE_BLOCKED",
             "UNKNOWN_OVERLAY_BLOCKED",
+            "OVERLAY_BLOCKED",
             "NPC_DIALOG_BLOCKED",
         }
     )
@@ -307,6 +328,7 @@ class CityEntryResolver:
             "CITYENTRY-%Y%m%d-%H%M%S"
         )
         self.initial_observation = initial_observation
+        self._action_records: dict[str, CityEntryActionRecord] = {}
 
     def _resolve_execution(self, raw: object) -> CityEntryExecution:
         if isinstance(raw, CityEntryExecution):
@@ -329,6 +351,20 @@ class CityEntryResolver:
         action_executed = False
         trace: list[CityEntryTraceEvent] = []
         last: CityEntryObservation | None = self.initial_observation
+
+        def capture_observation() -> tuple[CityEntryObservation | None, str]:
+            try:
+                frame = self.frame_provider()
+            except Exception as error:  # noqa: BLE001 - fail closed by type
+                return None, f"CAPTURE_FAILED:{type(error).__name__}"
+            if frame is None:
+                return None, "GAME_WINDOW_UNAVAILABLE"
+            if not isinstance(frame, list) and not hasattr(frame, "ocr"):
+                return None, "GAME_WINDOW_UNAVAILABLE"
+            try:
+                return observe_city_entry_frame(frame, now=self.now), ""
+            except Exception as error:  # noqa: BLE001 - no runtime retry
+                return None, f"CAPTURE_FAILED:{type(error).__name__}"
 
         def record(
             observation: CityEntryObservation,
@@ -374,12 +410,16 @@ class CityEntryResolver:
                 page_fingerprint=last.page_fingerprint if last else "",
                 trace=tuple(trace),
                 correlation_id=self.correlation_id,
+                action_journal=tuple(self._action_records.values()),
             )
 
         if self.monotonic() >= deadline:
             return finish(CityEntryState.TIMEOUT, "BLOCKED", "navigation_timeout")
         if last is None:
-            last = observe_city_entry_frame(self.frame_provider(), now=self.now)
+            last, capture_error = capture_observation()
+            if capture_error:
+                return finish(CityEntryState.FAILED, "FAILED", capture_error)
+            assert last is not None
         attempts += 1
         record(last)
 
@@ -397,7 +437,7 @@ class CityEntryResolver:
                 return finish(
                     CityEntryState.UNKNOWN,
                     "BLOCKED",
-                    last.reason,
+                    f"invalid_source_state:{last.state.value}",
                 )
             bounds = last.anchor_bbox
             action_key = "city_entry_navigation"
@@ -421,6 +461,35 @@ class CityEntryResolver:
             target = "top_left_back"
             expected = "HOME_READY"
 
+        action_id = f"{self.correlation_id}:{mode}"
+        previous = self._action_records.get(action_id)
+        if previous is not None and previous.executed:
+            record(
+                last,
+                action=action_key,
+                guard_result="NOT_REQUESTED",
+                postcondition=expected,
+                status="BLOCKED",
+                reason="duplicate_action_prevented",
+            )
+            return finish(
+                CityEntryState.FAILED,
+                "BLOCKED",
+                "duplicate_action_prevented",
+            )
+
+        self._action_records[action_id] = CityEntryActionRecord(
+            action_id=action_id,
+            correlation_id=self.correlation_id,
+            action_key=action_key,
+            requested=True,
+            approved=False,
+            executed=False,
+            observed=False,
+            verified=False,
+            guard_result="PENDING",
+            final_reason="action_requested",
+        )
         action_count += 1
         try:
             execution = self._resolve_execution(
@@ -437,6 +506,17 @@ class CityEntryResolver:
             execution = CityEntryExecution(False, False, type(error).__name__)
         action_allowed = execution.allowed
         action_executed = execution.executed
+        self._action_records[action_id] = replace(
+            self._action_records[action_id],
+            approved=execution.allowed,
+            executed=execution.executed,
+            guard_result=execution.guard_result,
+            final_reason=(
+                "execution_completed"
+                if execution.executed
+                else "execution_not_performed"
+            ),
+        )
         record(
             last,
             state=CityEntryState.CITY_ENTRY_CONFIRMING,
@@ -467,8 +547,20 @@ class CityEntryResolver:
             )
             if self.monotonic() >= deadline:
                 break
-            last = observe_city_entry_frame(self.frame_provider(), now=self.now)
+            last, capture_error = capture_observation()
+            if capture_error:
+                self._action_records[action_id] = replace(
+                    self._action_records[action_id],
+                    final_reason=capture_error,
+                )
+                return finish(CityEntryState.FAILED, "FAILED", capture_error)
+            assert last is not None
             attempts += 1
+            self._action_records[action_id] = replace(
+                self._action_records[action_id],
+                observed=True,
+                final_reason="post_action_observed",
+            )
             same_frame = bool(
                 last.screenshot_hash and last.screenshot_hash == last_hash
             )
@@ -481,6 +573,11 @@ class CityEntryResolver:
                 record(last, status="BLOCKED", reason=last.reason)
                 return finish(CityEntryState.UNKNOWN, "BLOCKED", last.reason)
             if mode == "enter" and last.state is CityEntryState.CITY_DETAIL:
+                self._action_records[action_id] = replace(
+                    self._action_records[action_id],
+                    verified=True,
+                    final_reason="city_detail_verified",
+                )
                 record(
                     last,
                     postcondition="CITY_DETAIL",
@@ -496,6 +593,11 @@ class CityEntryResolver:
                 CityEntryState.HOME_READY,
                 CityEntryState.CITY_ENTRY_VISIBLE,
             }:
+                self._action_records[action_id] = replace(
+                    self._action_records[action_id],
+                    verified=True,
+                    final_reason="home_ready_restored",
+                )
                 record(
                     last,
                     state=CityEntryState.HOME_READY,
@@ -558,6 +660,7 @@ class CityEntryResolver:
 
 
 __all__ = [
+    "CityEntryActionRecord",
     "CityEntryExecution",
     "CityEntryObservation",
     "CityEntryResolver",
