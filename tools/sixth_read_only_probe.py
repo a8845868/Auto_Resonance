@@ -173,6 +173,26 @@ def _classify_page(texts: list[str]) -> tuple[str, list[str]]:
 def _classify_observed_items(items: list[dict]) -> tuple[str, list[str]]:
     texts = [str(item.get("text", "")).replace(" ", "") for item in items]
     page_type, markers = _classify_page(texts)
+    session_entry_markers = (
+        "点击任意位置进入游戏",
+        "点击屏幕进入游戏",
+        "继续游戏",
+        "开始游戏",
+    )
+    session_forbidden_markers = (
+        "输入账号", "请输入账号", "账号登录", "输入密码", "请输入密码",
+        "验证码", "获取验证码", "第三方授权", "授权确认", "账号绑定",
+        "确认购买", "确认支付", "领取奖励",
+    )
+    has_session_entry = any(
+        marker in text for text in texts for marker in session_entry_markers
+    )
+    has_session_forbidden = any(
+        marker in text for text in texts for marker in session_forbidden_markers
+    )
+    if has_session_entry and not has_session_forbidden:
+        page_type = "session_ready"
+        markers = ["session_ready", "existing_session_entry"]
     city = observe_city_frame(items)
     city_page_types = {
         ReadOnlyCityNavigationState.HOME_READY: "home",
@@ -305,6 +325,16 @@ def _trusted_observation() -> TrustedFrameEvidence:
         bounds = _bbox(item)
         if bounds is None:
             continue
+        if page_type == "session_ready" and any(
+            marker in text_value
+            for marker in (
+                "点击任意位置进入游戏",
+                "点击屏幕进入游戏",
+                "继续游戏",
+                "开始游戏",
+            )
+        ):
+            anchors.append(ObservedAnchor("session_entry", text_value, bounds))
         if "我要买" in text_value:
             anchors.append(ObservedAnchor("buy_navigation", text_value, bounds))
         if "我要卖" in text_value:
