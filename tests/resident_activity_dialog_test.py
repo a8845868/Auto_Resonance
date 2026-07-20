@@ -24,4 +24,9 @@ def test_go_home_handles_clarity_replenish_dialog_without_name_error():
     driver.tap = Mock()
 
     assert driver.go_home() is True
-    driver.tap.assert_called_once_with((333, 512))
+    driver.tap.assert_called_once_with(
+        (333, 512),
+        action_key="dialog_cancel",
+        anchor_key="cancel",
+        page_id="clarity_dialog",
+    )

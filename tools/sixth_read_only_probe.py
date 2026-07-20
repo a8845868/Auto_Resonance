@@ -21,7 +21,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from auto import exchange_navigation  # noqa: E402
-from auto.module.strength import read_strength  # noqa: E402
+from auto.module.strength import (  # noqa: E402
+    _open_fatigue_panel,
+    observe_fatigue_frame,
+    read_strength,
+)
+from auto.resident_activity import ResidentActivityAutomation  # noqa: E402
 from auto.reward_collection import RewardCollector, RewardDriver  # noqa: E402
 from core.control.control import (  # noqa: E402
     connect_adb,
@@ -69,13 +74,18 @@ def _capture(output: Path, name: str) -> dict:
     frame = Image(envelope.frame)
     image_path = output / f"{name}.png"
     cv.imwrite(str(image_path), frame.image)
+    items = list(frame.ocr())
+    page_type, markers = _classify_page(
+        [str(item.get("text", "")).replace(" ", "") for item in items]
+    )
     payload = {
         "name": name,
         "captured_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
         "image": image_path.name,
         "sha256": hashlib.sha256(image_path.read_bytes()).hexdigest(),
         "shape": list(frame.image.shape),
-        "ocr": _jsonable(frame.ocr()),
+        "page_type": page_type,
+        "markers": markers,
     }
     (output / f"{name}.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
@@ -97,6 +107,12 @@ def _classify_page(texts: list[str]) -> tuple[str, list[str]]:
     """Classify specific transactional pages before their generic menu shell."""
 
     joined = "|".join(texts)
+    if any(marker in joined for marker in ("每日签到奖励", "签到奖励", "签到")):
+        return "checkin_overlay", ["checkin_overlay"]
+    if any(marker in joined for marker in ("公告", "资讯")):
+        return "announcement_overlay", ["announcement_overlay"]
+    if "触碰空白区域退出" in joined:
+        return "unknown_overlay", ["unknown_overlay"]
     buy_features = {
         marker for marker in ("预计买入", "买入总价", "载货量", "买入")
         if marker in joined
@@ -123,6 +139,8 @@ def _classify_page(texts: list[str]) -> tuple[str, list[str]]:
         return "manual_tasks", ["manual_tasks"]
     if "环游手册" in joined:
         return "manual_track", ["manual_track"]
+    if any(marker in joined for marker in ("恢复疲劳值方式", "疲劳值恢复", "FATIGUE")):
+        return "fatigue_info", ["fatigue_info"]
     if any(marker in joined for marker in ("我要买", "我要卖")):
         return "exchange", ["exchange_menu"]
     if any(marker in joined for marker in ("你想要什么", "研究报告", "什么都行")):
@@ -465,9 +483,51 @@ def _run_probe(
         "adb_port": args.adb_port,
         "captures": [],
     }
-    if not _return_home_safely(driver, attempt_limit=8):
-        raise RuntimeError("cannot reach game home safely")
+    initial_capture = _capture(output, "initial-state")
+    result["captures"].append(initial_capture)
+    result["initial_page"] = initial_capture.get("page_type", "unknown")
+    home_navigation_ok = True
+    if (
+        isinstance(guard, ReadOnlyActionGuard)
+        and result["initial_page"] not in {"home", "hud"}
+    ):
+        home_navigation_ok = bool(driver.go_home(attempt_limit=45))
+    if not home_navigation_ok or not _return_home_safely(driver, attempt_limit=8):
+        blocked_capture = _capture(output, "home-blocked")
+        result["captures"].append(blocked_capture)
+        blocked_page = blocked_capture.get("page_type", "unknown")
+        blocked_reason = {
+            "checkin_overlay": "checkin_overlay_observed_no_click",
+            "announcement_overlay": "announcement_overlay_observed_no_click",
+            "unknown_overlay": "unknown_overlay_observed_no_click",
+        }.get(blocked_page, "cannot_reach_game_home_safely")
+        result.update({
+            "acceptance_status": "BLOCKED",
+            "blocked_stage": "home_navigation",
+            "blocked_reason": blocked_reason,
+            "blocked_page": blocked_page,
+        })
+        result.update(policy_report(guard, policy_canary_results=policy_canaries))
+        result["prohibited_actions_invoked"] = [
+            entry["action_key"] for entry in result["actual_blocked_production_actions"]
+        ]
+        return result
     result["captures"].append(_capture(output, "home-before"))
+
+    result["resident_activity"] = {"success": False, "scope": "not_run"}
+    result["fatigue_observation"] = None
+    # Unit tests use a small journal stub; device-only observations must remain
+    # excluded from deterministic test execution.
+    if isinstance(guard, ReadOnlyActionGuard):
+        resident = ResidentActivityAutomation()
+        result["resident_activity"] = {
+            "success": bool(resident.driver.go_home()),
+            "scope": "go_home_readonly_chain",
+        }
+        if _return_home_safely(driver, attempt_limit=8) and _open_fatigue_panel():
+            result["fatigue_observation"] = _jsonable(observe_fatigue_frame())
+            result["captures"].append(_capture(output, "fatigue-observation"))
+            result["fatigue_home_returned"] = _return_home_safely(driver, attempt_limit=8)
 
     buy = exchange_navigation.open_exchange_action(
         exchange_navigation.ExchangeAction.BUY, read_only=True
@@ -604,12 +664,55 @@ def main() -> int:
             result["blocked_reason"] = (
                 f"shareable_live_evidence_failed:{type(error).__name__}:{error}"
             )
+    live_entries = [asdict(entry) for entry in guard.journal]
+    irreversible_actions = sum(
+        1 for entry in live_entries
+        if entry.get("action_key") in guard.BLOCKED_ACTIONS
+        and entry.get("side_effect_occurred")
+    )
+    overall = str(result.get("acceptance_status", "UNKNOWN")).upper()
+    exact_live_result = {
+        "correlation_id": datetime.now().astimezone().strftime("READONLY-%Y%m%d-%H%M%S"),
+        "instance": "0",
+        "backend_generation": (
+            live_entries[-1].get("backend_generation") if live_entries else None
+        ),
+        "status": overall if overall in {"PASS", "BLOCKED", "UNKNOWN", "FAILED"} else "UNKNOWN",
+        "reason": result.get("blocked_reason", "validation_completed"),
+        "scenarios": {
+            "HOME": (
+                "PASS" if any(
+                    capture.get("page_type") in {"home", "hud"}
+                    for capture in result.get("captures", ())
+                ) else "BLOCKED"
+            ),
+            "Resident Activity": (
+                "PASS" if result.get("resident_activity", {}).get("success") else "BLOCKED"
+            ),
+            "BUY": "PASS" if result.get("buy_navigation", {}).get("success") else "BLOCKED",
+            "SELL": "PASS" if result.get("sell_navigation", {}).get("success") else "BLOCKED",
+            "fatigue": (
+                str(result.get("fatigue_observation", {}).get("status", "BLOCKED"))
+                if result.get("fatigue_observation") else "BLOCKED"
+            ),
+            "daily": (
+                "PASS" if result.get("daily_activity", {}).get("confidence") == "HIGH"
+                else "UNKNOWN" if result.get("daily_activity") else "BLOCKED"
+            ),
+            "manual": "PASS" if result.get("manual") else "BLOCKED",
+        },
+        "irreversible_actions": irreversible_actions,
+    }
+    (output / "LIVE_VALIDATION_RESULT.json").write_text(
+        json.dumps(exact_live_result, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     (output / "read-only-result.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
     print(json.dumps({
-        "output": str(output),
+        "output": output.name,
         "acceptance_status": result.get("acceptance_status", "UNKNOWN"),
         "buy_success": bool(result.get("buy_navigation", {}).get("success")),
         "sell_success": bool(result.get("sell_navigation", {}).get("success")),

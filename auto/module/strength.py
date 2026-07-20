@@ -1,6 +1,8 @@
 import re
 import time
+import hashlib
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal, Optional
 
 from loguru import logger
@@ -30,6 +32,18 @@ class RestAreaRecovery:
     used: int = 0
 
 
+@dataclass(frozen=True)
+class FatigueObservation:
+    current: int | None
+    maximum: int | None
+    confidence: str
+    source: str
+    screenshot_hash: str
+    captured_at: datetime
+    status: str
+    reason: str = ""
+
+
 def input_tap(
     pos: tuple[int, int],
     *,
@@ -52,18 +66,61 @@ def input_tap(
     )
 
 
-def read_strength() -> Optional[Strength]:
-    """Read current/max fatigue from any screen that displays ``123/816``."""
+def _strength_candidates(items: list[dict]) -> list[tuple[float, int, int]]:
     candidates = []
-    for item in screenshot().ocr():
-        match = re.search(r"(\d+)\s*/\s*(\d+)", item["text"])
+    for item in items:
+        match = re.search(r"(\d+)\s*/\s*(\d+)", str(item.get("text", "")))
         if match:
             current, maximum = map(int, match.groups())
-            position = item["position"]
+            position = item.get("position") or ()
+            if len(position) < 3:
+                continue
             center_x = (position[0][0] + position[2][0]) / 2
             center_y = (position[0][1] + position[2][1]) / 2
-            if center_y < 100 and 500 <= maximum <= 2000:
+            if center_y < 100 and 0 <= current <= maximum and 500 <= maximum <= 2000:
                 candidates.append((center_x, current, maximum))
+    return candidates
+
+
+def observe_fatigue_frame(
+    frame=None, *, captured_at: datetime | None = None,
+) -> FatigueObservation:
+    """Observe the fatigue panel; never infer a missing value or maximum."""
+
+    frame = frame or screenshot()
+    items = list(frame.ocr())
+    captured = captured_at or datetime.now().astimezone()
+    image = getattr(frame, "image", None)
+    screenshot_hash = (
+        hashlib.sha256(image.tobytes()).hexdigest()
+        if image is not None else ""
+    )
+    joined = "|".join(str(item.get("text", "")).replace(" ", "") for item in items)
+    page_visible = any(
+        marker in joined
+        for marker in ("恢复疲劳值方式", "疲劳值恢复", "FATIGUE")
+    )
+    candidates = _strength_candidates(items)
+    if not page_visible:
+        return FatigueObservation(
+            None, None, "UNKNOWN", "screen_ocr", screenshot_hash, captured,
+            "BLOCKED", "fatigue_page_not_confirmed",
+        )
+    if not candidates:
+        return FatigueObservation(
+            None, None, "UNKNOWN", "screen_ocr", screenshot_hash, captured,
+            "UNKNOWN", "fatigue_ratio_not_observed",
+        )
+    _, current, maximum = max(candidates, key=lambda item: item[0])
+    return FatigueObservation(
+        current, maximum, "HIGH", "ocr_top_hud_ratio", screenshot_hash, captured,
+        "PASS", "fatigue_ratio_confirmed",
+    )
+
+
+def read_strength() -> Optional[Strength]:
+    """Read current/max fatigue from any screen that displays ``123/816``."""
+    candidates = _strength_candidates(list(screenshot().ocr()))
     # Cargo is also rendered as x/y, immediately to the left of fatigue.
     if not candidates:
         return None

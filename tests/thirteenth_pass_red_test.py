@@ -258,7 +258,7 @@ def test_go_outlets_does_not_continue_after_city_failure(monkeypatch):
     assert selected
     assert ocr_calls[0][1]["cropped_pos1"] == (160, 40)
     assert ocr_calls[0][1]["cropped_pos2"] == (1000, 500)
-    assert ocr_calls[0][1]["excursion_pos"] == (0, 80)
+    assert ocr_calls[0][1]["excursion_pos"] == (0, 0)
 
 
 def test_blurry_ocr_click_propagates_guard_denial(monkeypatch):

@@ -42,6 +42,8 @@ class CityNavigationState(str, Enum):
     HUD = "HUD"
     CITY_ENTRY_AVAILABLE = "CITY_ENTRY_AVAILABLE"
     CITY_MAP = "CITY_MAP"
+    CITY_DETAIL = "CITY_DETAIL"
+    NPC_DIALOG = "NPC_DIALOG"
     NPC_DIALOGUE = "NPC_DIALOGUE"
     EXCHANGE_MENU = "EXCHANGE_MENU"
     EXCHANGE_BUY = "EXCHANGE_BUY"
@@ -547,7 +549,7 @@ def _city_frame_observation(frame) -> CityFrameObservation:
     elif "我要买" in joined and "我要卖" in joined:
         state = CityNavigationState.EXCHANGE_MENU
     elif any(marker in joined for marker in ("你想要什么", "研究报告", "什么都行")):
-        state = CityNavigationState.NPC_DIALOGUE
+        state = CityNavigationState.NPC_DIALOG
     elif (
         sum(marker in joined for marker in (
             "当前城市", "城市设施", "城市手册", "城市发展度", "CITY",
@@ -557,6 +559,10 @@ def _city_frame_observation(frame) -> CityFrameObservation:
         )) >= 1
     ):
         state = CityNavigationState.CITY_MAP
+    elif sum(marker in joined for marker in (
+        "当前城市", "城市详情", "城市发展度", "CITY",
+    )) >= 2:
+        state = CityNavigationState.CITY_DETAIL
     elif anchor is not None and any(marker in joined for marker in ("启程", "作战终端", "整备列车")):
         state = CityNavigationState.HOME
     elif any(marker in joined for marker in ("启程", "作战终端", "整备列车")):
@@ -588,7 +594,7 @@ def go_city(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     cancellation: Callable[[], bool] | None = None,
-    max_attempts: int = 6, timeout: float = 20.0, stall_frames: int = 2,
+    max_attempts: int = 10, timeout: float = 30.0, stall_frames: int = 5,
 ):
     """
     说明:
@@ -631,7 +637,8 @@ def go_city(
         if state is CityNavigationState.CITY_MAP:
             return finish(state, True, "city_map_verified")
         if state in {
-            CityNavigationState.NPC_DIALOGUE, CityNavigationState.EXCHANGE_MENU,
+            CityNavigationState.NPC_DIALOG, CityNavigationState.NPC_DIALOGUE,
+            CityNavigationState.CITY_DETAIL, CityNavigationState.EXCHANGE_MENU,
             CityNavigationState.EXCHANGE_BUY, CityNavigationState.EXCHANGE_SELL,
             CityNavigationState.STARTUP_OVERLAY, CityNavigationState.UNKNOWN,
         }:
@@ -702,7 +709,10 @@ def go_outlets(
         result = ocr_click(
             name,
             cropped_pos1=(160, 40), cropped_pos2=(1000, 500),
-            excursion_pos=(0, 80), log=False, score=0.3,
+            # The read-only permit is bound to the observed label bounding box.
+            # An historical +80 px offset left that evidence and was correctly
+            # denied by the guard on the real city map.
+            excursion_pos=(0, 0), log=False, score=0.3,
             action_key="navigation_anchor", page_id="city_outlets",
             trynum=1,
         )

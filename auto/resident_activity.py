@@ -13,10 +13,13 @@ from loguru import logger
 
 from core.control.control import connect, input_swipe, input_tap, screenshot
 from core.control.adb_port import EmulatorInfo, get_adb_port
+from core.services.read_only_policy import ActionIntent
 from core.services.screen_state import (
     RESOURCE_DOWNLOAD_CONFIRM_TAP,
     RESOURCE_DOWNLOAD_WAIT_ATTEMPTS,
     clarity_replenish_cancel_position,
+    ResidentHomeState,
+    resident_home_state,
     startup_screen_action,
 )
 
@@ -153,8 +156,23 @@ class ScreenDriver:
     def texts(self) -> list[dict]:
         return screenshot().ocr()
 
-    def tap(self, pos: tuple[int, int], *, precise: bool = False) -> None:
-        input_tap(pos, random_offset=not precise)
+    def observe_home_state(self, items: list[dict] | None = None) -> ResidentHomeState | None:
+        return resident_home_state(self.texts() if items is None else items)
+
+    def tap(
+        self,
+        pos: tuple[int, int],
+        *,
+        precise: bool = False,
+        action_key: str = "unclassified_tap",
+        anchor_key: str = "unclassified",
+        page_id: str = "resident_activity",
+    ) -> None:
+        input_tap(
+            pos,
+            random_offset=not precise,
+            intent=ActionIntent(action_key, anchor_key, f"resident:{page_id}:{anchor_key}"),
+        )
 
     def swipe_left(self) -> None:
         input_swipe((1100, 450), (500, 450), swipe_time=650)
@@ -233,28 +251,39 @@ class ScreenDriver:
         while attempt < attempt_limit:
             attempt += 1
             texts = self.texts()
-            if any(
-                _matches(item["text"], marker)
-                for item in texts
-                for marker in ("作战终端", "访问城市", "启程")
-            ):
+            home_state = self.observe_home_state(texts)
+            if home_state is ResidentHomeState.HOME_READY:
                 return True
+            if home_state in {
+                ResidentHomeState.ANNOUNCEMENT_OVERLAY,
+                ResidentHomeState.CHECKIN_OVERLAY,
+            } or (
+                home_state is ResidentHomeState.UNKNOWN_OVERLAY and not startup_recovery
+            ):
+                logger.warning(f"resident home blocked by observed overlay: {home_state.value}")
+                return False
             clarity_cancel = clarity_replenish_cancel_position(texts)
             if clarity_cancel is not None:
                 logger.info("检测到澄明度补充提示，取消后继续返回主界面")
-                self.tap(clarity_cancel)
+                self.tap(
+                    clarity_cancel, action_key="dialog_cancel", anchor_key="cancel",
+                    page_id="clarity_dialog",
+                )
                 self.sleep(1)
                 continue
             action = startup_screen_action(texts)
             if action == "cancel_resource_repair":
                 logger.warning("检测到资源完整性修复提示，取消修复")
-                self.tap((320, 500))
+                self.tap(
+                    (320, 500), action_key="dialog_cancel", anchor_key="cancel",
+                    page_id="resource_repair",
+                )
                 startup_recovery = True
                 self.sleep(1)
                 continue
             if action == "confirm_resource_download":
                 logger.info("检测到登录前资源包更新提示，确认下载并等待完成")
-                self.tap(RESOURCE_DOWNLOAD_CONFIRM_TAP)
+                self.tap(RESOURCE_DOWNLOAD_CONFIRM_TAP, page_id="resource_download")
                 startup_recovery = True
                 if not resource_download_seen:
                     attempt_limit = max(
@@ -266,20 +295,29 @@ class ScreenDriver:
                 continue
             if action == "enter_game":
                 logger.info("检测到游戏登录页，点击安全区域进入游戏")
-                self.tap((640, 560))
+                self.tap(
+                    (640, 560), action_key="enter_game", anchor_key="enter_game",
+                    page_id="login",
+                )
                 startup_recovery = True
                 self.sleep(4)
                 continue
             if action == "dismiss_startup_overlay":
                 logger.info("关闭登录后的启动弹窗")
-                self.tap((100, 650))
+                self.tap(
+                    (100, 650), action_key="dialog_cancel", anchor_key="cancel",
+                    page_id="startup_overlay",
+                )
                 startup_recovery = True
                 self.sleep(1)
                 continue
             if action == "wait_for_game" or startup_recovery:
                 self.sleep(2)
                 continue
-            self.tap((82, 36))
+            self.tap(
+                (82, 36), action_key="page_back", anchor_key="top_left_back",
+                page_id="unknown_page",
+            )
             self.sleep(1)
         return False
 
