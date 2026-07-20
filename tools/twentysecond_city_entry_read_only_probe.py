@@ -41,6 +41,22 @@ def _save_frame(frame: object, output: Path, name: str) -> None:
         cv.imwrite(str(output / f"{name}.png"), image)
 
 
+def _sanitized_guard_journal(guard) -> list[dict[str, object]]:
+    return [
+        {
+            "correlation_id": entry.correlation_id,
+            "action_key": entry.action_key,
+            "stage": entry.stage,
+            "allowed": entry.allowed,
+            "reason": entry.reason,
+            "side_effect_occurred": entry.side_effect_occurred,
+            "screenshot_hash": entry.screenshot_hash,
+            "page_type": entry.page_type,
+        }
+        for entry in guard.journal
+    ]
+
+
 def run(output: Path, *, adb_port: int = 16384) -> dict[str, object]:
     output.mkdir(parents=True, exist_ok=True)
     if not connect_adb(adb_port):
@@ -84,9 +100,14 @@ def run(output: Path, *, adb_port: int = 16384) -> dict[str, object]:
             initial_observation=before,
         ).enter_city()
 
-    final_frame = screenshot()
-    _save_frame(final_frame, output, "city-entry-after")
-    after = observe_city_entry_frame(final_frame)
+    final_capture_error = ""
+    try:
+        final_frame = screenshot()
+        _save_frame(final_frame, output, "city-entry-after")
+        after = observe_city_entry_frame(final_frame)
+    except Exception as error:  # noqa: BLE001 - preserve journals on disconnect
+        after = None
+        final_capture_error = f"CAPTURE_FAILED:{type(error).__name__}"
     irreversible_actions = sum(
         1
         for entry in guard.journal
@@ -99,16 +120,22 @@ def run(output: Path, *, adb_port: int = 16384) -> dict[str, object]:
             "scenario": "city_entry_live_validation",
             "instance": "0",
             "before": before.state.value,
-            "after": after.state.value,
+            "after": after.state.value if after is not None else result.state.value,
             "screenshot_hash_before": before.screenshot_hash,
-            "screenshot_hash_after": after.screenshot_hash,
-            "final_evidence": list(after.evidence),
+            "screenshot_hash_after": (
+                after.screenshot_hash if after is not None else result.screenshot_hash
+            ),
+            "final_evidence": list(after.evidence) if after is not None else [],
+            "final_capture_error": final_capture_error,
+            "guard_journal": _sanitized_guard_journal(guard),
             "irreversible_actions": irreversible_actions,
         }
     )
-    if result.status == "PASS" and after.state is not CityEntryState.CITY_DETAIL:
+    if result.status == "PASS" and (
+        after is None or after.state is not CityEntryState.CITY_DETAIL
+    ):
         payload["status"] = "FAILED"
-        payload["reason"] = "final_capture_not_city_detail"
+        payload["reason"] = final_capture_error or "final_capture_not_city_detail"
     if irreversible_actions:
         payload["status"] = "FAILED"
         payload["reason"] = "irreversible_action_detected"
