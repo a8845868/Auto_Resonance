@@ -752,9 +752,16 @@ def screenshot() -> Image:
     if STOP:
         raise StopExecution()
 
-    screenshot = screenshot_image()
-
-    return Image(screenshot)
+    envelope = capture_envelope()
+    frame = Image(envelope.frame)
+    # Preserve trusted capture identity for evidence-driven adapters without
+    # changing the Image API used by legacy callers.
+    frame.raw_frame_hash = envelope.raw_frame_hash
+    frame.source_capture_id = envelope.backend_capture_id
+    frame.captured_at = envelope.captured_at
+    frame.backend_generation = envelope.backend_generation
+    frame.instance_id = envelope.instance_id
+    return frame
 
 
 def screenshot_image() -> cv.typing.MatLike:

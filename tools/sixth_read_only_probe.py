@@ -51,6 +51,10 @@ from core.services.read_only_policy import (  # noqa: E402
     installed_read_only_guard,
 )
 from core.services.station_facilities import rest_area_availability  # noqa: E402
+from core.services.city_navigation import (  # noqa: E402
+    CityNavigationState as ReadOnlyCityNavigationState,
+    observe_city_frame,
+)
 from core.services.startup_overlay_resolver import (  # noqa: E402
     StartupResolver,
     StartupState,
@@ -80,9 +84,7 @@ def _capture(output: Path, name: str) -> dict:
     image_path = output / f"{name}.png"
     cv.imwrite(str(image_path), frame.image)
     items = list(frame.ocr())
-    page_type, markers = _classify_page(
-        [str(item.get("text", "")).replace(" ", "") for item in items]
-    )
+    page_type, markers = _classify_observed_items(items)
     payload = {
         "name": name,
         "captured_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
@@ -168,6 +170,33 @@ def _classify_page(texts: list[str]) -> tuple[str, list[str]]:
     return "unknown", ["unknown"]
 
 
+def _classify_observed_items(items: list[dict]) -> tuple[str, list[str]]:
+    texts = [str(item.get("text", "")).replace(" ", "") for item in items]
+    page_type, markers = _classify_page(texts)
+    city = observe_city_frame(items)
+    city_page_types = {
+        ReadOnlyCityNavigationState.HOME_READY: "home",
+        ReadOnlyCityNavigationState.CITY_ENTRY_VISIBLE: "home",
+        ReadOnlyCityNavigationState.CITY_MAP: "city_map",
+        ReadOnlyCityNavigationState.CITY_DETAIL: "city_map",
+        ReadOnlyCityNavigationState.EXCHANGE_NPC_VISIBLE: "city_map",
+        ReadOnlyCityNavigationState.NPC_DIALOG: "npc_dialogue",
+        ReadOnlyCityNavigationState.EXCHANGE_MENU: "exchange",
+        ReadOnlyCityNavigationState.EXCHANGE_BUY: "exchange_buy",
+        ReadOnlyCityNavigationState.EXCHANGE_SELL: "exchange_sell",
+    }
+    if city.state in city_page_types:
+        page_type = city_page_types[city.state]
+        markers = list(dict.fromkeys((*markers, city.state.value.casefold())))
+    elif page_type == "unknown" and not texts:
+        # This state is post-only: it cannot authorize an input.  It lets the
+        # city-entry guard hand control back to the bounded adapter, which must
+        # still observe two independent city evidence categories before PASS.
+        page_type = "city_transition"
+        markers = ["city_transition"]
+    return page_type, markers
+
+
 def _static_region(
     anchor_id: str,
     bbox: tuple[int, int, int, int],
@@ -194,7 +223,7 @@ def _trusted_observation() -> TrustedFrameEvidence:
     items = list(frame.ocr())
     texts = [str(item.get("text", "")).replace(" ", "") for item in items]
     joined = "|".join(texts)
-    classified_page_type, markers = _classify_page(texts)
+    classified_page_type, markers = _classify_observed_items(items)
     page_type = (
         "startup_overlay"
         if classified_page_type in {"announcement_overlay", "checkin_overlay"}
