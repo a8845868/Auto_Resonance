@@ -414,6 +414,12 @@ DEFAULT_POLICY_SPECS = {
         "enter_game", frozenset({"login"}), "enter_game",
         postcondition="top_level_hud_or_safe_startup_transition",
     ),
+    "enter_session": ReadOnlyPolicySpec(
+        "enter_session", frozenset({"session_ready"}), "session_entry",
+        postcondition="top_level_hud_or_safe_startup_transition",
+        postcondition_attempts=3, postcondition_interval_seconds=0.35,
+        anchor_bbox_tolerance=8,
+    ),
 }
 
 # Production sessions always use this immutable, versioned snapshot. Test
@@ -1040,7 +1046,9 @@ class ReadOnlyPermitIssuer:
                     )
                     verified = same_context and shifted
                 elif record.postcondition == "top_level_hud_or_safe_startup_transition":
-                    verified = observation.page_type in {"login", "home", "hud", "startup_overlay"}
+                    verified = observation.page_type in {
+                        "login", "session_ready", "home", "hud", "startup_overlay",
+                    }
                 else:
                     verified = bool(
                         spec.allowed_post_page_types

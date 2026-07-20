@@ -16,6 +16,11 @@ from core.services.login_state_resolver import (
     LoginState,
     classify_login_frame,
 )
+from core.services.session_entry_resolver import (
+    SessionEntryResolver,
+    SessionEntryState,
+    classify_session_entry_frame,
+)
 
 
 class OverlayType(str, Enum):
@@ -32,6 +37,10 @@ class OverlayType(str, Enum):
 class StartupState(str, Enum):
     STARTING = "STARTING"
     LOGIN_STATE = "LOGIN_STATE"
+    SESSION_READY = "SESSION_READY"
+    ENTRY_GATE_REQUIRED = "ENTRY_GATE_REQUIRED"
+    ENTRY_CONFIRMING = "ENTRY_CONFIRMING"
+    ENTRY_FAILED = "ENTRY_FAILED"
     OVERLAY_RESOLUTION = "OVERLAY_RESOLUTION"
     WAITING_UI = "WAITING_UI"
     SAFE_OVERLAY = "SAFE_OVERLAY"
@@ -342,11 +351,69 @@ class StartupResolver:
                 append_path(StartupState.BLOCKED.value)
                 event(last, StartupState.BLOCKED)
                 return finish(StartupState.BLOCKED, "BLOCKED", login.reason)
+            if login.state is LoginState.SESSION_READY:
+                last = login_as_overlay(login)
+                append_path(StartupState.SESSION_READY.value)
+                event(last, StartupState.SESSION_READY)
+                entry_observation = classify_session_entry_frame(frame)
+                if entry_observation.state is not SessionEntryState.ENTRY_GATE_REQUIRED:
+                    append_path(StartupState.BLOCKED.value)
+                    return finish(
+                        StartupState.BLOCKED,
+                        "BLOCKED",
+                        entry_observation.reason,
+                    )
+                append_path(StartupState.ENTRY_GATE_REQUIRED.value)
+                entry = SessionEntryResolver(
+                    frame_provider=self.frame_provider,
+                    tap=self.tap,
+                    sleep=self.sleep,
+                    monotonic=self.monotonic,
+                    now=self.now,
+                    timeout=max(0.0, deadline - self.monotonic()),
+                    max_attempts=max(1, self.max_attempts - attempts + 1),
+                    poll_interval=self.poll_interval,
+                    correlation_id=self.correlation_id,
+                    initial_observation=entry_observation,
+                ).resolve()
+                attempts += max(0, entry.attempt_count - 1)
+                append_path(StartupState.ENTRY_CONFIRMING.value)
+                event(
+                    last,
+                    StartupState.ENTRY_CONFIRMING,
+                    action_taken=entry.action_executed,
+                    guard_result=("ALLOWED" if entry.action_allowed else "DENIED"),
+                    postcondition=entry.reason,
+                )
+                if entry.state is SessionEntryState.HOME_READY:
+                    last = OverlayObservation(
+                        page_type="HOME",
+                        overlay_type=OverlayType.HOME_READY,
+                        confidence="HIGH",
+                        screenshot_hash=entry.screenshot_hash,
+                        page_fingerprint=entry.page_fingerprint,
+                        reason=entry.reason,
+                    )
+                    append_path(StartupState.HOME_READY.value)
+                    event(
+                        last,
+                        StartupState.HOME_READY,
+                        postcondition="two_consistent_home_frames",
+                    )
+                    return finish(
+                        StartupState.HOME_READY,
+                        "PASS",
+                        entry.reason,
+                    )
+                if entry.state is SessionEntryState.BLOCKED:
+                    append_path(StartupState.BLOCKED.value)
+                    return finish(StartupState.BLOCKED, "BLOCKED", entry.reason)
+                append_path(StartupState.ENTRY_FAILED.value)
+                return finish(StartupState.ENTRY_FAILED, "FAILED", entry.reason)
             if login.state in {
                 LoginState.LOGIN_LOADING,
                 LoginState.SESSION_VALIDATING,
                 LoginState.SERVER_CONNECTING,
-                LoginState.SESSION_READY,
             }:
                 last = login_as_overlay(login)
                 append_path(login.state.value)
