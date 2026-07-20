@@ -17,10 +17,10 @@ from core.services.login_state_resolver import (
     classify_login_frame,
 )
 from core.services.session_entry_resolver import (
-    SessionEntryResolver,
     SessionEntryState,
     classify_session_entry_frame,
 )
+from core.services.session_entry_chain import EntryChainResolver
 
 
 class OverlayType(str, Enum):
@@ -363,8 +363,7 @@ class StartupResolver:
                         "BLOCKED",
                         entry_observation.reason,
                     )
-                append_path(StartupState.ENTRY_GATE_REQUIRED.value)
-                entry = SessionEntryResolver(
+                entry = EntryChainResolver(
                     frame_provider=self.frame_provider,
                     tap=self.tap,
                     sleep=self.sleep,
@@ -372,12 +371,15 @@ class StartupResolver:
                     now=self.now,
                     timeout=max(0.0, deadline - self.monotonic()),
                     max_attempts=max(1, self.max_attempts - attempts + 1),
+                    max_entry_steps=3,
                     poll_interval=self.poll_interval,
                     correlation_id=self.correlation_id,
                     initial_observation=entry_observation,
                 ).resolve()
                 attempts += max(0, entry.attempt_count - 1)
-                append_path(StartupState.ENTRY_CONFIRMING.value)
+                for entry_state in entry.path:
+                    if entry_state != SessionEntryState.SESSION_READY.value:
+                        append_path(entry_state)
                 event(
                     last,
                     StartupState.ENTRY_CONFIRMING,

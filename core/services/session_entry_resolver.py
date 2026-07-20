@@ -14,9 +14,11 @@ from core.services.read_only_policy import ActionIntent
 
 
 class SessionEntryState(str, Enum):
+    SESSION_READY = "SESSION_READY"
     UNKNOWN = "UNKNOWN"
     ENTRY_GATE_REQUIRED = "ENTRY_GATE_REQUIRED"
     ENTRY_CONFIRMING = "ENTRY_CONFIRMING"
+    ENTRY_TRANSITION = "ENTRY_TRANSITION"
     HOME_READY = "HOME_READY"
     BLOCKED = "BLOCKED"
     ENTRY_FAILED = "ENTRY_FAILED"
@@ -124,7 +126,11 @@ def classify_session_entry_frame(frame: object) -> SessionEntryObservation:
     ) -> SessionEntryObservation:
         fingerprint = hashlib.sha256(
             json.dumps(
-                {"state": state.value, "reason": reason},
+                {
+                    "state": state.value,
+                    "reason": reason,
+                    "evidence": evidence,
+                },
                 ensure_ascii=False,
                 sort_keys=True,
             ).encode("utf-8")
@@ -217,7 +223,7 @@ def classify_session_entry_frame(frame: object) -> SessionEntryObservation:
     )
     if confirming:
         return observation(
-            SessionEntryState.ENTRY_CONFIRMING,
+            SessionEntryState.ENTRY_TRANSITION,
             "session_entry_transition_in_progress",
             confirming,
         )
