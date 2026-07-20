@@ -51,6 +51,11 @@ from core.services.read_only_policy import (  # noqa: E402
     installed_read_only_guard,
 )
 from core.services.station_facilities import rest_area_availability  # noqa: E402
+from core.services.startup_overlay_resolver import (  # noqa: E402
+    StartupResolver,
+    StartupState,
+)
+from core.services.live_readonly_validation import startup_resolution_scenario  # noqa: E402
 from tools.audit_export import (  # noqa: E402
     build_live_validation_result,
     render_live_validation_addendum,
@@ -189,10 +194,36 @@ def _trusted_observation() -> TrustedFrameEvidence:
     items = list(frame.ocr())
     texts = [str(item.get("text", "")).replace(" ", "") for item in items]
     joined = "|".join(texts)
-    page_type, markers = _classify_page(texts)
+    classified_page_type, markers = _classify_page(texts)
+    page_type = (
+        "startup_overlay"
+        if classified_page_type in {"announcement_overlay", "checkin_overlay"}
+        else classified_page_type
+    )
+    if page_type != classified_page_type:
+        markers.append(classified_page_type)
     anchors: list[ObservedAnchor] = []
     geometry = current_display_geometry()
     static_regions: list[CalibratedStaticRegion] = []
+    claim_visible = any(
+        "已领取" not in text
+        and (
+            text in {"领取", "签到领取"}
+            or any(
+                marker in text
+                for marker in ("点击领取", "可领取", "领取奖励", "立即领取")
+            )
+        )
+        for text in texts
+    )
+    dangerous_confirmation_visible = any(
+        marker in joined
+        for marker in (
+            "确认购买", "确认支付", "充值", "支付订单",
+            "使用道具", "使用便当", "使用气泡水", "是否使用银枝",
+            "确认消耗", "消耗货币", "账号安全", "实名认证", "登录验证",
+        )
+    )
 
     if any(marker in joined for marker in ("注销", "退出登录", "账号设置")):
         markers.append("account_logout")
@@ -257,7 +288,21 @@ def _trusted_observation() -> TrustedFrameEvidence:
             anchors.append(ObservedAnchor("manual_tasks_tab", text_value, bounds))
         if text_value == "环游手册":
             anchors.append(ObservedAnchor("manual_track_tab", text_value, bounds))
-        if "取消" in text_value:
+        if "取消" in text_value and (
+            page_type != "startup_overlay"
+            or (not claim_visible and not dangerous_confirmation_visible)
+        ):
+            anchors.append(ObservedAnchor("cancel", text_value, bounds))
+        if (
+            (
+                classified_page_type == "announcement_overlay"
+                and any(marker in text_value for marker in ("关闭", "返回", "触碰空白区域退出"))
+                or classified_page_type == "checkin_overlay"
+                and "触碰空白区域退出" in text_value
+            )
+            and not claim_visible
+            and not dangerous_confirmation_visible
+        ):
             anchors.append(ObservedAnchor("cancel", text_value, bounds))
         match = re.search(r"(\d+)\s*/\s*(\d+)", text_value)
         if match and bounds[1] < 100 and 500 <= int(match.group(2)) <= 2000:
@@ -487,11 +532,30 @@ def _run_probe(
     result["captures"].append(initial_capture)
     result["initial_page"] = initial_capture.get("page_type", "unknown")
     home_navigation_ok = True
-    if (
-        isinstance(guard, ReadOnlyActionGuard)
-        and result["initial_page"] not in {"home", "hud"}
-    ):
-        home_navigation_ok = bool(driver.go_home(attempt_limit=45))
+    if isinstance(guard, ReadOnlyActionGuard):
+        if result["initial_page"] == "login":
+            # Existing login handling already uses the guarded enter-game action.
+            driver.go_home(attempt_limit=12)
+        startup = StartupResolver(
+            frame_provider=screenshot,
+            tap=lambda point, *, intent: guard.authorize_coordinate(
+                point, intent=intent
+            ),
+            timeout=30.0,
+            max_attempts=20,
+            correlation_id=datetime.now().astimezone().strftime("STARTUP-%Y%m%d-%H%M%S"),
+        ).resolve()
+        result["startup_overlay_resolution"] = startup_resolution_scenario(startup)
+        result["startup_trace"] = [asdict(event) for event in startup.trace]
+        (output / "LIVE_STARTUP_TRACE.json").write_text(
+            json.dumps({
+                "correlation_id": startup.correlation_id,
+                "instance": "0",
+                "events": result["startup_trace"],
+            }, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        home_navigation_ok = startup.state is StartupState.HOME_READY
     if not home_navigation_ok or not _return_home_safely(driver, attempt_limit=8):
         blocked_capture = _capture(output, "home-blocked")
         result["captures"].append(blocked_capture)
@@ -679,7 +743,17 @@ def main() -> int:
         ),
         "status": overall if overall in {"PASS", "BLOCKED", "UNKNOWN", "FAILED"} else "UNKNOWN",
         "reason": result.get("blocked_reason", "validation_completed"),
+        "startup_overlay_resolution": result.get("startup_overlay_resolution", {
+            "scenario": "startup_overlay_resolution",
+            "status": "BLOCKED",
+            "path": [],
+            "irreversible_actions": 0,
+            "reason": "not_run",
+        }),
         "scenarios": {
+            "startup_overlay_resolution": result.get(
+                "startup_overlay_resolution", {}
+            ).get("status", "BLOCKED"),
             "HOME": (
                 "PASS" if any(
                     capture.get("page_type") in {"home", "hud"}
