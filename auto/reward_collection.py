@@ -28,6 +28,8 @@ from core.services.screen_state import (
     RESOURCE_DOWNLOAD_CONFIRM_TAP,
     RESOURCE_DOWNLOAD_WAIT_ATTEMPTS,
     clarity_replenish_cancel_position,
+    ResidentHomeState,
+    resident_home_state,
     startup_screen_action,
 )
 from core.services.daily_rewards import (
@@ -339,6 +341,24 @@ class DailyActivityPageObservation:
     confidence: str
     observed_at: datetime
     missing_evidence: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class DailyVisualSnapshot:
+    activity_current: int | None
+    activity_maximum: int | None
+    task_cards: tuple[DailyTaskCard, ...]
+    claim_states: tuple[str, ...]
+    confidence: str
+    evidence_frames: tuple[str, ...]
+    status: str
+    reason: str
+
+    @property
+    def completed(self) -> bool | None:
+        if self.status != "PASS" or self.activity_current is None or self.activity_maximum is None:
+            return None
+        return self.activity_current >= self.activity_maximum
 
 
 @dataclass(frozen=True)
@@ -1259,6 +1279,44 @@ def observe_daily_activity_layout(
     )
 
 
+def build_daily_visual_snapshot(
+    frames: list[list[dict]],
+    *,
+    scanner: DailyCardScanner | None = None,
+    page_complete: bool | None = None,
+    stage_rewards_claimable: int = 0,
+    images: list[np.ndarray] | None = None,
+    captured_at: datetime | None = None,
+) -> DailyVisualSnapshot:
+    """Build a read-only snapshot whose unknown values remain unknown."""
+
+    del captured_at  # Evidence time remains on the underlying observation.
+    observation = observe_daily_activity_layout(
+        frames,
+        scanner=scanner,
+        page_complete=page_complete,
+        stage_rewards_claimable=stage_rewards_claimable,
+        images=images,
+    )
+    evidence_frames = tuple(
+        hashlib.sha256(
+            json.dumps(items, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        for items in frames
+    )
+    known = observation.current is not None and observation.maximum is not None
+    return DailyVisualSnapshot(
+        activity_current=observation.current,
+        activity_maximum=observation.maximum,
+        task_cards=observation.task_cards,
+        claim_states=tuple(card.claim_state.value for card in observation.task_cards),
+        confidence=observation.confidence if known else "UNKNOWN",
+        evidence_frames=evidence_frames,
+        status="PASS" if known else "UNKNOWN",
+        reason="daily_activity_confirmed" if known else "daily_activity_not_confirmed",
+    )
+
+
 def observe_manual_level_layout(
     frames: list[list[dict]],
     *,
@@ -1429,8 +1487,17 @@ class RewardDriver:
         while attempt < attempt_limit:
             attempt += 1
             texts = self.texts()
-            if any(_matches(i["text"], marker) for i in texts for marker in ("访问城市", "启程", "作战终端")):
+            home_state = resident_home_state(texts)
+            if home_state is ResidentHomeState.HOME_READY:
                 return True
+            if home_state in {
+                ResidentHomeState.ANNOUNCEMENT_OVERLAY,
+                ResidentHomeState.CHECKIN_OVERLAY,
+            } or (
+                home_state is ResidentHomeState.UNKNOWN_OVERLAY and not startup_recovery
+            ):
+                logger.warning(f"reward return-home blocked by observed overlay: {home_state.value}")
+                return False
             clarity_cancel = clarity_replenish_cancel_position(texts)
             if clarity_cancel is not None:
                 logger.info("检测到澄明度补充提示，取消后继续返回主界面")

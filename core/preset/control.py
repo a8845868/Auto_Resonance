@@ -25,6 +25,8 @@ from core.services.screen_state import (
     is_inventory_screen,
     is_top_level_hud,
     is_train_in_transit,
+    ResidentHomeState,
+    resident_home_state,
     startup_screen_action,
 )
 from core.utils.utils import RESOURCES_PATH
@@ -266,6 +268,18 @@ def go_home(*, attempt_limit: int = 45, deadline: float | None = None,
             logger.info("已返回主界面")
             return True
         visible = image.ocr()
+        home_state = resident_home_state(visible)
+        if home_state is ResidentHomeState.HOME_READY:
+            logger.info("已返回主界面（只读文本状态确认）")
+            return True
+        if home_state in {
+            ResidentHomeState.ANNOUNCEMENT_OVERLAY,
+            ResidentHomeState.CHECKIN_OVERLAY,
+        } or (
+            home_state is ResidentHomeState.UNKNOWN_OVERLAY and not startup_recovery
+        ):
+            logger.warning(f"return-home blocked by observed overlay: {home_state.value}")
+            return False
         clarity_cancel = clarity_replenish_cancel_position(visible)
         if clarity_cancel is not None:
             logger.info("检测到澄明度补充提示，取消后继续返回主界面")

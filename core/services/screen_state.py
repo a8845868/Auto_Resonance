@@ -1,5 +1,7 @@
 """Small, side-effect-free classifiers for top-level game screen state."""
 
+from enum import Enum
+
 
 # The control layer normalizes every frame to 1280x720.  This point is the
 # middle of the wide blue confirmation button on the pre-login resource-pack
@@ -23,6 +25,31 @@ def _center(item: dict) -> tuple[int, int] | None:
         int((points[0][0] + points[2][0]) / 2),
         int((points[0][1] + points[2][1]) / 2),
     )
+
+
+class ResidentHomeState(str, Enum):
+    HOME_READY = "HOME_READY"
+    ANNOUNCEMENT_OVERLAY = "ANNOUNCEMENT_OVERLAY"
+    CHECKIN_OVERLAY = "CHECKIN_OVERLAY"
+    UNKNOWN_OVERLAY = "UNKNOWN_OVERLAY"
+
+
+def resident_home_state(items: list[dict]) -> ResidentHomeState | None:
+    """Classify resident-activity home/overlay state without clicking it."""
+
+    if is_inventory_item_detail(items):
+        return None
+    texts = _texts(items)
+    joined = "|".join(texts)
+    if any(marker in joined for marker in ("访问城市", "作战终端", "启程")):
+        return ResidentHomeState.HOME_READY
+    if any(marker in joined for marker in ("公告", "资讯")):
+        return ResidentHomeState.ANNOUNCEMENT_OVERLAY
+    if any(marker in joined for marker in ("每日签到奖励", "签到奖励", "签到")):
+        return ResidentHomeState.CHECKIN_OVERLAY
+    if any("触碰空白区域退出" in text for text in texts):
+        return ResidentHomeState.UNKNOWN_OVERLAY
+    return None
 
 
 def clarity_replenish_cancel_position(
