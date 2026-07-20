@@ -138,8 +138,8 @@ def test_daily_unknown_not_completed():
 
 
 def test_exchange_buy_sell_classification():
-    buy = [_ocr(text) for text in ("交易品", "载货量", "预计买入", "买入总价")]
-    sell = [_ocr(text) for text in ("交易品", "载货量", "预计卖出", "卖出总价")]
+    buy = [_ocr(text) for text in ("交易品", "载货量", "预计买入", "全部买入", "买入总价")]
+    sell = [_ocr(text) for text in ("交易品", "载货量", "预计卖出", "全部卖出", "卖出总价")]
     assert exchange_navigation.exchange_page_matches(buy, "BUY")
     assert not exchange_navigation.exchange_page_matches(buy, "SELL")
     assert exchange_navigation.exchange_page_matches(sell, "SELL")

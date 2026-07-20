@@ -331,7 +331,7 @@ DEFAULT_POLICY_SPECS = {
     "page_back": ReadOnlyPolicySpec(
         "page_back",
         frozenset({"home", "daily_activity", "travel_manual", "manual_tasks", "manual_track", "city_map", "npc_dialogue", "exchange", "exchange_buy", "exchange_sell", "inventory", "fatigue_info"}),
-        "top_left_back", allowed_post_page_types=frozenset({"home", "hud", "station", "city_map", "npc_dialogue", "exchange", "daily_activity", "travel_manual", "manual_tasks", "manual_track", "inventory"}),
+        "top_left_back", allowed_post_page_types=frozenset({"home", "hud", "station", "city_transition", "city_map", "npc_dialogue", "exchange", "daily_activity", "travel_manual", "manual_tasks", "manual_track", "inventory"}),
         postcondition_attempts=5, postcondition_interval_seconds=0.35,
     ),
     "manual_tab": ReadOnlyPolicySpec(
@@ -366,13 +366,13 @@ DEFAULT_POLICY_SPECS = {
     ),
     "exchange_buy_navigation": ReadOnlyPolicySpec(
         "exchange_buy_navigation", frozenset({"station", "exchange"}), "buy_navigation",
-        allowed_post_page_types=frozenset({"exchange_buy"}),
+        allowed_post_page_types=frozenset({"city_transition", "exchange_buy"}),
         postcondition_attempts=5, postcondition_interval_seconds=0.35,
         anchor_bbox_tolerance=8,
     ),
     "exchange_sell_navigation": ReadOnlyPolicySpec(
         "exchange_sell_navigation", frozenset({"station", "exchange"}), "sell_navigation",
-        allowed_post_page_types=frozenset({"exchange_sell"}),
+        allowed_post_page_types=frozenset({"city_transition", "exchange_sell"}),
         postcondition_attempts=5, postcondition_interval_seconds=0.35,
         anchor_bbox_tolerance=8,
     ),
@@ -380,14 +380,17 @@ DEFAULT_POLICY_SPECS = {
         "city_entry_navigation", frozenset({"home", "hud"}), "city_entry",
         required_markers=("top_level_hud",),
         postcondition="city_map_verified",
-        allowed_post_page_types=frozenset({"city_map"}),
+        # A blank/low-OCR transition is accepted only as a post-action handoff;
+        # it is never an allowed source page.  The bounded city adapter still
+        # requires two independent city evidence categories before PASS.
+        allowed_post_page_types=frozenset({"city_transition", "city_map"}),
         postcondition_attempts=5, postcondition_interval_seconds=0.35,
         anchor_bbox_tolerance=8,
     ),
     "navigation_anchor": ReadOnlyPolicySpec(
         "navigation_anchor", frozenset({"city_map"}), "交易所",
         allowed_region=(820, 235, 990, 400),
-        allowed_post_page_types=frozenset({"npc_dialogue", "exchange"}),
+        allowed_post_page_types=frozenset({"city_transition", "npc_dialogue", "exchange"}),
         postcondition_attempts=5, postcondition_interval_seconds=0.35,
         anchor_bbox_tolerance=8,
     ),

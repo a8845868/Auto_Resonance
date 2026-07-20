@@ -27,6 +27,10 @@ from core.module.bgr import BGR
 from core.image.ocr import predict
 from core.preset import blurry_ocr_click, go_home
 from core.services.screen_state import is_train_in_transit
+from core.services.city_navigation import (
+    CityNavigationAdapter as ReadOnlyCityNavigationAdapter,
+    CityNavigationState as ReadOnlyCityNavigationState,
+)
 from core.services.read_only_policy import ActionIntent
 from core.services.station_availability import station_unavailable_reason
 from core.utils.utils import RESOURCES_PATH, read_json
@@ -600,6 +604,62 @@ def go_city(
     说明:
         进入城市界面
     """
+    if frame_analyzer is _city_frame_observation:
+        started = monotonic()
+        resolved = ReadOnlyCityNavigationAdapter(
+            frame_provider=frame_provider,
+            tap=tap,
+            sleep=sleep,
+            monotonic=monotonic,
+            timeout=timeout,
+            max_attempts=max_attempts,
+            stall_frames=stall_frames,
+            cancellation=lambda: is_stopped() or (
+                cancellation is not None and cancellation()
+            ),
+        ).enter_city()
+        attempted = (
+            ("city_entry_navigation",)
+            if any(event.action == "enter_city" for event in resolved.trace)
+            else ()
+        )
+        executed = (
+            ("city_entry_navigation",)
+            if any(
+                event.action == "enter_city"
+                and event.guard_result == "ALLOWED"
+                and event.reason == "city_entry_action_executed"
+                for event in resolved.trace
+            )
+            else ()
+        )
+        state_map = {
+            ReadOnlyCityNavigationState.CITY_MAP: CityNavigationState.CITY_MAP,
+            ReadOnlyCityNavigationState.CITY_DETAIL: CityNavigationState.CITY_DETAIL,
+            ReadOnlyCityNavigationState.EXCHANGE_NPC_VISIBLE: CityNavigationState.CITY_DETAIL,
+            ReadOnlyCityNavigationState.TIMEOUT: CityNavigationState.TIMEOUT,
+            ReadOnlyCityNavigationState.UNKNOWN: CityNavigationState.UNKNOWN,
+        }
+        if resolved.reason == "NAVIGATION_STALLED":
+            state = CityNavigationState.STALLED
+        elif resolved.reason == "guard_denied_city_entry":
+            state = CityNavigationState.READ_ONLY_DENIED
+        else:
+            state = state_map.get(resolved.state, CityNavigationState.UNKNOWN)
+        last = resolved.trace[-1] if resolved.trace else None
+        return CityNavigationResult(
+            resolved.status == "PASS",
+            state,
+            resolved.attempt_count,
+            max(0.0, monotonic() - started),
+            0.0,
+            last.page_fingerprint if last else "",
+            attempted,
+            executed,
+            resolved.reason,
+            tuple(event.reason for event in resolved.trace),
+        )
+
     started = monotonic()
     deadline = started + max(0.0, float(timeout))
     attempts = 0

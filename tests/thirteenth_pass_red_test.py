@@ -362,7 +362,7 @@ def test_city_entry_postcondition_requires_city_map():
 def test_city_entry_policy_rejects_npc_dialogue():
     spec = policy.DEFAULT_POLICY_SPECS["city_entry_navigation"]
     assert spec.allowed_page_types == frozenset({"home", "hud"})
-    assert spec.allowed_post_page_types == frozenset({"city_map"})
+    assert spec.allowed_post_page_types == frozenset({"city_transition", "city_map"})
     assert "npc_dialogue" not in spec.allowed_post_page_types
     guard, _issuer, executor = _guard([
         _city_policy_observation(10, "home"),

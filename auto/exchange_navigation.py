@@ -12,6 +12,11 @@ import cv2 as cv
 from loguru import logger
 
 from core.control.control import input_tap, screenshot
+from core.services.city_navigation import (
+    CityNavigationState,
+    ExchangeEntryAdapter,
+    observe_city_frame,
+)
 from core.services.read_only_policy import ActionIntent
 from core.services.runtime_control import RUNTIME_DIR
 
@@ -32,14 +37,6 @@ class ExchangeNavigationResult:
     diagnostic_path: str = ""
     stage: str = ""
     elapsed_seconds: float = 0.0
-
-
-MENU_MARKERS = ("交易所", "我要买", "我要卖", "交易品投资", "私人仓库")
-PAGE_COMMON = ("交易品", "载货量")
-PAGE_MARKERS = {
-    ExchangeAction.BUY: ("预计买入", "全部买入", "买入总价", "含税"),
-    ExchangeAction.SELL: ("预计卖出", "全部卖出", "卖出总价", "含税", "出售"),
-}
 
 
 def _action(value: ExchangeAction | str) -> ExchangeAction:
@@ -69,19 +66,13 @@ def _center(item: dict) -> tuple[int, int]:
 
 
 def exchange_menu_matches(items: Iterable[dict]) -> bool:
-    texts = [_text(item) for item in items]
-    return sum(any(marker in text for text in texts) for marker in MENU_MARKERS) >= 3
+    return observe_city_frame(list(items)).state is CityNavigationState.EXCHANGE_MENU
 
 
 def exchange_page_matches(items: Iterable[dict], action: ExchangeAction | str) -> bool:
     selected = _action(action)
-    texts = [_text(item) for item in items]
-    common = sum(any(marker in text for text in texts) for marker in PAGE_COMMON)
-    specific = sum(any(marker in text for text in texts) for marker in PAGE_MARKERS[selected])
-    # The current BUY/SELL pages retain the bottom "我要买/我要卖" tabs, so
-    # menu markers may coexist with the target page.  The strong page-specific
-    # combination below is what distinguishes the page from the NPC menu.
-    return common >= 1 and specific >= 2
+    observation = observe_city_frame(list(items))
+    return ExchangeEntryAdapter.page_matches(observation, selected.value)
 
 
 class ExchangeNavigator:
