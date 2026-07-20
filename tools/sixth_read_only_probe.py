@@ -562,9 +562,6 @@ def _run_probe(
     result["initial_page"] = initial_capture.get("page_type", "unknown")
     home_navigation_ok = True
     if isinstance(guard, ReadOnlyActionGuard):
-        if result["initial_page"] == "login":
-            # Existing login handling already uses the guarded enter-game action.
-            driver.go_home(attempt_limit=12)
         startup = StartupResolver(
             frame_provider=screenshot,
             tap=lambda point, *, intent: guard.authorize_coordinate(

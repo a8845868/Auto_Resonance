@@ -11,6 +11,11 @@ from enum import Enum
 from typing import Callable
 
 from core.services.read_only_policy import ActionIntent
+from core.services.login_state_resolver import (
+    LoginObservation,
+    LoginState,
+    classify_login_frame,
+)
 
 
 class OverlayType(str, Enum):
@@ -26,6 +31,8 @@ class OverlayType(str, Enum):
 
 class StartupState(str, Enum):
     STARTING = "STARTING"
+    LOGIN_STATE = "LOGIN_STATE"
+    OVERLAY_RESOLUTION = "OVERLAY_RESOLUTION"
     WAITING_UI = "WAITING_UI"
     SAFE_OVERLAY = "SAFE_OVERLAY"
     DISMISS_PENDING = "DISMISS_PENDING"
@@ -248,10 +255,34 @@ class StartupResolver:
         deadline = started + self.timeout
         attempts = 0
         trace: list[StartupTraceEvent] = []
-        path: list[str] = [StartupState.STARTING.value]
+        path: list[str] = [
+            StartupState.STARTING.value,
+            StartupState.LOGIN_STATE.value,
+        ]
         last: OverlayObservation | None = None
         home_fingerprint = ""
         home_frames = 0
+        overlay_phase_started = False
+
+        def append_path(value: str) -> None:
+            if not path or path[-1] != value:
+                path.append(value)
+
+        def login_as_overlay(
+            observation: LoginObservation,
+        ) -> OverlayObservation:
+            return OverlayObservation(
+                page_type=observation.state.value,
+                overlay_type=(
+                    OverlayType.ACCOUNT_SECURITY
+                    if observation.state is LoginState.LOGIN_REQUIRED
+                    else OverlayType.UNKNOWN
+                ),
+                confidence=observation.confidence,
+                screenshot_hash=observation.screenshot_hash,
+                page_fingerprint=observation.page_fingerprint,
+                reason=observation.reason,
+            )
 
         def event(
             observation: OverlayObservation,
@@ -294,16 +325,53 @@ class StartupResolver:
 
         while attempts < self.max_attempts and self.monotonic() < deadline:
             attempts += 1
-            last = classify_startup_frame(self.frame_provider())
+            frame = self.frame_provider()
+            login = classify_login_frame(frame)
+
+            if login.state is LoginState.LOGIN_REQUIRED:
+                last = login_as_overlay(login)
+                append_path(StartupState.BLOCKED.value)
+                event(last, StartupState.BLOCKED)
+                return finish(
+                    StartupState.BLOCKED,
+                    "BLOCKED",
+                    "BLOCKED_MANUAL_AUTH_REQUIRED",
+                )
+            if login.state in {LoginState.LOGIN_FAILED, LoginState.SERVER_ERROR}:
+                last = login_as_overlay(login)
+                append_path(StartupState.BLOCKED.value)
+                event(last, StartupState.BLOCKED)
+                return finish(StartupState.BLOCKED, "BLOCKED", login.reason)
+            if login.state in {
+                LoginState.LOGIN_LOADING,
+                LoginState.SESSION_VALIDATING,
+                LoginState.SERVER_CONNECTING,
+                LoginState.SESSION_READY,
+            }:
+                last = login_as_overlay(login)
+                append_path(login.state.value)
+                event(last, StartupState.LOGIN_STATE)
+                self.sleep(
+                    min(
+                        self.poll_interval,
+                        max(0.0, deadline - self.monotonic()),
+                    )
+                )
+                continue
+
+            if not overlay_phase_started:
+                append_path(StartupState.OVERLAY_RESOLUTION.value)
+                overlay_phase_started = True
+            last = classify_startup_frame(frame)
 
             if last.overlay_type is OverlayType.HOME_READY:
                 home_frames = home_frames + 1 if last.page_fingerprint == home_fingerprint else 1
                 home_fingerprint = last.page_fingerprint
                 if home_frames >= 2:
-                    path.append(StartupState.HOME_READY.value)
+                    append_path(StartupState.HOME_READY.value)
                     event(last, StartupState.HOME_READY, postcondition="two_consistent_home_frames")
                     return finish(StartupState.HOME_READY, "PASS", "home_ready_confirmed")
-                path.append("HOME_CANDIDATE")
+                append_path("HOME_CANDIDATE")
                 event(last, StartupState.WAITING_UI, postcondition="home_frame_1_of_2")
                 self.sleep(min(self.poll_interval, max(0.0, deadline - self.monotonic())))
                 continue
@@ -316,12 +384,13 @@ class StartupResolver:
                 OverlayType.ACCOUNT_SECURITY,
                 OverlayType.READ_ONLY_INFORMATION,
             } or (last.overlay_type is OverlayType.REWARD_RELATED and last.action is None):
-                path.append(StartupState.BLOCKED.value)
+                append_path(StartupState.BLOCKED.value)
                 event(last, StartupState.BLOCKED)
                 return finish(StartupState.BLOCKED, "BLOCKED", last.reason)
 
             if last.action is not None:
-                path.extend((StartupState.SAFE_OVERLAY.value, StartupState.DISMISS_PENDING.value))
+                append_path(StartupState.SAFE_OVERLAY.value)
+                append_path(StartupState.DISMISS_PENDING.value)
                 event(last, StartupState.DISMISS_PENDING)
                 try:
                     allowed = self.tap(
@@ -332,11 +401,11 @@ class StartupResolver:
                         ),
                     )
                 except (PermissionError, RuntimeError) as error:
-                    path.append(StartupState.BLOCKED.value)
+                    append_path(StartupState.BLOCKED.value)
                     event(last, StartupState.BLOCKED, guard_result=type(error).__name__)
                     return finish(StartupState.BLOCKED, "BLOCKED", "overlay_guard_denied")
                 if allowed is False:
-                    path.append(StartupState.BLOCKED.value)
+                    append_path(StartupState.BLOCKED.value)
                     event(last, StartupState.BLOCKED, guard_result="DENIED")
                     return finish(StartupState.BLOCKED, "BLOCKED", "overlay_guard_denied")
                 event(last, StartupState.DISMISS_PENDING, action_taken=True, guard_result="ALLOWED")
@@ -348,20 +417,20 @@ class StartupResolver:
                 event(post, StartupState.DISMISS_PENDING, postcondition="overlay_reclassified")
                 if post.overlay_type is last.overlay_type and post.page_fingerprint == last.page_fingerprint:
                     last = post
-                    path.append(StartupState.FAILED.value)
+                    append_path(StartupState.FAILED.value)
                     return finish(StartupState.FAILED, "FAILED", "overlay_persisted_after_dismiss")
                 last = post
                 if post.overlay_type is OverlayType.HOME_READY:
                     home_frames = 1
                     home_fingerprint = post.page_fingerprint
-                    path.append("HOME_CANDIDATE")
+                    append_path("HOME_CANDIDATE")
                 continue
 
-            path.append(StartupState.WAITING_UI.value)
+            append_path(StartupState.WAITING_UI.value)
             event(last, StartupState.WAITING_UI)
             self.sleep(min(self.poll_interval, max(0.0, deadline - self.monotonic())))
 
-        path.append(StartupState.TIMEOUT.value)
+        append_path(StartupState.TIMEOUT.value)
         return finish(StartupState.TIMEOUT, "BLOCKED", "startup_deadline_or_attempt_limit")
 
 
