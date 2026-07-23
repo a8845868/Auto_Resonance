@@ -12,6 +12,12 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+dist/debug_private/**
+dist/audit_private/**
+runtime_screenshots/
+runtime_replay_outputs/
+*.normalized.tmp.png
+*.normalized.tmp.jpg
 downloads/
 eggs/
 .eggs/
