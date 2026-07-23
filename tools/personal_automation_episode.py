@@ -1,8 +1,9 @@
 """Run one bounded instance-0 personal automation episode.
 
 Without ``--execute`` this command performs lifecycle, identity, capture, OCR,
-classification, and planning only.  With ``--execute`` it may dispatch only
-announcement dismissal and enter-city taps, then stops at CITY_DETAIL.
+classification, and planning only. With ``--execute`` it may also confirm one
+strictly detected resource update, observe its download, recover the package
+once, dismiss known overlays, and enter the city before stopping at CITY_DETAIL.
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ from core.services.personal_runtime_episode import (  # noqa: E402
     CoordinateTransform,
     EpisodePolicy,
     PersonalAutomationEpisode,
+    ResourceUpdateHandler,
     RunRecorder,
     StateDetector,
 )
@@ -58,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--package-id", default=GAME_PACKAGE)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--resource-update-timeout", type=float, default=600.0)
     parser.add_argument("--execute", action="store_true")
     return parser.parse_args()
 
@@ -135,6 +138,8 @@ def main() -> int:
     )
     options = LifecycleOptions(
         emulator_start_timeout=args.timeout,
+        stopping_settle_timeout=min(60.0, args.timeout),
+        android_boot_timeout=args.timeout,
         game_start_timeout=args.timeout,
         close_game_when_idle=False,
         close_emulator_when_idle=False,
@@ -172,7 +177,7 @@ def main() -> int:
     )
     adb = None
     result_payload: dict = {
-        "task": "PERSONAL_AUTOMATION_FAST_ROBUST_DEVELOPMENT_LOOP_V1",
+        "task": "PERSONAL_AUTOMATION_RESOURCE_UPDATE_RECOVERY_V1",
         "correlation_id": correlation_id,
         "execute_authorized": bool(args.execute),
         "instance_index": 0,
@@ -210,7 +215,9 @@ def main() -> int:
             return Image(raw)
 
         detector = StateDetector()
-        planner = ActionPlanner()
+        planner = ActionPlanner(
+            ResourceUpdateHandler(authorized_resource_size_mb=25.25)
+        )
         first = detector.detect(frame_provider())
         first_plan = planner.plan(first, budget=budget)
         result_payload["preflight"] = {
@@ -221,6 +228,9 @@ def main() -> int:
             "frame_hash": first.frame_hash,
             "frame_dimensions": first.frame_dimensions,
             "announcement_candidates": [candidate.point for candidate in first.announcement_candidates],
+            "resource_size_mb": first.resource_size_mb,
+            "resource_confirm_bbox": first.resource_confirm_bbox,
+            "resource_progress_percent": first.resource_progress_percent,
         }
         if not args.execute:
             result_payload.update(
@@ -240,8 +250,12 @@ def main() -> int:
                 return pending.pop(0) if pending else frame_provider()
 
             policy = EpisodePolicy(
-                maximum_observations=120,
+                maximum_observations=max(
+                    120,
+                    int(args.resource_update_timeout / 0.75) + 120,
+                ),
                 episode_timeout_seconds=args.timeout,
+                resource_update_timeout_seconds=args.resource_update_timeout,
                 minimum_action_interval_seconds=0.75,
             )
 
@@ -251,11 +265,30 @@ def main() -> int:
                 physical_action_count += 1
                 return True
 
+            def exact_target_still_active() -> bool:
+                current_info = manager.info()
+                current_identity = window_identity(current_info)
+                current_game = manager.game_info(GAME_PACKAGE)
+                return (
+                    int(current_identity["instance_index"]) == 0
+                    and str(current_identity["package_id"]) == GAME_PACKAGE
+                    and str(current_identity["runtime_family"]).casefold()
+                    == "MuMuV5".casefold()
+                    and str(current_game.get("state", "")).casefold() == "running"
+                )
+
+            def recover_resource_package() -> None:
+                runtime.ensure_package_running()
+                runtime.ensure_game_window_foreground()
+
             episode = PersonalAutomationEpisode(
                 frame_provider=episode_frame_provider,
                 detector=detector,
                 planner=planner,
-                executor=ActionExecutor(dispatch_tap),
+                executor=ActionExecutor(
+                    dispatch_tap,
+                    pre_dispatch_guard=exact_target_still_active,
+                ),
                 transform_provider=lambda detected: CoordinateTransform(
                     detected.frame_dimensions,
                     (853, 480),
@@ -265,6 +298,11 @@ def main() -> int:
                 budget=budget,
                 recorder=recorder,
                 policy=policy,
+                resource_update_recover_package=recover_resource_package,
+                resource_update_package_running=lambda: str(
+                    manager.game_info(GAME_PACKAGE).get("state", "")
+                ).casefold()
+                in {"running", "starting"},
             )
             episode_result = episode.run()
             result_payload.update(
@@ -301,6 +339,14 @@ def main() -> int:
                 adb.kill()
             except Exception:
                 pass
+        result_payload["lifecycle_state_history"] = lifecycle.instance_state_history
+        result_payload["instance_launch_dispatches"] = lifecycle.emulator_launch_dispatches
+        result_payload["package_launch_dispatches"] = budget.actions_by_action_type[
+            "START_PACKAGE"
+        ]
+        result_payload["resource_confirm_attempts"] = budget.actions_by_action_type[
+            "CONFIRM_RESOURCE_UPDATE"
+        ]
         result_payload["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         (args.output / "PERSONAL_AUTOMATION_EPISODE_RESULT.json").write_text(
             json.dumps(result_payload, ensure_ascii=False, indent=2),

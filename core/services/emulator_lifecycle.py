@@ -13,6 +13,7 @@ import subprocess
 import time
 import uuid
 from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -43,6 +44,14 @@ class LifecycleCancelled(LifecycleError):
 
 class UnsupportedEmulatorOperation(LifecycleError):
     """Raised when a custom ADB target is asked to control its host emulator."""
+
+
+class EmulatorInstanceState(str, Enum):
+    STOPPED = "STOPPED"
+    STOPPING = "STOPPING"
+    STARTING = "STARTING"
+    ANDROID_READY = "ANDROID_READY"
+    FAILED = "FAILED"
 
 
 def _run_subprocess_tree(
@@ -113,6 +122,8 @@ class LifecycleOptions:
     close_game_when_idle: bool = True
     close_emulator_when_idle: bool = False
     emulator_start_timeout: float = 180.0
+    stopping_settle_timeout: float = 60.0
+    android_boot_timeout: float | None = None
     game_start_timeout: float = 180.0
     cleanup_timeout: float = 10.0
     poll_interval: float = 2.0
@@ -351,7 +362,9 @@ class EmulatorLifecycle:
         self.monotonic = monotonic
         self.sleep = sleep
         self.emulator_started_by_us = False
+        self.emulator_launch_dispatches = 0
         self.game_started_by_us = False
+        self.instance_state_history: list[dict] = []
 
     @property
     def label(self) -> str:
@@ -397,6 +410,45 @@ class EmulatorLifecycle:
             else True
         )
         return bool(info.get("is_process_started")) and android_ready and port_ready
+
+    @classmethod
+    def _instance_state(cls, info: dict) -> EmulatorInstanceState:
+        raw_player_state = str(info.get("player_state") or "").strip().lower()
+        if int(info.get("launch_err_code") or 0) != 0 or raw_player_state in {
+            "failed",
+            "error",
+        }:
+            return EmulatorInstanceState.FAILED
+        if cls._emulator_ready(info):
+            return EmulatorInstanceState.ANDROID_READY
+        if raw_player_state == "stopping":
+            return EmulatorInstanceState.STOPPING
+        if raw_player_state in {"stopped", "stop_finished"}:
+            return EmulatorInstanceState.STOPPED
+        if not bool(info.get("is_process_started")):
+            return EmulatorInstanceState.STOPPED
+        return EmulatorInstanceState.STARTING
+
+    def _record_instance_state(
+        self,
+        info: dict,
+        *,
+        launch_dispatched: bool,
+        reason_code: str,
+    ) -> EmulatorInstanceState:
+        state = self._instance_state(info)
+        self.instance_state_history.append(
+            {
+                "timestamp": float(self.monotonic()),
+                "state": state.value,
+                "player_state": str(info.get("player_state") or ""),
+                "android_started": bool(info.get("is_android_started")),
+                "process_present": bool(info.get("is_process_started")),
+                "launch_dispatched": bool(launch_dispatched),
+                "reason_code": reason_code,
+            }
+        )
+        return state
 
     def _adb_boot_completed(self) -> bool:
         try:
@@ -472,40 +524,81 @@ class EmulatorLifecycle:
             return snapshot_device(self.device)
 
         self._check_cancelled(cancelled)
-        deadline = self.monotonic() + max(0.0, self.options.emulator_start_timeout)
-        info = self._wait_for_emulator_info(deadline, cancelled)
+        initial_deadline = self.monotonic() + max(
+            0.0, self.options.emulator_start_timeout
+        )
+        info = self._wait_for_emulator_info(initial_deadline, cancelled)
         self._update_device_from_info(info)
+        state = self._record_instance_state(
+            info, launch_dispatched=False, reason_code="initial_observation"
+        )
         if self._target_ready(info):
             logger.info(f"MuMu 多开实例已运行: {self.label}，ADB {self.device.port}")
             return snapshot_device(self.device)
 
-        process_started = bool(info.get("is_process_started"))
-        android_starting = (
-            "is_android_started" in info and not info.get("is_android_started")
-        )
-        if not process_started:
-            if not self.options.auto_start_emulator:
-                raise LifecycleError(f"MuMu 多开实例未启动且自动启动已关闭: {self.label}")
-            logger.info(f"正在启动 MuMu 多开实例: {self.label}")
-            # Mark ownership before invoking the command: a timeout can occur
-            # after MuMu accepted the launch request, and cleanup must then be
-            # allowed to compensate by shutting the new instance down.
-            self.emulator_started_by_us = True
-            self.manager.launch_emulator()
-        elif android_starting and self.options.auto_start_emulator:
-            logger.info(f"MuMu 进程存在但 Android 未就绪，正在唤醒: {self.label}")
-            self.manager.launch_emulator()
+        if state is EmulatorInstanceState.FAILED:
+            raise LifecycleError(f"MuMu 多开实例报告失败状态: {self.label}")
 
+        if state is EmulatorInstanceState.STOPPING:
+            settle_deadline = self.monotonic() + max(
+                0.0, self.options.stopping_settle_timeout
+            )
+            logger.info(f"MuMu 多开实例正在停止，等待状态收敛: {self.label}")
+            while state is EmulatorInstanceState.STOPPING:
+                if self.monotonic() >= settle_deadline:
+                    raise LifecycleError(
+                        f"等待 MuMu stopping 状态收敛超时: {self.label}"
+                    )
+                self._pause(settle_deadline, cancelled)
+                info = self._wait_for_emulator_info(settle_deadline, cancelled)
+                self._update_device_from_info(info)
+                state = self._record_instance_state(
+                    info,
+                    launch_dispatched=False,
+                    reason_code="stopping_settle_observation",
+                )
+                if self._target_ready(info):
+                    logger.info(
+                        f"MuMu 多开实例 stopping 后已就绪: {self.label}，ADB {self.device.port}"
+                    )
+                    return snapshot_device(self.device)
+            if state is EmulatorInstanceState.FAILED:
+                raise LifecycleError(f"MuMu 多开实例停止阶段失败: {self.label}")
+
+        boot_timeout = (
+            self.options.emulator_start_timeout
+            if self.options.android_boot_timeout is None
+            else self.options.android_boot_timeout
+        )
+        boot_deadline = self.monotonic() + max(0.0, boot_timeout)
+        launch_dispatched = False
         while True:
             self._check_cancelled(cancelled)
-            info = self._wait_for_emulator_info(deadline, cancelled)
+            if state is EmulatorInstanceState.STOPPED and not launch_dispatched:
+                if not self.options.auto_start_emulator:
+                    raise LifecycleError(
+                        f"MuMu 多开实例未启动且自动启动已关闭: {self.label}"
+                    )
+                logger.info(f"正在启动 MuMu 多开实例: {self.label}")
+                self.emulator_started_by_us = True
+                self.manager.launch_emulator()
+                self.emulator_launch_dispatches += 1
+                launch_dispatched = True
+            if self.monotonic() >= boot_deadline:
+                break
+            self._pause(boot_deadline, cancelled)
+            info = self._wait_for_emulator_info(boot_deadline, cancelled)
             self._update_device_from_info(info)
+            state = self._record_instance_state(
+                info,
+                launch_dispatched=launch_dispatched,
+                reason_code="android_boot_observation",
+            )
             if self._target_ready(info):
                 logger.info(f"MuMu 多开实例就绪: {self.label}，ADB {self.device.port}")
                 return snapshot_device(self.device)
-            if self.monotonic() >= deadline:
-                break
-            self._pause(deadline, cancelled)
+            if state is EmulatorInstanceState.FAILED:
+                raise LifecycleError(f"MuMu 多开实例启动失败: {self.label}")
         raise LifecycleError(f"等待 MuMu 多开实例启动超时: {self.label}")
 
     def _adb_shell(self, command: str) -> str:

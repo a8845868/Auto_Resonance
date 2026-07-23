@@ -22,6 +22,8 @@ from core.services.runtime_mode import RuntimeMode, resolve_runtime_mode
 
 
 class RuntimeState(str, Enum):
+    RESOURCE_UPDATE_REQUIRED = "RESOURCE_UPDATE_REQUIRED"
+    RESOURCE_UPDATE_DOWNLOADING = "RESOURCE_UPDATE_DOWNLOADING"
     ANNOUNCEMENT_VISIBLE = "ANNOUNCEMENT_VISIBLE"
     DAILY_CHECKIN = "DAILY_CHECKIN"
     SESSION_ENTRY = "SESSION_ENTRY"
@@ -32,6 +34,7 @@ class RuntimeState(str, Enum):
 
 
 class RuntimeAction(str, Enum):
+    CONFIRM_RESOURCE_UPDATE = "CONFIRM_RESOURCE_UPDATE"
     DISMISS_ANNOUNCEMENT = "DISMISS_ANNOUNCEMENT"
     DISMISS_DAILY_CHECKIN = "DISMISS_DAILY_CHECKIN"
     ENTER_SESSION = "ENTER_SESSION"
@@ -45,11 +48,18 @@ class EpisodePolicy:
     minimum_action_interval_seconds: float = 0.5
     maximum_observations: int = 120
     episode_timeout_seconds: float = 120.0
+    resource_update_timeout_seconds: float = 600.0
+    resource_update_stall_timeout_seconds: float = 120.0
 
     def validate(self) -> None:
         if self.minimum_action_interval_seconds < 0:
             raise ValueError("episode_action_interval_invalid")
-        if self.maximum_observations < 1 or self.episode_timeout_seconds <= 0:
+        if (
+            self.maximum_observations < 1
+            or self.episode_timeout_seconds <= 0
+            or self.resource_update_timeout_seconds <= 0
+            or self.resource_update_stall_timeout_seconds <= 0
+        ):
             raise ValueError("episode_observation_policy_invalid")
 
 
@@ -64,6 +74,9 @@ class DetectedRuntimeState:
     dialog_bbox: tuple[int, int, int, int] | None = None
     announcement_candidates: tuple[SafeBlankRegion, ...] = ()
     city_entry_bbox: tuple[int, int, int, int] | None = None
+    resource_size_mb: float | None = None
+    resource_confirm_bbox: tuple[int, int, int, int] | None = None
+    resource_progress_percent: float | None = None
     evidence: tuple[str, ...] = ()
     frame_hash: str = ""
 
@@ -144,6 +157,20 @@ class StateDetector:
 
     HOME_MARKERS = ("访问城市", "作战终端", "启程", "整备列车")
     CITY_MARKERS = ("市政厅", "交易所", "商会", "休息区", "城市设施")
+    RESOURCE_TEXT_MARKERS = ("需要下载资源包", "需要更新资源", "需要下载资源")
+    RESOURCE_BLOCKING_MARKERS = (
+        "购买",
+        "支付",
+        "充值",
+        "付费",
+        "奖励",
+        "领取",
+        "交易",
+        "买入",
+        "卖出",
+    )
+    RESOURCE_SIZE_PATTERN = re.compile(r"(?P<size>\d+(?:\.\d+)?)\s*MB", re.IGNORECASE)
+    RESOURCE_PROGRESS_PATTERN = re.compile(r"(?P<progress>\d{1,3}(?:\.\d+)?)\s*%")
 
     def __init__(
         self,
@@ -211,6 +238,81 @@ class StateDetector:
                 overlay = tuple(map(int, raw_overlay))
             if isinstance(raw_dialog, (list, tuple)) and len(raw_dialog) == 4:
                 dialog = tuple(map(int, raw_dialog))
+
+        resource_items = [
+            item
+            for item in items
+            if any(marker in self._text(item) for marker in self.RESOURCE_TEXT_MARKERS)
+        ]
+        size_matches = [
+            match
+            for text in texts
+            for match in self.RESOURCE_SIZE_PATTERN.finditer(text)
+        ]
+        confirm_items = [
+            item for item in items if self._text(item).replace(" ", "") == "确认" and _bbox(item)
+        ]
+        progress_matches = [
+            match
+            for text in texts
+            for match in self.RESOURCE_PROGRESS_PATTERN.finditer(text)
+        ]
+        blocking_cues = tuple(
+            marker
+            for marker in self.RESOURCE_BLOCKING_MARKERS
+            if any(marker in text for text in texts)
+        )
+        if (
+            len(resource_items) == 1
+            and size_matches
+            and progress_matches
+            and not blocking_cues
+        ):
+            resource_size = float(size_matches[0].group("size"))
+            progress = float(progress_matches[0].group("progress"))
+            confirm_bbox = _bbox(confirm_items[0]) if len(confirm_items) == 1 else None
+            if (
+                len(confirm_items) == 1
+                and progress <= 0
+                and confirm_bbox is not None
+                and 0 <= confirm_bbox[0] < confirm_bbox[2] <= width
+                and 0 <= confirm_bbox[1] < confirm_bbox[3] <= height
+            ):
+                return DetectedRuntimeState(
+                    RuntimeState.RESOURCE_UPDATE_REQUIRED,
+                    (width, height),
+                    1.0,
+                    bboxes,
+                    texts,
+                    resource_size_mb=resource_size,
+                    resource_confirm_bbox=confirm_bbox,
+                    resource_progress_percent=progress,
+                    evidence=(
+                        "resource_update_text_match_count=1",
+                        f"resource_size_mb={resource_size:g}",
+                        "confirm_button_match_count=1",
+                        "progress_indicator_present",
+                        "risk_cues_absent",
+                    ),
+                    frame_hash=frame_hash,
+                )
+            if len(confirm_items) == 0 or progress > 0:
+                return DetectedRuntimeState(
+                    RuntimeState.RESOURCE_UPDATE_DOWNLOADING,
+                    (width, height),
+                    1.0,
+                    bboxes,
+                    texts,
+                    resource_size_mb=resource_size,
+                    resource_progress_percent=progress,
+                    evidence=(
+                        "resource_update_text_match_count=1",
+                        f"resource_size_mb={resource_size:g}",
+                        f"download_progress={progress:g}",
+                        "risk_cues_absent",
+                    ),
+                    frame_hash=frame_hash,
+                )
 
         daily = (
             any("每日签到奖励" in text for text in texts)
@@ -326,7 +428,61 @@ class StateDetector:
         )
 
 
+class ResourceUpdateHandler:
+    """Plan at most one exact resource-update confirmation per episode."""
+
+    def __init__(self, *, authorized_resource_size_mb: float | None = None) -> None:
+        self.authorized_resource_size_mb = authorized_resource_size_mb
+
+    def plan(
+        self, detected: DetectedRuntimeState, budget: EpisodeActionBudget
+    ) -> PlannedRuntimeAction:
+        already_dispatched = budget.actions_by_action_type["CONFIRM_RESOURCE_UPDATE"] > 0
+        if (
+            self.authorized_resource_size_mb is not None
+            and detected.resource_size_mb != self.authorized_resource_size_mb
+        ):
+            return PlannedRuntimeAction(
+                RuntimeAction.OBSERVE_ONLY,
+                detected.state,
+                None,
+                detected.resource_confirm_bbox,
+                None,
+                "resource_update_size_not_authorized",
+            )
+        if already_dispatched:
+            return PlannedRuntimeAction(
+                RuntimeAction.OBSERVE_ONLY,
+                detected.state,
+                None,
+                detected.resource_confirm_bbox,
+                RuntimeState.RESOURCE_UPDATE_DOWNLOADING,
+                "resource_update_confirmation_already_attempted",
+            )
+        if detected.resource_confirm_bbox is None:
+            return PlannedRuntimeAction(
+                RuntimeAction.OBSERVE_ONLY,
+                detected.state,
+                None,
+                None,
+                None,
+                "resource_update_unique_confirm_unavailable",
+            )
+        bbox = detected.resource_confirm_bbox
+        return PlannedRuntimeAction(
+            RuntimeAction.CONFIRM_RESOURCE_UPDATE,
+            detected.state,
+            (round((bbox[0] + bbox[2]) / 2), round((bbox[1] + bbox[3]) / 2)),
+            bbox,
+            RuntimeState.RESOURCE_UPDATE_DOWNLOADING,
+            "unique_resource_update_confirm_selected",
+        )
+
+
 class ActionPlanner:
+    def __init__(self, resource_update_handler: ResourceUpdateHandler | None = None) -> None:
+        self.resource_update_handler = resource_update_handler or ResourceUpdateHandler()
+
     @staticmethod
     def _center(bbox: tuple[int, int, int, int]) -> tuple[int, int]:
         return (round((bbox[0] + bbox[2]) / 2), round((bbox[1] + bbox[3]) / 2))
@@ -348,6 +504,17 @@ class ActionPlanner:
     def plan(
         self, detected: DetectedRuntimeState, *, budget: EpisodeActionBudget
     ) -> PlannedRuntimeAction:
+        if detected.state is RuntimeState.RESOURCE_UPDATE_REQUIRED:
+            return self.resource_update_handler.plan(detected, budget)
+        if detected.state is RuntimeState.RESOURCE_UPDATE_DOWNLOADING:
+            return PlannedRuntimeAction(
+                RuntimeAction.OBSERVE_ONLY,
+                detected.state,
+                None,
+                None,
+                None,
+                "resource_update_download_observation_only",
+            )
         if detected.state is RuntimeState.ANNOUNCEMENT_VISIBLE:
             candidate = self._candidate(detected, budget)
             if candidate is None:
@@ -431,14 +598,22 @@ class ExecutionResult:
 
 
 class ActionExecutor:
-    def __init__(self, click: Callable[[tuple[int, int]], object]) -> None:
+    def __init__(
+        self,
+        click: Callable[[tuple[int, int]], object],
+        *,
+        pre_dispatch_guard: Callable[[], bool] | None = None,
+    ) -> None:
         self.click = click
+        self.pre_dispatch_guard = pre_dispatch_guard
 
     def execute(
         self, plan: PlannedRuntimeAction, *, transform: CoordinateTransform
     ) -> ExecutionResult:
         if plan.capture_point is None:
             return ExecutionResult(False, None, "action_point_missing")
+        if self.pre_dispatch_guard is not None and not self.pre_dispatch_guard():
+            return ExecutionResult(False, None, "target_identity_guard_failed")
         mapping = transform.map(plan.capture_point)
         result = self.click(mapping.render_client_point)
         return ExecutionResult(result is not False, mapping, "input_dispatched")
@@ -447,6 +622,8 @@ class ActionExecutor:
 class PostconditionVerifier:
     @staticmethod
     def verify(plan: PlannedRuntimeAction, detected: DetectedRuntimeState) -> bool:
+        if plan.action is RuntimeAction.CONFIRM_RESOURCE_UPDATE:
+            return detected.state is not RuntimeState.RESOURCE_UPDATE_REQUIRED
         return plan.expected_postcondition is not None and detected.state is plan.expected_postcondition
 
 
@@ -459,6 +636,11 @@ class RecoveryPolicy:
     ) -> bool:
         if current.state is RuntimeState.UNKNOWN:
             return True
+        if previous.action is RuntimeAction.CONFIRM_RESOURCE_UPDATE:
+            return current.state in {
+                RuntimeState.RESOURCE_UPDATE_REQUIRED,
+                RuntimeState.RESOURCE_UPDATE_DOWNLOADING,
+            }
         if previous.action in {
             RuntimeAction.DISMISS_ANNOUNCEMENT,
             RuntimeAction.DISMISS_DAILY_CHECKIN,
@@ -519,6 +701,8 @@ class PersonalAutomationEpisode:
         policy: EpisodePolicy = EpisodePolicy(),
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        resource_update_recover_package: Callable[[], object] | None = None,
+        resource_update_package_running: Callable[[], bool] | None = None,
         mode: RuntimeMode | str | None = None,
     ) -> None:
         policy.validate()
@@ -538,6 +722,8 @@ class PersonalAutomationEpisode:
         self.policy = policy
         self.sleep = sleep
         self.monotonic = monotonic
+        self.resource_update_recover_package = resource_update_recover_package
+        self.resource_update_package_running = resource_update_package_running
         self._started = False
 
     def run(self) -> EpisodeResult:
@@ -545,19 +731,91 @@ class PersonalAutomationEpisode:
             raise RuntimeError("episode_instance_cannot_restart")
         self._started = True
         started = self.monotonic()
+        episode_deadline = started + self.policy.episode_timeout_seconds
+        resource_deadline: float | None = None
+        resource_last_progress: float | None = None
+        resource_last_progress_at: float | None = None
+        resource_confirmation_dispatched = False
+        resource_package_recovery_attempted = False
         observations = 0
+        last_state = RuntimeState.UNKNOWN
         previous_plan: PlannedRuntimeAction | None = None
-        while (
-            observations < self.policy.maximum_observations
-            and self.monotonic() - started < self.policy.episode_timeout_seconds
-        ):
-            detected = self.detector.detect(self.frame_provider())
+        while observations < self.policy.maximum_observations:
+            now = self.monotonic()
+            active_deadline = max(episode_deadline, resource_deadline or episode_deadline)
+            if now >= active_deadline:
+                break
+            if (
+                resource_confirmation_dispatched
+                and self.resource_update_package_running is not None
+                and not self.resource_update_package_running()
+                and not resource_package_recovery_attempted
+                and self.resource_update_recover_package is not None
+            ):
+                resource_package_recovery_attempted = True
+                self.recorder.record(
+                    "resource_package_recovery",
+                    reason="package_not_running",
+                    attempt=1,
+                )
+                self.resource_update_recover_package()
+                self.sleep(self.policy.minimum_action_interval_seconds)
+                continue
+            try:
+                frame = self.frame_provider()
+            except Exception as exc:
+                if (
+                    resource_confirmation_dispatched
+                    and not resource_package_recovery_attempted
+                    and self.resource_update_recover_package is not None
+                ):
+                    resource_package_recovery_attempted = True
+                    self.recorder.record(
+                        "resource_package_recovery",
+                        error_type=type(exc).__name__,
+                        attempt=1,
+                    )
+                    self.resource_update_recover_package()
+                    self.sleep(self.policy.minimum_action_interval_seconds)
+                    continue
+                raise
+            detected = self.detector.detect(frame)
+            last_state = detected.state
             observations += 1
+            if detected.state in {
+                RuntimeState.RESOURCE_UPDATE_REQUIRED,
+                RuntimeState.RESOURCE_UPDATE_DOWNLOADING,
+            }:
+                if resource_deadline is None:
+                    resource_deadline = self.monotonic() + self.policy.resource_update_timeout_seconds
+                progress = detected.resource_progress_percent
+                if progress is not None and (
+                    resource_last_progress is None or progress > resource_last_progress
+                ):
+                    resource_last_progress = progress
+                    resource_last_progress_at = self.monotonic()
+                elif (
+                    resource_confirmation_dispatched
+                    and resource_last_progress_at is not None
+                    and self.monotonic() - resource_last_progress_at
+                    >= self.policy.resource_update_stall_timeout_seconds
+                ):
+                    return EpisodeResult(
+                        "BLOCKED",
+                        detected.state,
+                        self.budget.total_actions,
+                        observations,
+                        "resource_update_progress_stalled",
+                        tuple(self.recorder.events),
+                    )
             self.recorder.record(
                 "observation",
                 state=detected.state.value,
                 frame_hash=detected.frame_hash,
                 action_count=self.budget.total_actions,
+                resource_size_mb=detected.resource_size_mb,
+                resource_progress_percent=detected.resource_progress_percent,
+                resource_confirm_bbox=detected.resource_confirm_bbox,
             )
             if detected.state is RuntimeState.CITY_DETAIL:
                 return EpisodeResult(
@@ -588,6 +846,7 @@ class PersonalAutomationEpisode:
                 state=plan.state.value,
                 action=plan.action.value,
                 point=plan.capture_point,
+                target_bbox=plan.target_bbox,
                 reason=plan.reason,
             )
             if plan.action is RuntimeAction.STOP:
@@ -652,6 +911,10 @@ class PersonalAutomationEpisode:
                 )
             self.budget.record_dispatch(decision)
             self.budget.record_result(decision, "DISPATCHED")
+            if plan.action is RuntimeAction.CONFIRM_RESOURCE_UPDATE:
+                resource_confirmation_dispatched = True
+                if resource_last_progress_at is None:
+                    resource_last_progress_at = self.monotonic()
             self.recorder.record(
                 "execution",
                 action=plan.action.value,
@@ -661,12 +924,17 @@ class PersonalAutomationEpisode:
             )
             previous_plan = plan
             self.sleep(self.policy.minimum_action_interval_seconds)
+        reason = (
+            "resource_update_timeout"
+            if resource_deadline is not None and self.monotonic() >= resource_deadline
+            else "episode_deadline_or_observation_limit"
+        )
         return EpisodeResult(
             "BLOCKED",
-            RuntimeState.UNKNOWN,
+            last_state,
             self.budget.total_actions,
             observations,
-            "episode_deadline_or_observation_limit",
+            reason,
             tuple(self.recorder.events),
         )
 
@@ -683,6 +951,7 @@ __all__ = [
     "PlannedRuntimeAction",
     "PostconditionVerifier",
     "RecoveryPolicy",
+    "ResourceUpdateHandler",
     "RunRecorder",
     "RuntimeAction",
     "RuntimeState",

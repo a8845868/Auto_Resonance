@@ -75,3 +75,19 @@ def city_frame():
 
 def unknown_frame():
     return Frame(np.zeros((720, 1280, 3), dtype=np.uint8), [])
+
+
+def resource_update_frame(*, progress="0%", confirmations=1, extra_texts=(), size="25.25MB"):
+    texts = [
+        item(f"需要下载资源包（共{size}）", (468, 345, 795, 376)),
+        item(progress, (1211, 601, 1241, 622)),
+    ]
+    texts.extend(
+        item("确认", (643 + index * 80, 491, 691 + index * 80, 521))
+        for index in range(confirmations)
+    )
+    texts.extend(
+        item(text, (100, 100 + index * 30, 300, 125 + index * 30))
+        for index, text in enumerate(extra_texts)
+    )
+    return Frame(np.full((720, 1280, 3), 20, dtype=np.uint8), texts)

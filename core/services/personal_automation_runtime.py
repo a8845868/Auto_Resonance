@@ -296,19 +296,32 @@ class PersonalAutomationRuntime:
             decision = self._authorize_non_pointer(
                 state="INSTANCE_LIFECYCLE", action_type="START_EMULATOR"
             )
+        def launch_count() -> int:
+            return int(
+                getattr(
+                    self.lifecycle,
+                    "emulator_launch_dispatches",
+                    getattr(self.lifecycle, "emulator_launch_count", 0),
+                )
+            )
+
+        launches_before = launch_count()
         try:
             result = self.lifecycle.ensure_emulator_ready()
         except Exception:
             if decision is not None:
-                if bool(getattr(self.lifecycle, "emulator_started_by_us", False)):
+                if launch_count() > launches_before:
                     self.budget.record_dispatch(decision)
                     self.budget.record_result(decision, "START_DELIVERY_UNKNOWN")
                 else:
                     self.budget.record_result(decision, "START_FAILED_BEFORE_DISPATCH")
             raise
         if decision is not None:
-            self.budget.record_dispatch(decision)
-            self.budget.record_result(decision, "READY")
+            if launch_count() > launches_before:
+                self.budget.record_dispatch(decision)
+                self.budget.record_result(decision, "READY")
+            else:
+                self.budget.record_result(decision, "READY_WITHOUT_LAUNCH")
         return result
 
     def ensure_package_running(self) -> object:

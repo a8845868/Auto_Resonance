@@ -16,6 +16,7 @@ class EpisodeActionBudgetPolicy:
     max_same_point_clicks: int = 1
     max_announcement_dismiss_attempts: int = 2
     max_daily_checkin_dismiss_attempts: int = 2
+    max_resource_update_confirm_attempts: int = 1
     max_enter_city_attempts: int = 2
     unknown_state_actions: int = 0
 
@@ -26,6 +27,7 @@ class EpisodeActionBudgetPolicy:
             "max_same_point_clicks": 1,
             "max_announcement_dismiss_attempts": 2,
             "max_daily_checkin_dismiss_attempts": 2,
+            "max_resource_update_confirm_attempts": 1,
             "max_enter_city_attempts": 2,
             "unknown_state_actions": 0,
         }
@@ -67,6 +69,7 @@ class EpisodeActionBudget:
     _ACTION_LIMIT_FIELDS = {
         "DISMISS_ANNOUNCEMENT": "max_announcement_dismiss_attempts",
         "DISMISS_DAILY_CHECKIN": "max_daily_checkin_dismiss_attempts",
+        "CONFIRM_RESOURCE_UPDATE": "max_resource_update_confirm_attempts",
         "ENTER_CITY": "max_enter_city_attempts",
     }
     _NON_POINTER_ACTIONS = frozenset(
