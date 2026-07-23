@@ -171,6 +171,11 @@ class StateDetector:
     )
     RESOURCE_SIZE_PATTERN = re.compile(r"(?P<size>\d+(?:\.\d+)?)\s*MB", re.IGNORECASE)
     RESOURCE_PROGRESS_PATTERN = re.compile(r"(?P<progress>\d{1,3}(?:\.\d+)?)\s*%")
+    RESOURCE_TRANSFER_PATTERN = re.compile(
+        r"(?P<downloaded>\d+(?:\.\d+)?)\s*MB\s*/\s*"
+        r"(?P<total>\d+(?:\.\d+)?)\s*M(?:B)?",
+        re.IGNORECASE,
+    )
 
     def __init__(
         self,
@@ -257,6 +262,11 @@ class StateDetector:
             for text in texts
             for match in self.RESOURCE_PROGRESS_PATTERN.finditer(text)
         ]
+        transfer_matches = [
+            match
+            for text in texts
+            for match in self.RESOURCE_TRANSFER_PATTERN.finditer(text)
+        ]
         blocking_cues = tuple(
             marker
             for marker in self.RESOURCE_BLOCKING_MARKERS
@@ -313,6 +323,35 @@ class StateDetector:
                     ),
                     frame_hash=frame_hash,
                 )
+        if (
+            not resource_items
+            and len(confirm_items) == 0
+            and len(transfer_matches) == 1
+            and progress_matches
+            and not blocking_cues
+        ):
+            transfer = transfer_matches[0]
+            resource_size = float(transfer.group("total"))
+            progress = max(
+                float(match.group("progress")) for match in progress_matches
+            )
+            return DetectedRuntimeState(
+                RuntimeState.RESOURCE_UPDATE_DOWNLOADING,
+                (width, height),
+                1.0,
+                bboxes,
+                texts,
+                resource_size_mb=resource_size,
+                resource_progress_percent=progress,
+                evidence=(
+                    "resource_transfer_match_count=1",
+                    f"resource_size_mb={resource_size:g}",
+                    f"download_progress={progress:g}",
+                    "confirm_button_match_count=0",
+                    "risk_cues_absent",
+                ),
+                frame_hash=frame_hash,
+            )
 
         daily = (
             any("每日签到奖励" in text for text in texts)

@@ -194,6 +194,32 @@ def test_download_progress_is_observation_only():
     assert plan.action is RuntimeAction.OBSERVE_ONLY
 
 
+@pytest.mark.parametrize(
+    "transfer_text",
+    (
+        "[13.2%]9/13(3.34MB/25.25M)2.87MB/s",
+        "[74.8%]11/13(18.89MB/25.25MB)4.18MB/s",
+    ),
+)
+def test_real_download_transfer_signature_is_detected_without_prompt_text(
+    transfer_text,
+):
+    frame = Frame(
+        resource_update_frame().image,
+        [
+            item(transfer_text, (40, 600, 379, 622)),
+            item(transfer_text.split("%", 1)[0].lstrip("[") + "%", (1185, 600, 1243, 622)),
+            item("App:1.7.2", (36, 633, 127, 655)),
+        ],
+    )
+    detected = StateDetector().detect(frame)
+    assert detected.state is RuntimeState.RESOURCE_UPDATE_DOWNLOADING
+    assert detected.resource_size_mb == pytest.approx(25.25)
+    assert ActionPlanner().plan(
+        detected, budget=EpisodeActionBudget()
+    ).action is RuntimeAction.OBSERVE_ONLY
+
+
 def test_live_handler_rejects_unapproved_resource_size():
     detected = StateDetector().detect(resource_update_frame(size="30.00MB"))
     plan = ActionPlanner(
