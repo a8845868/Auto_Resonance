@@ -41,6 +41,7 @@ from app.view.passenger_planner_interface import PassengerPlannerInterface
 from app.view.shop_planner_interface import ShopPlannerInterface
 from core.utils.update.base_update_utils import UpdateStatus
 from core.utils.update.mirror_update_utils import MirrorUpdateUtils
+from core.services.personal_automation_entry import build_personal_startup_queued_task
 
 from .adb_data_interface import ADBDataInterface
 from .codex_debug_interface import CodexDebugInterface
@@ -196,6 +197,11 @@ class MainWindow(FluentWindow):
         self.two_run_business_interface = TwoRunBusinessInterface(self)
         self.homeInterface.setBusinessTaskProvider(
             self.two_run_business_interface.buildQueuedTask
+        )
+        self.homeInterface.addPriorityTaskProvider(
+            lambda: build_personal_startup_queued_task()
+            if bool(cfg.enablePersonalStartupEpisode.value)
+            else None
         )
         self.homeInterface.addPriorityTaskProvider(
             self.fatiguePlannerInterface.buildQueuedTask

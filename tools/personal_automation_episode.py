@@ -39,15 +39,15 @@ from core.services.personal_automation_runtime import (  # noqa: E402
     PersonalAutomationRuntime,
 )
 from core.services.personal_runtime_episode import (  # noqa: E402
-    ActionExecutor,
     ActionPlanner,
-    CoordinateTransform,
-    EpisodePolicy,
-    PersonalAutomationEpisode,
     ResourceUpdateHandler,
     ResourceUpdatePolicy,
     RunRecorder,
     StateDetector,
+)
+from core.services.personal_automation_entry import (  # noqa: E402
+    PersonalAutomationEntryConfig,
+    run_personal_automation_episode,
 )
 
 
@@ -270,12 +270,17 @@ def main() -> int:
             def episode_frame_provider():
                 return pending.pop(0) if pending else frame_provider()
 
-            policy = EpisodePolicy(
+            entry_config = PersonalAutomationEntryConfig(
                 episode_timeout_seconds=args.timeout,
                 resource_update_timeout_seconds=args.resource_update_timeout,
                 resource_update_stall_timeout_seconds=args.resource_update_stall_timeout,
-                minimum_action_interval_seconds=args.observation_interval,
                 observation_interval_seconds=args.observation_interval,
+                auto_confirm_resource_update=not args.disable_resource_update_auto_confirm,
+                minimum_resource_update_mb=args.resource_update_minimum_mb,
+                maximum_resource_update_mb=args.resource_update_maximum_mb,
+                allowed_exact_resource_update_sizes_mb=tuple(
+                    args.resource_update_exact_mb
+                ),
             )
 
             def dispatch_tap(point: tuple[int, int]) -> bool:
@@ -300,30 +305,19 @@ def main() -> int:
                 runtime.ensure_package_running()
                 runtime.ensure_game_window_foreground()
 
-            episode = PersonalAutomationEpisode(
+            episode_result, _ = run_personal_automation_episode(
                 frame_provider=episode_frame_provider,
-                detector=detector,
-                planner=planner,
-                executor=ActionExecutor(
-                    dispatch_tap,
-                    pre_dispatch_guard=exact_target_still_active,
-                ),
-                transform_provider=lambda detected: CoordinateTransform(
-                    detected.frame_dimensions,
-                    (853, 480),
-                    detected.frame_dimensions,
-                    (0, 0),
-                ),
+                click=dispatch_tap,
+                pre_dispatch_guard=exact_target_still_active,
                 budget=budget,
                 recorder=recorder,
-                policy=policy,
+                config=entry_config,
                 resource_update_recover_package=recover_resource_package,
                 resource_update_package_running=lambda: str(
                     manager.game_info(GAME_PACKAGE).get("state", "")
                 ).casefold()
                 in {"running", "starting"},
             )
-            episode_result = episode.run()
             result_payload.update(
                 {
                     "status": episode_result.status,

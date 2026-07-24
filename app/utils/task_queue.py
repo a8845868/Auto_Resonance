@@ -22,6 +22,14 @@ from core.services.task_schedule_state import next_daily_reset, task_result_succ
 
 
 @dataclass(frozen=True)
+class TaskExecutionContext:
+    lifecycle: QueueLifecycle | None
+    cancelled: Callable[[], bool]
+    logger: object
+    runtime_mode: str = "PERSONAL_AUTOMATION"
+
+
+@dataclass(frozen=True)
 class QueuedTask:
     name: str
     run: Callable[[], object]
@@ -31,6 +39,8 @@ class QueuedTask:
     failure_retry_seconds: int = 600
     recoverable_retries: int = 2
     retry_backoff_seconds: float = 1.0
+    run_with_context: Callable[[TaskExecutionContext], object] | None = None
+    halt_queue_on_failure: bool = False
 
     def next_run_after(self, succeeded: bool, now: datetime | None = None) -> datetime:
         now = now or datetime.now()
@@ -113,7 +123,16 @@ class TaskQueueWorker(QThread):
                 attempt = 0
                 while True:
                     try:
-                        result = task.run()
+                        if task.run_with_context is not None:
+                            result = task.run_with_context(
+                                TaskExecutionContext(
+                                    lifecycle=self.lifecycle,
+                                    cancelled=lambda: self._stop_requested,
+                                    logger=logger,
+                                )
+                            )
+                        else:
+                            result = task.run()
                         if self._stop_requested or not task_result_succeeded(result):
                             succeeded = False
                             if not self._stop_requested:
@@ -202,11 +221,16 @@ class TaskQueueWorker(QThread):
                 self.taskCompleted.emit(task, succeeded, result)
                 if self._fatal_error is not None:
                     break
-                if not succeeded and not self._stop_requested and self.halt_on_failure:
-                    self._halted_for_repair = True
-                    logger.warning(
-                        f"已暂停本批后续任务，等待 Codex 对 {task.name} 的失败现场进行隔离诊断"
-                    )
+                if not succeeded and not self._stop_requested and (
+                    self.halt_on_failure or task.halt_queue_on_failure
+                ):
+                    if self.halt_on_failure:
+                        self._halted_for_repair = True
+                        logger.warning(
+                            f"已暂停本批后续任务，等待 Codex 对 {task.name} 的失败现场进行隔离诊断"
+                        )
+                    else:
+                        logger.warning(f"前置任务失败，停止本批后续任务: {task.name}")
                     break
         finally:
             self._current = None

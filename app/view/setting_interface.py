@@ -116,6 +116,13 @@ class SettingInterface(ScrollArea):
             configItem=cfg.autoConfirmResourceUpdate,
             parent=self.lifecycleGroup,
         )
+        self.personalStartupEpisodeCard = SwitchSettingCard(
+            FIF.PLAY,
+            "启动任务前自动准备游戏并进入岚心城",
+            "作为优先队列任务运行；失败时停止后续普通任务",
+            configItem=cfg.enablePersonalStartupEpisode,
+            parent=self.lifecycleGroup,
+        )
         self.maximumResourceUpdateMbCard = SpinBoxSettingCard(
             cfg.maximumResourceUpdateMb,
             FIF.DOWNLOAD,
@@ -181,6 +188,7 @@ class SettingInterface(ScrollArea):
         self.lifecycleGroup.addSettingCard(self.autoStartEmulatorCard)
         self.lifecycleGroup.addSettingCard(self.closeGameWhenIdleCard)
         self.lifecycleGroup.addSettingCard(self.closeEmulatorWhenIdleCard)
+        self.lifecycleGroup.addSettingCard(self.personalStartupEpisodeCard)
         self.lifecycleGroup.addSettingCard(self.autoConfirmResourceUpdateCard)
         self.lifecycleGroup.addSettingCard(self.maximumResourceUpdateMbCard)
         self.selfHealingGroup.addSettingCard(self.codexSelfHealingCard)

@@ -70,3 +70,52 @@ def test_only_explicit_nonempty_results_are_completed():
         ("malformed-success-string", False),
         ("malformed-success-number", False),
     ]
+
+
+def test_context_task_reuses_queue_lifecycle_and_success_continues():
+    class Lifecycle:
+        def prepare(self, _cancelled):
+            pass
+
+        def cleanup(self):
+            pass
+
+    lifecycle = Lifecycle()
+    events = []
+    worker = TaskQueueWorker(
+        [
+            QueuedTask(
+                "startup",
+                lambda: False,
+                run_with_context=lambda context: events.append(
+                    ("startup", context.lifecycle, context.cancelled())
+                )
+                or {"success": True},
+                halt_queue_on_failure=True,
+            ),
+            QueuedTask("ordinary", lambda: events.append(("ordinary",)) or True),
+        ],
+        lifecycle=lifecycle,
+    )
+    worker.run()
+
+    assert events == [("startup", lifecycle, False), ("ordinary",)]
+
+
+def test_failed_priority_context_task_stops_ordinary_tasks():
+    events = []
+    worker = TaskQueueWorker(
+        [
+            QueuedTask(
+                "startup",
+                lambda: False,
+                run_with_context=lambda _context: {"success": False},
+                halt_queue_on_failure=True,
+            ),
+            QueuedTask("ordinary", lambda: events.append("ordinary") or True),
+        ]
+    )
+
+    worker.run()
+
+    assert events == []

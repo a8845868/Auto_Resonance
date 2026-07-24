@@ -219,6 +219,9 @@ class DashboardInterface(ScrollArea):
         self.controlButton.setMinimumHeight(48)
         self.controlButton.clicked.connect(self._toggleTaskQueue)
         self.mainLayout.addWidget(self.controlButton)
+        self.personalStartupStatusLabel = QLabel("个人启动：未运行", self.scrollWidget)
+        self.personalStartupStatusLabel.setWordWrap(True)
+        self.mainLayout.addWidget(self.personalStartupStatusLabel)
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self.scrollWidget)
         scheduler = QWidget(splitter)
@@ -407,7 +410,9 @@ class DashboardInterface(ScrollArea):
             )
 
         lifecycle = None
-        if bool(cfg.enableAutoGameLifecycle.value):
+        if bool(cfg.enableAutoGameLifecycle.value) or bool(
+            cfg.enablePersonalStartupEpisode.value
+        ):
             lifecycle = EmulatorQueueLifecycle(
                 cfg.device.value,
                 options=LifecycleOptions(
@@ -479,6 +484,10 @@ class DashboardInterface(ScrollArea):
         self.runningPanel.setTasks([f"{index}/{total}  {name}"])
         if name == "扫荡与全域整备":
             self.activityStateChanged.emit("●  运行中：正在执行全域整备", "#43a5ff")
+        elif name == "自动准备游戏并进入岚心城":
+            self.personalStartupStatusLabel.setText(
+                "个人启动：运行中 · 正在观察状态 · 最近动作 NONE"
+            )
 
     def _taskFinished(self, name, succeeded):
         if name == "扫荡与全域整备":
@@ -494,6 +503,17 @@ class DashboardInterface(ScrollArea):
         self.activityStateChanged.emit(f"✓  已完成：{details}", "#65c466")
 
     def _taskCompleted(self, task, succeeded, result):
+        if task.name == "自动准备游戏并进入岚心城":
+            details = result if isinstance(result, dict) else {}
+            state = details.get("current_state", "UNKNOWN")
+            action = details.get("last_action", "NONE")
+            actions = details.get("real_ui_actions", 0)
+            reason = details.get("reason", "no_result")
+            outcome = "PASS" if succeeded else "FAIL"
+            self.personalStartupStatusLabel.setText(
+                f"个人启动：{outcome} · 状态 {state} · 最近动作 {action} · "
+                f"动作 {actions}/10 · {reason}"
+            )
         if not task.key:
             return
         deferred = bool(succeeded and task_result_deferred(result))

@@ -131,6 +131,9 @@ class Config(RunningBusinessConfig):
     maximumResourceUpdateMb = ConfigItem(
         "PersonalAutomation", "MaximumResourceUpdateMb", 2048, None
     )
+    enablePersonalStartupEpisode = ConfigItem(
+        "PersonalAutomation", "PrepareGameAndEnterLanxinBeforeTasks", False, None
+    )
 
     enableCodexSelfHealing = ConfigItem(
         "SelfHealing", "Enabled", False, None

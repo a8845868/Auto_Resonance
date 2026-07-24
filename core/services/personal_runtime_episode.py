@@ -941,6 +941,7 @@ class PersonalAutomationEpisode:
         monotonic: Callable[[], float] = time.monotonic,
         resource_update_recover_package: Callable[[], object] | None = None,
         resource_update_package_running: Callable[[], bool] | None = None,
+        cancelled: Callable[[], bool] | None = None,
         mode: RuntimeMode | str | None = None,
     ) -> None:
         policy.validate()
@@ -962,6 +963,7 @@ class PersonalAutomationEpisode:
         self.monotonic = monotonic
         self.resource_update_recover_package = resource_update_recover_package
         self.resource_update_package_running = resource_update_package_running
+        self.cancelled = cancelled or (lambda: False)
         self._started = False
 
     def run(self) -> EpisodeResult:
@@ -980,6 +982,15 @@ class PersonalAutomationEpisode:
         previous_plan: PlannedRuntimeAction | None = None
         observation_limit = self.policy.observation_limit()
         while observations < observation_limit:
+            if self.cancelled():
+                return EpisodeResult(
+                    "BLOCKED",
+                    last_state,
+                    self.budget.total_actions,
+                    observations,
+                    "episode_cancelled",
+                    tuple(self.recorder.events),
+                )
             now = self.monotonic()
             active_deadline = max(episode_deadline, resource_deadline or episode_deadline)
             if now >= active_deadline:
