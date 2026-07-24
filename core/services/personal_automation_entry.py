@@ -136,10 +136,9 @@ def run_personal_automation_episode_from_config(
     if lifecycle is None:
         raise RuntimeError("personal_entry_existing_lifecycle_required")
     device = getattr(lifecycle, "device", None)
-    if int(getattr(device, "index", -1)) != 0 or not bool(
-        getattr(device, "is_mumu", False)
-    ):
-        raise RuntimeError("personal_entry_instance_zero_required")
+    if not bool(getattr(device, "is_mumu", False)):
+        raise RuntimeError("personal_entry_mumu_instance_required")
+    selected_instance_index = int(getattr(device, "index", -1))
 
     if app_config is None:
         from app.common.config import cfg as app_config
@@ -163,7 +162,7 @@ def run_personal_automation_episode_from_config(
     def target_still_active() -> bool:
         return (
             not context.cancelled()
-            and int(getattr(lifecycle.device, "index", -1)) == 0
+            and int(getattr(lifecycle.device, "index", -1)) == selected_instance_index
             and bool(lifecycle.is_game_running())
         )
 

@@ -8,7 +8,6 @@ from core.control.base_control import IADB
 from adb_shell.adb_device import AdbDeviceTcp
 from adb_shell.exceptions import TcpTimeoutException
 
-from core.model import app
 from core.services.repair_safety import ensure_automation_allowed
 
 PNG_KEY = b"\x89PNG"
@@ -21,9 +20,13 @@ class ADB(IADB):
 
     def connect(self, adb_port: Optional[int] = None) -> bool:
         ensure_automation_allowed("建立底层 ADB 连接")
+        from core.control.control import get_runtime_device
+
+        runtime_device = get_runtime_device()
+        self.adb_host = str(runtime_device.adb_host or "127.0.0.1")
         name = "自定义ADB端口"
         if adb_port is None:
-            device = app.Global.device
+            device = runtime_device
             adb_port = device.port
             name = device.name
         if adb_port is None:

@@ -1,4 +1,5 @@
 from app.utils.task_queue import QueuedTask, TaskQueueWorker
+from core.services.emulator_lifecycle import LifecycleCancelled
 
 
 def test_tasks_run_in_declared_order():
@@ -119,3 +120,26 @@ def test_failed_priority_context_task_stops_ordinary_tasks():
     worker.run()
 
     assert events == []
+
+
+def test_lifecycle_cancellation_is_reported_without_running_tasks():
+    events = []
+
+    class CancelledLifecycle:
+        def prepare(self, _cancelled):
+            raise LifecycleCancelled("cancelled")
+
+        def cleanup(self):
+            events.append("cleanup")
+
+    worker = TaskQueueWorker(
+        [QueuedTask("task", lambda: events.append("task"))],
+        lifecycle=CancelledLifecycle(),
+    )
+    worker.error.connect(events.append)
+
+    worker.run()
+
+    assert "task" not in events
+    assert "personal_startup_cancelled" in events
+    assert "cleanup" in events

@@ -6,7 +6,12 @@ import pytest
 import app.view.adb_data_interface as adb_data_interface
 import core.services.emulator_lifecycle as emulator_lifecycle
 from app.common.config import EmulatorSerializer
-from core.control.adb_port import EmulatorInfo, EmulatorType
+from core.control.adb_port import (
+    EmulatorInfo,
+    EmulatorType,
+    clean_tool_environment,
+    resolve_adb_executable,
+)
 from core.services.emulator_lifecycle import (
     EmulatorLifecycle,
     LifecycleError,
@@ -52,6 +57,55 @@ def test_config_roundtrip_preserves_instance_zero():
     assert restored.index == 0
     assert restored.type is EmulatorType.MUMUV5
     assert restored.path == original.path
+
+
+def test_config_roundtrip_preserves_custom_adb_executable_and_host():
+    serializer = EmulatorSerializer()
+    original = _mumu_device(r"C:\Program Files\NetEase\MuMu", index=7)
+    original.adb_path = r"C:\Program Files\NetEase\MuMu\nx_main\adb.exe"
+    original.adb_host = "127.0.0.2"
+
+    restored = serializer.deserialize(serializer.serialize(original))
+
+    assert restored.index == 7
+    assert restored.adb_path == original.adb_path
+    assert restored.adb_host == "127.0.0.2"
+
+
+def test_mumu_install_prefers_adb_next_to_manager(tmp_path):
+    nx_main = tmp_path / "MuMu" / "nx_main"
+    nx_main.mkdir(parents=True)
+    (nx_main / "MuMuManager.exe").write_bytes(b"")
+    expected = nx_main / "adb.exe"
+    expected.write_bytes(b"")
+
+    assert resolve_adb_executable(_mumu_device(tmp_path / "MuMu")) == expected
+
+
+def test_explicit_adb_path_overrides_installation_default(tmp_path):
+    nx_main = tmp_path / "MuMu" / "nx_main"
+    nx_main.mkdir(parents=True)
+    (nx_main / "MuMuManager.exe").write_bytes(b"")
+    (nx_main / "adb.exe").write_bytes(b"")
+    explicit = tmp_path / "platform-tools" / "adb.exe"
+    explicit.parent.mkdir()
+    explicit.write_bytes(b"")
+    target = _mumu_device(tmp_path / "MuMu")
+    target.adb_path = str(explicit)
+
+    assert resolve_adb_executable(target) == explicit
+
+
+def test_vendor_tool_environment_drops_qt_overrides(monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("QT_PLUGIN_PATH", r"C:\wrong-qt-plugins")
+    monkeypatch.setenv("PATH", "preserved")
+
+    environment = clean_tool_environment()
+
+    assert "QT_QPA_PLATFORM" not in environment
+    assert "QT_PLUGIN_PATH" not in environment
+    assert environment["PATH"] == "preserved"
 
 
 def test_sparse_instance_id_is_not_row_index(monkeypatch):
@@ -129,6 +183,7 @@ def test_launcher_command_uses_argument_list_and_launcher_cwd(tmp_path):
     assert argv == [str(executable), "info", "-v", "0"]
     assert kwargs["shell"] is False
     assert kwargs["cwd"] == str(nx_main)
+    assert not any(key.upper().startswith("QT_") for key in kwargs["env"])
 
 
 def test_default_launcher_runner_has_one_bounded_timeout(monkeypatch, tmp_path):

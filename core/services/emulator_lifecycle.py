@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import time
 import uuid
@@ -25,6 +26,9 @@ from core.control.adb_port import (
     EmulatorInfo,
     EmulatorPathError,
     EmulatorType,
+    clean_tool_environment,
+    get_adb_port,
+    resolve_adb_executable,
     resolve_mumu_launcher,
 )
 from core.services.repair_safety import ensure_automation_allowed
@@ -52,6 +56,19 @@ class EmulatorInstanceState(str, Enum):
     STARTING = "STARTING"
     ANDROID_READY = "ANDROID_READY"
     FAILED = "FAILED"
+
+
+class AdbReadinessState(str, Enum):
+    """Observable readiness phases after the host instance is running."""
+
+    ANDROID_STARTED = "ANDROID_STARTED"
+    ADB_PORT_NOT_LISTENING = "ADB_PORT_NOT_LISTENING"
+    ADB_CONNECTING = "ADB_CONNECTING"
+    ADB_DEVICE_READY = "ADB_DEVICE_READY"
+    PACKAGE_STARTING = "PACKAGE_STARTING"
+    PACKAGE_READY = "PACKAGE_READY"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 def _run_subprocess_tree(
@@ -129,6 +146,54 @@ class LifecycleOptions:
     poll_interval: float = 2.0
     command_timeout: float = 10.0
     adb_timeout: float = 5.0
+    adb_port_ready_timeout: float = 90.0
+    adb_device_ready_timeout: float = 60.0
+    adb_poll_interval: float = 1.0
+
+
+def _probe_tcp_endpoint(host: str, port: int, timeout: float) -> bool:
+    """Return whether one exact local endpoint accepts TCP connections."""
+
+    try:
+        with socket.create_connection((host, int(port)), timeout=max(0.05, timeout)):
+            return True
+    except OSError:
+        return False
+
+
+def resolve_selected_mumu_configuration(
+    configured: EmulatorInfo,
+    *,
+    discover: Callable[..., list[EmulatorInfo]] = get_adb_port,
+) -> EmulatorInfo:
+    """Resolve the configured multi-open index to one unique MuMu instance."""
+
+    if configured.is_mumu:
+        return snapshot_device(configured)
+    target_index = int(configured.index)
+    candidates = [
+        candidate
+        for candidate in discover(preferred=configured)
+        if candidate.is_mumu and int(candidate.index) == target_index
+    ]
+    unique = {device_identity(candidate): candidate for candidate in candidates}
+    if not unique:
+        raise LifecycleError("selected_instance_configuration_not_found")
+    if len(unique) != 1:
+        raise LifecycleError("selected_instance_configuration_ambiguous")
+    return snapshot_device(next(iter(unique.values())))
+
+
+def resolve_instance_zero_configuration(
+    configured: EmulatorInfo,
+    *,
+    discover: Callable[..., list[EmulatorInfo]] = get_adb_port,
+) -> EmulatorInfo:
+    """Backward-compatible strict resolver used by older instance-zero tools."""
+
+    if int(configured.index) != 0:
+        raise LifecycleError("personal_runtime_instance_zero_required")
+    return resolve_selected_mumu_configuration(configured, discover=discover)
 
 
 def snapshot_device(device: EmulatorInfo) -> EmulatorInfo:
@@ -188,6 +253,7 @@ class MuMuManagerClient:
             "text": True,
             "encoding": "utf-8",
             "errors": "replace",
+            "env": clean_tool_environment(),
             "timeout": self.timeout,
         }
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -344,6 +410,8 @@ class EmulatorLifecycle:
         adb_factory: Callable[..., AdbDeviceTcp] = AdbDeviceTcp,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        tcp_probe: Callable[[str, int, float], bool] | None = None,
+        adb_runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
         correlation_id: str | None = None,
     ) -> None:
         self.device = snapshot_device(device)
@@ -361,17 +429,33 @@ class EmulatorLifecycle:
         self.adb_factory = adb_factory
         self.monotonic = monotonic
         self.sleep = sleep
+        # Injected transports are fake-I/O by design and therefore opt out of
+        # the operating-system socket probe unless a fake probe is supplied.
+        self.tcp_probe = tcp_probe or (
+            _probe_tcp_endpoint
+            if adb_factory is AdbDeviceTcp
+            else lambda _host, _port, _timeout: True
+        )
+        self.adb_runner = adb_runner
+        self.adb_host = str(self.device.adb_host or "127.0.0.1")
+        self.endpoint_source = (
+            "mumu_manager_instance_info"
+            if self.device.is_mumu
+            else "explicit_custom_config"
+        )
+        self.endpoint_resolution_timestamp: float | None = None
         self.emulator_started_by_us = False
         self.emulator_launch_dispatches = 0
         self.game_started_by_us = False
         self.game_launch_dispatches = 0
         self.instance_state_history: list[dict] = []
+        self.readiness_history: list[dict] = []
 
     @property
     def label(self) -> str:
         if self.device.is_mumu:
             return f"{self.device.name} (instance_id={int(self.device.index)})"
-        endpoint = f"127.0.0.1:{self.device.port}" if self.device.port else "未配置"
+        endpoint = f"{self.device.adb_host}:{self.device.port}" if self.device.port else "未配置"
         return f"{self.device.name} (ADB {endpoint})"
 
     @staticmethod
@@ -395,9 +479,31 @@ class EmulatorLifecycle:
             self.device,
             name=str(info.get("name") or self.device.name),
             port=normalized_port,
+            adb_host=str(info.get("adb_host_ip") or self.device.adb_host or "127.0.0.1"),
         )
+        host = str(self.device.adb_host or "127.0.0.1").strip()
+        self.adb_host = host or "127.0.0.1"
+        if not self.device.adb_path:
+            adb = resolve_adb_executable(self.device)
+            if adb is not None:
+                self.device = replace(self.device, adb_path=str(adb))
+        self.endpoint_source = "mumu_manager_instance_info"
+        self.endpoint_resolution_timestamp = float(self.monotonic())
         if self.manager is not None:
             self.manager.device = snapshot_device(self.device)
+
+    def _record_readiness(self, state: AdbReadinessState, reason: str) -> None:
+        self.readiness_history.append(
+            {
+                "timestamp": float(self.monotonic()),
+                "state": state.value,
+                "reason_code": reason,
+                "instance_index": int(self.device.index),
+                "adb_host": self.adb_host,
+                "adb_port": self.device.port,
+                "endpoint_source": self.endpoint_source,
+            }
+        )
 
     @staticmethod
     def _emulator_ready(info: dict) -> bool:
@@ -459,14 +565,162 @@ class EmulatorLifecycle:
             return False
 
     def _target_ready(self, info: dict) -> bool:
-        if not self._emulator_ready(info):
-            return False
-        # Current MuMu V5 reports Android state explicitly.  Once it does,
-        # verify the freshly discovered target port rather than trusting any
-        # unrelated device returned by a global ADB scan.
-        if "is_android_started" in info:
-            return self._adb_boot_completed()
-        return True
+        """Return host-side readiness only; never connect ADB from this check."""
+
+        return self._emulator_ready(info)
+
+    def _adb_pause(
+        self,
+        deadline: float,
+        cancelled: Callable[[], bool] | None,
+    ) -> None:
+        self._check_cancelled(cancelled)
+        remaining = max(0.0, deadline - self.monotonic())
+        if remaining:
+            self.sleep(
+                min(max(0.01, self.options.adb_poll_interval), remaining)
+            )
+
+    @staticmethod
+    def _adb_failure_reason(error: BaseException) -> str:
+        text = f"{type(error).__name__}: {error}".lower()
+        if "unauthorized" in text:
+            return "adb_device_unauthorized"
+        if "offline" in text:
+            return "adb_device_offline"
+        return "adb_connect_failed"
+
+    def _run_selected_adb(self, *arguments: str) -> subprocess.CompletedProcess | None:
+        """Use the configured vendor ADB for server/device-state coordination."""
+
+        raw_path = str(self.device.adb_path or "").strip().strip('"')
+        if not raw_path:
+            return None
+        executable = Path(raw_path)
+        if not executable.is_file():
+            raise LifecycleError("adb_executable_not_found")
+        kwargs = {
+            "shell": False,
+            "cwd": str(executable.parent),
+            "capture_output": True,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "timeout": max(0.1, float(self.options.command_timeout)),
+            "env": clean_tool_environment(),
+        }
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if creation_flags:
+            kwargs["creationflags"] = creation_flags
+        return self.adb_runner([str(executable), *arguments], **kwargs)
+
+    def _wait_for_adb_ready(
+        self,
+        cancelled: Callable[[], bool] | None,
+    ) -> None:
+        """Wait for TCP, then establish one bounded logical ADB connection."""
+
+        if not self.device.port:
+            self._record_readiness(AdbReadinessState.FAILED, "adb_endpoint_resolution_failed")
+            raise LifecycleError("adb_endpoint_resolution_failed")
+        if self.endpoint_resolution_timestamp is None:
+            self.endpoint_resolution_timestamp = float(self.monotonic())
+
+        host = self.adb_host
+        port = int(self.device.port)
+        port_deadline = self.monotonic() + max(
+            0.0, self.options.adb_port_ready_timeout
+        )
+        try:
+            while not self.tcp_probe(
+                host,
+                port,
+                min(max(0.05, self.options.adb_timeout), 1.0),
+            ):
+                self._record_readiness(
+                    AdbReadinessState.ADB_PORT_NOT_LISTENING,
+                    "adb_endpoint_not_ready",
+                )
+                if self.monotonic() >= port_deadline:
+                    self._record_readiness(
+                        AdbReadinessState.FAILED,
+                        "adb_port_ready_timeout",
+                    )
+                    raise LifecycleError("adb_port_ready_timeout")
+                self._adb_pause(port_deadline, cancelled)
+
+            self._record_readiness(
+                AdbReadinessState.ADB_CONNECTING,
+                "adb_tcp_listening",
+            )
+            selected_connect = self._run_selected_adb(
+                "connect", f"{host}:{port}"
+            )
+            if selected_connect is not None and int(selected_connect.returncode) != 0:
+                output = str(selected_connect.stderr or selected_connect.stdout or "")
+                reason = self._adb_failure_reason(RuntimeError(output))
+                self._record_readiness(AdbReadinessState.FAILED, reason)
+                raise LifecycleError(reason)
+            timeout = max(0.1, float(self.options.adb_timeout))
+            adb = self.adb_factory(
+                host,
+                port=port,
+                default_transport_timeout_s=timeout,
+            )
+            connected = False
+            last_error: BaseException | None = None
+            device_deadline = self.monotonic() + max(
+                0.0, self.options.adb_device_ready_timeout
+            )
+            try:
+                while True:
+                    self._check_cancelled(cancelled)
+                    try:
+                        if not connected:
+                            connected = bool(
+                                adb.connect(
+                                    transport_timeout_s=timeout,
+                                    read_timeout_s=timeout,
+                                )
+                            )
+                        if connected:
+                            output = adb.shell(
+                                "getprop sys.boot_completed",
+                                transport_timeout_s=timeout,
+                                read_timeout_s=timeout,
+                                timeout_s=timeout,
+                            )
+                            if isinstance(output, bytes):
+                                output = output.decode("utf-8", errors="replace")
+                            if str(output or "").strip() == "1":
+                                self._record_readiness(
+                                    AdbReadinessState.ADB_DEVICE_READY,
+                                    "adb_device_ready",
+                                )
+                                return
+                    except Exception as exc:  # noqa: BLE001 - classify transport state
+                        last_error = exc
+                        reason = self._adb_failure_reason(exc)
+                        if reason in {"adb_device_offline", "adb_device_unauthorized"}:
+                            self._record_readiness(AdbReadinessState.FAILED, reason)
+                            raise LifecycleError(reason) from exc
+                    if self.monotonic() >= device_deadline:
+                        reason = (
+                            self._adb_failure_reason(last_error)
+                            if last_error is not None
+                            else "adb_connect_failed"
+                        )
+                        self._record_readiness(AdbReadinessState.FAILED, reason)
+                        raise LifecycleError(reason)
+                    self._adb_pause(device_deadline, cancelled)
+            finally:
+                try:
+                    adb.close()
+                except Exception as exc:  # pragma: no cover - defensive cleanup
+                    logger.debug(f"Closing readiness ADB connection failed: {exc}")
+        except LifecycleCancelled:
+            self._record_readiness(AdbReadinessState.CANCELLED, "personal_startup_cancelled")
+            raise
 
     def android_boot_completed(self) -> bool:
         """Refresh the exact MuMu target, then verify boot over its own ADB."""
@@ -515,7 +769,7 @@ class EmulatorLifecycle:
             if not self.device.port:
                 raise LifecycleError("自定义 ADB 端口为空，无法连接游戏")
             try:
-                self._adb_shell("getprop sys.boot_completed")
+                self._wait_for_adb_ready(cancelled)
             except LifecycleError as exc:
                 raise LifecycleError(
                     f"自定义 ADB {self.label} 当前不可用，且无法自动启动宿主模拟器；"
@@ -534,6 +788,11 @@ class EmulatorLifecycle:
             info, launch_dispatched=False, reason_code="initial_observation"
         )
         if self._target_ready(info):
+            self._record_readiness(
+                AdbReadinessState.ANDROID_STARTED,
+                "android_started",
+            )
+            self._wait_for_adb_ready(cancelled)
             logger.info(f"MuMu 多开实例已运行: {self.label}，ADB {self.device.port}")
             return snapshot_device(self.device)
 
@@ -559,6 +818,11 @@ class EmulatorLifecycle:
                     reason_code="stopping_settle_observation",
                 )
                 if self._target_ready(info):
+                    self._record_readiness(
+                        AdbReadinessState.ANDROID_STARTED,
+                        "android_started",
+                    )
+                    self._wait_for_adb_ready(cancelled)
                     logger.info(
                         f"MuMu 多开实例 stopping 后已就绪: {self.label}，ADB {self.device.port}"
                     )
@@ -582,9 +846,9 @@ class EmulatorLifecycle:
                     )
                 logger.info(f"正在启动 MuMu 多开实例: {self.label}")
                 self.emulator_started_by_us = True
-                self.manager.launch_emulator()
                 self.emulator_launch_dispatches += 1
                 launch_dispatched = True
+                self.manager.launch_emulator()
             if self.monotonic() >= boot_deadline:
                 break
             self._pause(boot_deadline, cancelled)
@@ -596,6 +860,11 @@ class EmulatorLifecycle:
                 reason_code="android_boot_observation",
             )
             if self._target_ready(info):
+                self._record_readiness(
+                    AdbReadinessState.ANDROID_STARTED,
+                    "android_started",
+                )
+                self._wait_for_adb_ready(cancelled)
                 logger.info(f"MuMu 多开实例就绪: {self.label}，ADB {self.device.port}")
                 return snapshot_device(self.device)
             if state is EmulatorInstanceState.FAILED:
@@ -610,7 +879,7 @@ class EmulatorLifecycle:
         timeout = max(0.1, float(self.options.adb_timeout))
         try:
             adb = self.adb_factory(
-                "127.0.0.1",
+                self.adb_host,
                 port=int(self.device.port),
                 default_transport_timeout_s=timeout,
             )
@@ -669,6 +938,10 @@ class EmulatorLifecycle:
             self._check_cancelled(cancelled)
             try:
                 if self.is_game_running():
+                    self._record_readiness(
+                        AdbReadinessState.PACKAGE_READY,
+                        "package_ready",
+                    )
                     if self.game_started_by_us:
                         logger.info(f"游戏进程已启动: {self.label}")
                     else:
@@ -679,6 +952,10 @@ class EmulatorLifecycle:
 
             now = self.monotonic()
             if not launch_dispatched:
+                self._record_readiness(
+                    AdbReadinessState.PACKAGE_STARTING,
+                    "package_launch_pending",
+                )
                 logger.info(f"正在启动游戏进程: {self.label}")
                 # Count the command at the invocation boundary: an exception may
                 # still mean the manager/ADB received it, so a fallback would be
@@ -715,9 +992,17 @@ class EmulatorLifecycle:
     def ensure_game_ready(
         self, cancelled: Callable[[], bool] | None = None
     ) -> EmulatorInfo:
-        self.ensure_emulator_ready(cancelled)
-        self.start_game(cancelled)
-        return snapshot_device(self.device)
+        try:
+            self.ensure_emulator_ready(cancelled)
+            self.start_game(cancelled)
+            return snapshot_device(self.device)
+        except LifecycleCancelled:
+            if not self.readiness_history or self.readiness_history[-1]["state"] != AdbReadinessState.CANCELLED.value:
+                self._record_readiness(
+                    AdbReadinessState.CANCELLED,
+                    "personal_startup_cancelled",
+                )
+            raise
 
     def _refresh_manager_target(self) -> bool | None:
         """Refresh the target port; never use a persisted MuMu port destructively."""
@@ -884,15 +1169,17 @@ class EmulatorQueueLifecycle:
         *,
         options: LifecycleOptions | None = None,
         lifecycle: EmulatorLifecycle | None = None,
+        target_resolver: Callable[[EmulatorInfo], EmulatorInfo] | None = None,
+        lifecycle_factory: Callable[..., EmulatorLifecycle] = EmulatorLifecycle,
         release_controller: Callable[[], None] | None = None,
         correlation_id: str | None = None,
     ) -> None:
         self.options = options or LifecycleOptions()
-        self.lifecycle = lifecycle or EmulatorLifecycle(
-            device,
-            options=self.options,
-            correlation_id=correlation_id,
-        )
+        self.configured_device = snapshot_device(device)
+        self.lifecycle = lifecycle
+        self.target_resolver = target_resolver
+        self.lifecycle_factory = lifecycle_factory
+        self.correlation_id = correlation_id
         self.release_controller = release_controller or self._release_global_controller
         self._cleaned = False
         self._prepared = False
@@ -904,6 +1191,15 @@ class EmulatorQueueLifecycle:
         kill()
 
     def prepare(self, cancelled: Callable[[], bool] | None = None) -> None:
+        if self.lifecycle is None:
+            device = snapshot_device(self.configured_device)
+            if self.target_resolver is not None:
+                device = self.target_resolver(device)
+            self.lifecycle = self.lifecycle_factory(
+                device,
+                options=self.options,
+                correlation_id=self.correlation_id,
+            )
         device = self.lifecycle.ensure_game_ready(cancelled)
         # Existing automation modules intentionally use one global controller.
         # Activate only the frozen queue target, after its current ADB port is
@@ -931,7 +1227,7 @@ class EmulatorQueueLifecycle:
             from core.control.control import clear_runtime_device
 
             clear_runtime_device()
-        if self.options.close_game_when_idle:
+        if self.options.close_game_when_idle and self.lifecycle is not None:
             try:
                 self.lifecycle.stop_game(
                     self.options.cleanup_timeout,
@@ -942,9 +1238,10 @@ class EmulatorQueueLifecycle:
                 logger.warning(f"队列结束后关闭游戏失败: {exc}")
         should_close_emulator = self.options.close_emulator_when_idle or (
             not self._prepared
+            and self.lifecycle is not None
             and bool(getattr(self.lifecycle, "emulator_started_by_us", False))
         )
-        if should_close_emulator:
+        if should_close_emulator and self.lifecycle is not None:
             try:
                 self.lifecycle.stop_emulator(self.options.cleanup_timeout)
             except Exception as exc:  # noqa: BLE001 - report after all cleanup attempts

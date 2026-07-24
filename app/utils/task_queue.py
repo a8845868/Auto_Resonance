@@ -94,6 +94,7 @@ class TaskQueueWorker(QThread):
                     self.lifecycle.prepare(lambda: self._stop_requested)
                 except LifecycleCancelled:
                     self._stop_requested = True
+                    self.error.emit("personal_startup_cancelled")
                     return
                 except Exception as error:
                     if self._stop_requested:

@@ -287,9 +287,10 @@ def test_queue_captures_close_game_preference(monkeypatch, close_game_when_idle)
     captured = {}
 
     class CapturingLifecycle:
-        def __init__(self, device, *, options):
+        def __init__(self, device, *, options, target_resolver=None):
             captured["device"] = device
             captured["options"] = options
+            captured["target_resolver"] = target_resolver
 
     class CapturingWorker:
         def __init__(self, _tasks, _parent, **kwargs):
@@ -312,6 +313,7 @@ def test_queue_captures_close_game_preference(monkeypatch, close_game_when_idle)
     monkeypatch.setattr(cfg.enableCodexSelfHealing, "value", False)
     monkeypatch.setattr(cfg.allowCodexIsolatedRepair, "value", False)
     monkeypatch.setattr(cfg.enableAutoGameLifecycle, "value", True)
+    monkeypatch.setattr(cfg.enablePersonalStartupEpisode, "value", True)
     monkeypatch.setattr(cfg.autoStartEmulator, "value", True)
     monkeypatch.setattr(
         cfg.closeGameWhenIdle, "value", close_game_when_idle
@@ -337,6 +339,7 @@ def test_queue_captures_close_game_preference(monkeypatch, close_game_when_idle)
 
     assert captured["device"] == "127.0.0.1:16544"
     assert captured["lifecycle"] is not None
+    assert captured["target_resolver"] is dashboard_module.resolve_selected_mumu_configuration
     assert (
         captured["options"].close_game_when_idle
         is close_game_when_idle

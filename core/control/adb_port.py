@@ -43,6 +43,8 @@ class EmulatorInfo:
     path: str
     type: EmulatorType
     index: int
+    adb_path: str = ""
+    adb_host: str = "127.0.0.1"
 
     def to_dict(self) -> dict:
         return {
@@ -51,6 +53,8 @@ class EmulatorInfo:
             "path": self.path,
             "type": self.type.value,
             "index": self.index,
+            "adb_path": self.adb_path,
+            "adb_host": self.adb_host,
         }
 
     @staticmethod
@@ -64,6 +68,8 @@ class EmulatorInfo:
             path=data["path"],
             type=EmulatorType(data["type"]),
             index=int(raw_index),
+            adb_path=str(data.get("adb_path") or ""),
+            adb_host=str(data.get("adb_host") or "127.0.0.1"),
         )
     
     @property
@@ -97,6 +103,37 @@ class EmulatorPathError(ValueError):
 class MuMuLauncher:
     executable: Path
     install_root: Path
+
+
+def clean_tool_environment() -> dict[str, str]:
+    """Do not leak this PySide process' Qt plugin settings to vendor tools."""
+
+    environment = os.environ.copy()
+    for name in list(environment):
+        if name.upper().startswith("QT_"):
+            environment.pop(name, None)
+    return environment
+
+
+def resolve_adb_executable(device: EmulatorInfo) -> Path | None:
+    """Resolve an explicit or installation-local ADB executable."""
+
+    explicit = str(device.adb_path or "").strip().strip('"')
+    if explicit:
+        candidate = Path(os.path.abspath(os.path.expandvars(explicit)))
+        return candidate if candidate.is_file() else None
+    if not device.is_mumu or not device.path:
+        return None
+    try:
+        launcher = resolve_mumu_launcher(device)
+    except EmulatorPathError:
+        return None
+    candidates = (
+        launcher.executable.parent / "adb.exe",
+        launcher.install_root / "adb.exe",
+        launcher.install_root / "shell" / "adb.exe",
+    )
+    return next((candidate for candidate in candidates if candidate.is_file()), None)
 
 
 def resolve_mumu_launcher(device: EmulatorInfo) -> MuMuLauncher:
@@ -190,6 +227,7 @@ def get_mumu_manager_info(
             capture_output=True,
             text=False,
             creationflags=creation_flags,
+            env=clean_tool_environment(),
             timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -207,17 +245,23 @@ def get_mumu_manager_info(
         entries = [result]
     else:
         entries = [item for item in result.values() if isinstance(item, dict)]
-    return [
+    instances = [
         EmulatorInfo(
             name=i["name"],
             port=i.get("adb_port"),
             path=root_path,
             type=emulator_type,
             index=int(i.get("index", "0")),
+            adb_host=str(i.get("adb_host_ip") or "127.0.0.1"),
         )
         for i in entries
         if i.get("name") is not None
     ]
+    for instance in instances:
+        adb = resolve_adb_executable(instance)
+        if adb is not None:
+            instance.adb_path = str(adb)
+    return instances
 
 
 def get_configured_mumu_info(device: EmulatorInfo) -> list[EmulatorInfo]:

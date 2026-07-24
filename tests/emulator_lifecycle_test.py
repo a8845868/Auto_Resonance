@@ -282,7 +282,8 @@ def test_ensure_ready_cold_starts_exact_instance_and_game():
     ]
     assert lifecycle.emulator_started_by_us is True
     assert lifecycle.game_started_by_us is True
-    assert adb.ports == []
+    assert adb.ports == [16544]
+    assert lifecycle.readiness_history[-1]["state"] == "PACKAGE_READY"
 
 
 def test_existing_game_start_is_idempotent():

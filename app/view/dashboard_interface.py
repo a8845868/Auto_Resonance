@@ -17,6 +17,7 @@ from core.logger import logger
 from core.services.emulator_lifecycle import (
     EmulatorQueueLifecycle,
     LifecycleOptions,
+    resolve_selected_mumu_configuration,
 )
 from core.services.self_healing import (
     discover_log_incidents,
@@ -410,9 +411,8 @@ class DashboardInterface(ScrollArea):
             )
 
         lifecycle = None
-        if bool(cfg.enableAutoGameLifecycle.value) or bool(
-            cfg.enablePersonalStartupEpisode.value
-        ):
+        personal_startup_enabled = bool(cfg.enablePersonalStartupEpisode.value)
+        if bool(cfg.enableAutoGameLifecycle.value) or personal_startup_enabled:
             lifecycle = EmulatorQueueLifecycle(
                 cfg.device.value,
                 options=LifecycleOptions(
@@ -421,6 +421,11 @@ class DashboardInterface(ScrollArea):
                     close_emulator_when_idle=bool(
                         cfg.closeEmulatorWhenIdle.value
                     ),
+                ),
+                target_resolver=(
+                    resolve_selected_mumu_configuration
+                    if personal_startup_enabled
+                    else None
                 ),
             )
         self.queueWorker = TaskQueueWorker(

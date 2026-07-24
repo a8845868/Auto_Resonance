@@ -11,8 +11,8 @@ from tests.personal_runtime_fixtures import city_frame, home_frame
 
 
 class FakeLifecycle:
-    def __init__(self):
-        self.device = SimpleNamespace(index=0, is_mumu=True, port=16384)
+    def __init__(self, index=0):
+        self.device = SimpleNamespace(index=index, is_mumu=True, port=16384)
 
     def is_game_running(self):
         return True
@@ -53,6 +53,27 @@ def test_gui_entry_reuses_existing_lifecycle_and_reaches_city_detail():
     assert result["real_ui_actions"] == 1
     assert foregrounded == [inner]
     assert len(clicks) == 1
+
+
+def test_gui_entry_accepts_explicitly_selected_nonzero_mumu_instance():
+    inner = FakeLifecycle(index=7)
+    context = TaskExecutionContext(
+        lifecycle=SimpleNamespace(lifecycle=inner),
+        cancelled=lambda: False,
+        logger=SimpleNamespace(info=lambda _message: None),
+    )
+    frames = iter([home_frame(), city_frame()])
+
+    result = run_personal_automation_episode_from_config(
+        context,
+        app_config=config(),
+        frame_provider=frames.__next__,
+        click=lambda _point: True,
+        foreground_window=lambda _lifecycle: None,
+    )
+
+    assert result["success"] is True
+    assert inner.device.index == 7
 
 
 def test_gui_entry_cancellation_stops_before_capture_or_input():
