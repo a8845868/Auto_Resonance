@@ -59,6 +59,7 @@ class EpisodePolicy:
     episode_timeout_seconds: float = 120.0
     resource_update_timeout_seconds: float = 600.0
     resource_update_stall_timeout_seconds: float = 120.0
+    require_fresh_pre_dispatch_confirmation: bool = False
 
     def validate(self) -> None:
         if self.minimum_action_interval_seconds < 0:
@@ -1203,6 +1204,57 @@ class PersonalAutomationEpisode:
             if plan.action is RuntimeAction.OBSERVE_ONLY:
                 self.sleep(self.policy.observation_interval_seconds)
                 continue
+            if self.policy.require_fresh_pre_dispatch_confirmation:
+                if observations >= observation_limit:
+                    break
+                try:
+                    confirmation_frame = self.frame_provider()
+                    confirmation = self.detector.detect(confirmation_frame)
+                except Exception as exc:
+                    self.recorder.record(
+                        "pre_dispatch_confirmation_failed",
+                        expected_state=plan.state.value,
+                        expected_action=plan.action.value,
+                        error_type=type(exc).__name__,
+                    )
+                    return EpisodeResult(
+                        "BLOCKED",
+                        last_state,
+                        self.budget.total_actions,
+                        observations,
+                        "pre_dispatch_confirmation_failed",
+                        tuple(self.recorder.events),
+                    )
+                observations += 1
+                last_state = confirmation.state
+                confirmed_plan = self.planner.plan(confirmation, budget=self.budget)
+                self.recorder.record(
+                    "pre_dispatch_confirmation",
+                    expected_state=plan.state.value,
+                    observed_state=confirmation.state.value,
+                    expected_action=plan.action.value,
+                    observed_action=confirmed_plan.action.value,
+                    expected_frame_hash=detected.frame_hash,
+                    frame_hash=confirmation.frame_hash,
+                    expected_target_bbox=plan.target_bbox,
+                    observed_target_bbox=confirmed_plan.target_bbox,
+                    confirmed=(
+                        confirmation.state is plan.state
+                        and confirmed_plan.action is plan.action
+                    ),
+                )
+                if (
+                    confirmation.state is not plan.state
+                    or confirmed_plan.action is not plan.action
+                ):
+                    previous_plan = None
+                    self.sleep(self.policy.observation_interval_seconds)
+                    continue
+                # Use the newest OCR/CV target.  This closes the race where the
+                # session-entry page changes into a clickable announcement
+                # between planning and dispatch.
+                plan = confirmed_plan
+                detected = confirmation
             transform = self.transform_provider(detected)
             assert plan.capture_point is not None
             mapping = (

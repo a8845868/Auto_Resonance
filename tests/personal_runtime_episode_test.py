@@ -10,6 +10,7 @@ from core.services.personal_runtime_episode import (
     CoordinateTransform,
     EpisodePolicy,
     PersonalAutomationEpisode,
+    PlannedRuntimeAction,
     RuntimeAction,
     RuntimeState,
     StateDetector,
@@ -87,6 +88,271 @@ def test_announcement_transition_can_continue_through_session_entry(leading):
     assert result.status == "PASS"
     assert budget.actions_by_action_type["ENTER_SESSION"] == 1
     assert budget.actions_by_state["UNKNOWN"] == 0
+
+
+def test_fresh_pre_dispatch_confirmation_prevents_stale_session_click_on_announcement():
+    frames = iter(
+        [
+            session_entry_frame(),
+            announcement_frame(),
+            announcement_frame(),
+            announcement_frame(),
+            home_frame(),
+            home_frame(),
+            city_frame(),
+        ]
+    )
+    clicks = []
+    budget = EpisodeActionBudget()
+    target = PersonalCityTarget(city_id="岚心城")
+    episode = PersonalAutomationEpisode(
+        frame_provider=lambda: next(frames),
+        detector=StateDetector(city_target=target),
+        planner=ActionPlanner(target_city_id="岚心城"),
+        executor=ActionExecutor(lambda point: clicks.append(point) or True),
+        transform_provider=lambda detected: CoordinateTransform(
+            detected.frame_dimensions, (853, 480), detected.frame_dimensions, (0, 0)
+        ),
+        budget=budget,
+        sleep=lambda _seconds: None,
+        policy=EpisodePolicy(
+            maximum_observations=7,
+            require_fresh_pre_dispatch_confirmation=True,
+        ),
+        target_city_id="岚心城",
+    )
+
+    result = episode.run()
+
+    assert budget.actions_by_action_type.get("ENTER_SESSION", 0) == 0
+    assert budget.actions_by_action_type["DISMISS_ANNOUNCEMENT"] == 1
+    assert clicks[0][1] > 422
+    confirmation = next(
+        event
+        for event in result.events
+        if event["event"] == "pre_dispatch_confirmation"
+    )
+    assert confirmation["expected_state"] == "SESSION_ENTRY"
+    assert confirmation["observed_state"] == "ANNOUNCEMENT_VISIBLE"
+    assert confirmation["confirmed"] is False
+
+
+def test_stale_confirmation_consumes_no_budget_and_never_calls_executor():
+    frames = iter([session_entry_frame(), announcement_frame()])
+    clicks = []
+    budget = EpisodeActionBudget()
+    episode = PersonalAutomationEpisode(
+        frame_provider=frames.__next__,
+        detector=StateDetector(),
+        planner=ActionPlanner(),
+        executor=ActionExecutor(lambda point: clicks.append(point) or True),
+        transform_provider=lambda detected: CoordinateTransform(
+            detected.frame_dimensions, (853, 480), detected.frame_dimensions, (0, 0)
+        ),
+        budget=budget,
+        policy=EpisodePolicy(
+            maximum_observations=2,
+            require_fresh_pre_dispatch_confirmation=True,
+        ),
+    )
+
+    result = episode.run()
+
+    assert result.status == "BLOCKED"
+    assert result.reason == "episode_deadline_or_observation_limit"
+    assert budget.total_actions == 0
+    assert budget.action_history == []
+    assert clicks == []
+
+
+def test_confirmation_uses_newest_target_bbox_and_click_point():
+    initial = home_frame(anchor=(1129, 474, 1216, 500))
+    latest = home_frame(anchor=(1115, 468, 1202, 494))
+    frames = iter([initial, latest, city_frame()])
+    clicks = []
+    budget = EpisodeActionBudget()
+    target = PersonalCityTarget(city_id="岚心城")
+    detector = StateDetector(city_target=target)
+    planner = ActionPlanner(target_city_id="岚心城")
+    expected_latest = planner.plan(detector.detect(latest), budget=budget)
+    episode = PersonalAutomationEpisode(
+        frame_provider=frames.__next__,
+        detector=detector,
+        planner=planner,
+        executor=ActionExecutor(lambda point: clicks.append(point) or True),
+        transform_provider=lambda detected: CoordinateTransform(
+            detected.frame_dimensions, (853, 480), detected.frame_dimensions, (0, 0)
+        ),
+        budget=budget,
+        policy=EpisodePolicy(
+            maximum_observations=3,
+            require_fresh_pre_dispatch_confirmation=True,
+        ),
+        target_city_id="岚心城",
+    )
+
+    result = episode.run()
+
+    assert result.status == "PASS"
+    expected_click = CoordinateTransform(
+        latest.image.shape[1::-1],
+        (853, 480),
+        latest.image.shape[1::-1],
+        (0, 0),
+    ).map(expected_latest.capture_point).render_client_point
+    assert clicks == [expected_click]
+    confirmation = next(
+        event for event in result.events if event["event"] == "pre_dispatch_confirmation"
+    )
+    assert confirmation["expected_target_bbox"] != confirmation["observed_target_bbox"]
+
+
+def test_same_state_confirmation_that_replans_to_stop_never_dispatches():
+    class StopOnConfirmationPlanner:
+        def __init__(self):
+            self.calls = 0
+            self.base = ActionPlanner(target_city_id="岚心城")
+
+        def plan(self, detected, *, budget):
+            self.calls += 1
+            if self.calls == 1:
+                return self.base.plan(detected, budget=budget)
+            return PlannedRuntimeAction(
+                RuntimeAction.STOP,
+                detected.state,
+                None,
+                None,
+                None,
+                "confirmation_stop",
+            )
+
+    frames = iter([home_frame(), home_frame()])
+    clicks = []
+    budget = EpisodeActionBudget()
+    episode = PersonalAutomationEpisode(
+        frame_provider=frames.__next__,
+        detector=StateDetector(city_target=PersonalCityTarget(city_id="岚心城")),
+        planner=StopOnConfirmationPlanner(),
+        executor=ActionExecutor(lambda point: clicks.append(point) or True),
+        transform_provider=lambda detected: CoordinateTransform(
+            detected.frame_dimensions, (853, 480), detected.frame_dimensions, (0, 0)
+        ),
+        budget=budget,
+        policy=EpisodePolicy(
+            maximum_observations=2,
+            require_fresh_pre_dispatch_confirmation=True,
+        ),
+        target_city_id="岚心城",
+    )
+
+    result = episode.run()
+
+    assert result.status == "BLOCKED"
+    assert budget.total_actions == 0
+    assert clicks == []
+    confirmation = result.events[-1]
+    assert confirmation["event"] == "pre_dispatch_confirmation"
+    assert confirmation["observed_action"] == "STOP"
+    assert confirmation["confirmed"] is False
+
+
+def test_confirmation_capture_exception_is_controlled_zero_input_failure():
+    calls = 0
+
+    def capture():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return home_frame()
+        raise OSError("capture_backend_lost")
+
+    clicks = []
+    budget = EpisodeActionBudget()
+    episode = PersonalAutomationEpisode(
+        frame_provider=capture,
+        detector=StateDetector(city_target=PersonalCityTarget(city_id="岚心城")),
+        planner=ActionPlanner(target_city_id="岚心城"),
+        executor=ActionExecutor(lambda point: clicks.append(point) or True),
+        transform_provider=lambda detected: CoordinateTransform(
+            detected.frame_dimensions, (853, 480), detected.frame_dimensions, (0, 0)
+        ),
+        budget=budget,
+        policy=EpisodePolicy(
+            maximum_observations=2,
+            require_fresh_pre_dispatch_confirmation=True,
+        ),
+        target_city_id="岚心城",
+    )
+
+    result = episode.run()
+
+    assert result.status == "BLOCKED"
+    assert result.reason == "pre_dispatch_confirmation_failed"
+    assert result.observation_count == 1
+    assert budget.total_actions == 0
+    assert budget.action_history == []
+    assert clicks == []
+    assert result.events[-1]["error_type"] == "OSError"
+
+
+def test_confirmation_observation_limit_is_zero_input():
+    clicks = []
+    budget = EpisodeActionBudget()
+    episode = PersonalAutomationEpisode(
+        frame_provider=lambda: home_frame(),
+        detector=StateDetector(city_target=PersonalCityTarget(city_id="岚心城")),
+        planner=ActionPlanner(target_city_id="岚心城"),
+        executor=ActionExecutor(lambda point: clicks.append(point) or True),
+        transform_provider=lambda detected: CoordinateTransform(
+            detected.frame_dimensions, (853, 480), detected.frame_dimensions, (0, 0)
+        ),
+        budget=budget,
+        policy=EpisodePolicy(
+            maximum_observations=1,
+            require_fresh_pre_dispatch_confirmation=True,
+        ),
+        target_city_id="岚心城",
+    )
+
+    result = episode.run()
+
+    assert result.status == "BLOCKED"
+    assert result.reason == "episode_deadline_or_observation_limit"
+    assert budget.total_actions == 0
+    assert clicks == []
+
+
+def test_target_identity_guard_remains_immediately_before_confirmed_dispatch():
+    frames = iter([home_frame(), home_frame()])
+    clicks = []
+    guard_calls = []
+    budget = EpisodeActionBudget()
+    episode = PersonalAutomationEpisode(
+        frame_provider=frames.__next__,
+        detector=StateDetector(city_target=PersonalCityTarget(city_id="岚心城")),
+        planner=ActionPlanner(target_city_id="岚心城"),
+        executor=ActionExecutor(
+            lambda point: clicks.append(point) or True,
+            pre_dispatch_guard=lambda: guard_calls.append(True) or False,
+        ),
+        transform_provider=lambda detected: CoordinateTransform(
+            detected.frame_dimensions, (853, 480), detected.frame_dimensions, (0, 0)
+        ),
+        budget=budget,
+        policy=EpisodePolicy(
+            maximum_observations=2,
+            require_fresh_pre_dispatch_confirmation=True,
+        ),
+        target_city_id="岚心城",
+    )
+
+    result = episode.run()
+
+    assert result.status == "BLOCKED"
+    assert result.reason == "target_identity_guard_failed"
+    assert guard_calls == [True]
+    assert budget.total_actions == 0
+    assert clicks == []
 
 
 def test_ordinary_unknown_and_ambiguous_session_entry_do_not_enter_session():

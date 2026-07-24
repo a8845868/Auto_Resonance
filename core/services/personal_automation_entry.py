@@ -104,6 +104,7 @@ def run_personal_automation_episode(
             episode_timeout_seconds=config.episode_timeout_seconds,
             resource_update_timeout_seconds=config.resource_update_timeout_seconds,
             resource_update_stall_timeout_seconds=config.resource_update_stall_timeout_seconds,
+            require_fresh_pre_dispatch_confirmation=True,
         ),
         resource_update_recover_package=resource_update_recover_package,
         resource_update_package_running=resource_update_package_running,
@@ -190,6 +191,11 @@ def run_personal_automation_episode_from_config(
         resource_update_recover_package=lambda: lifecycle.start_game(context.cancelled),
         resource_update_package_running=lifecycle.is_game_running,
     )
+    confirmations = [
+        event
+        for event in result.events
+        if event.get("event") == "pre_dispatch_confirmation"
+    ]
     payload = {
         "success": result.status == "PASS",
         "terminal": result.status == "PASS" and result.final_state.value in {
@@ -213,6 +219,10 @@ def run_personal_automation_episode_from_config(
         "action_count": budget.total_actions,
         "real_ui_actions": budget.total_actions,
         "observations": result.observation_count,
+        "pre_dispatch_confirmations": len(confirmations),
+        "stale_actions_discarded": sum(
+            1 for event in confirmations if event.get("confirmed") is False
+        ),
         "current_city_id": next(
             (
                 event.get("current_city_id")
