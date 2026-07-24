@@ -36,10 +36,23 @@ def current_week_start(today: date | None = None) -> str:
 
 
 def _flatten_batches(batches: list[dict]) -> list[dict[str, int]]:
+    if not isinstance(batches, list) or not batches:
+        raise ValueError("weekly_plan_execution_batches_required")
     runs: list[dict[str, int]] = []
     for batch in batches:
-        books = {str(city): int(count) for city, count in batch.get("books", {}).items()}
-        runs.extend(dict(books) for _ in range(int(batch.get("runs", 0))))
+        if not isinstance(batch, dict):
+            raise ValueError("weekly_plan_batch_invalid")
+        try:
+            run_count = int(batch["runs"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("weekly_plan_batch_runs_invalid") from error
+        if run_count <= 0:
+            raise ValueError("weekly_plan_batch_runs_must_be_positive")
+        raw_books = batch.get("books")
+        if not isinstance(raw_books, dict):
+            raise ValueError("weekly_plan_batch_books_required")
+        books = {str(city): int(count) for city, count in raw_books.items()}
+        runs.extend(dict(books) for _ in range(run_count))
     return runs
 
 
@@ -102,13 +115,18 @@ def roll_weekly_plan_forward(*, path: Path | None = None) -> dict[str, Any] | No
     return update_weekly_state(mutate, path=target)
 
 
-def save_weekly_plan(result: dict, *, path: Path | None = None) -> dict[str, Any]:
+def build_weekly_plan_state(result: dict) -> dict[str, Any]:
+    """Build the executable plan schema without writing it to disk."""
+
+    cycle = result.get("cycle")
+    if not isinstance(cycle, (list, tuple)) or len(cycle) != 2:
+        raise ValueError("weekly_plan_cycle_invalid")
     runs = _flatten_batches(result["execution_batches"])
-    planned: dict[str, Any] = {
+    return {
         "version": 3,
         "schema_version": 3,
         "week_start": current_week_start(),
-        "cycle": result["cycle"],
+        "cycle": list(cycle),
         "total_runs": len(runs),
         "runs": runs,
         "completed_runs": 0,
@@ -134,6 +152,11 @@ def save_weekly_plan(result: dict, *, path: Path | None = None) -> dict[str, Any
         "optimizer_config": result.get("optimizer_config", {}),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
+
+
+def save_weekly_plan(result: dict, *, path: Path | None = None) -> dict[str, Any]:
+    planned = build_weekly_plan_state(result)
+    runs = planned["runs"]
     def mutate(state: dict[str, Any]) -> None:
         same_plan = state.get("cycle") == result["cycle"] and state.get("runs") == runs
         completed_runs = min(int(state.get("completed_runs", 0)), len(runs)) if same_plan else 0

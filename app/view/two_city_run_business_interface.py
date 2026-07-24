@@ -433,32 +433,12 @@ class TwoRunBusinessInterface(ScrollArea):
         self.optimizerWorker = None
 
     def applyOptimizedRoute(self):
-        from core.services import remaining_batches, save_weekly_plan
-        from core.services.server_calendar import SERVER_CLOCK
-        from core.services.trade_planning import (
-            StalePriceSnapshot,
-            validate_executable_trade_budget,
-        )
+        from core.services.trade_planning import StalePriceSnapshot
 
         if not self.optimizationResult:
             return
         try:
-            preview_state = {
-                **self.optimizationResult,
-                "expected_profit": int(
-                    self.optimizationResult.get(
-                        "combined_profit", self.optimizationResult.get("profit", 0)
-                    )
-                ),
-                "books_total": int(self.optimizationResult.get("books_used", 0)),
-                "total_runs": int(self.optimizationResult.get("repeats", 1)),
-            }
-            validate_executable_trade_budget(
-                preview_state,
-                now=SERVER_CLOCK.server_now(),
-                fatigue_budget=max(0, int(self.optimizerFatigueSpinBox.value())),
-                purchase_books=max(0, int(self.optimizerBooksSpinBox.value())),
-            )
+            self._applyOptimizedRoute()
         except StalePriceSnapshot as error:
             InfoBar.error(
                 title="价格快照不可执行",
@@ -468,8 +448,37 @@ class TwoRunBusinessInterface(ScrollArea):
                 parent=self,
             )
             return
-        cycle = self.optimizationResult["cycle"]
-        state = save_weekly_plan(self.optimizationResult)
+        except Exception as error:
+            logger.exception("套用优化跑商路线失败")
+            InfoBar.error(
+                title="套用路线失败",
+                content=str(error) or type(error).__name__,
+                orient=Qt.Orientation.Horizontal,
+                isClosable=True,
+                parent=self,
+            )
+            return
+
+    def _applyOptimizedRoute(self):
+        """Validate, persist and apply one optimizer result behind the UI error boundary."""
+
+        from core.services import remaining_batches, save_weekly_plan
+        from core.services.server_calendar import SERVER_CLOCK
+        from core.services.trade_planning import validate_executable_trade_budget
+        from core.services.weekly_plan_state import build_weekly_plan_state
+
+        result = self.optimizationResult
+        if not result:
+            return
+        preview_state = build_weekly_plan_state(result)
+        validate_executable_trade_budget(
+            preview_state,
+            now=SERVER_CLOCK.server_now(),
+            fatigue_budget=max(0, int(self.optimizerFatigueSpinBox.value())),
+            purchase_books=max(0, int(self.optimizerBooksSpinBox.value())),
+        )
+        cycle = result["cycle"]
+        state = save_weekly_plan(result)
         batches = remaining_batches(state)
         first_batch = batches[0] if batches else {"runs": 0, "books": {}}
         self.buyCityComboBox.setCurrentText(cycle[0])
@@ -478,12 +487,12 @@ class TwoRunBusinessInterface(ScrollArea):
             qconfig.set(getattr(cfg, f"{city}进货书"), int(first_batch["books"].get(city, 0)))
         qconfig.set(cfg.BuyCount, int(first_batch["runs"]))
         self.updateRouteTradeSettings()
-        self.appliedWeeklyPlan = self.optimizationResult
+        self.appliedWeeklyPlan = result
         self.updateRouteInfo()
         self.refreshWeeklyProgress()
         InfoBar.success(
             title="已套用周计划第一批",
-            content=f"{cycle[0]} → {cycle[1]} → {cycle[0]}，点击开始后将自动完成全部 {self.optimizationResult['repeats']} 次往返并切换进货书",
+            content=f"{cycle[0]} → {cycle[1]} → {cycle[0]}，点击开始后将自动完成全部 {result['repeats']} 次往返并切换进货书",
             orient=Qt.Orientation.Horizontal,
             isClosable=False,
             parent=self,
