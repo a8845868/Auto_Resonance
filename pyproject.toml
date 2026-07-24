@@ -6,7 +6,7 @@ authors = [
     {name = "Night-stars-1", email = "nujj1042633805@gmail.com"},
 ]
 dependencies = [
-    "Pillow==10.3.0",
+    "Pillow==12.1.1",
     "loguru==0.7.2",
     "numpy==1.26.4",
     "opencv-python==4.9.0.80",
