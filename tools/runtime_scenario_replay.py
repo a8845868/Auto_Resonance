@@ -24,6 +24,7 @@ from core.services.announcement_overlay_handler import (  # noqa: E402
 )
 from core.services.capture_media import decode_capture_data_url  # noqa: E402
 from core.services.personal_action_budget import EpisodeActionBudget  # noqa: E402
+from core.services.personal_city_target import PersonalCityTarget  # noqa: E402
 from core.services.personal_runtime_episode import (  # noqa: E402
     ActionPlanner,
     StateDetector,
@@ -151,10 +152,13 @@ def replay_spec(spec: ScenarioSpec) -> dict:
             AnnouncementSafeRegionSelector(minimum_region_area=10_000_000)
             if spec.force_no_safe_region
             else None
-        )
+        ),
+        city_target=PersonalCityTarget(city_id="岚心城"),
     )
     detected = detector.detect(spec.frame)
-    planned = ActionPlanner().plan(detected, budget=EpisodeActionBudget())
+    planned = ActionPlanner(target_city_id="岚心城").plan(
+        detected, budget=EpisodeActionBudget()
+    )
     passed = detected.state.value == spec.expected_state and planned.action.value == spec.expected_action
     return {
         "scenario": spec.name,

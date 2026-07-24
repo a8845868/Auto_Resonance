@@ -59,6 +59,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--install-path", type=Path, required=True)
     parser.add_argument("--instance-id", type=int, default=0)
     parser.add_argument("--package-id", default=GAME_PACKAGE)
+    parser.add_argument(
+        "--target-city",
+        default=None,
+        help="Optional explicit city target; omitted means stop at generic TASK_READY.",
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--resource-update-timeout", type=float, default=600.0)
@@ -271,6 +276,7 @@ def main() -> int:
                 return pending.pop(0) if pending else frame_provider()
 
             entry_config = PersonalAutomationEntryConfig(
+                target_city_id=args.target_city,
                 episode_timeout_seconds=args.timeout,
                 resource_update_timeout_seconds=args.resource_update_timeout,
                 resource_update_stall_timeout_seconds=args.resource_update_stall_timeout,

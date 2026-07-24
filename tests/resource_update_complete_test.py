@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from core.services.personal_action_budget import EpisodeActionBudget
+from core.services.personal_city_target import PersonalCityTarget
 from core.services.personal_runtime_episode import (
     ActionExecutor,
     ActionPlanner,
@@ -122,8 +123,8 @@ def _run(frames):
     budget = EpisodeActionBudget(clock=lambda: clock.now)
     episode = PersonalAutomationEpisode(
         frame_provider=sequence.__next__,
-        detector=StateDetector(),
-        planner=ActionPlanner(),
+        detector=StateDetector(city_target=PersonalCityTarget(city_id="岚心城")),
+        planner=ActionPlanner(target_city_id="岚心城"),
         executor=ActionExecutor(lambda point: clicks.append(point) or True),
         transform_provider=lambda detected: CoordinateTransform(
             detected.frame_dimensions,
@@ -135,6 +136,7 @@ def _run(frames):
         sleep=sleep,
         monotonic=lambda: clock.now,
         policy=EpisodePolicy(maximum_observations=len(frames)),
+        target_city_id="岚心城",
     )
     return episode.run(), budget, clicks
 

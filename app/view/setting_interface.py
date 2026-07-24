@@ -118,8 +118,8 @@ class SettingInterface(ScrollArea):
         )
         self.personalStartupEpisodeCard = SwitchSettingCard(
             FIF.PLAY,
-            "启动任务前自动准备游戏并进入岚心城",
-            "作为优先队列任务运行；失败时停止后续普通任务",
+            "启动任务前自动准备游戏",
+            "自动启动指定模拟器和游戏，处理已知启动页面，并恢复到后续任务可以接管的已知页面。不会固定前往某个城市。",
             configItem=cfg.enablePersonalStartupEpisode,
             parent=self.lifecycleGroup,
         )

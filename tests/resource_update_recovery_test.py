@@ -12,6 +12,7 @@ from core.services.emulator_lifecycle import (
     LifecycleOptions,
 )
 from core.services.personal_action_budget import EpisodeActionBudget
+from core.services.personal_city_target import PersonalCityTarget
 from core.services.personal_runtime_episode import (
     ActionExecutor,
     ActionPlanner,
@@ -275,8 +276,8 @@ def run_episode(frames, *, policy=None, recover=None):
     budget = EpisodeActionBudget(clock=clock.monotonic)
     episode = PersonalAutomationEpisode(
         frame_provider=lambda: next(sequence),
-        detector=StateDetector(),
-        planner=ActionPlanner(),
+        detector=StateDetector(city_target=PersonalCityTarget(city_id="岚心城")),
+        planner=ActionPlanner(target_city_id="岚心城"),
         executor=ActionExecutor(lambda point: clicks.append(point) or True),
         transform_provider=lambda detected: CoordinateTransform(
             detected.frame_dimensions,
@@ -289,6 +290,7 @@ def run_episode(frames, *, policy=None, recover=None):
         monotonic=clock.monotonic,
         policy=policy or EpisodePolicy(maximum_observations=len(frames)),
         resource_update_recover_package=recover,
+        target_city_id="岚心城",
     )
     return episode, budget, clicks
 

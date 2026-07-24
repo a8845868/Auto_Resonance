@@ -5,13 +5,53 @@ LastEditTime: 2024-05-10 23:32:54
 LastEditors: Night-stars-1 nujj1042633805@gmail.com
 """
 
+import json
+import os
+from pathlib import Path
 import sys
+import uuid
+
+from loguru import logger
 
 from qfluentwidgets import ConfigItem, QConfig, Theme, qconfig, ConfigSerializer, OptionsValidator
 
 from app.utils.config import CITYS
 from core.control.adb_port import EmulatorInfo, EmulatorType
 from version import __version__
+
+
+PERSONAL_STARTUP_CONFIG_PATH = Path("config/app.json")
+
+
+def migrate_personal_startup_config(path: Path = PERSONAL_STARTUP_CONFIG_PATH) -> bool:
+    """Migrate only the legacy enable flag, never its fixed-city meaning."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    section = payload.get("PersonalAutomation")
+    if not isinstance(section, dict):
+        return False
+    legacy_key = "PrepareGameAndEnterLanxinBeforeTasks"
+    generic_key = "PrepareGameBeforeTasks"
+    if legacy_key not in section:
+        return False
+    if generic_key not in section:
+        section[generic_key] = section.get(legacy_key) is True
+    section.pop(legacy_key, None)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=4),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    except OSError as error:
+        logger.warning(f"旧启动准备配置迁移暂未写入，将在下次启动重试: {error}")
+        return False
+    logger.info("已迁移旧启动准备开关；未迁移任何固定目标城市语义")
+    return True
 
 
 class RunningBusinessConfig(QConfig):
@@ -132,7 +172,7 @@ class Config(RunningBusinessConfig):
         "PersonalAutomation", "MaximumResourceUpdateMb", 2048, None
     )
     enablePersonalStartupEpisode = ConfigItem(
-        "PersonalAutomation", "PrepareGameAndEnterLanxinBeforeTasks", False, None
+        "PersonalAutomation", "PrepareGameBeforeTasks", False, None
     )
 
     enableCodexSelfHealing = ConfigItem(
@@ -189,4 +229,5 @@ REPO_URL = "https://github.com/Night-stars-1/Auto_Resonance"
 
 cfg = Config()
 cfg.themeMode.value = Theme.AUTO
+migrate_personal_startup_config()
 qconfig.load("config/app.json", cfg)

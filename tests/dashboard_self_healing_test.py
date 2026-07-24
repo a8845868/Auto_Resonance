@@ -59,7 +59,7 @@ class _Worker:
         self.deleted = True
 
 
-def test_scheduler_starts_due_tasks_without_a_manual_button_click(monkeypatch):
+def test_status_timer_does_not_start_due_tasks_without_manual_click(monkeypatch):
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr(cfg.enableCodexSelfHealing, "value", False)
     monkeypatch.setattr(dashboard_module, "is_task_due", lambda _key: True)
@@ -71,9 +71,9 @@ def test_scheduler_starts_due_tasks_without_a_manual_button_click(monkeypatch):
 
     DashboardInterface._runDueTasks(dashboard)
 
-    assert dashboard.schedulerArmed is True
-    assert dashboard.controlButton.text() == "停止全部任务"
-    assert starts == ["started"]
+    assert dashboard.schedulerArmed is False
+    assert dashboard.controlButton.text() == "开始全部任务"
+    assert starts == []
     assert dashboard.shutdown() is True
     dashboard.deleteLater()
     app.processEvents()
@@ -100,6 +100,38 @@ def test_queue_failure_disarms_scheduler_before_timer_can_restart_tasks():
     assert dashboard.pendingPanel.tasks
     assert "暂停" in dashboard.pendingPanel.tasks[0]
     assert "调试" in dashboard.pendingPanel.tasks[0]
+    assert worker.deleted is True
+
+
+def test_completed_queue_returns_to_explicit_start_state():
+    class CompletedWorker:
+        halted_for_repair = False
+        queue_state = "COMPLETED"
+
+        def __init__(self):
+            self.deleted = False
+
+        def deleteLater(self):
+            self.deleted = True
+
+    worker = CompletedWorker()
+    dashboard = SimpleNamespace(
+        queueWorker=worker,
+        schedulerArmed=True,
+        runningPanel=_Panel(),
+        pendingPanel=_Panel(),
+        controlButton=_Button(),
+        refreshScheduleOverview=lambda: None,
+    )
+    dashboard._setControlRunning = lambda running: DashboardInterface._setControlRunning(
+        dashboard, running
+    )
+
+    DashboardInterface._queueFinished(dashboard, worker)
+
+    assert dashboard.schedulerArmed is False
+    assert dashboard.pendingPanel.tasks == ["任务已完成"]
+    assert dashboard.controlButton.text == "开始全部任务"
     assert worker.deleted is True
 
 
@@ -131,6 +163,62 @@ def test_single_control_button_toggles_scheduler_state():
     DashboardInterface._toggleTaskQueue(dashboard)
 
     assert calls == ["start", "stop"]
+
+
+def test_thirty_second_scheduler_ticks_do_not_reinsert_startup_only_plan(monkeypatch):
+    monkeypatch.setattr(cfg.enableCodexSelfHealing, "value", False)
+    monkeypatch.setattr(
+        dashboard_module, "recover_startup_fatigue_schedules", lambda: None
+    )
+    starts = []
+    captures = []
+    dashboard = SimpleNamespace(
+        queueWorker=None,
+        schedulerArmed=True,
+        _allEnabledTasks=lambda: [
+            SimpleNamespace(
+                key="",
+                one_shot_key="personal_startup_preparation",
+            )
+        ],
+        startTaskQueue=lambda: starts.append("started"),
+    )
+
+    # Two 30-second timer callbacks model more than the required 35-second
+    # post-completion observation without sleeping or touching a backend.
+    DashboardInterface._runDueTasks(dashboard)
+    DashboardInterface._runDueTasks(dashboard)
+
+    assert starts == []
+    assert captures == []
+
+
+def test_startup_status_unknown_city_is_not_replaced_with_lanxin():
+    class _Label:
+        text = ""
+
+        def setText(self, value):
+            self.text = value
+
+    label = _Label()
+    dashboard = SimpleNamespace(personalStartupStatusLabel=label)
+    task = SimpleNamespace(name="启动任务前自动准备游戏", key="")
+
+    DashboardInterface._taskCompleted(
+        dashboard,
+        task,
+        True,
+        {
+            "current_state": "CITY_DETAIL",
+            "last_action": "STOP",
+            "real_ui_actions": 0,
+            "reason": "task_ready_city_reached",
+            "current_city_id": None,
+        },
+    )
+
+    assert "当前城市：未知" in label.text
+    assert "岚心城" not in label.text
 
 
 def test_scheduled_rewards_defer_without_self_healing_when_nothing_is_claimable(monkeypatch):

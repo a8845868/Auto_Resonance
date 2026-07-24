@@ -20,6 +20,11 @@ from core.services.announcement_overlay_handler import (
 from core.services.personal_action_budget import EpisodeActionBudget
 from core.services.personal_city_target import PersonalCityTarget, resolve_personal_city_binding
 from core.services.runtime_mode import RuntimeMode, resolve_runtime_mode
+from core.services.station_facilities import (
+    KNOWN_NO_REST_AREA_STATIONS,
+    KNOWN_REST_AREA_CITIES,
+    normalize_station_name,
+)
 
 
 class RuntimeState(str, Enum):
@@ -99,6 +104,7 @@ class DetectedRuntimeState:
     city_label_bbox: tuple[int, int, int, int] | None = None
     target_region: tuple[int, int, int, int] | None = None
     spatial_relation: str | None = None
+    current_city_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -247,14 +253,25 @@ class StateDetector:
         *,
         announcement_handler: AnnouncementOverlayHandler | None = None,
         safe_region_selector: AnnouncementSafeRegionSelector | None = None,
-        city_target: PersonalCityTarget = PersonalCityTarget(),
+        city_target: PersonalCityTarget | None = None,
     ) -> None:
-        city_target.validate()
+        if city_target is not None:
+            city_target.validate()
         selector = safe_region_selector or AnnouncementSafeRegionSelector()
         self.announcement_handler = announcement_handler or AnnouncementOverlayHandler(
             safe_region_selector=selector
         )
         self.city_target = city_target
+
+    @staticmethod
+    def _recognized_city_id(texts: tuple[str, ...]) -> str | None:
+        known = KNOWN_REST_AREA_CITIES | KNOWN_NO_REST_AREA_STATIONS
+        matches = {
+            normalized
+            for text in texts
+            if (normalized := normalize_station_name(text)) in known
+        }
+        return next(iter(matches)) if len(matches) == 1 else None
 
     @staticmethod
     def _items(frame: object) -> list[dict]:
@@ -530,13 +547,31 @@ class StateDetector:
                 frame_hash=frame_hash,
             )
 
-        try:
-            city_binding = resolve_personal_city_binding(
-                items, (width, height), self.city_target
-            )
-        except ValueError:
-            city_binding = None
+        city_binding = None
+        if self.city_target is not None:
+            try:
+                city_binding = resolve_personal_city_binding(
+                    items, (width, height), self.city_target
+                )
+            except ValueError:
+                city_binding = None
         home_count = sum(any(marker in text for marker in self.HOME_MARKERS) for text in texts)
+        generic_visit_items = [
+            item
+            for item in items
+            if "访问城市" in self._text(item) and _bbox(item) is not None
+        ]
+        if self.city_target is None and len(generic_visit_items) == 1 and home_count >= 2:
+            return DetectedRuntimeState(
+                RuntimeState.HOME_READY,
+                (width, height),
+                1.0,
+                bboxes,
+                texts,
+                evidence=("unique_visit_city", "home_markers", "generic_task_ready"),
+                frame_hash=frame_hash,
+                current_city_id=self._recognized_city_id(texts),
+            )
         if city_binding is not None and home_count >= 2:
             return DetectedRuntimeState(
                 RuntimeState.HOME_READY,
@@ -550,19 +585,38 @@ class StateDetector:
                 city_label_bbox=city_binding.city_label_bbox,
                 target_region=city_binding.target_region,
                 spatial_relation=city_binding.spatial_relation,
+                current_city_id=self.city_target.city_id,
             )
-        visit_present = any(self.city_target.anchor_text in text for text in texts)
-        city_label_present = any(text.replace(" ", "") == self.city_target.city_id for text in texts)
+        anchor_text = self.city_target.anchor_text if self.city_target else "访问城市"
+        visit_present = any(anchor_text in text for text in texts)
+        recognized_city_id = self._recognized_city_id(texts)
+        city_label_present = bool(
+            self.city_target
+            and any(text.replace(" ", "") == self.city_target.city_id for text in texts)
+        )
         city_count = sum(any(marker in text for marker in self.CITY_MARKERS) for text in texts)
-        if city_label_present and city_count >= 2 and not visit_present:
+        if (
+            city_count >= 2
+            and not visit_present
+            and (self.city_target is None or city_label_present)
+        ):
             return DetectedRuntimeState(
                 RuntimeState.CITY_DETAIL,
                 (width, height),
                 1.0,
                 bboxes,
                 texts,
-                evidence=("exact_lanxin", "city_facilities"),
+                evidence=(
+                    ("generic_city_detail", "city_facilities")
+                    if self.city_target is None
+                    else ("explicit_target_city", "city_facilities")
+                ),
                 frame_hash=frame_hash,
+                current_city_id=(
+                    recognized_city_id
+                    if self.city_target is None
+                    else self.city_target.city_id
+                ),
             )
         return DetectedRuntimeState(
             RuntimeState.UNKNOWN,
@@ -695,8 +749,14 @@ class ResourceUpdateHandler:
 
 
 class ActionPlanner:
-    def __init__(self, resource_update_handler: ResourceUpdateHandler | None = None) -> None:
+    def __init__(
+        self,
+        resource_update_handler: ResourceUpdateHandler | None = None,
+        *,
+        target_city_id: str | None = None,
+    ) -> None:
         self.resource_update_handler = resource_update_handler or ResourceUpdateHandler()
+        self.target_city_id = target_city_id
 
     @staticmethod
     def _center(bbox: tuple[int, int, int, int]) -> tuple[int, int]:
@@ -779,7 +839,11 @@ class ActionPlanner:
                 RuntimeState.HOME_READY,
                 "explicit_enter_game_anchor_selected",
             )
-        if detected.state is RuntimeState.HOME_READY and detected.city_entry_bbox:
+        if (
+            self.target_city_id is not None
+            and detected.state is RuntimeState.HOME_READY
+            and detected.city_entry_bbox
+        ):
             return PlannedRuntimeAction(
                 RuntimeAction.ENTER_CITY,
                 detected.state,
@@ -787,6 +851,15 @@ class ActionPlanner:
                 detected.city_entry_bbox,
                 RuntimeState.CITY_DETAIL,
                 "unique_lanxin_entry_selected",
+            )
+        if self.target_city_id is None and detected.state is RuntimeState.HOME_READY:
+            return PlannedRuntimeAction(
+                RuntimeAction.STOP,
+                detected.state,
+                None,
+                None,
+                RuntimeState.HOME_READY,
+                "generic_task_ready_reached",
             )
         if detected.state is RuntimeState.CITY_DETAIL:
             return PlannedRuntimeAction(
@@ -943,6 +1016,7 @@ class PersonalAutomationEpisode:
         resource_update_package_running: Callable[[], bool] | None = None,
         cancelled: Callable[[], bool] | None = None,
         mode: RuntimeMode | str | None = None,
+        target_city_id: str | None = None,
     ) -> None:
         policy.validate()
         if resolve_runtime_mode(mode) is RuntimeMode.AUDIT:
@@ -964,6 +1038,7 @@ class PersonalAutomationEpisode:
         self.resource_update_recover_package = resource_update_recover_package
         self.resource_update_package_running = resource_update_package_running
         self.cancelled = cancelled or (lambda: False)
+        self.target_city_id = target_city_id
         self._started = False
 
     def run(self) -> EpisodeResult:
@@ -1070,6 +1145,7 @@ class PersonalAutomationEpisode:
                 download_complete_text=detected.download_complete_text,
                 tap_to_enter_text=detected.tap_to_enter_text,
                 reason_codes=detected.reason_codes,
+                current_city_id=detected.current_city_id,
             )
             if detected.state is RuntimeState.CITY_DETAIL:
                 return EpisodeResult(
@@ -1078,6 +1154,18 @@ class PersonalAutomationEpisode:
                     self.budget.total_actions,
                     observations,
                     "city_detail_reached",
+                    tuple(self.recorder.events),
+                )
+            if (
+                self.target_city_id is None
+                and detected.state is RuntimeState.HOME_READY
+            ):
+                return EpisodeResult(
+                    "PASS",
+                    detected.state,
+                    self.budget.total_actions,
+                    observations,
+                    "task_ready_home_reached",
                     tuple(self.recorder.events),
                 )
             if previous_plan is not None and self.verifier.verify(previous_plan, detected):

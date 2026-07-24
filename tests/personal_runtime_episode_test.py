@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from core.services.personal_action_budget import EpisodeActionBudget
+from core.services.personal_city_target import PersonalCityTarget
 from core.services.personal_runtime_episode import (
     ActionExecutor,
     ActionPlanner,
@@ -23,7 +24,7 @@ from tests.personal_runtime_fixtures import (
 )
 
 
-def run_episode(frames, *, budget=None):
+def run_episode(frames, *, budget=None, target_city_id="岚心城"):
     sequence = iter(frames)
     clicks = []
     clock = SimpleNamespace(now=0.0)
@@ -32,10 +33,15 @@ def run_episode(frames, *, budget=None):
         clock.now += seconds
 
     shared = budget or EpisodeActionBudget(clock=lambda: clock.now)
+    city_target = (
+        PersonalCityTarget(city_id=target_city_id)
+        if target_city_id is not None
+        else None
+    )
     episode = PersonalAutomationEpisode(
         frame_provider=lambda: next(sequence),
-        detector=StateDetector(),
-        planner=ActionPlanner(),
+        detector=StateDetector(city_target=city_target),
+        planner=ActionPlanner(target_city_id=target_city_id),
         executor=ActionExecutor(lambda point: clicks.append(point) or True),
         transform_provider=lambda detected: CoordinateTransform(
             detected.frame_dimensions, (853, 480), detected.frame_dimensions, (0, 0)
@@ -44,6 +50,7 @@ def run_episode(frames, *, budget=None):
         sleep=sleep,
         monotonic=lambda: clock.now,
         policy=EpisodePolicy(maximum_observations=len(frames)),
+        target_city_id=target_city_id,
     )
     return episode, shared, clicks
 
@@ -163,14 +170,15 @@ def test_dispatch_rejection_is_planned_but_not_counted():
     budget = EpisodeActionBudget()
     episode = PersonalAutomationEpisode(
         frame_provider=lambda: home_frame(),
-        detector=StateDetector(),
-        planner=ActionPlanner(),
+        detector=StateDetector(city_target=PersonalCityTarget(city_id="岚心城")),
+        planner=ActionPlanner(target_city_id="岚心城"),
         executor=ActionExecutor(lambda _point: False),
         transform_provider=lambda detected: CoordinateTransform(
             detected.frame_dimensions, (853, 480), detected.frame_dimensions, (0, 0)
         ),
         budget=budget,
         policy=EpisodePolicy(maximum_observations=1),
+        target_city_id="岚心城",
     )
     result = episode.run()
     assert result.status == "BLOCKED"
@@ -186,14 +194,15 @@ def test_dispatch_exception_is_counted_once_and_stops_delivery_unknown():
 
     episode = PersonalAutomationEpisode(
         frame_provider=lambda: home_frame(),
-        detector=StateDetector(),
-        planner=ActionPlanner(),
+        detector=StateDetector(city_target=PersonalCityTarget(city_id="岚心城")),
+        planner=ActionPlanner(target_city_id="岚心城"),
         executor=ActionExecutor(delivery_unknown),
         transform_provider=lambda detected: CoordinateTransform(
             detected.frame_dimensions, (853, 480), detected.frame_dimensions, (0, 0)
         ),
         budget=budget,
         policy=EpisodePolicy(maximum_observations=1),
+        target_city_id="岚心城",
     )
     result = episode.run()
     assert result.status == "BLOCKED"
@@ -203,8 +212,8 @@ def test_dispatch_exception_is_counted_once_and_stops_delivery_unknown():
 
 
 def test_state_detector_plans_expected_core_states():
-    detector = StateDetector()
-    planner = ActionPlanner()
+    detector = StateDetector(city_target=PersonalCityTarget(city_id="岚心城"))
+    planner = ActionPlanner(target_city_id="岚心城")
     budget = EpisodeActionBudget()
     assert planner.plan(detector.detect(home_frame()), budget=budget).action is RuntimeAction.ENTER_CITY
     assert planner.plan(detector.detect(unknown_frame()), budget=budget).action is RuntimeAction.OBSERVE_ONLY

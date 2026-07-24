@@ -1,6 +1,7 @@
 """ALAS-inspired scheduler overview with integrated live log."""
 
 from datetime import datetime, timedelta
+import uuid
 
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import QFrame, QLabel, QSizePolicy, QSplitter, QVBoxLayout, QWidget
@@ -187,12 +188,13 @@ class DashboardInterface(ScrollArea):
         self.priorityTaskProviders = []
         self.additionalTaskProviders = []
         recover_startup_fatigue_schedules()
-        # Keep the scheduler listening from application startup so reaching a
-        # configured next-run time does not require a manual button click.
-        self.schedulerArmed = True
+        # A queue run is an explicit user action.  The periodic UI timer never
+        # creates a task plan or silently starts a new run.
+        self.schedulerArmed = False
+        self.queueRunId = uuid.uuid4().hex
         self.scheduleTimer = QTimer(self)
         self.scheduleTimer.setInterval(30_000)
-        self.scheduleTimer.timeout.connect(self._runDueTasks)
+        self.scheduleTimer.timeout.connect(self._refreshDisplayStatus)
         self.scheduleTimer.start()
         self.currentTask = None
         self.shutdownRequested = False
@@ -220,7 +222,10 @@ class DashboardInterface(ScrollArea):
         self.controlButton.setMinimumHeight(48)
         self.controlButton.clicked.connect(self._toggleTaskQueue)
         self.mainLayout.addWidget(self.controlButton)
-        self.personalStartupStatusLabel = QLabel("个人启动：未运行", self.scrollWidget)
+        self.personalStartupStatusLabel = QLabel(
+            "自动准备游戏：等待 · 当前页面：其他 · 当前城市：未知 · 最近动作：NONE",
+            self.scrollWidget,
+        )
         self.personalStartupStatusLabel.setWordWrap(True)
         self.mainLayout.addWidget(self.personalStartupStatusLabel)
 
@@ -284,12 +289,13 @@ class DashboardInterface(ScrollArea):
         """Register a task that must run before all ordinary daily tasks."""
         self.priorityTaskProviders.append(provider)
 
-    def _allEnabledTasks(self):
+    def _allEnabledTasks(self, *, include_priority: bool = True):
         tasks = []
-        for provider in self.priorityTaskProviders:
-            provided_task = provider()
-            if provided_task:
-                tasks.append(provided_task)
+        if include_priority:
+            for provider in self.priorityTaskProviders:
+                provided_task = provider()
+                if provided_task:
+                    tasks.append(provided_task)
         if bool(cfg.enableResidentActivity.value):
             activity_task = cfg.residentActivityTask.value
             reward = cfg.residentActivityFullRealmReward.value
@@ -321,7 +327,15 @@ class DashboardInterface(ScrollArea):
         return tasks
 
     def _enabledTasks(self):
-        tasks = self._allEnabledTasks()
+        tasks = [
+            task
+            for task in self._allEnabledTasks()
+            if not task.one_shot_key
+            or TaskQueueWorker.one_shot_state_for(
+                self.queueRunId, task.one_shot_key
+            )
+            != "CONSUMED"
+        ]
         due = [task for task in tasks if not task.key or is_task_due(task.key)]
         reward_task = next(
             (task for task in due if task.key == "reward_collection"), None
@@ -384,13 +398,15 @@ class DashboardInterface(ScrollArea):
                 waiting.append(f"{task.name}  ·  {next_run}")
         self.waitingPanel.setTasks(waiting)
 
-    def startTaskQueue(self):
+    def startTaskQueue(self, *, new_queue_run: bool = False):
         self.schedulerArmed = True
         self._setControlRunning(True)
         # Keep the finished worker reserved until its queued finished slot has
         # run.  Otherwise an old slot can accidentally delete a new worker.
         if self.queueWorker is not None:
             return
+        if new_queue_run or not getattr(self, "queueRunId", ""):
+            self.queueRunId = uuid.uuid4().hex
         tasks = self._enabledTasks()
         if not tasks:
             if self.waitingPanel.content.text() != "无任务":
@@ -434,6 +450,7 @@ class DashboardInterface(ScrollArea):
             lifecycle=lifecycle,
             incident_reporter=report_incident,
             halt_on_failure=self_healing_enabled,
+            queue_run_id=self.queueRunId,
         )
         self.queueWorker.taskStarted.connect(self._taskStarted)
         self.queueWorker.taskFinished.connect(self._taskFinished)
@@ -449,6 +466,7 @@ class DashboardInterface(ScrollArea):
         if self.schedulerArmed:
             self.stopTaskQueue()
         else:
+            self.queueRunId = uuid.uuid4().hex
             self.startTaskQueue()
 
     def _setControlRunning(self, running):
@@ -468,30 +486,24 @@ class DashboardInterface(ScrollArea):
         cancel_deferred_fatigue_actions()
 
     def _runDueTasks(self):
-        """Wake scheduled tasks without keeping the queue worker blocked."""
-        # Retry durable FAILED_RETRYABLE handoffs on every bounded scheduler
-        # tick, so a transient schedule write failure does not require restart.
-        recover_startup_fatigue_schedules()
-        if self.queueWorker is not None:
-            return
-        if bool(cfg.enableCodexSelfHealing.value):
-            discover_log_incidents(
-                dispatch=True,
-                allow_repair=bool(cfg.allowCodexIsolatedRepair.value),
-            )
-        if not self.schedulerArmed:
-            return
-        if any(not task.key or is_task_due(task.key) for task in self._allEnabledTasks()):
-            self.startTaskQueue()
+        """Compatibility hook: periodic ticks never build or execute a plan."""
+
+        return None
+
+    def _refreshDisplayStatus(self):
+        """A pure UI timer hook; queue plans are built only on explicit start."""
+
+        return None
 
     def _taskStarted(self, name, index, total):
         self.currentTask = name
         self.runningPanel.setTasks([f"{index}/{total}  {name}"])
         if name == "扫荡与全域整备":
             self.activityStateChanged.emit("●  运行中：正在执行全域整备", "#43a5ff")
-        elif name == "自动准备游戏并进入岚心城":
+        elif name == "启动任务前自动准备游戏":
             self.personalStartupStatusLabel.setText(
-                "个人启动：运行中 · 正在观察状态 · 最近动作 NONE"
+                "自动准备游戏：运行中 · 当前页面：其他 · 当前城市：未知 · "
+                "最近动作：NONE"
             )
 
     def _taskFinished(self, name, succeeded):
@@ -508,16 +520,22 @@ class DashboardInterface(ScrollArea):
         self.activityStateChanged.emit(f"✓  已完成：{details}", "#65c466")
 
     def _taskCompleted(self, task, succeeded, result):
-        if task.name == "自动准备游戏并进入岚心城":
+        if task.name == "启动任务前自动准备游戏":
             details = result if isinstance(result, dict) else {}
             state = details.get("current_state", "UNKNOWN")
             action = details.get("last_action", "NONE")
             actions = details.get("real_ui_actions", 0)
             reason = details.get("reason", "no_result")
-            outcome = "PASS" if succeeded else "FAIL"
+            city = details.get("current_city_id") or "未知"
+            page = {
+                "HOME_READY": "主页",
+                "CITY_DETAIL": "城市详情",
+                "SESSION_ENTRY": "标题页",
+            }.get(state, "其他")
+            outcome = "已就绪" if succeeded else "失败"
             self.personalStartupStatusLabel.setText(
-                f"个人启动：{outcome} · 状态 {state} · 最近动作 {action} · "
-                f"动作 {actions}/10 · {reason}"
+                f"自动准备游戏：{outcome} · 当前页面：{page} · 当前城市：{city} · "
+                f"最近动作：{action} · 动作计数：{actions} · 原因：{reason}"
             )
         if not task.key:
             return
@@ -554,6 +572,12 @@ class DashboardInterface(ScrollArea):
             worker.deleteLater()
             return
         halted_for_repair = worker.halted_for_repair
+        queue_state = getattr(
+            worker,
+            "queue_state",
+            "FAILED" if getattr(worker, "fatal_error", None) else "COMPLETED",
+        )
+        self.schedulerArmed = False
         if halted_for_repair:
             self.schedulerArmed = False
         self.runningPanel.setTasks([])
@@ -563,7 +587,9 @@ class DashboardInterface(ScrollArea):
             )
             logger.warning("检测到任务异常，自动调度已熔断并等待人工审阅")
         else:
-            self.pendingPanel.setTasks([])
+            self.pendingPanel.setTasks(
+                ["任务已完成"] if queue_state == "COMPLETED" else []
+            )
         self._setControlRunning(self.schedulerArmed)
         self.refreshScheduleOverview()
         worker.deleteLater()

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import time
 import traceback
+from threading import Lock
 from typing import Callable
 import uuid
 
@@ -27,6 +28,7 @@ class TaskExecutionContext:
     cancelled: Callable[[], bool]
     logger: object
     runtime_mode: str = "PERSONAL_AUTOMATION"
+    queue_run_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,8 @@ class QueuedTask:
     retry_backoff_seconds: float = 1.0
     run_with_context: Callable[[TaskExecutionContext], object] | None = None
     halt_queue_on_failure: bool = False
+    one_shot_key: str = ""
+    requires_terminal_result: bool = False
 
     def next_run_after(self, succeeded: bool, now: datetime | None = None) -> datetime:
         now = now or datetime.now()
@@ -58,6 +62,8 @@ class TaskQueueWorker(QThread):
     taskResult = Signal(str, object)
     taskCompleted = Signal(object, bool, object)
     error = Signal(str)
+    _one_shot_lock = Lock()
+    _one_shot_states: dict[tuple[str, str], str] = {}
 
     def __init__(
         self,
@@ -68,6 +74,7 @@ class TaskQueueWorker(QThread):
         incident_reporter: Callable[[dict], None] | None = None,
         halt_on_failure: bool = False,
         retry_sleep: Callable[[float], None] = time.sleep,
+        queue_run_id: str | None = None,
     ):
         super().__init__(parent)
         self.tasks = tasks
@@ -81,9 +88,32 @@ class TaskQueueWorker(QThread):
         self._current: QueuedTask | None = None
         self._pending_incidents: list[dict] = []
         self._incident_batch_id = uuid.uuid4().hex
+        self.queue_run_id = queue_run_id or uuid.uuid4().hex
+        self.queue_state = "PENDING"
+        self.one_shot_transitions: list[dict[str, str]] = []
+        self._run_failed = False
+
+    @classmethod
+    def one_shot_state_for(cls, queue_run_id: str, one_shot_key: str) -> str:
+        with cls._one_shot_lock:
+            return cls._one_shot_states.get((queue_run_id, one_shot_key), "PENDING")
+
+    def _transition_one_shot(self, task: QueuedTask, state: str) -> None:
+        if not task.one_shot_key:
+            return
+        with self._one_shot_lock:
+            self._one_shot_states[(self.queue_run_id, task.one_shot_key)] = state
+        self.one_shot_transitions.append(
+            {
+                "queue_run_id": self.queue_run_id,
+                "one_shot_key": task.one_shot_key,
+                "state": state,
+            }
+        )
 
     def run(self):
         reset_stop()
+        self.queue_state = "RUNNING"
         pending = [task.name for task in self.tasks]
         self.queueChanged.emit(pending)
         lifecycle_entered = False
@@ -94,6 +124,9 @@ class TaskQueueWorker(QThread):
                     self.lifecycle.prepare(lambda: self._stop_requested)
                 except LifecycleCancelled:
                     self._stop_requested = True
+                    self.queue_state = "CANCELLED"
+                    for task in self.tasks:
+                        self._transition_one_shot(task, "CANCELLED")
                     self.error.emit("personal_startup_cancelled")
                     return
                 except Exception as error:
@@ -111,12 +144,25 @@ class TaskQueueWorker(QThread):
                     logger.exception("任务队列启动模拟器或游戏失败")
                     self.error.emit("模拟器或游戏启动失败，本批任务已进入失败重试")
                     self._mark_tasks_failed_before_start()
+                    self.queue_state = "FAILED"
+                    for task in self.tasks:
+                        self._transition_one_shot(task, "FAILED")
                     return
 
             for index, task in enumerate(self.tasks, start=1):
                 if self._stop_requested:
                     break
+                if task.one_shot_key:
+                    prior_state = self.one_shot_state_for(
+                        self.queue_run_id, task.one_shot_key
+                    )
+                    if prior_state == "CONSUMED":
+                        continue
+                    if prior_state in {"FAILED", "CANCELLED"}:
+                        self.queue_state = prior_state
+                        return
                 self._current = task
+                self._transition_one_shot(task, "RUNNING")
                 self.taskStarted.emit(task.name, index, len(self.tasks))
                 self.queueChanged.emit([item.name for item in self.tasks[index:]])
                 succeeded = True
@@ -130,18 +176,34 @@ class TaskQueueWorker(QThread):
                                     lifecycle=self.lifecycle,
                                     cancelled=lambda: self._stop_requested,
                                     logger=logger,
+                                    queue_run_id=self.queue_run_id,
                                 )
                             )
                         else:
                             result = task.run()
-                        if self._stop_requested or not task_result_succeeded(result):
+                        terminal_contract_failed = bool(
+                            task.requires_terminal_result
+                            and not (
+                                isinstance(result, dict)
+                                and result.get("terminal") is True
+                            )
+                        )
+                        if (
+                            self._stop_requested
+                            or not task_result_succeeded(result)
+                            or terminal_contract_failed
+                        ):
                             succeeded = False
                             if not self._stop_requested:
                                 self._queue_incident(
                                     task=task,
                                     failure_kind="unexpected_result",
                                     message="任务未返回明确成功结果",
-                                    expected="task_result_succeeded(result) == True",
+                                    expected=(
+                                        "task_result_succeeded(result) == True and terminal == True"
+                                        if task.requires_terminal_result
+                                        else "task_result_succeeded(result) == True"
+                                    ),
                                     observed=self._safe_observed(result),
                                     context={"task_index": index, "task_total": len(self.tasks)},
                                 )
@@ -216,6 +278,14 @@ class TaskQueueWorker(QThread):
                             f"{task.name}发生致命程序错误，已停止后续任务并记录现场"
                         )
                         break
+                if succeeded:
+                    self._transition_one_shot(task, "SUCCEEDED")
+                    self._transition_one_shot(task, "CONSUMED")
+                elif self._stop_requested:
+                    self._transition_one_shot(task, "CANCELLED")
+                else:
+                    self._run_failed = True
+                    self._transition_one_shot(task, "FAILED")
                 self.taskFinished.emit(task.name, succeeded)
                 if succeeded:
                     self.taskResult.emit(task.name, result)
@@ -234,6 +304,13 @@ class TaskQueueWorker(QThread):
                         logger.warning(f"前置任务失败，停止本批后续任务: {task.name}")
                     break
         finally:
+            if self.queue_state == "RUNNING":
+                if self._stop_requested:
+                    self.queue_state = "CANCELLED"
+                elif self._fatal_error is not None or self._run_failed:
+                    self.queue_state = "FAILED"
+                else:
+                    self.queue_state = "COMPLETED"
             self._current = None
             if lifecycle_entered and self.lifecycle is not None:
                 try:

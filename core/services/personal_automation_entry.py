@@ -22,6 +22,7 @@ from core.services.personal_runtime_episode import (
 
 @dataclass(frozen=True)
 class PersonalAutomationEntryConfig:
+    target_city_id: str | None = None
     auto_confirm_resource_update: bool = True
     minimum_resource_update_mb: float = 0.01
     maximum_resource_update_mb: float = 2048.0
@@ -32,6 +33,10 @@ class PersonalAutomationEntryConfig:
     observation_interval_seconds: float = 0.75
 
     def validate(self) -> None:
+        if self.target_city_id is not None:
+            from core.services.personal_city_target import PersonalCityTarget
+
+            PersonalCityTarget(city_id=self.target_city_id).validate()
         ResourceUpdatePolicy(
             auto_confirm_enabled=self.auto_confirm_resource_update,
             minimum_size_mb=self.minimum_resource_update_mb,
@@ -72,10 +77,18 @@ def run_personal_automation_episode(
         timeout_seconds=config.resource_update_timeout_seconds,
         stall_timeout_seconds=config.resource_update_stall_timeout_seconds,
     )
+    city_target = None
+    if config.target_city_id is not None:
+        from core.services.personal_city_target import PersonalCityTarget
+
+        city_target = PersonalCityTarget(city_id=config.target_city_id)
     episode = PersonalAutomationEpisode(
         frame_provider=frame_provider,
-        detector=StateDetector(),
-        planner=ActionPlanner(ResourceUpdateHandler(resource_policy)),
+        detector=StateDetector(city_target=city_target),
+        planner=ActionPlanner(
+            ResourceUpdateHandler(resource_policy),
+            target_city_id=config.target_city_id,
+        ),
         executor=ActionExecutor(click, pre_dispatch_guard=pre_dispatch_guard),
         transform_provider=lambda detected: CoordinateTransform(
             detected.frame_dimensions,
@@ -95,6 +108,7 @@ def run_personal_automation_episode(
         resource_update_recover_package=resource_update_recover_package,
         resource_update_package_running=resource_update_package_running,
         cancelled=cancelled,
+        target_city_id=config.target_city_id,
     )
     return episode.run(), shared_budget
 
@@ -178,6 +192,11 @@ def run_personal_automation_episode_from_config(
     )
     payload = {
         "success": result.status == "PASS",
+        "terminal": result.status == "PASS" and result.final_state.value in {
+            "HOME_READY",
+            "CITY_DETAIL",
+        },
+        "ready_state": result.final_state.value,
         "status": result.status,
         "final_state": result.final_state.value,
         "reason": result.reason,
@@ -191,8 +210,18 @@ def run_personal_automation_episode_from_config(
             "NONE",
         ),
         "total_action_budget": budget.snapshot(),
+        "action_count": budget.total_actions,
         "real_ui_actions": budget.total_actions,
         "observations": result.observation_count,
+        "current_city_id": next(
+            (
+                event.get("current_city_id")
+                for event in reversed(result.events)
+                if event.get("event") == "observation"
+                and event.get("current_city_id")
+            ),
+            None,
+        ),
     }
     context.logger.info(
         "Personal startup result status={status} state={state} actions={actions} reason={reason}".format(
@@ -211,12 +240,14 @@ def build_personal_startup_queued_task():
     from app.utils.task_queue import QueuedTask
 
     return QueuedTask(
-        "自动准备游戏并进入岚心城",
+        "启动任务前自动准备游戏",
         lambda: False,
         key="",
         recoverable_retries=0,
         run_with_context=run_personal_automation_episode_from_config,
         halt_queue_on_failure=True,
+        one_shot_key="personal_startup_preparation",
+        requires_terminal_result=True,
     )
 
 
