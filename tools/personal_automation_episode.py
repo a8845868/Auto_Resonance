@@ -177,7 +177,7 @@ def main() -> int:
     )
     adb = None
     result_payload: dict = {
-        "task": "PERSONAL_AUTOMATION_RESOURCE_UPDATE_RECOVERY_V1",
+        "task": "RESOURCE_UPDATE_COMPLETE_AND_CONTINUE_TO_CITY_DETAIL_V1",
         "correlation_id": correlation_id,
         "execute_authorized": bool(args.execute),
         "instance_index": 0,
@@ -231,6 +231,11 @@ def main() -> int:
             "resource_size_mb": first.resource_size_mb,
             "resource_confirm_bbox": first.resource_confirm_bbox,
             "resource_progress_percent": first.resource_progress_percent,
+            "download_complete_text": first.download_complete_text,
+            "tap_to_enter_text": first.tap_to_enter_text,
+            "confidence": first.confidence,
+            "reason_codes": first.reason_codes,
+            "authorized_window_match_count": 1,
         }
         if not args.execute:
             result_payload.update(
@@ -346,6 +351,9 @@ def main() -> int:
         ]
         result_payload["resource_confirm_attempts"] = budget.actions_by_action_type[
             "CONFIRM_RESOURCE_UPDATE"
+        ]
+        result_payload["resource_complete_entry_attempts"] = budget.actions_by_action_type[
+            "ENTER_AFTER_RESOURCE_UPDATE"
         ]
         result_payload["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         (args.output / "PERSONAL_AUTOMATION_EPISODE_RESULT.json").write_text(

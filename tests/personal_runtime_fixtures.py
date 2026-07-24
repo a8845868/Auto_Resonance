@@ -91,3 +91,18 @@ def resource_update_frame(*, progress="0%", confirmations=1, extra_texts=(), siz
         for index, text in enumerate(extra_texts)
     )
     return Frame(np.full((720, 1280, 3), 20, dtype=np.uint8), texts)
+
+
+def resource_update_complete_frame(
+    *,
+    width=1280,
+    height=720,
+    download_text="下载已经完成",
+    enter_text="点击任意位置进入游戏",
+):
+    texts = []
+    if download_text:
+        texts.append(item(download_text, (468, 546, 630, 574)))
+    if enter_text:
+        texts.append(item(enter_text, (620, 546, 820, 574)))
+    return Frame(np.full((height, width, 3), 20, dtype=np.uint8), texts)

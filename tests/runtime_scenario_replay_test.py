@@ -8,9 +8,9 @@ import sys
 from tools.runtime_scenario_replay import generated_scenarios, replay_all, replay_spec
 
 
-def test_all_eight_generated_runtime_scenarios_replay():
+def test_all_nine_generated_runtime_scenarios_replay():
     results = replay_all()
-    assert len(results) == 8
+    assert len(results) == 9
     assert all(item["result"] == "PASS" for item in results)
 
 
@@ -42,7 +42,7 @@ def test_home_city_daily_and_unknown_action_boundaries():
     assert results["transition_unknown"]["planned_action"] == "OBSERVE_ONLY"
 
 
-def test_cli_all_is_offline_and_emits_eight_results():
+def test_cli_all_is_offline_and_emits_nine_results():
     environment = os.environ.copy()
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     completed = subprocess.run(
@@ -57,7 +57,7 @@ def test_cli_all_is_offline_and_emits_eight_results():
         for line in completed.stdout.splitlines()
         if line.startswith("{")
     ]
-    assert len(results) == 8
+    assert len(results) == 9
     assert all(item["result"] == "PASS" for item in results)
 
 

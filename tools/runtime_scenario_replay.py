@@ -1,4 +1,4 @@
-"""Replay eight generated runtime scenarios without emulator or input access."""
+"""Replay nine generated runtime scenarios without emulator or input access."""
 
 from __future__ import annotations
 
@@ -88,6 +88,13 @@ def _encoded_frame(media_type: str, width: int = 851) -> ScenarioFrame:
 
 
 def generated_scenarios() -> tuple[ScenarioSpec, ...]:
+    resource_complete = ScenarioFrame(
+        np.full((720, 1280, 3), 20, dtype=np.uint8),
+        [
+            _item("下载已经完成", (468, 546, 630, 574)),
+            _item("点击任意位置进入游戏", (620, 546, 820, 574)),
+        ],
+    )
     daily = ScenarioFrame(
         np.full((720, 1280, 3), 35, dtype=np.uint8),
         [
@@ -129,6 +136,12 @@ def generated_scenarios() -> tuple[ScenarioSpec, ...]:
         ScenarioSpec("city_detail", city, "CITY_DETAIL", "STOP"),
         ScenarioSpec("transition_unknown", ScenarioFrame(np.zeros((720, 1280, 3), dtype=np.uint8), []), "UNKNOWN", "OBSERVE_ONLY"),
         ScenarioSpec("announcement_no_safe_region", blocked_announcement, "ANNOUNCEMENT_VISIBLE", "OBSERVE_ONLY", True),
+        ScenarioSpec(
+            "resource_update_complete_tap_to_enter",
+            resource_complete,
+            "RESOURCE_UPDATE_COMPLETE_TAP_TO_ENTER",
+            "ENTER_AFTER_RESOURCE_UPDATE",
+        ),
     )
 
 
@@ -153,6 +166,10 @@ def replay_spec(spec: ScenarioSpec) -> dict:
         "safe_target_count": 1 if planned.capture_point is not None else 0,
         "candidate_count": len(detected.announcement_candidates),
         "announcement_candidates": [asdict(item) for item in detected.announcement_candidates],
+        "download_complete_text": detected.download_complete_text,
+        "tap_to_enter_text": detected.tap_to_enter_text,
+        "confidence": detected.confidence,
+        "reason_codes": list(detected.reason_codes),
         "expected_state": spec.expected_state,
         "expected_planned_action": spec.expected_action,
         "result": "PASS" if passed else "FAIL",

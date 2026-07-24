@@ -24,6 +24,7 @@ from core.services.runtime_mode import RuntimeMode, resolve_runtime_mode
 class RuntimeState(str, Enum):
     RESOURCE_UPDATE_REQUIRED = "RESOURCE_UPDATE_REQUIRED"
     RESOURCE_UPDATE_DOWNLOADING = "RESOURCE_UPDATE_DOWNLOADING"
+    RESOURCE_UPDATE_COMPLETE_TAP_TO_ENTER = "RESOURCE_UPDATE_COMPLETE_TAP_TO_ENTER"
     ANNOUNCEMENT_VISIBLE = "ANNOUNCEMENT_VISIBLE"
     DAILY_CHECKIN = "DAILY_CHECKIN"
     SESSION_ENTRY = "SESSION_ENTRY"
@@ -35,6 +36,7 @@ class RuntimeState(str, Enum):
 
 class RuntimeAction(str, Enum):
     CONFIRM_RESOURCE_UPDATE = "CONFIRM_RESOURCE_UPDATE"
+    ENTER_AFTER_RESOURCE_UPDATE = "ENTER_AFTER_RESOURCE_UPDATE"
     DISMISS_ANNOUNCEMENT = "DISMISS_ANNOUNCEMENT"
     DISMISS_DAILY_CHECKIN = "DISMISS_DAILY_CHECKIN"
     ENTER_SESSION = "ENTER_SESSION"
@@ -79,6 +81,9 @@ class DetectedRuntimeState:
     resource_progress_percent: float | None = None
     evidence: tuple[str, ...] = ()
     frame_hash: str = ""
+    download_complete_text: str | None = None
+    tap_to_enter_text: str | None = None
+    reason_codes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -89,6 +94,7 @@ class PlannedRuntimeAction:
     target_bbox: tuple[int, int, int, int] | None
     expected_postcondition: RuntimeState | None
     reason: str
+    use_render_client_center: bool = False
 
 
 @dataclass(frozen=True)
@@ -99,6 +105,7 @@ class CoordinateMapping:
     screen_point: tuple[int, int]
     capture_to_normalized_scale: tuple[float, float]
     normalized_to_client_scale: tuple[float, float]
+    normalized_unit_point: tuple[float, float]
 
 
 @dataclass(frozen=True)
@@ -138,7 +145,44 @@ class CoordinateTransform:
             self.render_client_screen_origin[0] + client[0],
             self.render_client_screen_origin[1] + client[1],
         )
-        return CoordinateMapping(point, normalized, client, screen, capture_scale, client_scale)
+        return CoordinateMapping(
+            point,
+            normalized,
+            client,
+            screen,
+            capture_scale,
+            client_scale,
+            (point[0] / capture_width, point[1] / capture_height),
+        )
+
+    def map_render_client_center(self, capture_point: tuple[int, int]) -> CoordinateMapping:
+        capture_width, capture_height = self.capture_size
+        reference_width, reference_height = self.reference_render_size
+        client_width, client_height = self.render_client_size
+        if min(
+            capture_width,
+            capture_height,
+            reference_width,
+            reference_height,
+            client_width,
+            client_height,
+        ) <= 0:
+            raise ValueError("coordinate_geometry_invalid")
+        normalized = (reference_width // 2, reference_height // 2)
+        client = (client_width // 2, client_height // 2)
+        screen = (
+            self.render_client_screen_origin[0] + client[0],
+            self.render_client_screen_origin[1] + client[1],
+        )
+        return CoordinateMapping(
+            capture_point,
+            normalized,
+            client,
+            screen,
+            (reference_width / capture_width, reference_height / capture_height),
+            (client_width / reference_width, client_height / reference_height),
+            (0.5, 0.5),
+        )
 
 
 def normalize_capture_point(
@@ -158,6 +202,12 @@ class StateDetector:
     HOME_MARKERS = ("访问城市", "作战终端", "启程", "整备列车")
     CITY_MARKERS = ("市政厅", "交易所", "商会", "休息区", "城市设施")
     RESOURCE_TEXT_MARKERS = ("需要下载资源包", "需要更新资源", "需要下载资源")
+    RESOURCE_COMPLETE_TEXT_MARKERS = ("下载已经完成", "下载完成")
+    RESOURCE_TAP_TO_ENTER_MARKERS = (
+        "点击任意位置进入游戏",
+        "点击屏幕进入游戏",
+        "触碰任意位置进入游戏",
+    )
     RESOURCE_BLOCKING_MARKERS = (
         "购买",
         "支付",
@@ -272,6 +322,44 @@ class StateDetector:
             for marker in self.RESOURCE_BLOCKING_MARKERS
             if any(marker in text for text in texts)
         )
+        download_complete_text = next(
+            (
+                text
+                for text in texts
+                if any(marker in text for marker in self.RESOURCE_COMPLETE_TEXT_MARKERS)
+            ),
+            None,
+        )
+        tap_to_enter_text = next(
+            (
+                text
+                for text in texts
+                if any(marker in text for marker in self.RESOURCE_TAP_TO_ENTER_MARKERS)
+            ),
+            None,
+        )
+        if (
+            download_complete_text is not None
+            and tap_to_enter_text is not None
+            and not blocking_cues
+        ):
+            reason_codes = (
+                "DOWNLOAD_COMPLETE_TEXT_MATCH=YES",
+                "TAP_ANYWHERE_TO_ENTER_TEXT_MATCH=YES",
+                "RISK_CUES_ABSENT",
+            )
+            return DetectedRuntimeState(
+                RuntimeState.RESOURCE_UPDATE_COMPLETE_TAP_TO_ENTER,
+                (width, height),
+                1.0,
+                bboxes,
+                texts,
+                evidence=reason_codes,
+                frame_hash=frame_hash,
+                download_complete_text=download_complete_text,
+                tap_to_enter_text=tap_to_enter_text,
+                reason_codes=reason_codes,
+            )
         if (
             len(resource_items) == 1
             and size_matches
@@ -468,7 +556,7 @@ class StateDetector:
 
 
 class ResourceUpdateHandler:
-    """Plan at most one exact resource-update confirmation per episode."""
+    """Plan bounded resource confirmation and post-download entry actions."""
 
     def __init__(self, *, authorized_resource_size_mb: float | None = None) -> None:
         self.authorized_resource_size_mb = authorized_resource_size_mb
@@ -517,6 +605,30 @@ class ResourceUpdateHandler:
             "unique_resource_update_confirm_selected",
         )
 
+    @staticmethod
+    def plan_complete_entry(
+        detected: DetectedRuntimeState, budget: EpisodeActionBudget
+    ) -> PlannedRuntimeAction:
+        if budget.actions_by_action_type["ENTER_AFTER_RESOURCE_UPDATE"] > 0:
+            return PlannedRuntimeAction(
+                RuntimeAction.OBSERVE_ONLY,
+                detected.state,
+                None,
+                None,
+                None,
+                "resource_complete_entry_already_attempted",
+            )
+        width, height = detected.frame_dimensions
+        return PlannedRuntimeAction(
+            RuntimeAction.ENTER_AFTER_RESOURCE_UPDATE,
+            detected.state,
+            (width // 2, height // 2),
+            (0, 0, width, height),
+            None,
+            "resource_complete_render_client_center_selected",
+            use_render_client_center=True,
+        )
+
 
 class ActionPlanner:
     def __init__(self, resource_update_handler: ResourceUpdateHandler | None = None) -> None:
@@ -545,6 +657,8 @@ class ActionPlanner:
     ) -> PlannedRuntimeAction:
         if detected.state is RuntimeState.RESOURCE_UPDATE_REQUIRED:
             return self.resource_update_handler.plan(detected, budget)
+        if detected.state is RuntimeState.RESOURCE_UPDATE_COMPLETE_TAP_TO_ENTER:
+            return self.resource_update_handler.plan_complete_entry(detected, budget)
         if detected.state is RuntimeState.RESOURCE_UPDATE_DOWNLOADING:
             return PlannedRuntimeAction(
                 RuntimeAction.OBSERVE_ONLY,
@@ -653,7 +767,11 @@ class ActionExecutor:
             return ExecutionResult(False, None, "action_point_missing")
         if self.pre_dispatch_guard is not None and not self.pre_dispatch_guard():
             return ExecutionResult(False, None, "target_identity_guard_failed")
-        mapping = transform.map(plan.capture_point)
+        mapping = (
+            transform.map_render_client_center(plan.capture_point)
+            if plan.use_render_client_center
+            else transform.map(plan.capture_point)
+        )
         result = self.click(mapping.render_client_point)
         return ExecutionResult(result is not False, mapping, "input_dispatched")
 
@@ -663,6 +781,12 @@ class PostconditionVerifier:
     def verify(plan: PlannedRuntimeAction, detected: DetectedRuntimeState) -> bool:
         if plan.action is RuntimeAction.CONFIRM_RESOURCE_UPDATE:
             return detected.state is not RuntimeState.RESOURCE_UPDATE_REQUIRED
+        if plan.action is RuntimeAction.ENTER_AFTER_RESOURCE_UPDATE:
+            return detected.state in {
+                RuntimeState.ANNOUNCEMENT_VISIBLE,
+                RuntimeState.DAILY_CHECKIN,
+                RuntimeState.HOME_READY,
+            }
         return plan.expected_postcondition is not None and detected.state is plan.expected_postcondition
 
 
@@ -679,6 +803,13 @@ class RecoveryPolicy:
             return current.state in {
                 RuntimeState.RESOURCE_UPDATE_REQUIRED,
                 RuntimeState.RESOURCE_UPDATE_DOWNLOADING,
+            }
+        if previous.action is RuntimeAction.ENTER_AFTER_RESOURCE_UPDATE:
+            return current.state in {
+                RuntimeState.RESOURCE_UPDATE_COMPLETE_TAP_TO_ENTER,
+                RuntimeState.ANNOUNCEMENT_VISIBLE,
+                RuntimeState.DAILY_CHECKIN,
+                RuntimeState.HOME_READY,
             }
         if previous.action in {
             RuntimeAction.DISMISS_ANNOUNCEMENT,
@@ -824,6 +955,7 @@ class PersonalAutomationEpisode:
             if detected.state in {
                 RuntimeState.RESOURCE_UPDATE_REQUIRED,
                 RuntimeState.RESOURCE_UPDATE_DOWNLOADING,
+                RuntimeState.RESOURCE_UPDATE_COMPLETE_TAP_TO_ENTER,
             }:
                 if resource_deadline is None:
                     resource_deadline = self.monotonic() + self.policy.resource_update_timeout_seconds
@@ -855,6 +987,9 @@ class PersonalAutomationEpisode:
                 resource_size_mb=detected.resource_size_mb,
                 resource_progress_percent=detected.resource_progress_percent,
                 resource_confirm_bbox=detected.resource_confirm_bbox,
+                download_complete_text=detected.download_complete_text,
+                tap_to_enter_text=detected.tap_to_enter_text,
+                reason_codes=detected.reason_codes,
             )
             if detected.state is RuntimeState.CITY_DETAIL:
                 return EpisodeResult(
@@ -902,7 +1037,11 @@ class PersonalAutomationEpisode:
                 continue
             transform = self.transform_provider(detected)
             assert plan.capture_point is not None
-            mapping = transform.map(plan.capture_point)
+            mapping = (
+                transform.map_render_client_center(plan.capture_point)
+                if plan.use_render_client_center
+                else transform.map(plan.capture_point)
+            )
             decision = self.budget.authorize(
                 state=plan.state.value,
                 action_type=plan.action.value,
