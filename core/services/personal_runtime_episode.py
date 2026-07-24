@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -17,7 +18,7 @@ from core.services.announcement_overlay_handler import (
     _frame_bgr,
 )
 from core.services.personal_action_budget import EpisodeActionBudget
-from core.services.personal_city_target import PersonalCityTarget, resolve_personal_city_anchor
+from core.services.personal_city_target import PersonalCityTarget, resolve_personal_city_binding
 from core.services.runtime_mode import RuntimeMode, resolve_runtime_mode
 
 
@@ -48,7 +49,8 @@ class RuntimeAction(str, Enum):
 @dataclass(frozen=True)
 class EpisodePolicy:
     minimum_action_interval_seconds: float = 0.5
-    maximum_observations: int = 120
+    observation_interval_seconds: float = 0.5
+    maximum_observations: int | None = None
     episode_timeout_seconds: float = 120.0
     resource_update_timeout_seconds: float = 600.0
     resource_update_stall_timeout_seconds: float = 120.0
@@ -57,12 +59,22 @@ class EpisodePolicy:
         if self.minimum_action_interval_seconds < 0:
             raise ValueError("episode_action_interval_invalid")
         if (
-            self.maximum_observations < 1
+            (self.maximum_observations is not None and self.maximum_observations < 1)
+            or self.observation_interval_seconds <= 0
             or self.episode_timeout_seconds <= 0
             or self.resource_update_timeout_seconds <= 0
             or self.resource_update_stall_timeout_seconds <= 0
         ):
             raise ValueError("episode_observation_policy_invalid")
+
+    def observation_limit(self) -> int:
+        if self.maximum_observations is not None:
+            return self.maximum_observations
+        longest_timeout = max(
+            self.episode_timeout_seconds,
+            self.resource_update_timeout_seconds,
+        )
+        return math.ceil(longest_timeout / self.observation_interval_seconds) + 1
 
 
 @dataclass(frozen=True)
@@ -84,6 +96,9 @@ class DetectedRuntimeState:
     download_complete_text: str | None = None
     tap_to_enter_text: str | None = None
     reason_codes: tuple[str, ...] = ()
+    city_label_bbox: tuple[int, int, int, int] | None = None
+    target_region: tuple[int, int, int, int] | None = None
+    spatial_relation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -516,20 +531,25 @@ class StateDetector:
             )
 
         try:
-            city_anchor = resolve_personal_city_anchor(items, self.city_target)
+            city_binding = resolve_personal_city_binding(
+                items, (width, height), self.city_target
+            )
         except ValueError:
-            city_anchor = None
+            city_binding = None
         home_count = sum(any(marker in text for marker in self.HOME_MARKERS) for text in texts)
-        if city_anchor is not None and home_count >= 2:
+        if city_binding is not None and home_count >= 2:
             return DetectedRuntimeState(
                 RuntimeState.HOME_READY,
                 (width, height),
                 1.0,
                 bboxes,
                 texts,
-                city_entry_bbox=city_anchor,
-                evidence=("unique_visit_city", "exact_lanxin", "home_markers"),
+                city_entry_bbox=city_binding.visit_city_bbox,
+                evidence=("unique_visit_city", "exact_lanxin", "home_markers", "spatial_binding"),
                 frame_hash=frame_hash,
+                city_label_bbox=city_binding.city_label_bbox,
+                target_region=city_binding.target_region,
+                spatial_relation=city_binding.spatial_relation,
             )
         visit_present = any(self.city_target.anchor_text in text for text in texts)
         city_label_present = any(text.replace(" ", "") == self.city_target.city_id for text in texts)
@@ -555,20 +575,64 @@ class StateDetector:
         )
 
 
+@dataclass(frozen=True)
+class ResourceUpdatePolicy:
+    auto_confirm_enabled: bool = True
+    minimum_size_mb: float = 0.01
+    maximum_size_mb: float = 2048.0
+    allowed_exact_sizes_mb: tuple[float, ...] = ()
+    timeout_seconds: float = 600.0
+    stall_timeout_seconds: float = 120.0
+
+    def validate(self) -> None:
+        if (
+            self.minimum_size_mb < 0
+            or self.maximum_size_mb < self.minimum_size_mb
+            or self.timeout_seconds <= 0
+            or self.stall_timeout_seconds <= 0
+            or any(size < 0 for size in self.allowed_exact_sizes_mb)
+        ):
+            raise ValueError("resource_update_policy_invalid")
+
+    def allows(self, observed_size_mb: float | None) -> bool:
+        self.validate()
+        if observed_size_mb is None:
+            return False
+        if self.allowed_exact_sizes_mb:
+            return any(math.isclose(observed_size_mb, item, abs_tol=0.005) for item in self.allowed_exact_sizes_mb)
+        return self.minimum_size_mb <= observed_size_mb <= self.maximum_size_mb
+
+
 class ResourceUpdateHandler:
     """Plan bounded resource confirmation and post-download entry actions."""
 
-    def __init__(self, *, authorized_resource_size_mb: float | None = None) -> None:
-        self.authorized_resource_size_mb = authorized_resource_size_mb
+    def __init__(
+        self,
+        policy: ResourceUpdatePolicy | None = None,
+        *,
+        authorized_resource_size_mb: float | None = None,
+    ) -> None:
+        if policy is not None and authorized_resource_size_mb is not None:
+            raise ValueError("resource_update_policy_conflict")
+        if authorized_resource_size_mb is not None:
+            policy = ResourceUpdatePolicy(allowed_exact_sizes_mb=(authorized_resource_size_mb,))
+        self.policy = policy or ResourceUpdatePolicy()
+        self.policy.validate()
 
     def plan(
         self, detected: DetectedRuntimeState, budget: EpisodeActionBudget
     ) -> PlannedRuntimeAction:
         already_dispatched = budget.actions_by_action_type["CONFIRM_RESOURCE_UPDATE"] > 0
-        if (
-            self.authorized_resource_size_mb is not None
-            and detected.resource_size_mb != self.authorized_resource_size_mb
-        ):
+        if not self.policy.auto_confirm_enabled:
+            return PlannedRuntimeAction(
+                RuntimeAction.OBSERVE_ONLY,
+                detected.state,
+                None,
+                detected.resource_confirm_bbox,
+                None,
+                "resource_update_auto_confirm_disabled",
+            )
+        if not self.policy.allows(detected.resource_size_mb):
             return PlannedRuntimeAction(
                 RuntimeAction.OBSERVE_ONLY,
                 detected.state,
@@ -783,6 +847,7 @@ class PostconditionVerifier:
             return detected.state is not RuntimeState.RESOURCE_UPDATE_REQUIRED
         if plan.action is RuntimeAction.ENTER_AFTER_RESOURCE_UPDATE:
             return detected.state in {
+                RuntimeState.SESSION_ENTRY,
                 RuntimeState.ANNOUNCEMENT_VISIBLE,
                 RuntimeState.DAILY_CHECKIN,
                 RuntimeState.HOME_READY,
@@ -807,6 +872,7 @@ class RecoveryPolicy:
         if previous.action is RuntimeAction.ENTER_AFTER_RESOURCE_UPDATE:
             return current.state in {
                 RuntimeState.RESOURCE_UPDATE_COMPLETE_TAP_TO_ENTER,
+                RuntimeState.SESSION_ENTRY,
                 RuntimeState.ANNOUNCEMENT_VISIBLE,
                 RuntimeState.DAILY_CHECKIN,
                 RuntimeState.HOME_READY,
@@ -815,6 +881,8 @@ class RecoveryPolicy:
             RuntimeAction.DISMISS_ANNOUNCEMENT,
             RuntimeAction.DISMISS_DAILY_CHECKIN,
         }:
+            if current.state is RuntimeState.SESSION_ENTRY:
+                return True
             return self._has_distinct_candidate(current, budget)
         if previous.action is RuntimeAction.ENTER_SESSION:
             return current.state in {
@@ -910,7 +978,8 @@ class PersonalAutomationEpisode:
         observations = 0
         last_state = RuntimeState.UNKNOWN
         previous_plan: PlannedRuntimeAction | None = None
-        while observations < self.policy.maximum_observations:
+        observation_limit = self.policy.observation_limit()
+        while observations < observation_limit:
             now = self.monotonic()
             active_deadline = max(episode_deadline, resource_deadline or episode_deadline)
             if now >= active_deadline:
@@ -1033,7 +1102,7 @@ class PersonalAutomationEpisode:
                     tuple(self.recorder.events),
                 )
             if plan.action is RuntimeAction.OBSERVE_ONLY:
-                self.sleep(self.policy.minimum_action_interval_seconds)
+                self.sleep(self.policy.observation_interval_seconds)
                 continue
             transform = self.transform_provider(detected)
             assert plan.capture_point is not None
@@ -1130,6 +1199,7 @@ __all__ = [
     "PostconditionVerifier",
     "RecoveryPolicy",
     "ResourceUpdateHandler",
+    "ResourceUpdatePolicy",
     "RunRecorder",
     "RuntimeAction",
     "RuntimeState",

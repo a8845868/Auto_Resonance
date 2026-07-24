@@ -125,6 +125,12 @@ class Config(RunningBusinessConfig):
     closeEmulatorWhenIdle = ConfigItem(
         "EmulatorLifecycle", "CloseEmulatorWhenIdle", False, None
     )
+    autoConfirmResourceUpdate = ConfigItem(
+        "PersonalAutomation", "AutoConfirmResourceUpdate", True, None
+    )
+    maximumResourceUpdateMb = ConfigItem(
+        "PersonalAutomation", "MaximumResourceUpdateMb", 2048, None
+    )
 
     enableCodexSelfHealing = ConfigItem(
         "SelfHealing", "Enabled", False, None

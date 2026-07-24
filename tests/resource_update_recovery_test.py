@@ -19,10 +19,48 @@ from core.services.personal_runtime_episode import (
     EpisodePolicy,
     PersonalAutomationEpisode,
     ResourceUpdateHandler,
+    ResourceUpdatePolicy,
     RuntimeAction,
     RuntimeState,
     StateDetector,
 )
+
+
+def test_resource_update_policy_accepts_range_and_optional_exact_allowlist():
+    ranged = ResourceUpdatePolicy(minimum_size_mb=10, maximum_size_mb=30)
+    assert ranged.allows(25.25)
+    assert not ranged.allows(9.99)
+    assert not ranged.allows(30.01)
+    exact = ResourceUpdatePolicy(allowed_exact_sizes_mb=(25.25,))
+    assert exact.allows(25.25)
+    assert not exact.allows(25.5)
+
+
+def test_resource_update_policy_disabled_is_observation_only():
+    detected = StateDetector().detect(resource_update_frame(size="48.5MB"))
+    plan = ResourceUpdateHandler(
+        ResourceUpdatePolicy(auto_confirm_enabled=False)
+    ).plan(detected, EpisodeActionBudget())
+    assert plan.action is RuntimeAction.OBSERVE_ONLY
+    assert plan.reason == "resource_update_auto_confirm_disabled"
+
+
+def test_resource_update_policy_rejects_invalid_configuration():
+    with pytest.raises(ValueError, match="resource_update_policy_invalid"):
+        ResourceUpdateHandler(ResourceUpdatePolicy(minimum_size_mb=30, maximum_size_mb=10))
+
+
+def test_default_episode_observation_limit_covers_full_resource_timeout():
+    policy = EpisodePolicy(
+        observation_interval_seconds=0.75,
+        resource_update_timeout_seconds=600,
+    )
+    assert policy.observation_limit() * policy.observation_interval_seconds >= 600
+
+
+def test_nonpositive_observation_interval_is_rejected():
+    with pytest.raises(ValueError, match="episode_observation_policy_invalid"):
+        EpisodePolicy(observation_interval_seconds=0).validate()
 from tests.personal_runtime_fixtures import (
     Frame,
     city_frame,

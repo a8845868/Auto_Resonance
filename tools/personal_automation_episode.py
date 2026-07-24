@@ -45,6 +45,7 @@ from core.services.personal_runtime_episode import (  # noqa: E402
     EpisodePolicy,
     PersonalAutomationEpisode,
     ResourceUpdateHandler,
+    ResourceUpdatePolicy,
     RunRecorder,
     StateDetector,
 )
@@ -61,6 +62,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--resource-update-timeout", type=float, default=600.0)
+    parser.add_argument("--resource-update-stall-timeout", type=float, default=120.0)
+    parser.add_argument("--observation-interval", type=float, default=0.75)
+    parser.add_argument("--resource-update-minimum-mb", type=float, default=0.01)
+    parser.add_argument("--resource-update-maximum-mb", type=float, default=2048.0)
+    parser.add_argument("--resource-update-exact-mb", type=float, action="append", default=[])
+    parser.add_argument(
+        "--disable-resource-update-auto-confirm", action="store_true"
+    )
     parser.add_argument("--execute", action="store_true")
     return parser.parse_args()
 
@@ -215,9 +224,16 @@ def main() -> int:
             return Image(raw)
 
         detector = StateDetector()
-        planner = ActionPlanner(
-            ResourceUpdateHandler(authorized_resource_size_mb=25.25)
+        resource_policy = ResourceUpdatePolicy(
+            auto_confirm_enabled=not args.disable_resource_update_auto_confirm,
+            minimum_size_mb=args.resource_update_minimum_mb,
+            maximum_size_mb=args.resource_update_maximum_mb,
+            allowed_exact_sizes_mb=tuple(args.resource_update_exact_mb),
+            timeout_seconds=args.resource_update_timeout,
+            stall_timeout_seconds=args.resource_update_stall_timeout,
         )
+        resource_policy.validate()
+        planner = ActionPlanner(ResourceUpdateHandler(resource_policy))
         first = detector.detect(frame_provider())
         first_plan = planner.plan(first, budget=budget)
         result_payload["preflight"] = {
@@ -255,13 +271,11 @@ def main() -> int:
                 return pending.pop(0) if pending else frame_provider()
 
             policy = EpisodePolicy(
-                maximum_observations=max(
-                    120,
-                    int(args.resource_update_timeout / 0.75) + 120,
-                ),
                 episode_timeout_seconds=args.timeout,
                 resource_update_timeout_seconds=args.resource_update_timeout,
-                minimum_action_interval_seconds=0.75,
+                resource_update_stall_timeout_seconds=args.resource_update_stall_timeout,
+                minimum_action_interval_seconds=args.observation_interval,
+                observation_interval_seconds=args.observation_interval,
             )
 
             def dispatch_tap(point: tuple[int, int]) -> bool:

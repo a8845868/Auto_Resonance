@@ -16,6 +16,7 @@ from app.common.config import cfg
 from app.common.style_sheet import StyleSheet
 from app.components.settings.custom_adb_setting_card import CustomAdbSettingCard
 from app.components.settings.line_edit_setting_card import LineEditSettingCard
+from app.components.settings.spin_box_setting_card import SpinBoxSettingCard
 from core.model.emulator import emulator_list
 
 MIRROR_URL = "https://mirrorchyan.com/zh/projects?rid=Auto_Resonance&source=auto-resonance-release"
@@ -108,6 +109,22 @@ class SettingInterface(ScrollArea):
             configItem=cfg.closeEmulatorWhenIdle,
             parent=self.lifecycleGroup,
         )
+        self.autoConfirmResourceUpdateCard = SwitchSettingCard(
+            FIF.DOWNLOAD,
+            "自动确认资源更新",
+            "仅在识别到受控资源更新且大小未超过配置上限时确认",
+            configItem=cfg.autoConfirmResourceUpdate,
+            parent=self.lifecycleGroup,
+        )
+        self.maximumResourceUpdateMbCard = SpinBoxSettingCard(
+            cfg.maximumResourceUpdateMb,
+            FIF.DOWNLOAD,
+            "资源更新最大允许大小（MB）",
+            "实际识别大小超过该上限时停止，不执行确认",
+            spin_box_min=1,
+            spin_box_max=102400,
+            parent=self.lifecycleGroup,
+        )
         self.codexSelfHealingCard = SwitchSettingCard(
             FIF.SYNC,
             "启用 Codex 自愈智能体",
@@ -164,6 +181,8 @@ class SettingInterface(ScrollArea):
         self.lifecycleGroup.addSettingCard(self.autoStartEmulatorCard)
         self.lifecycleGroup.addSettingCard(self.closeGameWhenIdleCard)
         self.lifecycleGroup.addSettingCard(self.closeEmulatorWhenIdleCard)
+        self.lifecycleGroup.addSettingCard(self.autoConfirmResourceUpdateCard)
+        self.lifecycleGroup.addSettingCard(self.maximumResourceUpdateMbCard)
         self.selfHealingGroup.addSettingCard(self.codexSelfHealingCard)
         self.selfHealingGroup.addSettingCard(self.codexIsolatedRepairCard)
 

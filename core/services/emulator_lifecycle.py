@@ -364,6 +364,7 @@ class EmulatorLifecycle:
         self.emulator_started_by_us = False
         self.emulator_launch_dispatches = 0
         self.game_started_by_us = False
+        self.game_launch_dispatches = 0
         self.instance_state_history: list[dict] = []
 
     @property
@@ -663,9 +664,7 @@ class EmulatorLifecycle:
     def start_game(self, cancelled: Callable[[], bool] | None = None) -> None:
         self._check_cancelled(cancelled)
         deadline = self.monotonic() + max(0.0, self.options.game_start_timeout)
-        next_launch_attempt = self.monotonic()
-        manager_failed = False
-        announced_start = False
+        launch_dispatched = self.game_launch_dispatches > 0
         while True:
             self._check_cancelled(cancelled)
             try:
@@ -679,42 +678,39 @@ class EmulatorLifecycle:
                 logger.debug(f"等待游戏 ADB 就绪: {exc}")
 
             now = self.monotonic()
-            if now >= next_launch_attempt:
-                if not announced_start:
-                    logger.info(f"正在启动游戏进程: {self.label}")
-                    announced_start = True
-                launch_requested = False
-                if self.manager is not None and not manager_failed:
+            if not launch_dispatched:
+                logger.info(f"正在启动游戏进程: {self.label}")
+                # Count the command at the invocation boundary: an exception may
+                # still mean the manager/ADB received it, so a fallback would be
+                # an unsafe duplicate dispatch.
+                self.game_launch_dispatches += 1
+                self.game_started_by_us = True
+                launch_dispatched = True
+                if self.manager is not None:
                     try:
                         self.manager.launch_game(GAME_PACKAGE)
-                        launch_requested = True
-                    except LifecycleError as exc:
-                        manager_failed = True
-                        logger.warning(f"MuMuManager 启动游戏失败，尝试 ADB: {exc}")
-                if not launch_requested:
+                    except Exception as exc:
+                        raise LifecycleError(
+                            f"game_package_launch_failed: {self.label}: {exc}"
+                        ) from exc
+                else:
                     try:
-                        output = self._target_shell(
+                        output = self._adb_shell(
                             f"monkey -p {GAME_PACKAGE} "
                             "-c android.intent.category.LAUNCHER 1"
                         )
-                        if "No activities found" in output:
-                            raise LifecycleError(f"未找到游戏包 {GAME_PACKAGE}")
-                        launch_requested = True
-                    except LifecycleError as exc:
-                        logger.debug(f"请求启动游戏失败，稍后重试: {exc}")
-                if launch_requested:
-                    self.game_started_by_us = True
-                    next_launch_attempt = now + max(
-                        5.0, self.options.poll_interval
-                    )
-                    # Re-check immediately; do not impose an unnecessary poll
-                    # delay when MuMu reports the new PID synchronously.
-                    continue
-                next_launch_attempt = now + max(1.0, self.options.poll_interval)
+                    except Exception as exc:
+                        raise LifecycleError(
+                            f"game_package_launch_failed: {self.label}: {exc}"
+                        ) from exc
+                    if "No activities found" in output:
+                        raise LifecycleError(f"未找到游戏包 {GAME_PACKAGE}")
+                # Re-check immediately; all later iterations only poll state.
+                continue
             if now >= deadline:
                 break
             self._pause(deadline, cancelled)
-        raise LifecycleError(f"等待游戏进程启动超时: {self.label}")
+        raise LifecycleError(f"game_package_start_timeout: {self.label}")
 
     def ensure_game_ready(
         self, cancelled: Callable[[], bool] | None = None

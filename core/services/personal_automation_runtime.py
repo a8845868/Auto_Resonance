@@ -331,20 +331,36 @@ class PersonalAutomationRuntime:
         decision = self._authorize_non_pointer(
             state="PACKAGE_LIFECYCLE", action_type="START_PACKAGE"
         )
+        def launch_count() -> int:
+            return int(
+                getattr(
+                    self.lifecycle,
+                    "game_launch_dispatches",
+                    getattr(self.lifecycle, "game_launch_count", 0),
+                )
+            )
+
+        dispatches_before = launch_count()
+
+        def real_dispatches() -> int:
+            return launch_count()
+
         try:
             self.lifecycle.start_game()
         except Exception:
-            if bool(getattr(self.lifecycle, "game_started_by_us", False)):
+            if real_dispatches() > dispatches_before:
                 self.budget.record_dispatch(decision)
                 self.budget.record_result(decision, "START_DELIVERY_UNKNOWN")
             else:
                 self.budget.record_result(decision, "START_FAILED_BEFORE_DISPATCH")
             raise
-        self.budget.record_dispatch(decision)
+        dispatched = real_dispatches() > dispatches_before
+        if dispatched:
+            self.budget.record_dispatch(decision)
         if not self.lifecycle.is_game_running():
             self.budget.record_result(decision, "PACKAGE_NOT_RUNNING")
             raise PersonalRuntimeError("game_package_start_failed")
-        self.budget.record_result(decision, "RUNNING")
+        self.budget.record_result(decision, "RUNNING" if dispatched else "RUNNING_WITHOUT_LAUNCH")
         return getattr(self.lifecycle, "device", None)
 
     def ensure_game_window_available(self) -> GameWindowCandidate:

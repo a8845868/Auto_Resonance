@@ -295,6 +295,83 @@ def test_existing_game_start_is_idempotent():
 
     assert manager.events == []
     assert manager.shell_commands == []
+    assert lifecycle.game_launch_dispatches == 0
+
+
+def test_delayed_package_start_dispatches_manager_once_then_only_polls():
+    device = _device()
+    adb = FakeAdbState(running=False)
+    clock = FakeClock()
+
+    class DelayedManager(FakeManager):
+        def launch_game(self, package):
+            self.events.append(("launch_game", self.device.index, package))
+
+        def game_info(self, _package):
+            return {"state": "running" if clock.now >= 11 else "stopped"}
+
+    manager = DelayedManager(device, adb, running=True)
+    lifecycle = EmulatorLifecycle(
+        device,
+        manager=manager,
+        adb_factory=adb.factory,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        options=LifecycleOptions(game_start_timeout=20, poll_interval=1),
+    )
+
+    lifecycle.start_game()
+
+    assert manager.events == [("launch_game", 5, GAME_PACKAGE)]
+    assert lifecycle.game_launch_dispatches == 1
+    assert manager.shell_commands == []
+
+
+def test_manager_launch_exception_never_falls_back_to_adb():
+    device = _device()
+    adb = FakeAdbState(running=False)
+
+    class BrokenManager(FakeManager):
+        def launch_game(self, package):
+            self.events.append(("launch_game", self.device.index, package))
+            raise LifecycleError("manager request failed")
+
+    manager = BrokenManager(device, adb, running=True)
+    lifecycle = EmulatorLifecycle(device, manager=manager, adb_factory=adb.factory)
+
+    with pytest.raises(LifecycleError, match="game_package_launch_failed"):
+        lifecycle.start_game()
+
+    assert lifecycle.game_launch_dispatches == 1
+    assert manager.events == [("launch_game", 5, GAME_PACKAGE)]
+    assert manager.shell_commands == []
+    assert adb.commands == []
+
+
+def test_game_start_timeout_preserves_single_dispatch():
+    device = _device()
+    adb = FakeAdbState(running=False)
+    clock = FakeClock()
+
+    class NeverRunningManager(FakeManager):
+        def launch_game(self, package):
+            self.events.append(("launch_game", self.device.index, package))
+
+    manager = NeverRunningManager(device, adb, running=True)
+    lifecycle = EmulatorLifecycle(
+        device,
+        manager=manager,
+        adb_factory=adb.factory,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        options=LifecycleOptions(game_start_timeout=2, poll_interval=0.5),
+    )
+
+    with pytest.raises(LifecycleError, match="game_package_start_timeout"):
+        lifecycle.start_game()
+
+    assert lifecycle.game_launch_dispatches == 1
+    assert manager.events == [("launch_game", 5, GAME_PACKAGE)]
 
 
 def test_game_restart_is_close_force_stop_then_launch():

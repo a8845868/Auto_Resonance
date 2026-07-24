@@ -77,6 +77,15 @@ def unknown_frame():
     return Frame(np.zeros((720, 1280, 3), dtype=np.uint8), [])
 
 
+def session_entry_frame(*, anchors=1):
+    texts = [item("138****1258", (590, 576, 690, 600))]
+    texts.extend(
+        item("点击屏幕进入游戏", (560, 540 + index * 32, 720, 568 + index * 32))
+        for index in range(anchors)
+    )
+    return Frame(np.full((720, 1280, 3), 20, dtype=np.uint8), texts)
+
+
 def resource_update_frame(*, progress="0%", confirmations=1, extra_texts=(), size="25.25MB"):
     texts = [
         item(f"需要下载资源包（共{size}）", (468, 345, 795, 376)),

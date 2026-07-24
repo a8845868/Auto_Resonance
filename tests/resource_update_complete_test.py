@@ -22,6 +22,7 @@ from tests.personal_runtime_fixtures import (
     home_frame,
     item,
     resource_update_complete_frame,
+    session_entry_frame,
     unknown_frame,
 )
 
@@ -169,6 +170,30 @@ def test_resource_complete_unknown_transition_is_zero_input_then_home_city():
     assert len(clicks) == budget.total_actions == 2
     assert budget.actions_by_action_type["ENTER_AFTER_RESOURCE_UPDATE"] == 1
     assert budget.actions_by_state["UNKNOWN"] == 0
+
+
+def test_resource_complete_can_continue_through_session_entry():
+    result, budget, clicks = _run(
+        [resource_update_complete_frame(), session_entry_frame(), home_frame(), city_frame()]
+    )
+    assert result.status == "PASS"
+    assert budget.actions_by_action_type["ENTER_AFTER_RESOURCE_UPDATE"] == 1
+    assert budget.actions_by_action_type["ENTER_SESSION"] == 1
+
+
+def test_resource_complete_unknown_then_session_entry_remains_zero_input_in_unknown():
+    result, budget, clicks = _run(
+        [
+            resource_update_complete_frame(),
+            unknown_frame(),
+            session_entry_frame(),
+            home_frame(),
+            city_frame(),
+        ]
+    )
+    assert result.status == "PASS"
+    assert budget.actions_by_state["UNKNOWN"] == 0
+    assert budget.actions_by_action_type["ENTER_SESSION"] == 1
 
 
 def test_same_resource_complete_page_never_clicks_twice():

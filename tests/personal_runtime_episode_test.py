@@ -18,6 +18,7 @@ from tests.personal_runtime_fixtures import (
     city_frame,
     daily_frame,
     home_frame,
+    session_entry_frame,
     unknown_frame,
 )
 
@@ -67,6 +68,28 @@ def test_claimed_daily_home_city_uses_one_shared_budget():
     assert budget.actions_by_action_type["DISMISS_DAILY_CHECKIN"] == 1
     daily_point = clicks[0]
     assert not (174 <= daily_point[0] < 1105 and 64 <= daily_point[1] < 644)
+
+
+@pytest.mark.parametrize("leading", [announcement_frame(), announcement_frame(), unknown_frame()])
+def test_announcement_transition_can_continue_through_session_entry(leading):
+    frames = [announcement_frame(), session_entry_frame(), home_frame(), city_frame()]
+    if leading is not frames[0] and getattr(leading, "ocr")() == []:
+        frames.insert(1, leading)
+    episode, budget, clicks = run_episode(frames)
+    result = episode.run()
+    assert result.status == "PASS"
+    assert budget.actions_by_action_type["ENTER_SESSION"] == 1
+    assert budget.actions_by_state["UNKNOWN"] == 0
+
+
+def test_ordinary_unknown_and_ambiguous_session_entry_do_not_enter_session():
+    detector = StateDetector()
+    planner = ActionPlanner()
+    budget = EpisodeActionBudget()
+    assert planner.plan(detector.detect(unknown_frame()), budget=budget).action is RuntimeAction.OBSERVE_ONLY
+    detected = detector.detect(session_entry_frame(anchors=2))
+    assert detected.state is RuntimeState.UNKNOWN
+    assert planner.plan(detected, budget=budget).action is RuntimeAction.OBSERVE_ONLY
 
 
 def test_actual_capture_reference_client_and_screen_mapping_are_explicit():
