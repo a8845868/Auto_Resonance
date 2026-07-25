@@ -7,6 +7,7 @@ import json
 import sys
 from pathlib import Path
 
+from loguru import logger
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -52,6 +53,7 @@ def _blocked(reason: str) -> dict[str, object]:
 
 def run(output: Path, *, adb_port: int = 16384) -> dict[str, object]:
     output.mkdir(parents=True, exist_ok=True)
+    logger.disable("core.image.ocr")
     result = _blocked("preflight_not_run")
     device = get_runtime_device()
     if int(device.index) != 0:
