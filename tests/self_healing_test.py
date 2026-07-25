@@ -8,6 +8,117 @@ import time
 from core.services import self_healing
 
 
+def _write(path: Path, value: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value, encoding="utf-8")
+    return path
+
+
+def test_revision_reader_uses_normal_worktree_loose_ref(tmp_path):
+    revision = "1" * 40
+    _write(tmp_path / ".git" / "HEAD", "ref: refs/heads/main\r\n")
+    _write(tmp_path / ".git" / "refs" / "heads" / "main", revision + "\r\n")
+
+    identity = self_healing._read_git_identity(tmp_path)
+
+    assert identity.revision == revision
+    assert identity.revision_source == "worktree_loose_ref"
+
+
+def test_revision_reader_uses_linked_worktree_common_loose_ref(tmp_path):
+    revision = "2" * 40
+    common = tmp_path / "common"
+    git_dir = common / "worktrees" / "linked"
+    _write(tmp_path / "checkout" / ".git", f"gitdir: {git_dir}\r\n")
+    _write(git_dir / "HEAD", "ref: refs/heads/main\r\n")
+    _write(git_dir / "commondir", "../..\r\n")
+    _write(common / "refs" / "heads" / "main", revision + "\r\n")
+
+    identity = self_healing._read_git_identity(tmp_path / "checkout")
+
+    assert identity.revision == revision
+    assert identity.revision_source == "common_loose_ref"
+    assert Path(identity.worktree_git_dir) == git_dir
+    assert Path(identity.common_git_dir) == common
+
+
+def test_revision_reader_prefers_new_common_loose_ref_over_stale_packed_ref(tmp_path):
+    fresh = "3" * 40
+    stale = "4" * 40
+    common = tmp_path / "common"
+    git_dir = common / "worktrees" / "linked"
+    _write(tmp_path / "checkout" / ".git", f"gitdir: {git_dir}\n")
+    _write(git_dir / "HEAD", "ref: refs/heads/main\n")
+    _write(git_dir / "commondir", "../..\n")
+    _write(common / "refs" / "heads" / "main", fresh + "\n")
+    _write(common / "packed-refs", f"{stale} refs/heads/main\n")
+
+    identity = self_healing._read_git_identity(tmp_path / "checkout")
+
+    assert identity.revision == fresh
+    assert identity.revision_source == "common_loose_ref"
+
+
+def test_revision_reader_supports_detached_head(tmp_path):
+    revision = "5" * 40
+    _write(tmp_path / ".git" / "HEAD", revision + "\r\n")
+
+    identity = self_healing._read_git_identity(tmp_path)
+
+    assert identity.revision == revision
+    assert identity.revision_source == "detached_head"
+
+
+def test_revision_reader_supports_packed_ref_only(tmp_path):
+    revision = "6" * 40
+    _write(tmp_path / ".git" / "HEAD", "ref: refs/heads/main\n")
+    _write(
+        tmp_path / ".git" / "packed-refs",
+        f"# pack-refs with: peeled fully-peeled\n{revision} refs/heads/main\n",
+    )
+
+    identity = self_healing._read_git_identity(tmp_path)
+
+    assert identity.revision == revision
+    assert identity.revision_source == "worktree_packed_refs"
+
+
+def test_revision_reader_without_git_cli_fallback_is_no_throw(tmp_path):
+    def unavailable(*_args, **_kwargs):
+        raise FileNotFoundError("git unavailable")
+
+    identity = self_healing._read_git_identity(tmp_path, git_runner=unavailable)
+
+    assert identity.revision == "unknown"
+    assert identity.revision_source == "unknown"
+
+
+def test_base_context_records_dirty_file_sha(tmp_path, monkeypatch):
+    revision = "7" * 40
+    changed = _write(tmp_path / "changed.py", "local modification\n")
+    _write(tmp_path / ".git" / "HEAD", revision + "\n")
+    monkeypatch.setattr(self_healing, "ROOT", tmp_path)
+    monkeypatch.setattr(
+        self_healing,
+        "_main_worktree_preflight",
+        lambda: {
+            "dirty": True,
+            "signature": "dirty",
+            "changed_files": ["changed.py"],
+        },
+    )
+    monkeypatch.setattr(self_healing, "_runtime_snapshot", lambda: None)
+
+    context = self_healing._base_context(include_recent_log=False)
+
+    assert context["git_revision"] == revision
+    assert context["revision_source"] == "detached_head"
+    assert context["dirty_worktree"] is True
+    assert context["dirty_file_hashes"] == {
+        "changed.py": self_healing.hashlib.sha256(changed.read_bytes()).hexdigest()
+    }
+
+
 def _incident(**context):
     return {
         "source": "test_queue",

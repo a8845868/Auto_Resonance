@@ -49,6 +49,16 @@ class SubmissionResult:
     reason: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class GitRevisionIdentity:
+    """Resolved checkout identity with the exact Git source that won."""
+
+    revision: str = "unknown"
+    revision_source: str = "unknown"
+    worktree_git_dir: str = ""
+    common_git_dir: str = ""
+
+
 def _recursive_environment(*, allow_during_tests: bool) -> str | None:
     if is_repair_process():
         return REPAIR_ENV_VAR
@@ -64,50 +74,144 @@ def _recursive_environment(*, allow_during_tests: bool) -> str | None:
     return None
 
 
-def _read_git_revision() -> str:
-    """Read HEAD without spawning Git on the application's failure path."""
-
+def _packed_ref(path: Path, ref_name: str) -> str:
     try:
-        git_entry = ROOT / ".git"
-        git_dir = git_entry
-        if git_entry.is_file():
-            marker = git_entry.read_text(encoding="utf-8", errors="replace").strip()
-            if not marker.casefold().startswith("gitdir:"):
-                return "unknown"
-            git_dir = Path(marker.split(":", 1)[1].strip())
-            if not git_dir.is_absolute():
-                git_dir = (ROOT / git_dir).resolve()
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith(("#", "^")):
+            continue
+        fields = line.split()
+        if len(fields) == 2 and fields[1] == ref_name:
+            return fields[0][:64]
+    return ""
+
+
+def _read_git_identity(
+    root: Path | None = None,
+    *,
+    git_runner=None,
+) -> GitRevisionIdentity:
+    """Resolve HEAD using Git ref precedence, then a read-only CLI fallback."""
+
+    root = Path(root or ROOT).resolve()
+    git_dir = root / ".git"
+    common_dir = git_dir
+    try:
+        if git_dir.is_file():
+            marker = git_dir.read_text(
+                encoding="utf-8", errors="replace"
+            ).strip()
+            if marker.casefold().startswith("gitdir:"):
+                git_dir = Path(marker.split(":", 1)[1].strip())
+                if not git_dir.is_absolute():
+                    git_dir = (root / git_dir).resolve()
+        commondir_path = git_dir / "commondir"
+        common_dir = git_dir
+        if commondir_path.is_file():
+            common_value = commondir_path.read_text(
+                encoding="utf-8", errors="replace"
+            ).strip()
+            common_dir = Path(common_value)
+            if not common_dir.is_absolute():
+                common_dir = (git_dir / common_dir).resolve()
+
         head = (git_dir / "HEAD").read_text(
             encoding="utf-8", errors="replace"
         ).strip()
-        if not head.startswith("ref:"):
-            return head[:64] or "unknown"
-        ref_name = head.split(":", 1)[1].strip()
-        loose_ref = git_dir / ref_name
-        if loose_ref.is_file():
-            return loose_ref.read_text(
-                encoding="utf-8", errors="replace"
-            ).strip()[:64]
-        common_dir = git_dir
-        commondir_path = git_dir / "commondir"
-        if commondir_path.is_file():
-            common_dir = (
-                git_dir
-                / commondir_path.read_text(
-                    encoding="utf-8", errors="replace"
-                ).strip()
-            ).resolve()
-        packed_refs = common_dir / "packed-refs"
-        if packed_refs.is_file():
-            suffix = f" {ref_name}"
-            for line in packed_refs.read_text(
-                encoding="utf-8", errors="replace"
-            ).splitlines():
-                if line.endswith(suffix):
-                    return line.split(" ", 1)[0][:64]
+        if head and not head.startswith("ref:"):
+            return GitRevisionIdentity(
+                head[:64], "detached_head", str(git_dir), str(common_dir)
+            )
+        if head.startswith("ref:"):
+            ref_name = head.split(":", 1)[1].strip()
+            sources = (
+                (git_dir / ref_name, "worktree_loose_ref"),
+                (common_dir / ref_name, "common_loose_ref"),
+            )
+            seen: set[Path] = set()
+            for ref_path, source in sources:
+                resolved = ref_path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                if ref_path.is_file():
+                    revision = ref_path.read_text(
+                        encoding="utf-8", errors="replace"
+                    ).strip()[:64]
+                    if revision:
+                        return GitRevisionIdentity(
+                            revision, source, str(git_dir), str(common_dir)
+                        )
+            packed_sources = (
+                (git_dir / "packed-refs", "worktree_packed_refs"),
+                (common_dir / "packed-refs", "common_packed_refs"),
+            )
+            seen.clear()
+            for packed_path, source in packed_sources:
+                resolved = packed_path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                revision = _packed_ref(packed_path, ref_name)
+                if revision:
+                    return GitRevisionIdentity(
+                        revision, source, str(git_dir), str(common_dir)
+                    )
     except OSError:
         pass
-    return "unknown"
+
+    runner = git_runner or subprocess.run
+    try:
+        completed = runner(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(root),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=PREFLIGHT_GIT_TIMEOUT_SECONDS,
+            shell=False,
+        )
+        revision = (completed.stdout or "").strip()[:64]
+        if completed.returncode == 0 and revision:
+            return GitRevisionIdentity(
+                revision, "git_rev_parse_fallback", str(git_dir), str(common_dir)
+            )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return GitRevisionIdentity(
+        "unknown", "unknown", str(git_dir), str(common_dir)
+    )
+
+
+def _read_git_revision() -> str:
+    """Backward-compatible revision-only view of the checkout identity."""
+
+    return _read_git_identity().revision
+
+
+def _dirty_file_hashes(preflight: Mapping[str, Any] | None) -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    if not preflight or not preflight.get("dirty"):
+        return hashes
+    for relative in list(preflight.get("changed_files") or []):
+        try:
+            path = (ROOT / str(relative)).resolve()
+            path.relative_to(ROOT.resolve())
+            if not path.is_file():
+                hashes[str(relative)] = "missing_or_non_file"
+                continue
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            hashes[str(relative)] = digest.hexdigest()
+        except (OSError, ValueError):
+            hashes[str(relative)] = "unavailable"
+    return hashes
 
 
 def _tail(path: Path, *, max_bytes: int = 24_000, max_lines: int = 80) -> str:
@@ -154,8 +258,21 @@ def _runtime_snapshot() -> Mapping[str, Any] | None:
 
 
 def _base_context(*, include_recent_log: bool) -> dict[str, Any]:
+    revision = _read_git_revision()
+    identity = _read_git_identity()
+    preflight = _main_worktree_preflight()
+    revision_source = (
+        identity.revision_source
+        if identity.revision == revision
+        else "revision_override"
+    )
     context: dict[str, Any] = {
-        "git_revision": _read_git_revision(),
+        "git_revision": revision,
+        "revision_source": revision_source,
+        "worktree_git_dir": identity.worktree_git_dir,
+        "common_git_dir": identity.common_git_dir,
+        "dirty_worktree": bool(preflight and preflight.get("dirty")),
+        "dirty_file_hashes": _dirty_file_hashes(preflight),
         "python": sys.version.split()[0],
         "process_id": os.getpid(),
         "runtime_owner": _runtime_snapshot(),
