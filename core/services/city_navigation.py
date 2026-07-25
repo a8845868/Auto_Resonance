@@ -10,6 +10,11 @@ from datetime import datetime
 from enum import Enum
 from typing import Callable, Iterable
 
+from core.services.navigation_evidence import (
+    CoordinateChain,
+    NavigationAttemptEvidence,
+    record_navigation_attempt,
+)
 from core.services.read_only_policy import ActionIntent
 
 
@@ -36,6 +41,8 @@ class CityEntryObservation:
     confidence: str
     page_fingerprint: str
     source_capture_id: str
+    candidate_count: int = 0
+    candidate_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +85,60 @@ class CityNavigationResult:
     attempt_count: int
     trace: tuple[CityNavigationEvent, ...]
     irreversible_actions: int = 0
+    entry_opened: bool = False
+    station_confirmed: bool = False
+    station_id: str | None = None
+    terminal: bool = True
+    evidence_attempt_id: str = ""
+    evidence: NavigationAttemptEvidence | None = None
+
+
+@dataclass(frozen=True)
+class StationDetectionResult:
+    result: str
+    station_id: str | None
+    confidence: str
+    evidence_ids: tuple[str, ...]
+    candidate_count: int
+    reason: str
+
+
+def detect_current_station(
+    frame: object,
+    station_ids: Iterable[str],
+) -> StationDetectionResult:
+    """Resolve exactly one known station from full-frame OCR without defaults."""
+
+    try:
+        texts = tuple(_text(item) for item in _items(frame) if _text(item))
+    except Exception as error:  # noqa: BLE001 - detector failure is explicit
+        return StationDetectionResult(
+            "ERROR", None, "UNKNOWN", ("station_ocr_error",), 0,
+            f"station_detector_error:{type(error).__name__}",
+        )
+    known = tuple(dict.fromkeys(str(value).replace(" ", "") for value in station_ids if value))
+    exact = {station for station in known if station in texts}
+    matches = exact or {
+        station
+        for station in known
+        if any(station in text for text in texts)
+    }
+    if not matches:
+        return StationDetectionResult(
+            "NO_MATCH", None, "UNKNOWN", ("station_name_absent",), 0,
+            "station_detector_no_match",
+        )
+    if len(matches) != 1:
+        return StationDetectionResult(
+            "AMBIGUOUS", None, "UNKNOWN", ("multiple_station_names",),
+            len(matches), "station_detector_ambiguous",
+        )
+    station_id = next(iter(matches))
+    evidence_id = hashlib.sha256(station_id.encode("utf-8")).hexdigest()[:16]
+    return StationDetectionResult(
+        "PASS", station_id, "HIGH", (f"station_name_sha256:{evidence_id}",),
+        1, "station_confirmed",
+    )
 
 
 def _items(frame: object) -> list[dict]:
@@ -158,7 +219,14 @@ def observe_city_frame(
     timestamp = captured_at.isoformat(timespec="milliseconds")
     evidence: list[str] = []
 
-    city_entry_bbox = _unique_bbox(items, lambda text: "访问城市" in text)
+    city_entry_candidates = [
+        (bounds, float(item.get("score", 1.0)))
+        for item in items
+        if "访问城市" in _text(item) and (bounds := _bbox(item)) is not None
+    ]
+    city_entry_bbox = (
+        city_entry_candidates[0][0] if len(city_entry_candidates) == 1 else None
+    )
     exchange_bbox = _unique_bbox(items, lambda text: "交易所" in text)
     buy_bbox = _unique_bbox(items, lambda text: "我要买" in text)
     sell_bbox = _unique_bbox(items, lambda text: "我要卖" in text)
@@ -240,6 +308,11 @@ def observe_city_frame(
         confidence="HIGH" if city_entry_bbox is not None else "UNKNOWN",
         page_fingerprint=fingerprint,
         source_capture_id=source_capture_id,
+        candidate_count=len(city_entry_candidates),
+        candidate_score=(
+            city_entry_candidates[0][1]
+            if len(city_entry_candidates) == 1 else None
+        ),
     )
     return CityPageObservation(
         state=state,
@@ -272,6 +345,12 @@ class CityNavigationAdapter:
         stall_frames: int = 5,
         cancellation: Callable[[], bool] | None = None,
         correlation_id: str | None = None,
+        geometry_provider: Callable[[], object] | None = None,
+        evidence_recorder: Callable[[NavigationAttemptEvidence], object] | None = None,
+        station_ids: Iterable[str] = (),
+        station_detector: Callable[[object, Iterable[str]], StationDetectionResult] = detect_current_station,
+        require_station_confirmation: bool = False,
+        dispatch_backend: str = "device_control",
     ):
         self.frame_provider = frame_provider
         self.tap = tap
@@ -283,11 +362,22 @@ class CityNavigationAdapter:
         self.stall_frames = max(2, int(stall_frames))
         self.cancellation = cancellation or (lambda: False)
         self.correlation_id = correlation_id or now().strftime("CITYNAV-%Y%m%d-%H%M%S")
+        self.geometry_provider = geometry_provider
+        self.evidence_recorder = evidence_recorder or record_navigation_attempt
+        self.station_ids = tuple(station_ids)
+        self.station_detector = station_detector
+        self.require_station_confirmation = bool(require_station_confirmation)
+        self.dispatch_backend = str(dispatch_backend)
 
     def enter_city(self) -> CityNavigationResult:
         deadline = self.monotonic() + self.timeout
         attempts = 0
         trace: list[CityNavigationEvent] = []
+        evidence: NavigationAttemptEvidence | None = None
+        evidence_recorded = False
+        entry_opened = False
+        station_confirmed = False
+        station_id: str | None = None
 
         def record(observation, action, guard, postcondition, status, reason, *, state=None):
             trace.append(CityNavigationEvent(
@@ -304,17 +394,39 @@ class CityNavigationAdapter:
                 reason=reason,
             ))
 
+        def persist_evidence() -> None:
+            nonlocal evidence_recorded
+            if evidence is not None and not evidence_recorded:
+                self.evidence_recorder(evidence)
+                evidence_recorded = True
+
         def finish(state, status, reason):
+            persist_evidence()
             return CityNavigationResult(
-                state, status, reason, attempts, tuple(trace), 0,
+                state=state,
+                status=status,
+                reason=reason,
+                attempt_count=attempts,
+                trace=tuple(trace),
+                irreversible_actions=0,
+                entry_opened=entry_opened,
+                station_confirmed=station_confirmed,
+                station_id=station_id,
+                terminal=True,
+                evidence_attempt_id=evidence.attempt_id if evidence else "",
+                evidence=evidence,
             )
 
         if self.cancellation():
-            return finish(CityNavigationState.FAILED, "BLOCKED", "cancelled")
+            return finish(CityNavigationState.FAILED, "BLOCKED", "city_entry_cancelled")
         if self.monotonic() >= deadline:
             return finish(CityNavigationState.TIMEOUT, "BLOCKED", "navigation_deadline_or_attempt_limit")
-        before = observe_city_frame(self.frame_provider(), now=self.now)
+        planned_frame = self.frame_provider()
+        before = observe_city_frame(planned_frame, now=self.now)
         attempts += 1
+        if before.city_entry.candidate_count != 1:
+            record(before, "OBSERVE_CITY_ENTRY", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_entry_candidate_not_unique")
+            return finish(before.state, "BLOCKED", "city_entry_candidate_not_unique")
         if before.state is CityNavigationState.HOME_READY:
             record(before, "OBSERVE_CITY_ENTRY", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_entry_anchor_missing")
             return finish(CityNavigationState.HOME_READY, "BLOCKED", "city_entry_anchor_missing")
@@ -325,35 +437,106 @@ class CityNavigationAdapter:
         bounds = before.city_entry.anchor_bbox
         if bounds is None:
             return finish(CityNavigationState.HOME_READY, "BLOCKED", "city_entry_anchor_missing")
+
+        if self.cancellation():
+            return finish(CityNavigationState.FAILED, "BLOCKED", "city_entry_cancelled")
+        if self.monotonic() >= deadline:
+            return finish(CityNavigationState.TIMEOUT, "BLOCKED", "city_entry_postcondition_timeout")
+
+        # Fresh confirmation owns the dispatch plan. The earlier observation
+        # is only a prerequisite and is never reused for input.
+        fresh_frame = self.frame_provider()
+        fresh = observe_city_frame(fresh_frame, now=self.now)
+        attempts += 1
+        if (
+            before.source_capture_id
+            and fresh.source_capture_id
+            and before.source_capture_id == fresh.source_capture_id
+        ):
+            record(fresh, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "stale_frame_action")
+            return finish(CityNavigationState.FAILED, "BLOCKED", "stale_frame_action")
+        if fresh.city_entry.candidate_count != 1 or fresh.city_entry.anchor_bbox is None:
+            record(fresh, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_entry_candidate_not_unique")
+            return finish(fresh.state, "BLOCKED", "city_entry_candidate_not_unique")
+        if fresh.state is not CityNavigationState.CITY_ENTRY_VISIBLE:
+            record(fresh, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_entry_candidate_mismatch")
+            return finish(fresh.state, "BLOCKED", "city_entry_candidate_mismatch")
+
+        bounds = fresh.city_entry.anchor_bbox
         point = _center(bounds)
-        record(before, "enter_city", "PENDING", "city_evidence_categories_at_least_2", "PENDING", "city_entry_observed")
+        image = getattr(fresh_frame, "image", None)
+        if image is None or not hasattr(image, "shape") or len(image.shape) < 2:
+            return finish(CityNavigationState.FAILED, "BLOCKED", "city_entry_coordinate_chain_incomplete")
+        capture_height, capture_width = map(int, image.shape[:2])
+        render_size = (capture_width, capture_height)
+        device_size = render_size
+        if self.geometry_provider is not None:
+            geometry = self.geometry_provider()
+            device_size = render_size = (
+                int(getattr(geometry, "physical_width")),
+                int(getattr(geometry, "physical_height")),
+            )
+        try:
+            chain = CoordinateChain.from_capture_point(
+                point,
+                capture_size=(capture_width, capture_height),
+                render_client_size=render_size,
+                device_size=device_size,
+                source_coordinate_space="CAPTURE_PIXELS",
+            )
+        except (TypeError, ValueError):
+            return finish(CityNavigationState.FAILED, "BLOCKED", "city_entry_coordinate_chain_incomplete")
+        if not chain.complete:
+            return finish(CityNavigationState.FAILED, "BLOCKED", "city_entry_coordinate_chain_incomplete")
+
+        evidence = NavigationAttemptEvidence(
+            task_name="city_entry",
+            entry_name="visit_city",
+            pre_state="HOME_READY",
+            pre_frame_sha256=fresh.screenshot_hash,
+            coordinate_chain=chain,
+            candidate_type="ocr_visit_city_anchor",
+            candidate_bbox=bounds,
+            candidate_score=fresh.city_entry.candidate_score,
+            candidate_count=fresh.city_entry.candidate_count,
+            dispatch_backend=self.dispatch_backend,
+            random_offset_enabled=False,
+            random_offset_requested=False,
+            actual_dispatched_point=chain.device_point,
+        )
+        record(fresh, "enter_city", "PENDING", "city_evidence_categories_at_least_2", "PENDING", "city_entry_freshly_confirmed")
         try:
             allowed = self.tap(
                 point,
+                random_offset=False,
                 intent=ActionIntent(
-                    "city_entry_navigation", "city_entry", f"{self.correlation_id}:enter-city",
+                    "city_entry_navigation", "city_entry", evidence.attempt_id,
                 ),
             )
         except (PermissionError, RuntimeError) as error:
-            record(before, "enter_city", type(error).__name__, "NOT_CHECKED", "BLOCKED", "guard_denied_city_entry")
-            return finish(CityNavigationState.FAILED, "BLOCKED", "guard_denied_city_entry")
+            evidence.mark_dispatch(requested=True, acknowledged=False, result=f"dispatch_exception:{type(error).__name__}")
+            record(fresh, "enter_city", type(error).__name__, "NOT_CHECKED", "BLOCKED", "city_entry_dispatch_not_acknowledged")
+            return finish(CityNavigationState.FAILED, "BLOCKED", "city_entry_dispatch_not_acknowledged")
         if allowed is False:
-            record(before, "enter_city", "DENIED", "NOT_CHECKED", "BLOCKED", "guard_denied_city_entry")
-            return finish(CityNavigationState.FAILED, "BLOCKED", "guard_denied_city_entry")
-        record(before, "enter_city", "ALLOWED", "PENDING", "PENDING", "city_entry_action_executed")
+            evidence.mark_dispatch(requested=True, acknowledged=False, result="dispatch_rejected")
+            record(fresh, "enter_city", "DENIED", "NOT_CHECKED", "BLOCKED", "city_entry_dispatch_not_acknowledged")
+            return finish(CityNavigationState.FAILED, "BLOCKED", "city_entry_dispatch_not_acknowledged")
+        evidence.mark_dispatch(requested=True, acknowledged=True, result="call_returned")
+        record(fresh, "enter_city", "ALLOWED", "PENDING", "PENDING", "city_entry_action_executed")
 
-        last_hash = before.screenshot_hash
-        last_fingerprint = before.page_fingerprint
+        last_hash = fresh.screenshot_hash
+        last_fingerprint = fresh.page_fingerprint
         stable = 0
         for _ in range(max(0, self.max_attempts - attempts)):
             if self.cancellation():
-                return finish(CityNavigationState.FAILED, "BLOCKED", "cancelled")
+                return finish(CityNavigationState.FAILED, "BLOCKED", "city_entry_cancelled")
             if self.monotonic() >= deadline:
                 break
             self.sleep(min(0.5, max(0.0, deadline - self.monotonic())))
             if self.monotonic() >= deadline:
                 break
-            observation = observe_city_frame(self.frame_provider(), now=self.now)
+            post_frame = self.frame_provider()
+            observation = observe_city_frame(post_frame, now=self.now)
             attempts += 1
             same_frame = bool(observation.screenshot_hash and observation.screenshot_hash == last_hash)
             same_page = observation.page_fingerprint == last_fingerprint
@@ -361,29 +544,109 @@ class CityNavigationAdapter:
             last_hash = observation.screenshot_hash
             last_fingerprint = observation.page_fingerprint
 
-            if observation.state in {
+            trusted_city_state = observation.state in {
                 CityNavigationState.CITY_MAP,
                 CityNavigationState.CITY_DETAIL,
                 CityNavigationState.EXCHANGE_NPC_VISIBLE,
+            }
+            evidence.add_post_observation(
+                frame=post_frame,
+                state=observation.state.value,
+                positive_cues=(observation.reason, *observation.evidence),
+                negative_cues=(),
+                reason_codes=(
+                    "trusted_city_page" if trusted_city_state else "postcondition_pending",
+                ),
+                postcondition_result="PASS_TO_STATION_DETECTOR" if trusted_city_state else "PENDING",
+            )
+            if trusted_city_state:
+                entry_opened = True
+                if not self.require_station_confirmation:
+                    record(observation, "OBSERVE_CITY_POSTCONDITION", "ALLOWED", "VERIFIED", "PASS", "city_postcondition_verified")
+                    return finish(observation.state, "PASS", "city_postcondition_verified")
+                try:
+                    station = self.station_detector(post_frame, self.station_ids)
+                except Exception as error:  # noqa: BLE001 - explicit detector outcome
+                    station = StationDetectionResult(
+                        "ERROR", None, "UNKNOWN", ("station_detector_exception",), 0,
+                        f"station_detector_error:{type(error).__name__}",
+                    )
+                evidence.mark_station_detection(
+                    result=station.result,
+                    station_id=station.station_id,
+                    confidence=station.confidence,
+                    evidence_ids=station.evidence_ids,
+                )
+                if station.result == "PASS" and station.station_id:
+                    station_confirmed = True
+                    station_id = station.station_id
+                    evidence.add_post_observation(
+                        frame=post_frame,
+                        state=observation.state.value,
+                        positive_cues=("station_confirmed", *station.evidence_ids),
+                        reason_codes=("city_and_station_verified",),
+                        postcondition_result="PASS",
+                    )
+                    record(observation, "OBSERVE_STATION", "ALLOWED", "VERIFIED", "PASS", "station_confirmed")
+                    return finish(observation.state, "PASS", "station_confirmed")
+                if station.result == "AMBIGUOUS":
+                    evidence.add_post_observation(
+                        frame=post_frame,
+                        state=observation.state.value,
+                        negative_cues=("multiple_station_names",),
+                        reason_codes=("station_detector_ambiguous",),
+                        postcondition_result="FAIL",
+                    )
+                    record(observation, "OBSERVE_STATION", "ALLOWED", "FAILED", "FAILED", "station_detector_ambiguous")
+                    return finish(observation.state, "FAILED", "station_detector_ambiguous")
+                if station.result == "ERROR":
+                    evidence.add_post_observation(
+                        frame=post_frame,
+                        state=observation.state.value,
+                        negative_cues=("station_detector_error",),
+                        reason_codes=("station_detector_error",),
+                        postcondition_result="FAIL",
+                    )
+                    record(observation, "OBSERVE_STATION", "ALLOWED", "FAILED", "FAILED", "station_detector_error")
+                    return finish(observation.state, "FAILED", "station_detector_error")
+                record(observation, "OBSERVE_STATION", "ALLOWED", "PENDING", "PENDING", "station_detector_no_match")
+                continue
+            if observation.state in {
+                CityNavigationState.HOME_READY,
+                CityNavigationState.CITY_ENTRY_VISIBLE,
             }:
-                record(observation, "OBSERVE_CITY_POSTCONDITION", "ALLOWED", "VERIFIED", "PASS", "city_postcondition_verified")
-                return finish(observation.state, "PASS", "city_postcondition_verified")
-            if observation.state is CityNavigationState.UNKNOWN and observation.text_count == 0:
+                # A successfully dispatched tap does not guarantee that the
+                # next 500 ms capture has already left HOME.  OCR can also
+                # momentarily lose the unique `访问城市` anchor while the rest
+                # of the HOME evidence remains intact.  Keep observing within
+                # the existing deadline/stall budget, but never redispatch.
+                record(
+                    observation,
+                    "WAIT_CITY_TRANSITION",
+                    "ALLOWED",
+                    "PENDING",
+                    "PENDING",
+                    "home_page_still_visible_after_dispatch",
+                    state=CityNavigationState.CITY_TRANSITION,
+                )
+            elif observation.state is CityNavigationState.UNKNOWN and observation.text_count == 0:
                 record(
                     observation, "WAIT_CITY_TRANSITION", "ALLOWED", "PENDING", "PENDING",
                     "city_transition_without_committed_page", state=CityNavigationState.CITY_TRANSITION,
                 )
             elif observation.state is CityNavigationState.UNKNOWN:
-                record(observation, "OBSERVE_CITY_POSTCONDITION", "ALLOWED", "FAILED", "FAILED", "NAVIGATION_POSTCONDITION_FAILED")
-                return finish(CityNavigationState.FAILED, "FAILED", "NAVIGATION_POSTCONDITION_FAILED")
+                record(observation, "OBSERVE_CITY_POSTCONDITION", "ALLOWED", "FAILED", "FAILED", "city_entry_unexpected_page")
+                return finish(CityNavigationState.FAILED, "FAILED", "city_entry_unexpected_page")
             else:
-                record(observation, "OBSERVE_CITY_POSTCONDITION", "ALLOWED", "FAILED", "FAILED", "NAVIGATION_POSTCONDITION_FAILED")
-                return finish(CityNavigationState.FAILED, "FAILED", "NAVIGATION_POSTCONDITION_FAILED")
+                record(observation, "OBSERVE_CITY_POSTCONDITION", "ALLOWED", "FAILED", "FAILED", "city_entry_unexpected_page")
+                return finish(CityNavigationState.FAILED, "FAILED", "city_entry_unexpected_page")
             if stable >= self.stall_frames:
                 record(observation, "WAIT_CITY_TRANSITION", "ALLOWED", "FAILED", "FAILED", "NAVIGATION_STALLED", state=CityNavigationState.FAILED)
                 return finish(CityNavigationState.FAILED, "FAILED", "NAVIGATION_STALLED")
 
-        return finish(CityNavigationState.TIMEOUT, "BLOCKED", "navigation_deadline_or_attempt_limit")
+        if entry_opened and self.require_station_confirmation:
+            return finish(CityNavigationState.TIMEOUT, "FAILED", "station_detector_no_match")
+        return finish(CityNavigationState.TIMEOUT, "BLOCKED", "city_entry_postcondition_timeout")
 
 
 class ExchangeEntryAdapter:
@@ -564,5 +827,7 @@ __all__ = [
     "CityNavigationState",
     "CityPageObservation",
     "ExchangeEntryAdapter",
+    "StationDetectionResult",
+    "detect_current_station",
     "observe_city_frame",
 ]

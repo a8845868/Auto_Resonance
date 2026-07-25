@@ -36,6 +36,7 @@ def test_coordinate_chain_is_complete_for_device_backend_without_screen_space():
 
     assert chain.source_point == (1101, 51)
     assert chain.render_client_point == chain.device_point == (732, 34)
+    assert (chain.device_width, chain.device_height) == (851, 480)
     assert chain.screen_point is None
     assert chain.screen_coordinate_applicable is False
     assert chain.complete is True
@@ -65,6 +66,13 @@ def test_attempt_id_binds_dispatch_and_post_frames_and_redacts_raw_ocr():
     )
     evidence = _evidence(chain)
     evidence.mark_dispatch(requested=True, acknowledged=True, result="accepted")
+    evidence.actual_dispatched_point = chain.device_point
+    evidence.mark_station_detection(
+        result="PASS",
+        station_id="七号自由港",
+        confidence="HIGH",
+        evidence_ids=("station_name_sha256:0123456789abcdef",),
+    )
     frame = np.zeros((720, 1280, 3), dtype=np.uint8)
     evidence.add_post_observation(
         frame=frame,
@@ -79,6 +87,11 @@ def test_attempt_id_binds_dispatch_and_post_frames_and_redacts_raw_ocr():
 
     assert document["attempt_id"] == evidence.attempt_id
     assert document["dispatch_acknowledged"] is True
+    assert document["device_width"] == 1280
+    assert document["device_height"] == 720
+    assert document["actual_dispatched_point"] == (1101, 51)
+    assert document["station_detection_result"] == "PASS"
+    assert document["station_id"] == "七号自由港"
     assert document["post_observations"][0]["post_observation_index"] == 1
     assert document["post_observation_index"] == 1
     assert document["positive_cues"] == (

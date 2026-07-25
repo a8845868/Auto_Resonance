@@ -2,18 +2,24 @@ from __future__ import annotations
 
 import inspect
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 import core.control.control as control
+from core.preset import presets
 from core.services.city_navigation import (
     CityNavigationAdapter,
     CityNavigationState,
     ExchangeEntryAdapter,
+    StationDetectionResult,
+    detect_current_station,
     observe_city_frame,
 )
 from core.services.read_only_policy import DEFAULT_POLICY_SPECS
 from tools import sixth_read_only_probe as live_probe
+from tools import city_entry_single_action_probe as single_city_probe
 from tools import eighteenth_city_read_only_probe as city_probe
 
 
@@ -31,13 +37,21 @@ def _item(text: str, x: int, y: int) -> dict:
 
 
 class _Frame:
-    def __init__(self, *texts: str, pixel: int = 0, capture_id: str = "capture"):
-        self.image = np.full((720, 1280, 3), pixel, dtype=np.uint8)
+    def __init__(
+        self, *texts: str, pixel: int = 0, capture_id: str = "capture",
+        size: tuple[int, int] = (1280, 720),
+    ):
+        width, height = size
+        self.image = np.full((height, width, 3), pixel, dtype=np.uint8)
         self.raw_frame_hash = f"{pixel + 1:064x}"
         self.source_capture_id = capture_id
         self.captured_at = NOW
         self._items = [
-            _item(text, 1100 if "访问城市" in text else 300 + index * 100, 480 if "访问城市" in text else 220)
+            _item(
+                text,
+                round(width * 1100 / 1280) if "访问城市" in text else round(width * (300 + index * 100) / 1280),
+                round(height * 480 / 720) if "访问城市" in text else round(height * 220 / 720),
+            )
             for index, text in enumerate(texts)
         ]
 
@@ -69,6 +83,7 @@ def _adapter(frames, *, tap=lambda *_args, **_kwargs: True, timeout=10.0, stall_
         max_attempts=len(frames),
         stall_frames=stall_frames,
         correlation_id="CITYNAV-20260720-TEST",
+        evidence_recorder=lambda _evidence: True,
     )
 
 
@@ -92,14 +107,17 @@ def _home(*, pixel=1):
     return _Frame("访问城市", "作战终端", "启程", pixel=pixel, capture_id=f"home-{pixel}")
 
 
-def _city_detail(*, pixel=3):
-    return _Frame("当前城市", "城市设施", "城市手册", pixel=pixel, capture_id=f"city-{pixel}")
+def _city_detail(*, pixel=3, station: str | None = None):
+    texts = ["当前城市", "城市设施", "城市手册"]
+    if station:
+        texts.append(station)
+    return _Frame(*texts, pixel=pixel, capture_id=f"city-{pixel}")
 
 
 def test_home_ready_to_city_detail_uses_observed_anchor_and_waits_through_transition():
     taps = []
     result = _adapter(
-        [_home(), _Frame(pixel=2, capture_id="transition"), _city_detail()],
+        [_home(), _home(pixel=2), _Frame(pixel=3, capture_id="transition"), _city_detail(pixel=4)],
         tap=lambda *args, **kwargs: taps.append((args, kwargs)) or True,
     ).enter_city()
     assert result.status == "PASS"
@@ -110,6 +128,221 @@ def test_home_ready_to_city_detail_uses_observed_anchor_and_waits_through_transi
     assert CityNavigationState.CITY_TRANSITION in [event.state for event in result.trace]
 
 
+def test_post_click_home_frame_with_lost_anchor_waits_without_redispatch():
+    taps = []
+    result = _adapter(
+        [
+            _home(),
+            _home(pixel=2),
+            _Frame("市问城市", "启程", "整备列车", pixel=3, capture_id="home-ocr-glitch"),
+            _Frame(pixel=4, capture_id="transition"),
+            _city_detail(pixel=5),
+        ],
+        tap=lambda *args, **kwargs: taps.append((args, kwargs)) or True,
+    ).enter_city()
+
+    assert result.status == "PASS"
+    assert result.state is CityNavigationState.CITY_DETAIL
+    assert len(taps) == 1
+    assert any(
+        event.reason == "home_page_still_visible_after_dispatch"
+        and event.state is CityNavigationState.CITY_TRANSITION
+        for event in result.trace
+    )
+
+
+def test_get_station_uses_guarded_navigation_once_and_observation_consensus():
+    clock = _Clock()
+    navigation_calls = []
+    frames = iter([_Frame("城市详情", pixel=index) for index in range(10, 17)])
+    def navigator(**kwargs):
+        navigation_calls.append(kwargs)
+        return SimpleNamespace(
+            success=True, station_confirmed=True, station_id="岚心城"
+        )
+
+    station = presets.get_station(
+        is_go_home=False,
+        frame_provider=lambda: next(frames),
+        recognizer=lambda *_args, **_kwargs: pytest.fail("legacy fixed-ROI OCR used"),
+        home_resolver=lambda **_kwargs: True,
+        city_navigator=navigator,
+        tap=lambda *_args, **_kwargs: True,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+        observation_sample_budget=20,
+        state_deadline_seconds=30,
+        physical_dispatch_budget=1,
+    )
+
+    assert station == "岚心城"
+    assert len(navigation_calls) == 1
+    assert navigation_calls[0]["max_attempts"] == 20
+
+
+def test_get_station_never_retries_failed_city_navigation():
+    navigation_calls = []
+
+    def navigator(**kwargs):
+        navigation_calls.append(kwargs)
+        return SimpleNamespace(success=False)
+
+    result = presets.get_station(
+        is_go_home=False,
+        frame_provider=lambda: pytest.fail("no frame after failed navigation"),
+        recognizer=lambda *_args, **_kwargs: pytest.fail("no OCR after failed navigation"),
+        home_resolver=lambda **_kwargs: True,
+        city_navigator=navigator,
+        observation_sample_budget=20,
+        physical_dispatch_budget=1,
+    )
+
+    assert result is None
+    assert len(navigation_calls) == 1
+
+
+def test_city_entry_fresh_confirmation_records_exact_device_point_without_random_offset():
+    taps = []
+    recorded = []
+    result = _adapter(
+        [_home(), _home(pixel=2), _city_detail(pixel=3)],
+        tap=lambda *args, **kwargs: taps.append((args, kwargs)) or True,
+    )
+    result.evidence_recorder = recorded.append
+    outcome = result.enter_city()
+
+    assert outcome.status == "PASS"
+    assert len(taps) == 1
+    assert taps[0][1]["random_offset"] is False
+    assert len(recorded) == 1
+    evidence = recorded[0]
+    assert evidence.random_offset_enabled is False
+    assert evidence.random_offset_requested is False
+    assert evidence.actual_dispatched_point == evidence.coordinate_chain.device_point
+    assert evidence.coordinate_chain.complete is True
+    assert evidence.dispatch_acknowledged is True
+
+
+def test_city_entry_coordinate_mapping_is_consistent_for_supported_capture_widths():
+    mapped = []
+    for index, size in enumerate(((1280, 720), (851, 480), (853, 480)), start=1):
+        first = _Frame("访问城市", "作战终端", "启程", pixel=index, capture_id=f"plan-{index}", size=size)
+        fresh = _Frame("访问城市", "作战终端", "启程", pixel=index + 10, capture_id=f"fresh-{index}", size=size)
+        city = _Frame("当前城市", "城市设施", "城市手册", pixel=index + 20, capture_id=f"city-{index}", size=size)
+        adapter = _adapter([first, fresh, city])
+        adapter.geometry_provider = lambda: SimpleNamespace(physical_width=1280, physical_height=720)
+        result = adapter.enter_city()
+        assert result.status == "PASS"
+        mapped.append(result.evidence.coordinate_chain.device_point)
+    assert max(point[0] for point in mapped) - min(point[0] for point in mapped) <= 1
+    assert max(point[1] for point in mapped) - min(point[1] for point in mapped) <= 1
+
+
+def test_multiple_city_entry_candidates_block_without_dispatch():
+    taps = []
+    result = _adapter(
+        [_Frame("访问城市", "访问城市", "启程", pixel=1)],
+        tap=lambda *args, **kwargs: taps.append((args, kwargs)) or True,
+    ).enter_city()
+    assert result.reason == "city_entry_candidate_not_unique"
+    assert taps == []
+
+
+def test_stale_fresh_confirmation_blocks_without_dispatch():
+    frame = _home()
+    taps = []
+    result = _adapter(
+        [frame, frame],
+        tap=lambda *args, **kwargs: taps.append((args, kwargs)) or True,
+    ).enter_city()
+    assert result.reason == "stale_frame_action"
+    assert taps == []
+
+
+def test_unknown_transition_then_station_confirmation_passes_with_one_dispatch():
+    taps = []
+    adapter = _adapter(
+        [_home(), _home(pixel=2), _Frame(pixel=3, capture_id="blank"), _city_detail(pixel=4, station="七号自由港")],
+        tap=lambda *args, **kwargs: taps.append((args, kwargs)) or True,
+    )
+    adapter.require_station_confirmation = True
+    adapter.station_ids = ("岚心城", "七号自由港")
+    result = adapter.enter_city()
+    assert result.status == "PASS"
+    assert result.entry_opened is True
+    assert result.station_confirmed is True
+    assert result.station_id == "七号自由港"
+    assert len(taps) == 1
+
+
+def test_station_detector_no_match_is_not_defaulted_to_lanxin():
+    result = detect_current_station(_city_detail(), ("岚心城", "七号自由港"))
+    assert result.result == "NO_MATCH"
+    assert result.station_id is None
+    assert result.reason == "station_detector_no_match"
+
+
+def test_station_detector_rejects_multiple_station_names():
+    frame = _Frame("当前城市", "城市设施", "岚心城", "七号自由港")
+    result = detect_current_station(frame, ("岚心城", "七号自由港"))
+    assert result.result == "AMBIGUOUS"
+    assert result.station_id is None
+    assert result.reason == "station_detector_ambiguous"
+
+
+def test_station_detector_exception_has_precise_terminal_reason():
+    adapter = _adapter([_home(), _home(pixel=2), _city_detail(pixel=3)])
+    adapter.require_station_confirmation = True
+    adapter.station_ids = ("岚心城",)
+    adapter.station_detector = lambda *_args: (_ for _ in ()).throw(ValueError("boom"))
+    result = adapter.enter_city()
+    assert result.status == "FAILED"
+    assert result.reason == "station_detector_error"
+
+
+def test_trusted_city_page_without_station_cue_fails_as_station_no_match():
+    adapter = _adapter([_home(), _home(pixel=2), _city_detail(pixel=3)])
+    adapter.require_station_confirmation = True
+    adapter.station_ids = ("岚心城",)
+    result = adapter.enter_city()
+    assert result.entry_opened is True
+    assert result.station_confirmed is False
+    assert result.reason == "station_detector_no_match"
+
+
+def test_unexpected_page_after_dispatch_fails_without_second_action():
+    taps = []
+    result = _adapter(
+        [_home(), _home(pixel=2), _Frame("未知菜单", pixel=3)],
+        tap=lambda *args, **kwargs: taps.append((args, kwargs)) or True,
+    ).enter_city()
+    assert result.reason == "city_entry_unexpected_page"
+    assert len(taps) == 1
+
+
+def test_cancellation_after_dispatch_sends_no_additional_input():
+    calls = 0
+    taps = []
+
+    def cancelled():
+        nonlocal calls
+        calls += 1
+        return calls >= 3
+
+    iterator = iter([_home(), _home(pixel=2)])
+    clock = _Clock()
+    result = CityNavigationAdapter(
+        frame_provider=lambda: next(iterator),
+        tap=lambda *args, **kwargs: taps.append((args, kwargs)) or True,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+        timeout=10,
+        cancellation=cancelled,
+    ).enter_city()
+    assert result.reason == "city_entry_cancelled"
+    assert len(taps) == 1
+
+
 def test_unknown_page_blocks_action():
     taps = []
     result = _adapter(
@@ -118,31 +351,31 @@ def test_unknown_page_blocks_action():
     ).enter_city()
     assert result.status == "BLOCKED"
     assert result.state is CityNavigationState.UNKNOWN
-    assert result.reason == "unknown_page_blocks_action"
+    assert result.reason == "city_entry_candidate_not_unique"
     assert taps == []
 
 
 def test_missing_city_entry_anchor_blocks_action():
     result = _adapter([_Frame("作战终端", "启程", pixel=1)]).enter_city()
     assert result.status == "BLOCKED"
-    assert result.reason == "city_entry_anchor_missing"
+    assert result.reason == "city_entry_candidate_not_unique"
 
 
 def test_navigation_timeout_is_bounded():
-    frames = [_home()] + [
+    frames = [_home(), _home(pixel=2)] + [
         _Frame(pixel=index, capture_id=f"transition-{index}")
-        for index in range(2, 9)
+        for index in range(3, 9)
     ]
     result = _adapter(frames, timeout=1.5, stall_frames=99).enter_city()
     assert result.status == "BLOCKED"
     assert result.state is CityNavigationState.TIMEOUT
-    assert result.reason == "navigation_deadline_or_attempt_limit"
+    assert result.reason == "city_entry_postcondition_timeout"
 
 
 def test_stall_detection_uses_repeated_frame_or_page_fingerprint():
     stalled = _Frame(pixel=2, capture_id="stalled")
     result = _adapter(
-        [_home(), stalled, stalled, stalled], stall_frames=3,
+        [_home(), _home(pixel=3), stalled, stalled, stalled], stall_frames=3,
     ).enter_city()
     assert result.status == "FAILED"
     assert result.state is CityNavigationState.FAILED
@@ -196,17 +429,17 @@ def test_buy_page_is_not_sell_page():
 def test_guard_denial_propagates_without_retry():
     calls = []
     result = _adapter(
-        [_home()],
+        [_home(), _home(pixel=2)],
         tap=lambda *args, **kwargs: calls.append((args, kwargs)) or False,
     ).enter_city()
     assert result.status == "BLOCKED"
     assert result.state is CityNavigationState.FAILED
-    assert result.reason == "guard_denied_city_entry"
+    assert result.reason == "city_entry_dispatch_not_acknowledged"
     assert len(calls) == 1
 
 
 def test_navigation_result_never_counts_irreversible_action():
-    result = _adapter([_home(), _city_detail()], tap=lambda *_args, **_kwargs: True).enter_city()
+    result = _adapter([_home(), _home(pixel=2), _city_detail()], tap=lambda *_args, **_kwargs: True).enter_city()
     assert result.status == "PASS"
     assert result.irreversible_actions == 0
     assert all(event.action not in {"BUY", "SELL", "PURCHASE", "CLAIM"} for event in result.trace)
@@ -289,6 +522,18 @@ def test_live_city_probe_has_no_direct_input_or_irreversible_action_key():
     assert "transaction_sell" not in source
     assert "reward_claim" not in source
     assert "departure_confirm" not in source
+
+
+def test_single_action_probe_stops_before_exchange_or_other_product_features():
+    source = inspect.getsource(single_city_probe)
+    for forbidden in (
+        "open_menu(", "open_action(", "run_business", "fatigue_recovery",
+        "reward_claim", "departure_confirm", "sweep",
+    ):
+        assert forbidden not in source
+    blocked = single_city_probe._blocked("test")
+    assert blocked["real_ui_actions"] == 0
+    assert blocked["city_entry_dispatches"] == 0
 
 
 def test_screenshot_preserves_backend_capture_identity(monkeypatch):

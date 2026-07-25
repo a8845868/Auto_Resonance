@@ -16,6 +16,7 @@ from loguru import logger
 from core.control.control import (
     input_swipe,
     input_tap,
+    current_display_geometry,
     is_stopped,
     screenshot,
     screenshot_image,
@@ -31,6 +32,7 @@ from core.services.city_navigation import (
     CityNavigationAdapter as ReadOnlyCityNavigationAdapter,
     CityNavigationState as ReadOnlyCityNavigationState,
 )
+from core.services.navigation_evidence import record_navigation_attempt
 from core.services.read_only_policy import ActionIntent
 from core.services.station_availability import station_unavailable_reason
 from core.utils.utils import RESOURCES_PATH, read_json
@@ -81,6 +83,11 @@ class CityNavigationResult:
     actions_executed: tuple[str, ...]
     blocked_reason: str
     diagnostics: tuple[str, ...]
+    entry_opened: bool = False
+    station_confirmed: bool = False
+    station_id: str | None = None
+    terminal: bool = True
+    evidence_attempt_id: str = ""
 
     def __bool__(self) -> bool:
         return self.success
@@ -486,37 +493,68 @@ def click_station(
     return STATION(False)
 
 
-def get_station(is_go_home: bool = True):
+def get_station(
+    is_go_home: bool = True,
+    *,
+    frame_provider: Callable[[], object] = screenshot,
+    recognizer: Callable[[object], list] = predict,
+    home_resolver: Callable[..., object] = go_home,
+    city_navigator: Callable[..., object] | None = None,
+    tap: Callable[..., object] = input_tap,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    observation_sample_budget: int = 60,
+    state_deadline_seconds: float = 30.0,
+    physical_dispatch_budget: int = 1,
+    geometry_provider: Callable[[], object] = current_display_geometry,
+    evidence_recorder: Callable[..., object] = record_navigation_attempt,
+    station_ids: tuple[str, ...] | None = None,
+):
     """
     获取当前站点
 
     :param is_go_home: 是否返回主界面
     """
-    result = []
-    for attempt in range(3):
-        # A fatigue failure can leave the negotiation reset-warning above the
-        # shop. Resolve it before trying to navigate to the city information.
-        visible = [item["text"] for item in screenshot().ocr()]
-        if any("退出后议价幅度将重置" in text for text in visible):
-            input_tap((768, 447))
-            time.sleep(2)
-        go_home()
-        input_tap((1170, 493))
-        time.sleep(1.0)
-        result = predict(
-            screenshot_image(), cropped_pos1=(166, 520), cropped_pos2=(470, 600)
-        )
-        if result:
-            break
-        logger.warning(f"第 {attempt + 1}/3 次未识别当前城市，重新回主界面")
-    if not result:
-        logger.error("连续 3 次未识别当前城市，安全暂停本轮")
+    del recognizer  # station OCR is resolved by the full-frame trusted detector
+    deadline = monotonic() + max(0.0, float(state_deadline_seconds))
+    observation_budget = max(1, int(observation_sample_budget))
+    dispatch_budget = max(0, min(1, int(physical_dispatch_budget)))
+
+    if dispatch_budget < 1:
+        logger.error("城市识别 physical_dispatch_budget=0；保持只观察")
         return None
-    logger.info(f"当前站点: {result[0]['text']}")
+
+    navigator = city_navigator or go_city
+    navigation = navigator(
+        frame_provider=frame_provider,
+        tap=tap,
+        sleep=sleep,
+        monotonic=monotonic,
+        max_attempts=observation_budget,
+        timeout=max(0.0, deadline - monotonic()),
+        geometry_provider=geometry_provider,
+        evidence_recorder=evidence_recorder,
+        station_ids=station_ids or tuple(STATION_NAME2PNG),
+        require_station_confirmation=True,
+    )
+    station = getattr(navigation, "station_id", None)
+    if not bool(getattr(navigation, "success", navigation)) or not bool(
+        getattr(navigation, "station_confirmed", False)
+    ):
+        reason = str(
+            getattr(navigation, "blocked_reason", "")
+            or getattr(navigation, "reason", "station_detector_no_match")
+        )
+        logger.error(f"城市/站点单动作确认失败：{reason}；不执行第二次城市入口动作")
+        return None
+    if not station:
+        logger.error("站点 detector 返回空标识；不使用岚心城或任何默认值")
+        return None
+    logger.info(f"当前站点: {station}（physical_dispatches=1）")
     if is_go_home:
         # 返回主界面，回溯进入城市地图操作
-        go_home()
-    return result[0]["text"]
+        home_resolver(deadline=deadline)
+    return station
 
 
 def _ocr_bbox(item: dict) -> tuple[int, int, int, int] | None:
@@ -599,6 +637,10 @@ def go_city(
     monotonic: Callable[[], float] = time.monotonic,
     cancellation: Callable[[], bool] | None = None,
     max_attempts: int = 10, timeout: float = 30.0, stall_frames: int = 5,
+    geometry_provider: Callable[[], object] = current_display_geometry,
+    evidence_recorder: Callable[..., object] = record_navigation_attempt,
+    station_ids: tuple[str, ...] = (),
+    require_station_confirmation: bool = False,
 ):
     """
     说明:
@@ -617,6 +659,10 @@ def go_city(
             cancellation=lambda: is_stopped() or (
                 cancellation is not None and cancellation()
             ),
+            geometry_provider=geometry_provider,
+            evidence_recorder=evidence_recorder,
+            station_ids=station_ids,
+            require_station_confirmation=require_station_confirmation,
         ).enter_city()
         attempted = (
             ("city_entry_navigation",)
@@ -658,6 +704,11 @@ def go_city(
             executed,
             resolved.reason,
             tuple(event.reason for event in resolved.trace),
+            resolved.entry_opened,
+            resolved.station_confirmed,
+            resolved.station_id,
+            resolved.terminal,
+            resolved.evidence_attempt_id,
         )
 
     started = monotonic()

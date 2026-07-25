@@ -60,6 +60,8 @@ class CoordinateChain:
     capture_height: int
     render_client_width: int
     render_client_height: int
+    device_width: int
+    device_height: int
     screen_width: int | None = None
     screen_height: int | None = None
     dpi: float | None = None
@@ -115,6 +117,8 @@ class CoordinateChain:
             capture_height=capture_height,
             render_client_width=render_width,
             render_client_height=render_height,
+            device_width=device_width,
+            device_height=device_height,
             screen_width=screen_width,
             screen_height=screen_height,
             dpi=dpi,
@@ -158,6 +162,13 @@ class NavigationAttemptEvidence:
     candidate_score: float | None
     candidate_count: int
     dispatch_backend: str
+    random_offset_enabled: bool = False
+    random_offset_requested: bool = False
+    actual_dispatched_point: tuple[int, int] | None = None
+    station_detection_result: str = "not_run"
+    station_id: str | None = None
+    station_confidence: str | None = None
+    station_evidence_ids: tuple[str, ...] = ()
     attempt_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     dispatch_requested: bool = False
     dispatch_acknowledged: bool = False
@@ -170,6 +181,19 @@ class NavigationAttemptEvidence:
         self.dispatch_acknowledged = bool(acknowledged)
         self.dispatch_result = str(result)
         self.dispatch_timestamp = _now()
+
+    def mark_station_detection(
+        self,
+        *,
+        result: str,
+        station_id: str | None = None,
+        confidence: str | None = None,
+        evidence_ids: Iterable[str] = (),
+    ) -> None:
+        self.station_detection_result = str(result)
+        self.station_id = str(station_id) if station_id else None
+        self.station_confidence = str(confidence) if confidence else None
+        self.station_evidence_ids = _codes(evidence_ids)
 
     def add_post_observation(
         self,
@@ -202,6 +226,8 @@ class NavigationAttemptEvidence:
                 "capture_height": self.coordinate_chain.capture_height,
                 "render_client_width": self.coordinate_chain.render_client_width,
                 "render_client_height": self.coordinate_chain.render_client_height,
+                "device_width": self.coordinate_chain.device_width,
+                "device_height": self.coordinate_chain.device_height,
                 "screen_width": self.coordinate_chain.screen_width,
                 "screen_height": self.coordinate_chain.screen_height,
                 "dpi": self.coordinate_chain.dpi,
