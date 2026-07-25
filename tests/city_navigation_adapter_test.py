@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 import core.control.control as control
+import core.services.city_navigation as city_navigation_module
 from core.preset import presets
 from core.services.city_navigation import (
     CityNavigationAdapter,
@@ -70,7 +71,14 @@ class _Clock:
         self.value += float(seconds)
 
 
-def _adapter(frames, *, tap=lambda *_args, **_kwargs: True, timeout=10.0, stall_frames=5):
+def _adapter(
+    frames,
+    *,
+    tap=lambda *_args, **_kwargs: True,
+    timeout=10.0,
+    stall_frames=5,
+    **adapter_kwargs,
+):
     iterator = iter(frames)
     clock = _Clock()
     return CityNavigationAdapter(
@@ -84,6 +92,7 @@ def _adapter(frames, *, tap=lambda *_args, **_kwargs: True, timeout=10.0, stall_
         stall_frames=stall_frames,
         correlation_id="CITYNAV-20260720-TEST",
         evidence_recorder=lambda _evidence: True,
+        **adapter_kwargs,
     )
 
 
@@ -275,6 +284,147 @@ def test_unknown_transition_then_station_confirmation_passes_with_one_dispatch()
     assert len(taps) == 1
 
 
+def test_nonempty_unknown_transition_replays_real_defect_then_reaches_station():
+    taps = []
+    adapter = _adapter(
+        [
+            _home(),
+            _home(pixel=2),
+            _Frame("载入中的装饰文字", pixel=3, capture_id="unknown-text-1"),
+            _Frame("过渡动画字幕", pixel=4, capture_id="unknown-text-2"),
+            _city_detail(pixel=5, station="岚心城"),
+        ],
+        tap=lambda *args, **kwargs: taps.append((args, kwargs)) or True,
+        city_entry_minimum_grace_seconds=2.0,
+    )
+    adapter.require_station_confirmation = True
+    adapter.station_ids = ("岚心城", "七号自由港")
+
+    result = adapter.enter_city()
+
+    assert result.status == "PASS"
+    assert result.reason == "station_confirmed"
+    assert result.dispatch_count == 1
+    assert result.post_observation_count == 3
+    assert result.transition_result == "PASS"
+    assert result.last_observed_state == "CITY_DETAIL"
+    assert result.attempt_count != result.dispatch_count
+    assert len(taps) == 1
+    pending = [event for event in result.trace if event.transition_classification == "PENDING"]
+    assert any(event.reason == "city_transition_with_uncommitted_page_evidence" for event in pending)
+    assert all(event.elapsed_since_dispatch_seconds is not None for event in pending)
+
+
+def test_nonempty_unknown_after_minimum_grace_remains_pending_until_success():
+    adapter = _adapter(
+        [
+            _home(),
+            _home(pixel=2),
+            _Frame("普通过渡文字", pixel=3),
+            _Frame("普通过渡文字", pixel=4),
+            _Frame("普通过渡文字", pixel=5),
+            _city_detail(pixel=6),
+        ],
+        city_entry_minimum_grace_seconds=0.5,
+    )
+
+    result = adapter.enter_city()
+
+    assert result.status == "PASS"
+    assert result.dispatch_count == 1
+    assert result.post_observation_count == 4
+    assert any(
+        event.transition_classification == "PENDING"
+        and event.elapsed_since_dispatch_seconds >= 0.5
+        for event in result.trace
+    )
+
+
+@pytest.mark.parametrize(
+    "foreign_texts",
+    [
+        ("装备", "载货", "素材"),
+        ("行动汇总", "任务结果"),
+        ("https://example.invalid", "浏览器"),
+    ],
+)
+def test_committed_foreign_pages_fail_early_without_redispatch(foreign_texts):
+    taps = []
+    result = _adapter(
+        [_home(), _home(pixel=2), _Frame(*foreign_texts, pixel=3)],
+        tap=lambda *args, **kwargs: taps.append((args, kwargs)) or True,
+    ).enter_city()
+
+    assert result.reason == "city_entry_unexpected_page"
+    assert result.transition_result == "EXPLICIT_FAILURE"
+    assert result.post_observation_count == 1
+    assert result.dispatch_count == 1
+    assert len(taps) == 1
+
+
+@pytest.mark.parametrize(
+    ("post_frames", "expected_state"),
+    [
+        (
+            [
+                _Frame("作战终端", "启程", pixel=3),
+                _Frame("作战终端", "启程", pixel=4),
+            ],
+            "HOME_READY",
+        ),
+        ([_home(pixel=3), _home(pixel=4)], "CITY_ENTRY_VISIBLE"),
+    ],
+)
+def test_home_states_after_dispatch_remain_pending_until_timeout(
+    post_frames, expected_state,
+):
+    result = _adapter(
+        [_home(), _home(pixel=2), *post_frames],
+        timeout=1.5,
+        stall_frames=1,
+    ).enter_city()
+
+    assert result.reason == "city_entry_postcondition_timeout"
+    assert result.transition_result == "TIMEOUT"
+    assert result.dispatch_count == 1
+    assert result.post_observation_count == 2
+    assert result.last_observed_state == expected_state
+    assert all(
+        event.transition_classification == "PENDING"
+        for event in result.trace
+        if event.action == "WAIT_CITY_TRANSITION"
+    )
+
+
+def test_post_dispatch_capture_failure_has_precise_reason():
+    result = _adapter([_home(), _home(pixel=2)]).enter_city()
+
+    assert result.reason == "city_entry_transition_capture_failed"
+    assert result.transition_result == "FAIL"
+    assert result.dispatch_count == 1
+    assert result.post_observation_count == 0
+
+
+def test_post_dispatch_detection_failure_has_precise_reason(monkeypatch):
+    original = city_navigation_module.observe_city_frame
+    calls = 0
+
+    def fail_third_observation(frame, *, now=lambda: NOW):
+        nonlocal calls
+        calls += 1
+        if calls >= 3:
+            raise RuntimeError("detector failed")
+        return original(frame, now=now)
+
+    monkeypatch.setattr(city_navigation_module, "observe_city_frame", fail_third_observation)
+    result = _adapter([_home(), _home(pixel=2), _Frame("过渡", pixel=3)]).enter_city()
+
+    assert result.reason == "city_entry_transition_detection_failed"
+    assert result.transition_result == "FAIL"
+    assert result.dispatch_count == 1
+    assert result.post_observation_count == 0
+
+
 def test_station_detector_no_match_is_not_defaulted_to_lanxin():
     result = detect_current_station(_city_detail(), ("岚心城", "七号自由港"))
     assert result.result == "NO_MATCH"
@@ -308,15 +458,18 @@ def test_trusted_city_page_without_station_cue_fails_as_station_no_match():
     assert result.entry_opened is True
     assert result.station_confirmed is False
     assert result.reason == "station_detector_no_match"
+    assert result.transition_result == "PASS"
 
 
-def test_unexpected_page_after_dispatch_fails_without_second_action():
+def test_explicit_inventory_page_after_dispatch_fails_without_second_action():
     taps = []
     result = _adapter(
-        [_home(), _home(pixel=2), _Frame("未知菜单", pixel=3)],
+        [_home(), _home(pixel=2), _Frame("装备", "载货", "素材", pixel=3)],
         tap=lambda *args, **kwargs: taps.append((args, kwargs)) or True,
     ).enter_city()
     assert result.reason == "city_entry_unexpected_page"
+    assert result.transition_result == "EXPLICIT_FAILURE"
+    assert result.dispatch_count == 1
     assert len(taps) == 1
 
 
@@ -340,6 +493,8 @@ def test_cancellation_after_dispatch_sends_no_additional_input():
         cancellation=cancelled,
     ).enter_city()
     assert result.reason == "city_entry_cancelled"
+    assert result.transition_result == "CANCELLED"
+    assert result.dispatch_count == 1
     assert len(taps) == 1
 
 
@@ -372,14 +527,18 @@ def test_navigation_timeout_is_bounded():
     assert result.reason == "city_entry_postcondition_timeout"
 
 
-def test_stall_detection_uses_repeated_frame_or_page_fingerprint():
+def test_repeated_unknown_frames_wait_for_transition_timeout():
     stalled = _Frame(pixel=2, capture_id="stalled")
     result = _adapter(
-        [_home(), _home(pixel=3), stalled, stalled, stalled], stall_frames=3,
+        [_home(), _home(pixel=3), stalled, stalled, stalled],
+        timeout=1.5,
+        stall_frames=1,
     ).enter_city()
-    assert result.status == "FAILED"
-    assert result.state is CityNavigationState.FAILED
-    assert result.reason == "NAVIGATION_STALLED"
+    assert result.status == "BLOCKED"
+    assert result.state is CityNavigationState.TIMEOUT
+    assert result.reason == "city_entry_postcondition_timeout"
+    assert result.transition_result == "TIMEOUT"
+    assert result.dispatch_count == 1
 
 
 def test_buy_page_requires_title_list_button_and_price_evidence():
@@ -534,6 +693,8 @@ def test_single_action_probe_stops_before_exchange_or_other_product_features():
     blocked = single_city_probe._blocked("test")
     assert blocked["real_ui_actions"] == 0
     assert blocked["city_entry_dispatches"] == 0
+    assert blocked["transition_observation_count"] == 0
+    assert blocked["transition_result"] == "NOT_RUN"
 
 
 def test_screenshot_preserves_backend_capture_identity(monkeypatch):

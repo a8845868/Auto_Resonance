@@ -42,6 +42,11 @@ def _blocked(reason: str) -> dict[str, object]:
         "city_entry_dispatches": 0,
         "dispatch_acknowledged": False,
         "post_state_sequence": [],
+        "transition_observation_count": 0,
+        "transition_elapsed_seconds": 0.0,
+        "transition_result": "NOT_RUN",
+        "last_observed_state": "",
+        "transition_timeline": [],
         "city_entry_postcondition": "NOT_RUN",
         "station_confirmed": False,
         "station_id": None,
@@ -98,6 +103,35 @@ def run(output: Path, *, adb_port: int = 16384) -> dict[str, object]:
     evidence = navigation.evidence
     if recorded and evidence is not recorded[0]:
         raise RuntimeError("navigation_evidence_identity_mismatch")
+    post_events = [
+        event
+        for event in navigation.trace
+        if event.elapsed_since_dispatch_seconds is not None
+        and event.action != "enter_city"
+    ]
+    post_evidence = list(evidence.post_observations) if evidence else []
+    transition_timeline = []
+    for index, event in enumerate(post_events, start=1):
+        matched = next(
+            (
+                item
+                for item in post_evidence
+                if item.post_frame_sha256 == event.screenshot_hash
+            ),
+            None,
+        )
+        transition_timeline.append(
+            {
+                "post_observation_index": index,
+                "elapsed_since_dispatch_seconds": event.elapsed_since_dispatch_seconds,
+                "frame_sha256": event.screenshot_hash,
+                "detected_state": matched.post_state if matched else event.state.value,
+                "transition_classification": event.transition_classification,
+                "positive_cues": list(matched.positive_cues) if matched else [],
+                "negative_cues": list(matched.negative_cues) if matched else [],
+                "reason_codes": list(matched.reason_codes) if matched else [event.reason],
+            }
+        )
     result.update(
         {
             "status": "PASS" if navigation.status == "PASS" else navigation.status,
@@ -105,6 +139,11 @@ def run(output: Path, *, adb_port: int = 16384) -> dict[str, object]:
             "city_entry_dispatches": dispatches,
             "dispatch_acknowledged": bool(evidence and evidence.dispatch_acknowledged),
             "post_state_sequence": state_sequence,
+            "transition_observation_count": navigation.post_observation_count,
+            "transition_elapsed_seconds": navigation.transition_elapsed_seconds,
+            "transition_result": navigation.transition_result,
+            "last_observed_state": navigation.last_observed_state,
+            "transition_timeline": transition_timeline,
             "city_entry_postcondition": "PASS" if navigation.entry_opened else "FAIL",
             "station_confirmed": navigation.station_confirmed,
             "station_id": navigation.station_id,
@@ -123,6 +162,11 @@ def run(output: Path, *, adb_port: int = 16384) -> dict[str, object]:
                 "status": navigation.status,
                 "reason": navigation.reason,
                 "attempt_count": navigation.attempt_count,
+                "dispatch_count": navigation.dispatch_count,
+                "post_observation_count": navigation.post_observation_count,
+                "transition_elapsed_seconds": navigation.transition_elapsed_seconds,
+                "transition_result": navigation.transition_result,
+                "last_observed_state": navigation.last_observed_state,
                 "entry_opened": navigation.entry_opened,
                 "station_confirmed": navigation.station_confirmed,
                 "station_id": navigation.station_id,
