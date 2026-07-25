@@ -31,6 +31,8 @@ class PersonalAutomationEntryConfig:
     resource_update_timeout_seconds: float = 600.0
     resource_update_stall_timeout_seconds: float = 120.0
     observation_interval_seconds: float = 0.75
+    enter_session_transition_timeout_seconds: float = 30.0
+    enter_session_transition_stable_frames: int = 1
 
     def validate(self) -> None:
         if self.target_city_id is not None:
@@ -50,6 +52,8 @@ class PersonalAutomationEntryConfig:
             episode_timeout_seconds=self.episode_timeout_seconds,
             resource_update_timeout_seconds=self.resource_update_timeout_seconds,
             resource_update_stall_timeout_seconds=self.resource_update_stall_timeout_seconds,
+            enter_session_transition_timeout_seconds=self.enter_session_transition_timeout_seconds,
+            enter_session_transition_stable_frames=self.enter_session_transition_stable_frames,
         ).validate()
 
 
@@ -104,6 +108,8 @@ def run_personal_automation_episode(
             episode_timeout_seconds=config.episode_timeout_seconds,
             resource_update_timeout_seconds=config.resource_update_timeout_seconds,
             resource_update_stall_timeout_seconds=config.resource_update_stall_timeout_seconds,
+            enter_session_transition_timeout_seconds=config.enter_session_transition_timeout_seconds,
+            enter_session_transition_stable_frames=config.enter_session_transition_stable_frames,
             require_fresh_pre_dispatch_confirmation=True,
         ),
         resource_update_recover_package=resource_update_recover_package,

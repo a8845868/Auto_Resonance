@@ -59,6 +59,8 @@ class EpisodePolicy:
     episode_timeout_seconds: float = 120.0
     resource_update_timeout_seconds: float = 600.0
     resource_update_stall_timeout_seconds: float = 120.0
+    enter_session_transition_timeout_seconds: float = 30.0
+    enter_session_transition_stable_frames: int = 1
     require_fresh_pre_dispatch_confirmation: bool = False
 
     def validate(self) -> None:
@@ -70,6 +72,8 @@ class EpisodePolicy:
             or self.episode_timeout_seconds <= 0
             or self.resource_update_timeout_seconds <= 0
             or self.resource_update_stall_timeout_seconds <= 0
+            or self.enter_session_transition_timeout_seconds <= 0
+            or self.enter_session_transition_stable_frames < 1
         ):
             raise ValueError("episode_observation_policy_invalid")
 
@@ -998,6 +1002,18 @@ class EpisodeResult:
 
 
 class PersonalAutomationEpisode:
+    _ENTER_SESSION_LANDING_STATES = frozenset(
+        {
+            RuntimeState.RESOURCE_UPDATE_REQUIRED,
+            RuntimeState.RESOURCE_UPDATE_DOWNLOADING,
+            RuntimeState.RESOURCE_UPDATE_COMPLETE_TAP_TO_ENTER,
+            RuntimeState.ANNOUNCEMENT_VISIBLE,
+            RuntimeState.DAILY_CHECKIN,
+            RuntimeState.HOME_READY,
+            RuntimeState.CITY_DETAIL,
+        }
+    )
+
     def __init__(
         self,
         *,
@@ -1056,18 +1072,73 @@ class PersonalAutomationEpisode:
         observations = 0
         last_state = RuntimeState.UNKNOWN
         previous_plan: PlannedRuntimeAction | None = None
+        enter_session_transition_started: float | None = None
+        enter_session_transition_deadline: float | None = None
+        enter_session_transition_observations = 0
+        enter_session_transition_state: RuntimeState | None = None
+        enter_session_transition_stable_frames = 0
         observation_limit = self.policy.observation_limit()
-        while observations < observation_limit:
+        while (
+            observations < observation_limit
+            or enter_session_transition_deadline is not None
+        ):
             if self.cancelled():
+                if enter_session_transition_deadline is not None:
+                    self.recorder.record(
+                        "session_transition_result",
+                        result="CANCELLED",
+                        observation_count=enter_session_transition_observations,
+                        elapsed_seconds=max(
+                            0.0,
+                            self.monotonic()
+                            - (
+                                enter_session_transition_started
+                                if enter_session_transition_started is not None
+                                else self.monotonic()
+                            ),
+                        ),
+                        reason="personal_startup_cancelled",
+                    )
                 return EpisodeResult(
                     "BLOCKED",
                     last_state,
                     self.budget.total_actions,
                     observations,
-                    "episode_cancelled",
+                    (
+                        "personal_startup_cancelled"
+                        if enter_session_transition_deadline is not None
+                        else "episode_cancelled"
+                    ),
                     tuple(self.recorder.events),
                 )
             now = self.monotonic()
+            if (
+                enter_session_transition_deadline is not None
+                and now >= enter_session_transition_deadline
+            ):
+                self.recorder.record(
+                    "session_transition_result",
+                    result="TIMEOUT",
+                    observation_count=enter_session_transition_observations,
+                    elapsed_seconds=max(
+                        0.0,
+                        now
+                        - (
+                            enter_session_transition_started
+                            if enter_session_transition_started is not None
+                            else now
+                        ),
+                    ),
+                    reason="enter_session_transition_timeout",
+                )
+                return EpisodeResult(
+                    "BLOCKED",
+                    last_state,
+                    self.budget.total_actions,
+                    observations,
+                    "enter_session_transition_timeout",
+                    tuple(self.recorder.events),
+                )
             active_deadline = max(episode_deadline, resource_deadline or episode_deadline)
             if now >= active_deadline:
                 break
@@ -1090,6 +1161,31 @@ class PersonalAutomationEpisode:
             try:
                 frame = self.frame_provider()
             except Exception as exc:
+                if enter_session_transition_deadline is not None:
+                    self.recorder.record(
+                        "session_transition_result",
+                        result="CAPTURE_FAILED",
+                        observation_count=enter_session_transition_observations,
+                        elapsed_seconds=max(
+                            0.0,
+                            self.monotonic()
+                            - (
+                                enter_session_transition_started
+                                if enter_session_transition_started is not None
+                                else self.monotonic()
+                            ),
+                        ),
+                        error_type=type(exc).__name__,
+                        reason="enter_session_transition_capture_failed",
+                    )
+                    return EpisodeResult(
+                        "BLOCKED",
+                        last_state,
+                        self.budget.total_actions,
+                        observations,
+                        "enter_session_transition_capture_failed",
+                        tuple(self.recorder.events),
+                    )
                 if (
                     resource_confirmation_dispatched
                     and not resource_package_recovery_attempted
@@ -1105,7 +1201,35 @@ class PersonalAutomationEpisode:
                     self.sleep(self.policy.minimum_action_interval_seconds)
                     continue
                 raise
-            detected = self.detector.detect(frame)
+            try:
+                detected = self.detector.detect(frame)
+            except Exception as exc:
+                if enter_session_transition_deadline is None:
+                    raise
+                self.recorder.record(
+                    "session_transition_result",
+                    result="DETECTION_FAILED",
+                    observation_count=enter_session_transition_observations,
+                    elapsed_seconds=max(
+                        0.0,
+                        self.monotonic()
+                        - (
+                            enter_session_transition_started
+                            if enter_session_transition_started is not None
+                            else self.monotonic()
+                        ),
+                    ),
+                    error_type=type(exc).__name__,
+                    reason="enter_session_transition_detection_failed",
+                )
+                return EpisodeResult(
+                    "BLOCKED",
+                    last_state,
+                    self.budget.total_actions,
+                    observations,
+                    "enter_session_transition_detection_failed",
+                    tuple(self.recorder.events),
+                )
             last_state = detected.state
             observations += 1
             if detected.state in {
@@ -1148,6 +1272,80 @@ class PersonalAutomationEpisode:
                 reason_codes=detected.reason_codes,
                 current_city_id=detected.current_city_id,
             )
+            if enter_session_transition_deadline is not None:
+                enter_session_transition_observations += 1
+                elapsed = max(
+                    0.0,
+                    self.monotonic()
+                    - (
+                        enter_session_transition_started
+                        if enter_session_transition_started is not None
+                        else self.monotonic()
+                    ),
+                )
+                self.recorder.record(
+                    "session_transition_observation",
+                    state=detected.state.value,
+                    frame_hash=detected.frame_hash,
+                    observation_count=enter_session_transition_observations,
+                    elapsed_seconds=elapsed,
+                    input_actions=0,
+                )
+                if detected.state in self._ENTER_SESSION_LANDING_STATES:
+                    if detected.state is enter_session_transition_state:
+                        enter_session_transition_stable_frames += 1
+                    else:
+                        enter_session_transition_state = detected.state
+                        enter_session_transition_stable_frames = 1
+                    if (
+                        enter_session_transition_stable_frames
+                        >= self.policy.enter_session_transition_stable_frames
+                    ):
+                        self.recorder.record(
+                            "session_transition_result",
+                            result="PASS",
+                            known_landing_state=detected.state.value,
+                            observation_count=enter_session_transition_observations,
+                            elapsed_seconds=elapsed,
+                            reason="enter_session_known_startup_state_reached",
+                        )
+                        enter_session_transition_started = None
+                        enter_session_transition_deadline = None
+                        enter_session_transition_state = None
+                        enter_session_transition_stable_frames = 0
+                        previous_plan = None
+                    else:
+                        self.sleep(self.policy.observation_interval_seconds)
+                        continue
+                else:
+                    enter_session_transition_state = None
+                    enter_session_transition_stable_frames = 0
+                    if self.monotonic() >= enter_session_transition_deadline:
+                        self.recorder.record(
+                            "session_transition_result",
+                            result="TIMEOUT",
+                            observation_count=enter_session_transition_observations,
+                            elapsed_seconds=max(
+                                0.0,
+                                self.monotonic()
+                                - (
+                                    enter_session_transition_started
+                                    if enter_session_transition_started is not None
+                                    else self.monotonic()
+                                ),
+                            ),
+                            reason="enter_session_transition_timeout",
+                        )
+                        return EpisodeResult(
+                            "BLOCKED",
+                            detected.state,
+                            self.budget.total_actions,
+                            observations,
+                            "enter_session_transition_timeout",
+                            tuple(self.recorder.events),
+                        )
+                    self.sleep(self.policy.observation_interval_seconds)
+                    continue
             if detected.state is RuntimeState.CITY_DETAIL:
                 return EpisodeResult(
                     "PASS",
@@ -1321,6 +1519,23 @@ class PersonalAutomationEpisode:
                 action_count=self.budget.total_actions,
             )
             previous_plan = plan
+            if plan.action is RuntimeAction.ENTER_SESSION:
+                enter_session_transition_started = self.monotonic()
+                enter_session_transition_deadline = min(
+                    episode_deadline,
+                    enter_session_transition_started
+                    + self.policy.enter_session_transition_timeout_seconds,
+                )
+                enter_session_transition_observations = 0
+                enter_session_transition_state = None
+                enter_session_transition_stable_frames = 0
+                self.recorder.record(
+                    "session_transition_started",
+                    action_dispatch="PASS",
+                    timeout_seconds=self.policy.enter_session_transition_timeout_seconds,
+                    stable_frames=self.policy.enter_session_transition_stable_frames,
+                    action_count=self.budget.total_actions,
+                )
             self.sleep(self.policy.minimum_action_interval_seconds)
         reason = (
             "resource_update_timeout"
