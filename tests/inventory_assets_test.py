@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 from unittest.mock import call, patch
 
 import auto.inventory as inventory
@@ -115,6 +116,196 @@ class OcrFrame:
 
     def ocr(self):
         return self.items
+
+
+class FrameProvider:
+    def __init__(self, frames):
+        self.frames = list(frames)
+        self.last = self.frames[-1]
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        if self.frames:
+            self.last = self.frames.pop(0)
+        return self.last
+
+
+class Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+def _home_frame():
+    return OcrFrame([box(190, 675, "资产"), box(1040, 130, "任务")])
+
+
+def _inventory_frame():
+    return OcrFrame([
+        box(1100, 30, "道具"),
+        box(1100, 100, "材料"),
+        box(1100, 170, "装备"),
+        box(1100, 240, "载货"),
+    ])
+
+
+def _candidate(x=1101, y=51, score=1.0):
+    return inventory.AssetsEntryCandidate(
+        point=(x, y), bbox=(x - 22, y - 22, x + 22, y + 22), score=score
+    )
+
+
+def _geometry():
+    return SimpleNamespace(physical_width=1280, physical_height=720)
+
+
+def test_assets_entry_dispatch_and_backpack_postcondition_share_evidence():
+    provider = FrameProvider([_home_frame(), _inventory_frame()])
+    clock = Clock()
+    dispatches = []
+    evidence = []
+
+    result = inventory._open_assets_entry(
+        frame_provider=provider,
+        dispatcher=lambda point, **kwargs: dispatches.append((point, kwargs)) or True,
+        candidate_resolver=lambda _image: [_candidate()],
+        geometry_provider=_geometry,
+        evidence_recorder=evidence.append,
+        timeout=2,
+        poll_interval=0.4,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert result is True
+    assert len(dispatches) == 1
+    assert dispatches[0][0] == (1101, 51)
+    assert dispatches[0][1]["random_offset"] is False
+    assert len(evidence) == 1
+    document = evidence[0].to_dict()
+    assert document["dispatch_acknowledged"] is True
+    assert document["post_state"] == "INVENTORY"
+    assert document["postcondition_result"] == "PASS"
+    assert document["coordinate_chain_complete"] is True
+
+
+def test_assets_entry_home_unchanged_fails_after_one_dispatch():
+    provider = FrameProvider([_home_frame(), _home_frame()])
+    clock = Clock()
+    dispatches = []
+    evidence = []
+
+    result = inventory._open_assets_entry(
+        frame_provider=provider,
+        dispatcher=lambda point, **kwargs: dispatches.append(point) or True,
+        candidate_resolver=lambda _image: [_candidate()],
+        geometry_provider=_geometry,
+        evidence_recorder=evidence.append,
+        timeout=0.8,
+        poll_interval=0.4,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert result is False
+    assert dispatches == [(1101, 51)]
+    assert evidence[0].to_dict()["reason_codes"] == ("home_unchanged",)
+
+
+def test_assets_entry_unexpected_page_fails_without_retry():
+    unexpected = OcrFrame([box(500, 300, "活动总览")])
+    provider = FrameProvider([_home_frame(), unexpected])
+    clock = Clock()
+    dispatches = []
+    evidence = []
+
+    result = inventory._open_assets_entry(
+        frame_provider=provider,
+        dispatcher=lambda point, **kwargs: dispatches.append(point) or True,
+        candidate_resolver=lambda _image: [_candidate()],
+        geometry_provider=_geometry,
+        evidence_recorder=evidence.append,
+        timeout=2,
+        poll_interval=0.4,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert result is False
+    assert len(dispatches) == 1
+    assert evidence[0].to_dict()["reason_codes"] == ("unexpected_page",)
+
+
+def test_assets_entry_dispatch_rejection_stops_before_post_observation():
+    provider = FrameProvider([_home_frame()])
+    evidence = []
+
+    result = inventory._open_assets_entry(
+        frame_provider=provider,
+        dispatcher=lambda *_args, **_kwargs: False,
+        candidate_resolver=lambda _image: [_candidate()],
+        geometry_provider=_geometry,
+        evidence_recorder=evidence.append,
+    )
+
+    assert result is False
+    assert provider.calls == 1
+    assert evidence[0].dispatch_result == "dispatch_rejected"
+    assert evidence[0].post_observations == []
+
+
+def test_assets_entry_distinguishes_postcondition_detector_failure():
+    class BrokenOcrFrame(OcrFrame):
+        def ocr(self):
+            raise RuntimeError("offline detector failure")
+
+    provider = FrameProvider([_home_frame(), BrokenOcrFrame([])])
+    clock = Clock()
+    evidence = []
+
+    result = inventory._open_assets_entry(
+        frame_provider=provider,
+        dispatcher=lambda *_args, **_kwargs: True,
+        candidate_resolver=lambda _image: [_candidate()],
+        geometry_provider=_geometry,
+        evidence_recorder=evidence.append,
+        timeout=0.4,
+        poll_interval=0.4,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert result is False
+    assert evidence[0].dispatch_acknowledged is True
+    assert evidence[0].to_dict()["reason_codes"] == (
+        "postcondition_detector_error",
+    )
+
+
+def test_assets_entry_multiple_candidates_blocks_all_dispatch():
+    provider = FrameProvider([_home_frame()])
+    dispatches = []
+    evidence = []
+
+    result = inventory._open_assets_entry(
+        frame_provider=provider,
+        dispatcher=lambda point, **kwargs: dispatches.append(point) or True,
+        candidate_resolver=lambda _image: [_candidate(), _candidate(1220, 51, 0.91)],
+        geometry_provider=_geometry,
+        evidence_recorder=evidence.append,
+    )
+
+    assert result is False
+    assert dispatches == []
+    assert evidence[0].candidate_count == 2
+    assert evidence[0].dispatch_requested is False
+    assert evidence[0].to_dict()["reason_codes"] == ("candidate_ambiguous",)
 
 
 def test_restock_book_scan_scrolls_past_first_page_and_confirms_twice():

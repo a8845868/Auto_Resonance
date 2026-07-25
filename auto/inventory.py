@@ -4,13 +4,20 @@ import re
 import time
 import json
 from collections import Counter
+from dataclasses import dataclass
 
 import cv2 as cv
 import numpy as np
 
 from loguru import logger
 
-from core.control.control import connect, input_swipe, input_tap, screenshot
+from core.control.control import (
+    connect,
+    current_display_geometry,
+    input_swipe,
+    input_tap,
+    screenshot,
+)
 from core.exception.exceptions import StopExecution
 from core.preset import go_home
 from core.preset.control import blurry_ocr_click
@@ -27,6 +34,13 @@ from core.services.inventory_assets import (
     parse_amount,
     parse_ocr_assets,
 )
+from core.services.navigation_evidence import (
+    CoordinateChain,
+    NavigationAttemptEvidence,
+    frame_sha256,
+    record_navigation_attempt,
+)
+from core.services.read_only_policy import ActionIntent
 
 
 def _center(item: dict) -> tuple[float, float]:
@@ -277,11 +291,19 @@ def _white_icon_mask(image: cv.typing.MatLike) -> cv.typing.MatLike:
     return cv.morphologyEx(mask, cv.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8))
 
 
-def _find_assets_entry(image) -> tuple[tuple[int, int] | None, float]:
-    """Find the Assets entry from its white glyph, ignoring transparent/blue pixels."""
+@dataclass(frozen=True, slots=True)
+class AssetsEntryCandidate:
+    point: tuple[int, int]
+    bbox: tuple[int, int, int, int]
+    score: float
+
+
+def _find_assets_entry_candidates(image) -> list[AssetsEntryCandidate]:
+    """Find distinct Assets glyph candidates in the guarded top-right ROI."""
+
     template = cv.imread(str(RESOURCES_PATH / "inventory" / "assets_entry.png"))
     if template is None:
-        return None, 0.0
+        return []
     # The stored screenshot contains old scenery around the icon. Only the
     # central white six-part glyph is stable across themes and game versions.
     th, tw = template.shape[:2]
@@ -289,7 +311,7 @@ def _find_assets_entry(image) -> tuple[tuple[int, int] | None, float]:
     template_mask = _white_icon_mask(template)
     ys, xs = np.where(template_mask > 0)
     if not len(xs):
-        return None, 0.0
+        return []
     template_mask = template_mask[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
     # The icon lives in the top-right toolbar. Cropping avoids visually similar
     # white hexagons elsewhere on the home screen and makes matching faster.
@@ -297,8 +319,7 @@ def _find_assets_entry(image) -> tuple[tuple[int, int] | None, float]:
     x1, y1 = int(width * 0.58), 0
     roi = image[y1 : int(height * 0.18), x1:width]
     roi_mask = _white_icon_mask(roi)
-    best_score = 0.0
-    best_loc = None
+    raw_candidates: list[AssetsEntryCandidate] = []
     for scale_percent in range(60, 141, 5):
         scale = scale_percent / 100
         resized = cv.resize(template_mask, None, fx=scale, fy=scale, interpolation=cv.INTER_NEAREST)
@@ -306,11 +327,46 @@ def _find_assets_entry(image) -> tuple[tuple[int, int] | None, float]:
         if glyph_h >= roi_mask.shape[0] or glyph_w >= roi_mask.shape[1]:
             continue
         result = cv.matchTemplate(roi_mask, resized, cv.TM_CCOEFF_NORMED)
-        _, score, _, loc = cv.minMaxLoc(result)
-        if score > best_score:
-            best_score = score
-            best_loc = (x1 + loc[0] + glyph_w // 2, y1 + loc[1] + glyph_h // 2)
-    return (best_loc if best_score >= 0.70 else None), best_score
+        local_maxima = cv.dilate(result, np.ones((3, 3), dtype=np.uint8))
+        candidate_ys, candidate_xs = np.where(
+            (result >= 0.70) & np.isfinite(result) & (result >= local_maxima - 1e-6)
+        )
+        ranked = sorted(
+            (
+                (float(result[y, x]), int(x), int(y))
+                for x, y in zip(candidate_xs, candidate_ys)
+            ),
+            reverse=True,
+        )[:20]
+        for score, x, y in ranked:
+            left, top = x1 + x, y1 + y
+            raw_candidates.append(
+                AssetsEntryCandidate(
+                    point=(left + glyph_w // 2, top + glyph_h // 2),
+                    bbox=(left, top, left + glyph_w, top + glyph_h),
+                    score=score,
+                )
+            )
+
+    distinct: list[AssetsEntryCandidate] = []
+    for candidate in sorted(raw_candidates, key=lambda item: item.score, reverse=True):
+        if any(
+            abs(candidate.point[0] - kept.point[0]) <= 24
+            and abs(candidate.point[1] - kept.point[1]) <= 24
+            for kept in distinct
+        ):
+            continue
+        distinct.append(candidate)
+    return distinct
+
+
+def _find_assets_entry(image) -> tuple[tuple[int, int] | None, float]:
+    """Backward-compatible best-candidate view used by older callers/tests."""
+
+    candidates = _find_assets_entry_candidates(image)
+    if not candidates:
+        return None, 0.0
+    return candidates[0].point, candidates[0].score
 
 
 def _find_assets_text_entry(items: list[dict], width: int, height: int):
@@ -343,8 +399,42 @@ def _wait_for_assets_inventory(timeout: float = 6.0) -> bool:
     return False
 
 
-def _open_assets_entry() -> bool:
-    image = screenshot()
+def _assets_post_state(frame) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    try:
+        items = frame.ocr()
+    except Exception:  # noqa: BLE001 - detector errors must be distinguished
+        return "DETECTOR_ERROR", (), ("ocr_detector_error",)
+    height, width = frame.image.shape[:2]
+    if _is_assets_inventory_screen(items):
+        return "INVENTORY", ("inventory_category_rail",), ()
+    if _find_assets_text_entry(items, width, height):
+        return "HOME_READY", ("home_assets_balance",), ("inventory_category_rail_absent",)
+    if items:
+        return "UNEXPECTED_PAGE", (), ("inventory_category_rail_absent",)
+    return "UNKNOWN", (), ("no_page_cues",)
+
+
+def _open_assets_entry(
+    *,
+    frame_provider=None,
+    dispatcher=None,
+    candidate_resolver=None,
+    geometry_provider=None,
+    evidence_recorder=None,
+    timeout: float = 6.0,
+    poll_interval: float = 0.4,
+    monotonic=None,
+    sleep=None,
+) -> bool:
+    frame_provider = frame_provider or screenshot
+    dispatcher = dispatcher or input_tap
+    candidate_resolver = candidate_resolver or _find_assets_entry_candidates
+    geometry_provider = geometry_provider or current_display_geometry
+    evidence_recorder = evidence_recorder or record_navigation_attempt
+    monotonic = monotonic or time.monotonic
+    sleep = sleep or time.sleep
+
+    image = frame_provider()
     height, width = image.image.shape[:2]
     items = image.ocr()
     if _is_assets_inventory_screen(items):
@@ -355,22 +445,132 @@ def _open_assets_entry() -> bool:
     if not _find_assets_text_entry(items, width, height):
         logger.warning("当前画面未识别到站点主界面的资产余额，拒绝盲点背包入口")
         return False
-    location, score = _find_assets_entry(image.image)
-    candidates = []
-    if location and location[0] >= width * 0.75 and location[1] <= height * 0.2:
-        candidates.append((location, f"模板匹配度 {score:.3f}"))
-    # Current UI: white cube icon at about 86% width / 9.5% height.  This
-    # normalized fallback is used only after the station-home guard above.
-    normalized_cube = (int(width * 0.858), int(height * 0.095))
-    if not candidates or abs(candidates[0][0][0] - normalized_cube[0]) > width * 0.06:
-        candidates.append((normalized_cube, "主界面归一化坐标"))
-    for candidate, source in candidates:
-        logger.info(f"点击右上角资产魔方图标：{candidate}（{source}）")
-        input_tap(candidate)
-        if _wait_for_assets_inventory():
+    candidates = [
+        candidate
+        for candidate in candidate_resolver(image.image)
+        if candidate.point[0] >= width * 0.75 and candidate.point[1] <= height * 0.2
+    ]
+    if not candidates:
+        logger.error("未找到唯一资产魔方模板候选；拒绝归一化猜测坐标")
+        return False
+
+    candidate = candidates[0]
+    geometry = geometry_provider()
+    chain = CoordinateChain.from_capture_point(
+        candidate.point,
+        capture_size=(width, height),
+        render_client_size=(int(geometry.physical_width), int(geometry.physical_height)),
+        device_size=(int(geometry.physical_width), int(geometry.physical_height)),
+        source_coordinate_space="CAPTURE_LOGICAL_1280x720",
+    )
+    evidence = NavigationAttemptEvidence(
+        task_name="inventory_scan",
+        entry_name="assets_entry",
+        pre_state="HOME_READY",
+        pre_frame_sha256=frame_sha256(image),
+        coordinate_chain=chain,
+        candidate_type="template_white_glyph",
+        candidate_bbox=candidate.bbox,
+        candidate_score=candidate.score,
+        candidate_count=len(candidates),
+        dispatch_backend="device_control",
+    )
+    if len(candidates) != 1:
+        evidence.mark_dispatch(
+            requested=False, acknowledged=False, result="blocked_ambiguous_candidates"
+        )
+        evidence.add_post_observation(
+            frame=image,
+            state="HOME_READY",
+            positive_cues=("home_assets_balance",),
+            negative_cues=("multiple_assets_candidates",),
+            reason_codes=("candidate_ambiguous",),
+            postcondition_result="FAIL",
+        )
+        evidence_recorder(evidence)
+        logger.error(f"资产入口模板候选不唯一（{len(candidates)}），拒绝点击")
+        return False
+
+    logger.info(
+        f"资产入口 attempt={evidence.attempt_id} capture_point={candidate.point} "
+        f"device_point={chain.device_point} bbox={candidate.bbox} score={candidate.score:.3f}"
+    )
+    try:
+        dispatch_result = dispatcher(
+            candidate.point,
+            random_offset=False,
+            intent=ActionIntent(
+                "open_assets_entry", "assets_entry", evidence.attempt_id
+            ),
+        )
+    except Exception as error:  # noqa: BLE001 - preserve evidence before fail-closed
+        evidence.mark_dispatch(
+            requested=True,
+            acknowledged=False,
+            result=f"dispatch_exception:{type(error).__name__}",
+        )
+        evidence_recorder(evidence)
+        logger.exception("资产入口 dispatch 失败")
+        return False
+    acknowledged = bool(dispatch_result)
+    evidence.mark_dispatch(
+        requested=True,
+        acknowledged=acknowledged,
+        result="call_returned" if acknowledged else "dispatch_rejected",
+    )
+    if not acknowledged:
+        evidence_recorder(evidence)
+        logger.error("资产入口 dispatch 未确认，停止且不重试")
+        return False
+
+    deadline = monotonic() + max(0.0, float(timeout))
+    final_state = "UNKNOWN"
+    while monotonic() < deadline:
+        if poll_interval > 0:
+            sleep(poll_interval)
+        post_frame = frame_provider()
+        state, positive, negative = _assets_post_state(post_frame)
+        final_state = state
+        passed = state == "INVENTORY"
+        evidence.add_post_observation(
+            frame=post_frame,
+            state=state,
+            positive_cues=positive,
+            negative_cues=negative,
+            reason_codes=(
+                "backpack_visible"
+                if passed
+                else "unexpected_page"
+                if state == "UNEXPECTED_PAGE"
+                else "postcondition_pending"
+            ,),
+            postcondition_result="PASS" if passed else "PENDING",
+        )
+        if passed:
+            evidence_recorder(evidence)
             logger.info("已确认进入资产背包（识别到右侧道具/材料分类栏）")
             return True
-    logger.error("点击资产魔方后仍未识别到背包分类栏，停止背包扫描")
+        if state == "UNEXPECTED_PAGE":
+            break
+
+    reason = (
+        "postcondition_detector_error"
+        if final_state == "DETECTOR_ERROR"
+        else "home_unchanged"
+        if final_state == "HOME_READY"
+        else "unexpected_page"
+        if final_state == "UNEXPECTED_PAGE"
+        else "postcondition_unknown"
+    )
+    evidence.add_post_observation(
+        frame=post_frame if "post_frame" in locals() else image,
+        state=final_state,
+        negative_cues=("inventory_category_rail_absent",),
+        reason_codes=(reason,),
+        postcondition_result="FAIL",
+    )
+    evidence_recorder(evidence)
+    logger.error(f"资产入口后置条件失败：{reason}；停止且不重试")
     return False
 
 
