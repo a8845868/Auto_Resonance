@@ -5,8 +5,9 @@ LastEditTime: 2025-02-10 23:25:35
 LastEditors: Night-stars-1 nujj1042633805@gmail.com
 """
 
+from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Dict, Optional
+from typing import Dict, Mapping, Optional
 
 from loguru import logger
 from PySide6.QtCore import Qt, QTimer
@@ -32,6 +33,20 @@ from app.components.task_schedule_card import TaskScheduleCard
 from app.components.settings.spin_box_setting_card import SpinBoxSettingCard
 from app.utils.config import CITYS, CITY_GOODS, CITY_POSITIONS
 from core.model.config import config
+
+
+@dataclass(frozen=True)
+class RouteApplyResult:
+    built: bool = False
+    validated: bool = False
+    persisted: bool = False
+    progress_refreshed: bool = False
+    gui_applied: bool = False
+    reason: str | None = None
+
+
+class RoutePlanSaveError(RuntimeError):
+    """The route was validated but could not be persisted."""
 
 
 class TwoRunBusinessInterface(ScrollArea):
@@ -438,11 +453,21 @@ class TwoRunBusinessInterface(ScrollArea):
         if not self.optimizationResult:
             return
         try:
-            self._applyOptimizedRoute()
+            outcome = self._applyOptimizedRoute()
         except StalePriceSnapshot as error:
             InfoBar.error(
                 title="价格快照不可执行",
                 content=str(error),
+                orient=Qt.Orientation.Horizontal,
+                isClosable=True,
+                parent=self,
+            )
+            return
+        except RoutePlanSaveError as error:
+            logger.exception("保存优化跑商路线失败")
+            InfoBar.error(
+                title="保存路线失败",
+                content=str(error) or type(error).__name__,
                 orient=Qt.Orientation.Horizontal,
                 isClosable=True,
                 parent=self,
@@ -458,8 +483,27 @@ class TwoRunBusinessInterface(ScrollArea):
                 parent=self,
             )
             return
+        if outcome is None:
+            return
+        cycle = self.optimizationResult["cycle"]
+        if outcome.persisted and not outcome.progress_refreshed:
+            InfoBar.warning(
+                title="路线已保存，但周进度显示刷新失败",
+                content="计划已写入本地；不会重复保存。可等待下一次安全刷新。",
+                orient=Qt.Orientation.Horizontal,
+                isClosable=True,
+                parent=self,
+            )
+            return
+        InfoBar.success(
+            title="路线已套用",
+            content=f"{cycle[0]} → {cycle[1]} → {cycle[0]}，点击开始后将自动完成全部 {self.optimizationResult['repeats']} 次往返并切换进货书",
+            orient=Qt.Orientation.Horizontal,
+            isClosable=False,
+            parent=self,
+        )
 
-    def _applyOptimizedRoute(self):
+    def _applyOptimizedRoute(self) -> RouteApplyResult | None:
         """Validate, persist and apply one optimizer result behind the UI error boundary."""
 
         from core.services import remaining_batches, save_weekly_plan
@@ -469,7 +513,7 @@ class TwoRunBusinessInterface(ScrollArea):
 
         result = self.optimizationResult
         if not result:
-            return
+            return None
         preview_state = build_weekly_plan_state(result)
         validate_executable_trade_budget(
             preview_state,
@@ -478,24 +522,37 @@ class TwoRunBusinessInterface(ScrollArea):
             purchase_books=max(0, int(self.optimizerBooksSpinBox.value())),
         )
         cycle = result["cycle"]
-        state = save_weekly_plan(result)
-        batches = remaining_batches(state)
-        first_batch = batches[0] if batches else {"runs": 0, "books": {}}
-        self.buyCityComboBox.setCurrentText(cycle[0])
-        self.sellCityComboBox.setCurrentText(cycle[1])
-        for city in CITYS:
-            qconfig.set(getattr(cfg, f"{city}进货书"), int(first_batch["books"].get(city, 0)))
-        qconfig.set(cfg.BuyCount, int(first_batch["runs"]))
-        self.updateRouteTradeSettings()
-        self.appliedWeeklyPlan = result
-        self.updateRouteInfo()
-        self.refreshWeeklyProgress()
-        InfoBar.success(
-            title="已套用周计划第一批",
-            content=f"{cycle[0]} → {cycle[1]} → {cycle[0]}，点击开始后将自动完成全部 {result['repeats']} 次往返并切换进货书",
-            orient=Qt.Orientation.Horizontal,
-            isClosable=False,
-            parent=self,
+        try:
+            state = save_weekly_plan(result)
+        except Exception as error:
+            raise RoutePlanSaveError(str(error) or type(error).__name__) from error
+        try:
+            batches = remaining_batches(state)
+            first_batch = batches[0] if batches else {"runs": 0, "books": {}}
+            self.buyCityComboBox.setCurrentText(cycle[0])
+            self.sellCityComboBox.setCurrentText(cycle[1])
+            for city in CITYS:
+                qconfig.set(getattr(cfg, f"{city}进货书"), int(first_batch["books"].get(city, 0)))
+            qconfig.set(cfg.BuyCount, int(first_batch["runs"]))
+            self.updateRouteTradeSettings()
+            self.appliedWeeklyPlan = result
+            self.updateRouteInfo()
+        except Exception:
+            logger.exception("路线已保存，但 GUI 套用状态更新失败")
+            return RouteApplyResult(
+                built=True,
+                validated=True,
+                persisted=True,
+                reason="route_gui_apply_failed",
+            )
+        refreshed = self.refreshWeeklyProgress()
+        return RouteApplyResult(
+            built=True,
+            validated=True,
+            persisted=True,
+            progress_refreshed=refreshed,
+            gui_applied=True,
+            reason=None if refreshed else "weekly_progress_refresh_failed",
         )
 
     @staticmethod
@@ -503,16 +560,48 @@ class TwoRunBusinessInterface(ScrollArea):
         using = [f"每次到{city}进货时用{count}本" for city, count in books.items() if int(count) > 0]
         return "、".join(using) if using else "不用进货书"
 
-    def _format_batch(self, batch: dict) -> str:
-        return f"{batch['runs']}次往返{self._format_books(batch.get('books', {}))}"
+    def _format_batch(self, batch: object) -> str:
+        if batch is None:
+            return "暂无当前批次"
+        if not isinstance(batch, Mapping):
+            logger.error(
+                "invalid_weekly_progress_batch_type: {}",
+                type(batch).__name__,
+            )
+            return "周进度不可用（invalid_weekly_progress_batch_type）"
+        try:
+            runs = int(batch["runs"])
+            books = batch["books"]
+            if runs <= 0 or not isinstance(books, Mapping):
+                raise ValueError("invalid batch schema")
+            return f"{runs}次往返{self._format_books(dict(books))}"
+        except (KeyError, TypeError, ValueError):
+            logger.exception("invalid_weekly_progress_batch_schema")
+            return "周进度不可用（invalid_weekly_progress_batch_schema）"
 
-    def refreshWeeklyProgress(self):
+    def refreshWeeklyProgress(self) -> bool:
+        try:
+            self._refreshWeeklyProgress()
+            return True
+        except Exception:
+            logger.exception("weekly_progress_refresh_failed")
+            try:
+                self.weeklyProgressLabel.setText(
+                    "周进度显示刷新失败（weekly_progress_refresh_failed）；已保存计划不会被重复写入。"
+                )
+            except (AttributeError, RuntimeError):
+                pass
+            return False
+
+    def _refreshWeeklyProgress(self) -> None:
         from core.services import progress_summary
+        from core.services.weekly_plan_state import validate_progress_summary
 
         summary = progress_summary()
         if not summary:
             self.weeklyProgressLabel.setText("本周尚未套用计划。请先实时计算，再点击“套用路线”。")
             return
+        validate_progress_summary(summary)
         cycle = summary["cycle"]
         confirmed = summary.get("full_week_total")
         fact_text = (
@@ -536,7 +625,7 @@ class TwoRunBusinessInterface(ScrollArea):
                 f"计划执行记录 {summary['completed_runs']}/{summary['total_runs']} 次。"
             )
             return
-        current = summary["current_batch"]
+        current = summary["current_batch"] or summary["next_batch"]
         later_batches = summary["remaining_batches"][1:]
         later = "；完成后再跑 " + "；".join(self._format_batch(batch) for batch in later_batches) if later_batches else ""
         suggested_today = summary.get("today_suggested_runs")
@@ -579,13 +668,15 @@ class TwoRunBusinessInterface(ScrollArea):
                 parent=self,
             )
             return
-        self.refreshWeeklyProgress()
-        InfoBar.success(
-            title="本周事实已同步",
-            content=(
-                f"来源 {facts.source.value}；追踪开始 "
-                f"{facts.tracking_started_at.isoformat(timespec='seconds') if facts.tracking_started_at else '尚无事件'}"
-            ),
+        refreshed = self.refreshWeeklyProgress()
+        message = (
+            f"来源 {facts.source.value}；追踪开始 "
+            f"{facts.tracking_started_at.isoformat(timespec='seconds') if facts.tracking_started_at else '尚无事件'}"
+        )
+        info = InfoBar.success if refreshed else InfoBar.warning
+        info(
+            title="本周事实已同步" if refreshed else "本周事实已同步，但进度显示刷新失败",
+            content=message,
             orient=Qt.Orientation.Horizontal,
             isClosable=True,
             parent=self,
@@ -624,9 +715,10 @@ class TwoRunBusinessInterface(ScrollArea):
             max(0, int(value)),
             observed_at=SERVER_CLOCK.server_now(),
         )
-        self.refreshWeeklyProgress()
-        InfoBar.success(
-            title="本周基线已校准",
+        refreshed = self.refreshWeeklyProgress()
+        info = InfoBar.success if refreshed else InfoBar.warning
+        info(
+            title="本周基线已校准" if refreshed else "本周基线已校准，但进度显示刷新失败",
             content=f"已记录 {max(0, int(value))} 次完整往返及审计时间",
             orient=Qt.Orientation.Horizontal,
             isClosable=True,

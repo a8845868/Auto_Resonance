@@ -2,12 +2,16 @@ from .columba_optimizer import OptimizationConfig, optimize_live_routes
 from .passenger_planner import PassengerPlanConfig, estimate_passenger_plan
 from .passenger_build_planner import calculate_passenger_build_plan
 from .weekly_plan_state import (
+    WeeklyProgressContractError,
     load_weekly_plan,
     progress_summary,
     record_completed_run,
     remaining_batches,
     roll_weekly_plan_forward,
     save_weekly_plan,
+    serialize_progress_summary,
+    validate_progress_batch,
+    validate_progress_summary,
 )
 from .book_budget import BOOK_SOURCES, calculate_book_budget
 from .inventory_assets import Asset, classify_asset, merge_assets, parse_amount, parse_ocr_assets
@@ -20,6 +24,10 @@ __all__ = [
     "optimize_live_routes",
     "load_weekly_plan",
     "progress_summary",
+    "validate_progress_batch",
+    "validate_progress_summary",
+    "serialize_progress_summary",
+    "WeeklyProgressContractError",
     "record_completed_run",
     "remaining_batches",
     "save_weekly_plan",

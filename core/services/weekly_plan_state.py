@@ -8,7 +8,7 @@ import time
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, TypedDict
 
 from core.utils.utils import ROOT_PATH
 from core.services.server_calendar import SERVER_CLOCK
@@ -28,6 +28,95 @@ _STATE_LOCK = threading.RLock()
 
 class WeeklyStateCorrupt(RuntimeError):
     """The weekly state cannot be trusted and must not be partially replaced."""
+
+
+class WeeklyProgressContractError(ValueError):
+    """A computed weekly progress value violates the internal UI contract."""
+
+
+class WeeklyProgressBatch(TypedDict):
+    runs: int
+    books: dict[str, int]
+
+
+class WeeklyProgressSummary(TypedDict, total=False):
+    current_batch: WeeklyProgressBatch | None
+    current_batch_index: int | None
+    current_batch_started_at: datetime | None
+    current_batch_scheduled_at: datetime | None
+    next_batch: WeeklyProgressBatch | None
+    next_batch_scheduled_at: datetime | None
+    evaluated_at: datetime
+    completed_runs: int
+    total_runs: int
+    status: str
+    reason: str | None
+
+
+def validate_progress_batch(batch: object) -> WeeklyProgressBatch | None:
+    if batch is None:
+        return None
+    if not isinstance(batch, Mapping):
+        raise WeeklyProgressContractError("invalid_weekly_progress_batch_type")
+    try:
+        runs = int(batch["runs"])
+        raw_books = batch["books"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise WeeklyProgressContractError("invalid_weekly_progress_batch_schema") from error
+    if runs <= 0 or not isinstance(raw_books, Mapping):
+        raise WeeklyProgressContractError("invalid_weekly_progress_batch_schema")
+    try:
+        books = {str(city): int(count) for city, count in raw_books.items()}
+    except (TypeError, ValueError) as error:
+        raise WeeklyProgressContractError("invalid_weekly_progress_batch_books") from error
+    return {"runs": runs, "books": books}
+
+
+def validate_progress_summary(summary: Mapping[str, object]) -> None:
+    if not isinstance(summary, Mapping):
+        raise WeeklyProgressContractError("invalid_weekly_progress_summary_type")
+    validate_progress_batch(summary.get("current_batch"))
+    validate_progress_batch(summary.get("next_batch"))
+    for field in (
+        "current_batch_started_at",
+        "current_batch_scheduled_at",
+        "next_batch_scheduled_at",
+    ):
+        value = summary.get(field)
+        if value is not None and (
+            not isinstance(value, datetime)
+            or value.tzinfo is None
+            or value.utcoffset() is None
+        ):
+            raise WeeklyProgressContractError(
+                f"invalid_weekly_progress_datetime:{field}"
+            )
+    evaluated_at = summary.get("evaluated_at")
+    if (
+        not isinstance(evaluated_at, datetime)
+        or evaluated_at.tzinfo is None
+        or evaluated_at.utcoffset() is None
+    ):
+        raise WeeklyProgressContractError("invalid_weekly_progress_datetime:evaluated_at")
+    if summary.get("status") not in {"NOT_STARTED", "IN_PROGRESS", "COMPLETED"}:
+        raise WeeklyProgressContractError("invalid_weekly_progress_status")
+
+
+def serialize_progress_summary(summary: Mapping[str, object]) -> dict[str, object]:
+    """Create a JSON-safe copy without changing the internal datetime contract."""
+
+    validate_progress_summary(summary)
+    serialized = dict(summary)
+    for field in (
+        "evaluated_at",
+        "current_batch_started_at",
+        "current_batch_scheduled_at",
+        "next_batch_scheduled_at",
+    ):
+        value = serialized.get(field)
+        if isinstance(value, datetime):
+            serialized[field] = value.isoformat(timespec="seconds")
+    return serialized
 
 
 def current_week_start(today: date | None = None) -> str:
@@ -386,14 +475,32 @@ def progress_summary(
     state = state or load_weekly_plan()
     if not state:
         return None
+    evaluated_at = now or SERVER_CLOCK.server_now()
+    if evaluated_at.tzinfo is None or evaluated_at.utcoffset() is None:
+        raise WeeklyProgressContractError("weekly_progress_now_must_be_timezone_aware")
     completed = _effective_completed_runs(state, ledger_path=ledger_path, now=now)
     total = int(state.get("total_runs", 0))
     books_used = int(state.get("completed_books", 0))
     books_total = int(state.get("books_total", 0))
     remaining = max(0, total - completed)
     batches = remaining_batches(state, ledger_path=ledger_path, now=now)
-    current = batches[0] if batches else None
     facts = load_trade_week_state(ledger_path, now=now)
+    partial = facts.current_partial_cycle or {}
+    active_batch = bool(
+        remaining and max(0, int(partial.get("confirmed_legs", 0))) > 0
+    )
+    current_batch = validate_progress_batch(batches[0]) if active_batch else None
+    next_batch_value = (
+        batches[1] if len(batches) > 1 else None
+    ) if active_batch else (batches[0] if batches else None)
+    next_batch = validate_progress_batch(next_batch_value)
+    status = (
+        "COMPLETED"
+        if remaining == 0
+        else "IN_PROGRESS"
+        if completed > 0 or active_batch
+        else "NOT_STARTED"
+    )
     expected_profit = int(state.get("expected_profit", 0))
     expected_fatigue = float(state.get("cycle_fatigue", 0)) * total
     profit_per_fatigue = (
@@ -406,7 +513,6 @@ def progress_summary(
     )
 
     leg_costs = [max(0, float(value)) for value in state.get("leg_fatigue_schedule", ())]
-    partial = facts.current_partial_cycle or {}
     confirmed_legs = min(
         len(leg_costs), max(0, int(partial.get("confirmed_legs", 0)))
     )
@@ -426,10 +532,9 @@ def progress_summary(
     )
     from core.services.daily_capabilities import CurrentResourceEvidence
 
-    current = now or SERVER_CLOCK.server_now()
     resource_observation = CurrentResourceEvidence.from_value(state.get("current_resources"))
     resource_error = (
-        resource_observation.freshness_error(current)
+        resource_observation.freshness_error(evaluated_at)
         if resource_observation is not None
         else "current_resources_missing"
     )
@@ -457,8 +562,8 @@ def progress_summary(
         and location_valid_until is not None
         and location_observed.tzinfo is not None
         and location_valid_until.tzinfo is not None
-        and location_observed <= current <= location_valid_until
-        and location.get("server_day_id") == SERVER_CLOCK.server_day_id(current)
+        and location_observed <= evaluated_at <= location_valid_until
+        and location.get("server_day_id") == SERVER_CLOCK.server_day_id(evaluated_at)
         and location.get("revision")
     )
     ledger_city = (
@@ -509,7 +614,7 @@ def progress_summary(
         recommendation_reason = "exact_schedule_evidence_unknown"
     else:
         recommendation_reason = "exact_remaining_schedule"
-    return {
+    summary = {
         **state,
         "remaining_runs": remaining,
         "remaining_books": max(0, books_total - books_used),
@@ -523,7 +628,15 @@ def progress_summary(
         "remaining_expected_profit": remaining_expected_profit,
         "remaining_expected_fatigue": round(remaining_required_fatigue, 2),
         "remaining_profit_per_fatigue": remaining_profit_per_fatigue,
-        "current_batch": current,
+        "current_batch": current_batch,
+        "current_batch_index": completed if active_batch else None,
+        "current_batch_started_at": None,
+        "current_batch_scheduled_at": None,
+        "next_batch": next_batch,
+        "next_batch_scheduled_at": None,
+        "evaluated_at": evaluated_at,
+        "status": status,
+        "reason": None,
         "remaining_batches": batches,
         "finished": remaining == 0,
         "server_week_id": facts.server_week_id,
@@ -563,3 +676,5 @@ def progress_summary(
         "today_suggested_runs": suggested_today,
         "today_recommendation_reason": recommendation_reason,
     }
+    validate_progress_summary(summary)
+    return summary

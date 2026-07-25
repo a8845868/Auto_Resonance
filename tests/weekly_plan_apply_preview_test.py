@@ -125,7 +125,7 @@ def _fake_gui(result):
         appliedWeeklyPlan="unchanged",
         updateRouteTradeSettings=lambda: calls.append("settings"),
         updateRouteInfo=lambda: calls.append("info"),
-        refreshWeeklyProgress=lambda: calls.append("progress"),
+        refreshWeeklyProgress=lambda: calls.append("progress") or True,
     )
     return fake, calls
 
@@ -160,7 +160,7 @@ def test_successful_fake_gui_apply_previews_and_persists_the_same_expanded_runs(
     monkeypatch.setattr(gui_module.qconfig, "set", lambda *_args: None)
     monkeypatch.setattr(gui_module.InfoBar, "success", lambda **_kwargs: None)
 
-    gui_module.TwoRunBusinessInterface._applyOptimizedRoute(fake)
+    outcome = gui_module.TwoRunBusinessInterface._applyOptimizedRoute(fake)
 
     assert len(built_states) == 2
     assert built_states[0]["runs"] == built_states[1]["runs"]
@@ -168,6 +168,9 @@ def test_successful_fake_gui_apply_previews_and_persists_the_same_expanded_runs(
     assert fake.sellCityComboBox.values == ["铁盟哨站"]
     assert fake.appliedWeeklyPlan is result
     assert calls == ["settings", "info", "progress"]
+    assert outcome.persisted is True
+    assert outcome.progress_refreshed is True
+    assert outcome.gui_applied is True
 
 
 def test_validator_value_error_is_caught_without_save_or_state_change(monkeypatch):
@@ -243,4 +246,104 @@ def test_save_exception_is_caught_before_any_gui_or_qconfig_update(monkeypatch):
     assert fake.sellCityComboBox.values == []
     assert qconfig_updates == []
     assert calls == []
+    assert errors[0]["title"] == "保存路线失败"
+
+
+def test_build_failure_never_calls_save_or_changes_gui(monkeypatch):
+    import core.services as services
+    from app.view import two_city_run_business_interface as gui_module
+
+    errors = []
+    save_calls = []
+    fake, calls = _fake_gui(optimizer_result())
+    fake._applyOptimizedRoute = MethodType(
+        gui_module.TwoRunBusinessInterface._applyOptimizedRoute,
+        fake,
+    )
+    monkeypatch.setattr(
+        "core.services.weekly_plan_state.build_weekly_plan_state",
+        lambda _result: (_ for _ in ()).throw(ValueError("bad_builder_input")),
+    )
+    monkeypatch.setattr(services, "save_weekly_plan", lambda value: save_calls.append(value))
+    monkeypatch.setattr(gui_module.InfoBar, "error", lambda **kwargs: errors.append(kwargs))
+
+    gui_module.TwoRunBusinessInterface.applyOptimizedRoute(fake)
+
+    assert save_calls == []
+    assert fake.appliedWeeklyPlan == "unchanged"
+    assert calls == []
     assert errors[0]["title"] == "套用路线失败"
+
+
+def test_persisted_route_with_refresh_failure_reports_partial_success_once(monkeypatch):
+    import core.services as services
+    from app.view import two_city_run_business_interface as gui_module
+    from core.services.weekly_plan_state import build_weekly_plan_state
+
+    warnings = []
+    successes = []
+    save_calls = []
+    result = optimizer_result()
+    fake, calls = _fake_gui(result)
+    fake.refreshWeeklyProgress = lambda: calls.append("progress") or False
+    fake._applyOptimizedRoute = MethodType(
+        gui_module.TwoRunBusinessInterface._applyOptimizedRoute,
+        fake,
+    )
+
+    def save_once(value):
+        save_calls.append(value)
+        return build_weekly_plan_state(value)
+
+    monkeypatch.setattr(
+        "core.services.trade_planning.validate_executable_trade_budget",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(services, "save_weekly_plan", save_once)
+    monkeypatch.setattr(
+        services,
+        "remaining_batches",
+        lambda state: [{"runs": state["total_runs"], "books": state["runs"][0]}],
+    )
+    monkeypatch.setattr(gui_module.qconfig, "set", lambda *_args: None)
+    monkeypatch.setattr(gui_module.InfoBar, "warning", lambda **kwargs: warnings.append(kwargs))
+    monkeypatch.setattr(gui_module.InfoBar, "success", lambda **kwargs: successes.append(kwargs))
+
+    gui_module.TwoRunBusinessInterface.applyOptimizedRoute(fake)
+
+    assert save_calls == [result]
+    assert fake.appliedWeeklyPlan is result
+    assert calls == ["settings", "info", "progress"]
+    assert successes == []
+    assert warnings[0]["title"] == "路线已保存，但周进度显示刷新失败"
+
+
+def test_persisted_route_with_successful_refresh_reports_full_success(monkeypatch):
+    import core.services as services
+    from app.view import two_city_run_business_interface as gui_module
+    from core.services.weekly_plan_state import build_weekly_plan_state
+
+    successes = []
+    result = optimizer_result()
+    fake, calls = _fake_gui(result)
+    fake._applyOptimizedRoute = MethodType(
+        gui_module.TwoRunBusinessInterface._applyOptimizedRoute,
+        fake,
+    )
+    monkeypatch.setattr(
+        "core.services.trade_planning.validate_executable_trade_budget",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(services, "save_weekly_plan", build_weekly_plan_state)
+    monkeypatch.setattr(
+        services,
+        "remaining_batches",
+        lambda state: [{"runs": state["total_runs"], "books": state["runs"][0]}],
+    )
+    monkeypatch.setattr(gui_module.qconfig, "set", lambda *_args: None)
+    monkeypatch.setattr(gui_module.InfoBar, "success", lambda **kwargs: successes.append(kwargs))
+
+    gui_module.TwoRunBusinessInterface.applyOptimizedRoute(fake)
+
+    assert calls == ["settings", "info", "progress"]
+    assert successes[0]["title"] == "路线已套用"
