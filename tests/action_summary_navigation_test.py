@@ -633,7 +633,11 @@ def test_fresh_semantic_identity_large_position_change_has_zero_input():
 
 
 def test_foreign_inventory_page_fails_immediately():
-    foreign = Frame([item("道具", 1000, 100), item("材料", 1000, 200)])
+    foreign = Frame([
+        item("道具", 1000, 100),
+        item("材料", 1000, 200),
+        item("装备", 1000, 300),
+    ])
     result, taps, _ = run([home(), home(), foreign])
     assert not result.success
     assert result.reason == "unexpected_page"
@@ -734,7 +738,11 @@ def test_first_stage_three_equivalent_home_frames_are_no_touch_effect():
 
 def test_first_stage_known_foreign_page_is_precise():
     foreign = Frame(
-        [item("道具", 1000, 100), item("材料", 1000, 200)],
+        [
+            item("道具", 1000, 100),
+            item("材料", 1000, 200),
+            item("装备", 1000, 300),
+        ],
         capture_id="3", pixel=23,
     )
     result, taps, evidence = run_first([home("1"), home("2"), foreign])
@@ -796,6 +804,18 @@ def test_global_prep_optional_overlay_is_reported_without_dismissal():
     assert len(taps) == len(evidence) == 1
 
 
+def test_overlay_is_orthogonal_to_visible_activity_background():
+    covered = Frame([
+        item("全域整备", 60, 314, 58, 17),
+        item("资讯", 640, 90),
+        item("触碰空白区域退出", 640, 680, 180, 24),
+    ], capture_id="covered", pixel=21)
+
+    observed = observe_action_summary(covered)
+
+    assert observed.state is ActionSummaryState.OPTIONAL_OVERLAY_VISIBLE
+
+
 def test_global_prep_direct_action_summary_is_reported_and_stops():
     result, taps, evidence = run_global([
         overview("1"), overview("2"), summary("3"),
@@ -834,7 +854,11 @@ def test_global_prep_no_visual_effect_is_precise():
 
 def test_global_prep_known_foreign_page_is_precise():
     foreign = Frame(
-        [item("道具", 1000, 100), item("材料", 1000, 200)],
+        [
+            item("道具", 1000, 100),
+            item("材料", 1000, 200),
+            item("装备", 1000, 300),
+        ],
         capture_id="3", pixel=41,
     )
     result, taps, evidence = run_global([overview("1"), overview("2"), foreign])
@@ -842,6 +866,51 @@ def test_global_prep_known_foreign_page_is_precise():
     assert not result.success
     assert result.reason == "global_prep_known_foreign_page"
     assert len(taps) == len(evidence) == 1
+
+
+def test_global_prep_page_description_material_does_not_override_specific_page():
+    real_page_shape = Frame([
+        item("全域整备", 820, 92, 120, 32),
+        item("行动汇总", 980, 270, 120, 32),
+        item("满足物流需求，由此收集装备、材料等物资", 940, 330, 360, 28),
+    ], capture_id="3", pixel=43)
+
+    observed = observe_action_summary(real_page_shape)
+
+    assert observed.state is ActionSummaryState.ACTION_SUMMARY_ENTRY_VISIBLE
+    assert "action_summary_entry_unique" in observed.positive_cues
+
+
+def test_material_word_alone_is_unknown_not_foreign():
+    observed = observe_action_summary(
+        Frame([item("材料", 640, 360)], capture_id="material-only")
+    )
+
+    assert observed.state is ActionSummaryState.UNKNOWN
+
+
+def test_action_summary_description_substring_is_not_a_page_signature():
+    observed = observe_action_summary(
+        Frame([item("行动汇总说明", 640, 360)], capture_id="description-only")
+    )
+
+    assert observed.state is ActionSummaryState.UNKNOWN
+
+
+def test_global_prep_live_page_shape_passes_single_stage_without_retry():
+    real_page_shape = Frame([
+        item("全域整备", 820, 92, 120, 32),
+        item("行动汇总", 980, 270, 120, 32),
+        item("收集装备、材料等物资", 940, 330, 260, 28),
+    ], capture_id="3", pixel=45)
+    result, taps, evidence = run_global([
+        overview("1"), overview("2"), real_page_shape,
+    ])
+
+    assert result.success
+    assert result.global_prep_stage_result == "PASS"
+    assert result.state is ActionSummaryState.ACTION_SUMMARY_ENTRY_VISIBLE
+    assert len(taps) == len(evidence) == result.dispatch_count == 1
 
 
 def test_global_prep_fresh_candidate_disappearance_has_zero_input():

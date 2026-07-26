@@ -17,6 +17,7 @@ from core.services.navigation_evidence import (
     record_navigation_attempt,
 )
 from core.services.read_only_policy import ActionIntent
+from core.services.runtime_navigation_kernel import UiState, normalize_legacy_state
 
 
 CITY_ENTRY_TRANSITION_TIMEOUT_SECONDS = 30.0
@@ -67,6 +68,16 @@ class CityPageObservation:
     text_count: int
     reason: str
     foreign_page_reason: str | None = None
+
+    def to_ui_state(self) -> UiState:
+        return normalize_legacy_state(
+            self.state.value,
+            phase="CITY_NAVIGATION",
+            confidence=self.confidence,
+            evidence=self.evidence,
+            frame_hash=self.screenshot_hash,
+            capture_id=self.source_capture_id,
+        )
 
 
 @dataclass(frozen=True)

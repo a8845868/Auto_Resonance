@@ -41,6 +41,7 @@ from core.services.navigation_evidence import (
     record_navigation_attempt,
 )
 from core.services.read_only_policy import ActionIntent
+from core.services.runtime_navigation_kernel import UiState, normalize_legacy_state
 
 
 def _center(item: dict) -> tuple[float, float]:
@@ -399,19 +400,71 @@ def _wait_for_assets_inventory(timeout: float = 6.0) -> bool:
     return False
 
 
-def _assets_post_state(frame) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+def _assets_runtime_state(frame) -> tuple[UiState, tuple[str, ...]]:
+    frame_hash = frame_sha256(frame)
+    capture_id = str(getattr(frame, "source_capture_id", "") or "")
     try:
         items = frame.ocr()
     except Exception:  # noqa: BLE001 - detector errors must be distinguished
-        return "DETECTOR_ERROR", (), ("ocr_detector_error",)
+        return (
+            normalize_legacy_state(
+                "DETECTOR_ERROR",
+                phase="OPEN_INVENTORY",
+                confidence="UNKNOWN",
+                frame_hash=frame_hash,
+                capture_id=capture_id,
+            ),
+            ("ocr_detector_error",),
+        )
     height, width = frame.image.shape[:2]
     if _is_assets_inventory_screen(items):
-        return "INVENTORY", ("inventory_category_rail",), ()
+        return (
+            normalize_legacy_state(
+                "INVENTORY",
+                phase="OPEN_INVENTORY",
+                evidence=("inventory_category_rail",),
+                frame_hash=frame_hash,
+                capture_id=capture_id,
+            ),
+            (),
+        )
     if _find_assets_text_entry(items, width, height):
-        return "HOME_READY", ("home_assets_balance",), ("inventory_category_rail_absent",)
+        return (
+            normalize_legacy_state(
+                "HOME_READY",
+                phase="OPEN_INVENTORY",
+                evidence=("home_assets_balance",),
+                frame_hash=frame_hash,
+                capture_id=capture_id,
+            ),
+            ("inventory_category_rail_absent",),
+        )
     if items:
-        return "UNEXPECTED_PAGE", (), ("inventory_category_rail_absent",)
-    return "UNKNOWN", (), ("no_page_cues",)
+        return (
+            normalize_legacy_state(
+                "UNEXPECTED_PAGE",
+                phase="OPEN_INVENTORY",
+                confidence="UNKNOWN",
+                frame_hash=frame_hash,
+                capture_id=capture_id,
+            ),
+            ("inventory_category_rail_absent",),
+        )
+    return (
+        normalize_legacy_state(
+            "UNKNOWN",
+            phase="OPEN_INVENTORY",
+            confidence="UNKNOWN",
+            frame_hash=frame_hash,
+            capture_id=capture_id,
+        ),
+        ("no_page_cues",),
+    )
+
+
+def _assets_post_state(frame) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    state, negative = _assets_runtime_state(frame)
+    return state.base_page, state.evidence, negative
 
 
 def _open_assets_entry(

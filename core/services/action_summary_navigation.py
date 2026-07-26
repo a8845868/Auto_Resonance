@@ -24,7 +24,23 @@ from core.services.navigation_evidence import (
 )
 from core.services.personal_action_budget import EpisodeActionBudget
 from core.services.read_only_policy import ActionIntent
-from core.services.screen_state import ResidentHomeState, resident_home_state
+from core.services.runtime_navigation_kernel import (
+    Confidence,
+    PageKind,
+    PagePerception,
+    PageSignature,
+    PROVEN_NAVIGATION_CONTRACTS,
+    RuntimeNavigationKernel,
+    TransitionClassification,
+    TransitionClassifier,
+    UiState,
+    normalize_legacy_state,
+)
+from core.services.screen_state import (
+    ResidentHomeState,
+    is_inventory_screen,
+    resident_home_state,
+)
 
 
 class ActionSummaryState(str, Enum):
@@ -46,6 +62,30 @@ class ActionSummaryObservation:
     positive_cues: tuple[str, ...]
     negative_cues: tuple[str, ...] = ()
     source_frame: object | None = field(default=None, compare=False, repr=False)
+
+    def to_ui_state(self) -> UiState:
+        page = {
+            ActionSummaryState.ACTION_SUMMARY_ENTRY_VISIBLE: "GLOBAL_PREP_PAGE",
+            ActionSummaryState.OPTIONAL_OVERLAY_VISIBLE: "UNKNOWN",
+        }.get(self.state, self.state.value)
+        overlays = (
+            ("OPTIONAL_OVERLAY_VISIBLE",)
+            if self.state is ActionSummaryState.OPTIONAL_OVERLAY_VISIBLE
+            else ()
+        )
+        return normalize_legacy_state(
+            page,
+            overlays=overlays,
+            phase="ACTION_SUMMARY_NAVIGATION",
+            confidence=(
+                Confidence.UNKNOWN
+                if self.state is ActionSummaryState.UNKNOWN
+                else Confidence.HIGH
+            ),
+            evidence=self.positive_cues,
+            frame_hash=self.frame_hash,
+            capture_id=self.capture_id,
+        )
 
 
 @dataclass
@@ -272,7 +312,119 @@ _SIEGE_PAGE_LABELS = (
     "特殊订单", "利刃行动", "挑灯看剑", "武器材质分析", "骑士小说",
     "我思我在", "所知所闻", "大的！", "总体围剿",
 )
-_FOREIGN_MARKERS = ("道具", "材料", "交易所", "买入", "卖出", "浏览器")
+_EXCHANGE_FOREIGN_MARKERS = (
+    "交易所", "我要买", "我要卖", "全部买入", "全部卖出", "买入价格", "卖出价格",
+)
+_BROWSER_FOREIGN_MARKERS = ("http//", "https//", "Chrome", "浏览器", "网页")
+_LOGIN_FOREIGN_MARKERS = ("点击屏幕进入游戏", "账号登录", "验证码", "用户协议")
+
+
+_ACTION_PAGE_KERNEL = RuntimeNavigationKernel(
+    (
+        PageSignature(
+            "action_summary.page",
+            "ACTION_SUMMARY_VISIBLE",
+            PageKind.TRUSTED,
+            required_all=frozenset({"action_summary_layout"}),
+            capabilities=frozenset({"SELECT_ACTION_TASK"}),
+            priority=120,
+        ),
+        # The real Global Prep page contains both its title and the Action
+        # Summary entry.  This multi-cue signature must outrank every generic
+        # word that may also occur in the descriptive copy (for example
+        # ``材料``).
+        PageSignature(
+            "global_prep.page.multi_cue",
+            "GLOBAL_PREP_PAGE",
+            PageKind.TRUSTED,
+            required_all=frozenset({
+                "global_prep_entry_unique", "action_summary_entry_unique",
+            }),
+            capabilities=frozenset({"OPEN_ACTION_SUMMARY"}),
+            priority=115,
+        ),
+        # Compatibility with cropped/legacy frames that expose only the
+        # unique entry.  The cue is still specific and cannot be synthesized
+        # by one broad descriptive keyword.
+        PageSignature(
+            "global_prep.page.entry_only",
+            "GLOBAL_PREP_PAGE",
+            PageKind.TRUSTED,
+            required_all=frozenset({"action_summary_entry_unique"}),
+            capabilities=frozenset({"OPEN_ACTION_SUMMARY"}),
+            priority=105,
+            confidence=Confidence.MEDIUM,
+        ),
+        PageSignature(
+            "activity_overview.page",
+            "ACTIVITY_OVERVIEW_VISIBLE",
+            PageKind.TRUSTED,
+            required_all=frozenset({"global_prep_entry_unique"}),
+            forbidden=frozenset({"action_summary_entry_unique"}),
+            capabilities=frozenset({"OPEN_GLOBAL_PREP"}),
+            priority=95,
+        ),
+        PageSignature(
+            "resident_home.page",
+            "HOME_READY",
+            PageKind.TRUSTED,
+            required_all=frozenset({"resident_home_ready"}),
+            capabilities=frozenset({"OPEN_CITY", "OPEN_ACTION_TERMINAL"}),
+            priority=90,
+        ),
+        PageSignature(
+            "blank_exit.overlay",
+            "BLANK_EXIT_OVERLAY",
+            PageKind.OVERLAY,
+            required_all=frozenset({"blank_exit_overlay"}),
+            priority=90,
+        ),
+        PageSignature(
+            "announcement.overlay",
+            "ANNOUNCEMENT_OVERLAY",
+            PageKind.OVERLAY,
+            required_all=frozenset({"announcement_overlay"}),
+            priority=80,
+        ),
+        PageSignature(
+            "checkin.overlay",
+            "CHECKIN_OVERLAY",
+            PageKind.OVERLAY,
+            required_all=frozenset({"checkin_overlay"}),
+            priority=80,
+        ),
+        PageSignature(
+            "inventory.foreign",
+            "INVENTORY",
+            PageKind.FOREIGN,
+            required_all=frozenset({"inventory_category_rail"}),
+            priority=70,
+        ),
+        PageSignature(
+            "exchange.foreign",
+            "EXCHANGE_PAGE",
+            PageKind.FOREIGN,
+            required_all=frozenset({"exchange_transaction_layout"}),
+            priority=70,
+        ),
+        PageSignature(
+            "external_browser.foreign",
+            "EXTERNAL_BROWSER",
+            PageKind.FOREIGN,
+            required_all=frozenset({"external_browser_layout"}),
+            priority=70,
+        ),
+        PageSignature(
+            "login.foreign",
+            "LOGIN_PAGE",
+            PageKind.FOREIGN,
+            required_all=frozenset({"login_layout"}),
+            priority=70,
+        ),
+    )
+)
+
+
 # Derived from two read-only 1280x720 HOME frames on 2026-07-26.  The terminal
 # button bbox was (1149,394)-(1232,422) and (1148,391)-(1232,423); the legacy
 # measured point (1180,415) is inside the same region.  The quest copy containing
@@ -1010,60 +1162,123 @@ def _items(frame: object) -> tuple[dict, ...]:
 
 
 def _matches(items: Sequence[Mapping[str, object]], marker: str) -> list[dict]:
-    return [dict(item) for item in items if marker in str(item.get("text", "")).replace(" ", "")]
+    normalized_marker = _normalized_text(marker)
+    return [
+        dict(item)
+        for item in items
+        if normalized_marker in _normalized_text(item.get("text", ""))
+    ]
+
+
+def _exact_matches(items: Sequence[Mapping[str, object]], marker: str) -> list[dict]:
+    normalized_marker = _normalized_text(marker)
+    return [
+        dict(item)
+        for item in items
+        if _normalized_text(item.get("text", "")) == normalized_marker
+    ]
 
 
 def observe_action_summary(frame: object) -> ActionSummaryObservation:
-    """Classify only source-backed states used by the old navigation chain."""
+    """Classify navigation pages through composable, ordered signatures.
+
+    Specific trusted pages are resolved before overlays and strongly committed
+    foreign pages.  Generic words such as ``材料`` never decide a page by
+    themselves.
+    """
 
     items = _items(frame)
-    texts = tuple(str(item.get("text", "")).replace(" ", "") for item in items)
+    texts = tuple(_normalized_text(item.get("text", "")) for item in items)
     joined = "|".join(texts)
     capture_id = str(getattr(frame, "source_capture_id", "") or "")
 
     task_count = sum(any(label in text for text in texts) for label in _SIEGE_PAGE_LABELS)
     challenge_count = sum("进入挑战" in text for text in texts)
     has_old_title = "利刃围剿" in joined
-    # One historical title is deliberately insufficient.  A page needs a
-    # list structure and a stable action affordance as independent cues.
+    has_blank_exit = "触碰空白区域退出" in joined
+    facts: set[str] = set()
+    # One historical title is deliberately insufficient. A page needs a list
+    # structure and a stable action affordance as independent cues.
     if (has_old_title or task_count >= 2) and task_count >= 2 and challenge_count >= 1:
-        return ActionSummaryObservation(
-            ActionSummaryState.ACTION_SUMMARY_VISIBLE,
-            frame_sha256(frame), capture_id, items,
-            ("action_summary_list", "action_summary_action_region", "action_summary_layout"),
-            source_frame=frame,
-        )
-    if any(marker in joined for marker in _FOREIGN_MARKERS):
-        return ActionSummaryObservation(
-            ActionSummaryState.FOREIGN_PAGE, frame_sha256(frame), capture_id, items,
-            (), ("foreign_page_cue",), source_frame=frame,
-        )
+        facts.add("action_summary_layout")
+
+    if len(_exact_matches(items, "行动汇总")) == 1:
+        facts.add("action_summary_entry_unique")
+    if len(_exact_matches(items, "全域整备")) == 1:
+        facts.add("global_prep_entry_unique")
+
     home = resident_home_state(list(items))
     if home is ResidentHomeState.HOME_READY:
-        return ActionSummaryObservation(
-            ActionSummaryState.HOME_READY, frame_sha256(frame), capture_id, items,
-            ("home_ready",), source_frame=frame,
-        )
-    if "触碰空白区域退出" in joined:
+        facts.add("resident_home_ready")
+    elif home is ResidentHomeState.ANNOUNCEMENT_OVERLAY:
+        facts.add("announcement_overlay")
+    elif home is ResidentHomeState.CHECKIN_OVERLAY:
+        facts.add("checkin_overlay")
+    # Overlay identity is orthogonal to the base page. Background OCR can
+    # still expose HOME or activity cues, so derive these facts independently.
+    announcement_cues = sum(marker in joined for marker in ("资讯", "公告"))
+    if announcement_cues >= 2 or (announcement_cues == 1 and has_blank_exit):
+        facts.add("announcement_overlay")
+    if any(marker in joined for marker in ("每日签到奖励", "签到奖励")):
+        facts.add("checkin_overlay")
+    if has_blank_exit:
+        facts.add("blank_exit_overlay")
+
+    # Foreign pages require a layout or multiple independent cues.  A single
+    # common noun cannot override a more specific trusted signature.
+    if is_inventory_screen(list(items)):
+        facts.add("inventory_category_rail")
+    if sum(marker in joined for marker in _EXCHANGE_FOREIGN_MARKERS) >= 2:
+        facts.add("exchange_transaction_layout")
+    if sum(marker in joined for marker in _BROWSER_FOREIGN_MARKERS) >= 2:
+        facts.add("external_browser_layout")
+    if sum(marker in joined for marker in _LOGIN_FOREIGN_MARKERS) >= 2:
+        facts.add("login_layout")
+
+    normalized = _ACTION_PAGE_KERNEL.classify(
+        PagePerception.from_facts(
+            facts,
+            frame_hash=frame_sha256(frame),
+            capture_id=capture_id,
+        ),
+        phase="ACTION_SUMMARY_NAVIGATION",
+    )
+    if normalized.overlays:
         return ActionSummaryObservation(
             ActionSummaryState.OPTIONAL_OVERLAY_VISIBLE,
-            frame_sha256(frame), capture_id, items, ("known_blank_exit_overlay",),
+            normalized.frame_hash,
+            capture_id,
+            items,
+            tuple(f"overlay:{name.casefold()}" for name in normalized.overlays),
             source_frame=frame,
         )
-    if len(_matches(items, "行动汇总")) == 1:
+    state_map = {
+        "HOME_READY": ActionSummaryState.HOME_READY,
+        "ACTIVITY_OVERVIEW_VISIBLE": ActionSummaryState.ACTIVITY_OVERVIEW_VISIBLE,
+        "GLOBAL_PREP_PAGE": ActionSummaryState.ACTION_SUMMARY_ENTRY_VISIBLE,
+        "ACTION_SUMMARY_VISIBLE": ActionSummaryState.ACTION_SUMMARY_VISIBLE,
+    }
+    if normalized.base_page in state_map:
         return ActionSummaryObservation(
-            ActionSummaryState.ACTION_SUMMARY_ENTRY_VISIBLE,
-            frame_sha256(frame), capture_id, items, ("action_summary_entry",),
+            state_map[normalized.base_page],
+            normalized.frame_hash,
+            capture_id,
+            items,
+            normalized.evidence,
             source_frame=frame,
         )
-    if len(_matches(items, "全域整备")) == 1:
+    if not normalized.is_unknown:
         return ActionSummaryObservation(
-            ActionSummaryState.ACTIVITY_OVERVIEW_VISIBLE,
-            frame_sha256(frame), capture_id, items, ("full_realm_card",),
+            ActionSummaryState.FOREIGN_PAGE,
+            normalized.frame_hash,
+            capture_id,
+            items,
+            (),
+            tuple(f"foreign:{cue}" for cue in normalized.evidence),
             source_frame=frame,
         )
     return ActionSummaryObservation(
-        ActionSummaryState.UNKNOWN, frame_sha256(frame), capture_id, items, (),
+        ActionSummaryState.UNKNOWN, normalized.frame_hash, capture_id, items, (),
         ("recognized_state_absent",), source_frame=frame,
     )
 
@@ -1338,9 +1553,16 @@ class ActionSummaryNavigator:
     ) -> tuple[ActionSummaryObservation | None, str]:
         deadline = dispatch_started + self.postcondition_timeout
         last_capture_id = pre_capture_id
-        stable_changed_hash = ""
-        stable_changed_count = 0
-        any_changed = False
+        transition = TransitionClassifier(
+            PROVEN_NAVIGATION_CONTRACTS["OPEN_GLOBAL_PREP"],
+            source_state=normalize_legacy_state(
+                "ACTIVITY_OVERVIEW_VISIBLE",
+                phase="OPEN_GLOBAL_PREP",
+                frame_hash=evidence.pre_frame_sha256,
+                capture_id=pre_capture_id,
+            ),
+            stable_unknown_frames=2,
+        )
         while self.monotonic() < deadline:
             if self.cancellation():
                 return None, "CANCELLED"
@@ -1373,27 +1595,21 @@ class ActionSummaryNavigator:
                 frame_changed=frame_changed,
                 target_page_changed=target_page_changed,
             )
-            any_changed = any_changed or frame_changed
-            classification = "PENDING"
-            if observed.state is ActionSummaryState.ACTION_SUMMARY_ENTRY_VISIBLE:
-                classification = "EXPECTED_NEXT_PAGE"
-            elif observed.state is ActionSummaryState.OPTIONAL_OVERLAY_VISIBLE:
+            transition_decision = transition.observe(observed.to_ui_state())
+            if transition_decision.classification is TransitionClassification.EXPECTED_POST_STATE:
+                classification = (
+                    "ACTION_SUMMARY_VISIBLE"
+                    if observed.state is ActionSummaryState.ACTION_SUMMARY_VISIBLE
+                    else "EXPECTED_NEXT_PAGE"
+                )
+            elif transition_decision.classification is TransitionClassification.OPTIONAL_OVERLAY_REACHED:
                 classification = "KNOWN_OPTIONAL_OVERLAY"
-            elif observed.state is ActionSummaryState.ACTION_SUMMARY_VISIBLE:
-                classification = "ACTION_SUMMARY_VISIBLE"
-            elif observed.state is ActionSummaryState.FOREIGN_PAGE:
+            elif transition_decision.classification is TransitionClassification.STABLE_CHANGED_UNKNOWN:
+                classification = "STABLE_CHANGED_UNKNOWN"
+            elif transition_decision.classification is TransitionClassification.KNOWN_FOREIGN_PAGE:
                 classification = "KNOWN_FOREIGN_PAGE"
-            elif frame_changed and observed.state is ActionSummaryState.UNKNOWN:
-                if observed.frame_hash == stable_changed_hash:
-                    stable_changed_count += 1
-                else:
-                    stable_changed_hash = observed.frame_hash
-                    stable_changed_count = 1
-                if stable_changed_count >= 2:
-                    classification = "STABLE_CHANGED_UNKNOWN"
             else:
-                stable_changed_hash = ""
-                stable_changed_count = 0
+                classification = "PENDING"
             evidence.add_post_observation(
                 frame=frame, state=observed.state.value,
                 positive_cues=observed.positive_cues,
@@ -1416,8 +1632,11 @@ class ActionSummaryNavigator:
             })
             if classification != "PENDING":
                 return observed, classification
+        timeout = transition.timeout().classification
         return None, (
-            "TRANSITION_TIMEOUT" if any_changed else "NO_TOUCH_EFFECT_OBSERVED"
+            "NO_TOUCH_EFFECT_OBSERVED"
+            if timeout is TransitionClassification.NO_TOUCH_EFFECT_OBSERVED
+            else "TRANSITION_TIMEOUT"
         )
 
     def navigate(self) -> ActionSummaryResult:
