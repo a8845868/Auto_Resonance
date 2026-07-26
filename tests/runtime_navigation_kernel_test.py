@@ -1,3 +1,5 @@
+import subprocess
+import sys
 from types import SimpleNamespace
 
 from auto import inventory
@@ -16,6 +18,7 @@ from core.services.runtime_navigation_kernel import (
     TransitionClassification,
     TransitionClassifier,
     UiState,
+    confirm_fresh_capability,
     confirm_fresh_target,
     normalize_legacy_state,
 )
@@ -84,7 +87,10 @@ def test_specific_signature_precedes_overlay_and_foreign_page():
     assert state.base_page == "GLOBAL_PREP_PAGE"
     assert state.overlays == ("CHECKIN_OVERLAY",)
     assert state.capabilities == frozenset({"OPEN_ACTION_SUMMARY"})
-    assert not state.has_capability("OPEN_ACTION_SUMMARY")
+    assert not state.has_capability(
+        "OPEN_ACTION_SUMMARY", current_capture_id=state.capture_id,
+        current_frame_hash=state.frame_hash,
+    )
 
 
 def test_generic_domain_word_without_layout_fact_stays_unknown():
@@ -109,7 +115,25 @@ def test_equal_priority_conflicting_specific_pages_fail_closed():
     state = kernel.classify(PagePerception.from_facts({"shared"}))
 
     assert state.is_unknown
-    assert state.reason == "ambiguous_or_unknown_page_signature"
+    assert state.reason == "ambiguous_trusted_page_signatures"
+
+
+def test_different_priority_conflicting_specific_pages_also_fail_closed():
+    kernel = RuntimeNavigationKernel((
+        PageSignature(
+            "higher", "HIGHER_PAGE", PageKind.TRUSTED,
+            required_all=frozenset({"shared"}), priority=50,
+        ),
+        PageSignature(
+            "lower", "LOWER_PAGE", PageKind.TRUSTED,
+            required_all=frozenset({"shared"}), priority=5,
+        ),
+    ))
+
+    state = kernel.classify(PagePerception.from_facts({"shared"}))
+
+    assert state.is_unknown
+    assert state.reason == "ambiguous_trusted_page_signatures"
 
 
 def test_action_contract_is_capability_and_overlay_driven():
@@ -120,17 +144,91 @@ def test_action_contract_is_capability_and_overlay_driven():
         required_capabilities=frozenset({"OPEN_ACTION_SUMMARY"}),
         allowed_post_pages=frozenset({"ACTION_SUMMARY_VISIBLE"}),
     )
-    ready = normalize_legacy_state("GLOBAL_PREP_PAGE")
-    covered = normalize_legacy_state("GLOBAL_PREP_PAGE", overlays=("HELP_OVERLAY",))
+    ready = normalize_legacy_state(
+        "GLOBAL_PREP_PAGE", frame_hash="ready", capture_id="capture-2"
+    )
+    covered = normalize_legacy_state(
+        "GLOBAL_PREP_PAGE", overlays=("HELP_OVERLAY",),
+        frame_hash="covered", capture_id="capture-3",
+    )
 
-    assert contract.authorize(ready).allowed
-    assert contract.authorize(covered).reason == "overlay_blocks_action"
-    assert contract.authorize(ready, dispatch_count=1).reason == (
+    assert contract.authorize(
+        ready, current_capture_id="capture-2", current_frame_hash="ready"
+    ).allowed
+    assert contract.authorize(
+        covered, current_capture_id="capture-3", current_frame_hash="covered"
+    ).reason == "overlay_blocks_action"
+    assert contract.authorize(
+        ready, current_capture_id="capture-2", current_frame_hash="ready",
+        dispatch_count=1,
+    ).reason == (
         "action_dispatch_budget_exhausted"
     )
-    assert contract.authorize(normalize_legacy_state("UNKNOWN")).reason == (
+    assert contract.authorize(
+        normalize_legacy_state(
+            "UNKNOWN", frame_hash="unknown", capture_id="capture-4"
+        ),
+        current_capture_id="capture-4",
+        current_frame_hash="unknown",
+    ).reason == (
         "unknown_pre_state"
     )
+
+
+def test_capability_is_bound_to_fresh_capture_confidence_and_contract():
+    contract = PROVEN_NAVIGATION_CONTRACTS["OPEN_ACTION_SUMMARY"]
+    initial = normalize_legacy_state(
+        "ACTION_SUMMARY_ENTRY_VISIBLE",
+        frame_hash="initial-hash",
+        capture_id="capture-1",
+    )
+    fresh = normalize_legacy_state(
+        "ACTION_SUMMARY_ENTRY_VISIBLE",
+        frame_hash="fresh-hash",
+        capture_id="capture-2",
+    )
+
+    stale = contract.authorize(
+        initial,
+        current_capture_id=fresh.capture_id,
+        current_frame_hash=fresh.frame_hash,
+    )
+    rebound = confirm_fresh_capability(initial, fresh, contract)
+
+    assert stale.reason == "capability_capture_identity_stale"
+    assert rebound.allowed
+    assert rebound.action_id == "open_action_summary"
+    assert rebound.capture_id == "capture-2"
+    assert fresh.has_capability(
+        "OPEN_ACTION_SUMMARY",
+        current_capture_id="capture-2",
+        current_frame_hash="fresh-hash",
+    )
+    assert not initial.has_capability(
+        "OPEN_ACTION_SUMMARY",
+        current_capture_id="capture-2",
+        current_frame_hash="fresh-hash",
+    )
+
+
+def test_medium_confidence_and_missing_capture_identity_do_not_authorize_capability():
+    contract = PROVEN_NAVIGATION_CONTRACTS["OPEN_ACTION_SUMMARY"]
+    medium = normalize_legacy_state(
+        "GLOBAL_PREP_PAGE", confidence=Confidence.MEDIUM,
+        frame_hash="medium", capture_id="capture-medium",
+    )
+    identity_missing = normalize_legacy_state("GLOBAL_PREP_PAGE")
+
+    assert contract.authorize(
+        medium,
+        current_capture_id="capture-medium",
+        current_frame_hash="medium",
+    ).reason == "capability_confidence_not_high"
+    assert contract.authorize(
+        identity_missing,
+        current_capture_id="",
+        current_frame_hash="",
+    ).reason == "capability_capture_identity_missing"
 
 
 def _target(point=(112, 290), *, semantic="全域整备", occluded=False):
@@ -184,6 +282,39 @@ def test_transition_classifier_keeps_unknown_pending_then_commits_stable_unknown
     assert second.terminal and not second.success
 
 
+def test_transition_classifier_rejects_duplicate_non_source_capture_as_stale():
+    contract = PROVEN_NAVIGATION_CONTRACTS["OPEN_GLOBAL_PREP"]
+    source = normalize_legacy_state(
+        "ACTIVITY_OVERVIEW_VISIBLE", frame_hash="source", capture_id="capture-1"
+    )
+    classifier = TransitionClassifier(contract, source_state=source)
+    first = classifier.observe(UiState(
+        "UNKNOWN", frame_hash="changing-1", capture_id="capture-2"
+    ))
+    duplicate = classifier.observe(UiState(
+        "UNKNOWN", frame_hash="changing-1", capture_id="capture-2"
+    ))
+
+    assert first.classification is TransitionClassification.UNKNOWN_RECOVERABLE
+    assert duplicate.classification is TransitionClassification.STALE
+
+
+def test_optional_overlay_precedes_expected_background_page():
+    contract = PROVEN_NAVIGATION_CONTRACTS["OPEN_GLOBAL_PREP"]
+    source = normalize_legacy_state(
+        "ACTIVITY_OVERVIEW_VISIBLE", frame_hash="source", capture_id="capture-1"
+    )
+    covered_post = normalize_legacy_state(
+        "GLOBAL_PREP_PAGE", overlays=("OPTIONAL_OVERLAY_VISIBLE",),
+        frame_hash="covered", capture_id="capture-2",
+    )
+
+    decision = TransitionClassifier(contract, source_state=source).observe(covered_post)
+
+    assert decision.classification is TransitionClassification.OPTIONAL_OVERLAY_REACHED
+    assert decision.success
+
+
 def test_transition_classifier_accepts_expected_and_stops_on_explicit_foreign():
     contract = ActionContract(
         "open_global_prep",
@@ -234,13 +365,58 @@ def test_four_proven_adapters_normalize_to_reusable_capabilities():
         _item("收集装备、材料等物资", 940, 330, 260),
     ], "global-prep")).to_ui_state()
 
-    assert assets.has_capability("OPEN_INVENTORY")
-    assert city.has_capability("ENTER_CITY")
-    assert terminal.has_capability("OPEN_ACTION_TERMINAL")
-    assert global_prep.has_capability("OPEN_ACTION_SUMMARY")
+    assert assets.has_capability(
+        "OPEN_INVENTORY", current_capture_id="home", current_frame_hash=assets.frame_hash
+    )
+    assert city.has_capability(
+        "ENTER_CITY", current_capture_id="home", current_frame_hash=city.frame_hash
+    )
+    assert terminal.has_capability(
+        "OPEN_ACTION_TERMINAL",
+        current_capture_id="home",
+        current_frame_hash=terminal.frame_hash,
+    )
+    assert global_prep.has_capability(
+        "OPEN_ACTION_SUMMARY",
+        current_capture_id="global-prep",
+        current_frame_hash=global_prep.frame_hash,
+    )
 
-    assert PROVEN_NAVIGATION_CONTRACTS["OPEN_INVENTORY"].authorize(assets).allowed
-    assert PROVEN_NAVIGATION_CONTRACTS["ENTER_CITY"].authorize(city).allowed
-    assert PROVEN_NAVIGATION_CONTRACTS["OPEN_ACTION_TERMINAL"].authorize(terminal).allowed
-    overview = normalize_legacy_state("ACTIVITY_OVERVIEW_VISIBLE")
-    assert PROVEN_NAVIGATION_CONTRACTS["OPEN_GLOBAL_PREP"].authorize(overview).allowed
+    assert PROVEN_NAVIGATION_CONTRACTS["OPEN_INVENTORY"].authorize(
+        assets, current_capture_id="home", current_frame_hash=assets.frame_hash
+    ).allowed
+    assert PROVEN_NAVIGATION_CONTRACTS["ENTER_CITY"].authorize(
+        city, current_capture_id="home", current_frame_hash=city.frame_hash
+    ).allowed
+    assert PROVEN_NAVIGATION_CONTRACTS["OPEN_ACTION_TERMINAL"].authorize(
+        terminal, current_capture_id="home", current_frame_hash=terminal.frame_hash
+    ).allowed
+    overview = normalize_legacy_state(
+        "ACTIVITY_OVERVIEW_VISIBLE", frame_hash="overview", capture_id="overview"
+    )
+    assert PROVEN_NAVIGATION_CONTRACTS["OPEN_GLOBAL_PREP"].authorize(
+        overview, current_capture_id="overview", current_frame_hash="overview"
+    ).allowed
+    assert PROVEN_NAVIGATION_CONTRACTS["OPEN_ACTION_SUMMARY"].authorize(
+        global_prep,
+        current_capture_id="global-prep",
+        current_frame_hash=global_prep.frame_hash,
+    ).allowed
+    assert global_prep.base_page == "GLOBAL_PREP_PAGE"
+
+
+def test_kernel_import_does_not_load_capture_input_or_ocr_backends():
+    script = (
+        "import sys; import core.services.runtime_navigation_kernel; "
+        "blocked=('core.control.control','core.control.adb','core.control.nemu',"
+        "'core.image.ocr'); print([name for name in blocked if name in sys.modules])"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(__import__("pathlib").Path(__file__).resolve().parents[1]),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.stdout.strip().splitlines()[-1] == "[]"

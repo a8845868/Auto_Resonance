@@ -26,6 +26,8 @@ from core.services.personal_action_budget import EpisodeActionBudget
 from core.services.read_only_policy import ActionIntent
 from core.services.runtime_navigation_kernel import (
     Confidence,
+    DEFAULT_CAPABILITIES,
+    InteractionTarget,
     PageKind,
     PagePerception,
     PageSignature,
@@ -34,6 +36,8 @@ from core.services.runtime_navigation_kernel import (
     TransitionClassification,
     TransitionClassifier,
     UiState,
+    confirm_fresh_capability,
+    confirm_fresh_target,
     normalize_legacy_state,
 )
 from core.services.screen_state import (
@@ -61,13 +65,15 @@ class ActionSummaryObservation:
     items: tuple[dict, ...]
     positive_cues: tuple[str, ...]
     negative_cues: tuple[str, ...] = ()
+    confidence: Confidence = Confidence.UNKNOWN
     source_frame: object | None = field(default=None, compare=False, repr=False)
 
     def to_ui_state(self) -> UiState:
-        page = {
-            ActionSummaryState.ACTION_SUMMARY_ENTRY_VISIBLE: "GLOBAL_PREP_PAGE",
-            ActionSummaryState.OPTIONAL_OVERLAY_VISIBLE: "UNKNOWN",
-        }.get(self.state, self.state.value)
+        page = (
+            "UNKNOWN"
+            if self.state is ActionSummaryState.OPTIONAL_OVERLAY_VISIBLE
+            else self.state.value
+        )
         overlays = (
             ("OPTIONAL_OVERLAY_VISIBLE",)
             if self.state is ActionSummaryState.OPTIONAL_OVERLAY_VISIBLE
@@ -77,11 +83,7 @@ class ActionSummaryObservation:
             page,
             overlays=overlays,
             phase="ACTION_SUMMARY_NAVIGATION",
-            confidence=(
-                Confidence.UNKNOWN
-                if self.state is ActionSummaryState.UNKNOWN
-                else Confidence.HIGH
-            ),
+            confidence=self.confidence,
             evidence=self.positive_cues,
             frame_hash=self.frame_hash,
             capture_id=self.capture_id,
@@ -103,6 +105,7 @@ class ActionSummaryResult:
     global_prep_candidate_resolutions: list["GlobalPrepResolutionEvidence"] = field(default_factory=list)
     global_prep_hit_target_resolutions: list["GlobalPrepHitTargetEvidence"] = field(default_factory=list)
     global_prep_stage_result: str = "NOT_RUN"
+    action_summary_entry_resolutions: list["ActionSummaryEntryResolutionEvidence"] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -308,6 +311,43 @@ class GlobalPrepHitTargetEvidence:
         }
 
 
+@dataclass(frozen=True)
+class ActionSummaryEntryResolutionEvidence:
+    phase: str
+    exact_match_count: int
+    region_filtered_candidate_count: int
+    parent_container_count: int
+    target: InteractionTarget | None
+    rejected_reasons: tuple[str, ...]
+    failure_class: str | None
+
+    def to_dict(self) -> dict:
+        target = self.target
+        return {
+            "phase": self.phase,
+            "exact_match_count": self.exact_match_count,
+            "region_filtered_candidate_count": self.region_filtered_candidate_count,
+            "parent_container_count": self.parent_container_count,
+            "target": (
+                {
+                    "semantic_id": target.semantic_id,
+                    "candidate_count": target.candidate_count,
+                    "label_bbox": target.label_bbox,
+                    "parent_bbox": target.parent_bbox,
+                    "hit_target_bbox": target.hit_target_bbox,
+                    "hit_target_point": target.hit_target_point,
+                    "capture_size": target.capture_size,
+                    "method": target.method,
+                    "occluded": target.occluded,
+                }
+                if target is not None
+                else None
+            ),
+            "rejected_reasons": self.rejected_reasons,
+            "failure_class": self.failure_class,
+        }
+
+
 _SIEGE_PAGE_LABELS = (
     "特殊订单", "利刃行动", "挑灯看剑", "武器材质分析", "骑士小说",
     "我思我在", "所知所闻", "大的！", "总体围剿",
@@ -326,7 +366,7 @@ _ACTION_PAGE_KERNEL = RuntimeNavigationKernel(
             "ACTION_SUMMARY_VISIBLE",
             PageKind.TRUSTED,
             required_all=frozenset({"action_summary_layout"}),
-            capabilities=frozenset({"SELECT_ACTION_TASK"}),
+            capabilities=DEFAULT_CAPABILITIES["ACTION_SUMMARY_VISIBLE"],
             priority=120,
         ),
         # The real Global Prep page contains both its title and the Action
@@ -338,9 +378,9 @@ _ACTION_PAGE_KERNEL = RuntimeNavigationKernel(
             "GLOBAL_PREP_PAGE",
             PageKind.TRUSTED,
             required_all=frozenset({
-                "global_prep_entry_unique", "action_summary_entry_unique",
+                "global_prep_page_title", "action_summary_entry_unique",
             }),
-            capabilities=frozenset({"OPEN_ACTION_SUMMARY"}),
+            capabilities=DEFAULT_CAPABILITIES["GLOBAL_PREP_PAGE"],
             priority=115,
         ),
         # Compatibility with cropped/legacy frames that expose only the
@@ -351,7 +391,7 @@ _ACTION_PAGE_KERNEL = RuntimeNavigationKernel(
             "GLOBAL_PREP_PAGE",
             PageKind.TRUSTED,
             required_all=frozenset({"action_summary_entry_unique"}),
-            capabilities=frozenset({"OPEN_ACTION_SUMMARY"}),
+            capabilities=DEFAULT_CAPABILITIES["GLOBAL_PREP_PAGE"],
             priority=105,
             confidence=Confidence.MEDIUM,
         ),
@@ -361,7 +401,7 @@ _ACTION_PAGE_KERNEL = RuntimeNavigationKernel(
             PageKind.TRUSTED,
             required_all=frozenset({"global_prep_entry_unique"}),
             forbidden=frozenset({"action_summary_entry_unique"}),
-            capabilities=frozenset({"OPEN_GLOBAL_PREP"}),
+            capabilities=DEFAULT_CAPABILITIES["ACTIVITY_OVERVIEW_VISIBLE"],
             priority=95,
         ),
         PageSignature(
@@ -369,7 +409,7 @@ _ACTION_PAGE_KERNEL = RuntimeNavigationKernel(
             "HOME_READY",
             PageKind.TRUSTED,
             required_all=frozenset({"resident_home_ready"}),
-            capabilities=frozenset({"OPEN_CITY", "OPEN_ACTION_TERMINAL"}),
+            capabilities=DEFAULT_CAPABILITIES["HOME_READY"],
             priority=90,
         ),
         PageSignature(
@@ -433,6 +473,9 @@ ACTION_TERMINAL_REGION_NORMALIZED = (0.86, 0.52, 0.99, 0.62)
 ACTION_TERMINAL_PARENT_REGION_NORMALIZED = (0.83, 0.50, 1.0, 0.66)
 GLOBAL_PREP_LABEL_REGION_NORMALIZED = (0.005, 0.32, 0.18, 0.48)
 GLOBAL_PREP_PARENT_REGION_NORMALIZED = (0.005, 0.30, 0.20, 0.52)
+ACTION_SUMMARY_ENTRY_LABEL_REGION_NORMALIZED = (0.62, 0.28, 0.90, 0.58)
+ACTION_SUMMARY_ENTRY_PARENT_REGION_NORMALIZED = (0.48, 0.20, 0.96, 0.72)
+_ACTION_SUMMARY_ENTRY_TEXT = "\u884c\u52a8\u6c47\u603b"
 _ACTION_TERMINAL_TEXT = "作战终端"
 _ACTION_TERMINAL_FRAGMENTS = ("作战", "终端")
 _GLOBAL_PREP_TEXT = "全域整备"
@@ -1100,6 +1143,152 @@ def resolve_global_prep_hit_target(
     return target, GlobalPrepHitTargetEvidence(phase, 1, target, ())
 
 
+def resolve_action_summary_entry_target(
+    frame: object, *, phase: str
+) -> tuple[InteractionTarget | None, ActionSummaryEntryResolutionEvidence]:
+    """Bind the unique Action Summary label to its enclosing action card.
+
+    The semantic OCR label proves identity but is never used as the physical
+    point. The target is a deterministic lower action band inside the single
+    enclosing right-side card.
+    """
+
+    items = _items(frame)
+    image = getattr(frame, "image", None)
+    if image is None or not hasattr(image, "shape") or len(image.shape) < 2:
+        evidence = ActionSummaryEntryResolutionEvidence(
+            phase, 0, 0, 0, None, ("capture_pixels_missing",),
+            "CAPTURE_PIXELS_MISSING",
+        )
+        return None, evidence
+    height, width = map(int, image.shape[:2])
+    exact = [
+        (index, bounds)
+        for index, item in enumerate(items)
+        if _normalized_text(item.get("text", "")) == _ACTION_SUMMARY_ENTRY_TEXT
+        and (bounds := _bbox(item)) is not None
+    ]
+    if len(exact) != 1:
+        evidence = ActionSummaryEntryResolutionEvidence(
+            phase, len(exact), 0, 0, None,
+            ("semantic_anchor_missing" if not exact else "semantic_anchor_not_unique",),
+            "SEMANTIC_ANCHOR_NOT_UNIQUE",
+        )
+        return None, evidence
+    _, label = exact[0]
+    label_center = _center(label)
+    lleft, ltop, lright, lbottom = ACTION_SUMMARY_ENTRY_LABEL_REGION_NORMALIZED
+    in_region = (
+        lleft <= label_center[0] / width <= lright
+        and ltop <= label_center[1] / height <= lbottom
+    )
+    if not in_region:
+        evidence = ActionSummaryEntryResolutionEvidence(
+            phase, 1, 0, 0, None, ("semantic_anchor_outside_trusted_region",),
+            "SEMANTIC_ANCHOR_REGION_REJECTED",
+        )
+        return None, evidence
+
+    pleft, ptop, pright, pbottom = ACTION_SUMMARY_ENTRY_PARENT_REGION_NORMALIZED
+    search = (
+        max(0, round(pleft * width)),
+        max(0, round(ptop * height)),
+        min(width, round(pright * width)),
+        min(height, round(pbottom * height)),
+    )
+    roi = image[search[1]:search[3], search[0]:search[2]]
+    gray = cv.cvtColor(roi, cv.COLOR_BGR2GRAY) if len(roi.shape) == 3 else roi
+    edges = cv.Canny(gray, 30, 100)
+    contours, _ = cv.findContours(edges, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE)
+    raw_parents: list[tuple[int, int, int, int]] = []
+    for contour in contours:
+        x, y, card_width, card_height = cv.boundingRect(contour)
+        bounds = (
+            search[0] + x,
+            search[1] + y,
+            search[0] + x + card_width,
+            search[1] + y + card_height,
+        )
+        if not (
+            0.25 * width <= card_width <= 0.48 * width
+            and 0.18 * height <= card_height <= 0.38 * height
+            and 1.5 <= card_width / float(max(1, card_height)) <= 3.5
+            and bounds[0] <= label_center[0] < bounds[2]
+            and bounds[1] <= label_center[1] < bounds[3]
+        ):
+            continue
+        perimeter = cv.arcLength(contour, True)
+        expected_perimeter = 2.0 * (card_width + card_height)
+        if perimeter >= 0.55 * expected_perimeter:
+            raw_parents.append(bounds)
+    parents: list[tuple[int, int, int, int]] = []
+    for bounds in sorted(
+        raw_parents,
+        key=lambda value: (value[2] - value[0]) * (value[3] - value[1]),
+        reverse=True,
+    ):
+        area = max(1, (bounds[2] - bounds[0]) * (bounds[3] - bounds[1]))
+        if not any(
+            _iou(bounds, existing) >= 0.80
+            or _intersection_area(bounds, existing)
+            / float(min(
+                area,
+                max(1, (existing[2] - existing[0]) * (existing[3] - existing[1])),
+            ))
+            >= 0.90
+            for existing in parents
+        ):
+            parents.append(bounds)
+    if len(parents) != 1:
+        evidence = ActionSummaryEntryResolutionEvidence(
+            phase, 1, 1, len(parents), None,
+            ("visual_parent_missing" if not parents else "visual_parent_not_unique",),
+            "PARENT_CONTROL_NOT_UNIQUE",
+        )
+        return None, evidence
+
+    parent = parents[0]
+    parent_width = parent[2] - parent[0]
+    parent_height = parent[3] - parent[1]
+    hit_bbox = (
+        parent[0] + round(parent_width * 0.38),
+        parent[1] + round(parent_height * 0.62),
+        parent[2] - round(parent_width * 0.06),
+        parent[3] - round(parent_height * 0.08),
+    )
+    modal_markers = (
+        "\u89e6\u78b0\u7a7a\u767d\u533a\u57df\u9000\u51fa",
+        "\u6bcf\u65e5\u7b7e\u5230\u5956\u52b1",
+        "\u8d44\u8baf",
+        "\u516c\u544a",
+    )
+    modal_present = any(
+        marker in _normalized_text(item.get("text", ""))
+        for marker in modal_markers
+        for item in items
+    )
+    target = InteractionTarget(
+        semantic_id="ACTION_SUMMARY_ENTRY",
+        candidate_count=1,
+        label_bbox=label,
+        parent_bbox=parent,
+        hit_target_bbox=hit_bbox,
+        hit_target_point=_center(hit_bbox),
+        capture_size=(width, height),
+        method="enclosing_right_action_card_contour",
+        occluded=modal_present,
+    )
+    if target.occluded:
+        evidence = ActionSummaryEntryResolutionEvidence(
+            phase, 1, 1, 1, target, ("target_occluded",), "TARGET_OCCLUDED"
+        )
+        return None, evidence
+    evidence = ActionSummaryEntryResolutionEvidence(
+        phase, 1, 1, 1, target, (), None
+    )
+    return target, evidence
+
+
 def _same_global_prep_identity(
     initial: GlobalPrepHitTarget,
     fresh: GlobalPrepHitTarget,
@@ -1202,10 +1391,46 @@ def observe_action_summary(frame: object) -> ActionSummaryObservation:
     if (has_old_title or task_count >= 2) and task_count >= 2 and challenge_count >= 1:
         facts.add("action_summary_layout")
 
-    if len(_exact_matches(items, "行动汇总")) == 1:
+    image = getattr(frame, "image", None)
+    height, width = (
+        map(int, image.shape[:2])
+        if image is not None and hasattr(image, "shape") and len(image.shape) >= 2
+        else (0, 0)
+    )
+    action_entries = [
+        item for item in _exact_matches(items, "行动汇总")
+        if (bounds := _bbox(item)) is not None and width > 0 and height > 0
+        and ACTION_SUMMARY_ENTRY_LABEL_REGION_NORMALIZED[0]
+        <= _center(bounds)[0] / width
+        <= ACTION_SUMMARY_ENTRY_LABEL_REGION_NORMALIZED[2]
+        and ACTION_SUMMARY_ENTRY_LABEL_REGION_NORMALIZED[1]
+        <= _center(bounds)[1] / height
+        <= ACTION_SUMMARY_ENTRY_LABEL_REGION_NORMALIZED[3]
+    ]
+    if len(action_entries) == 1:
         facts.add("action_summary_entry_unique")
-    if len(_exact_matches(items, "全域整备")) == 1:
+    global_prep_matches = [
+        item for item in _exact_matches(items, "全域整备")
+        if (bounds := _bbox(item)) is not None and width > 0 and height > 0
+    ]
+    left_rail_global_prep = [
+        item for item in global_prep_matches
+        if (bounds := _bbox(item)) is not None
+        and GLOBAL_PREP_LABEL_REGION_NORMALIZED[0] <= _center(bounds)[0] / width
+        <= GLOBAL_PREP_LABEL_REGION_NORMALIZED[2]
+        and GLOBAL_PREP_LABEL_REGION_NORMALIZED[1] <= _center(bounds)[1] / height
+        <= GLOBAL_PREP_LABEL_REGION_NORMALIZED[3]
+    ]
+    page_title_global_prep = [
+        item for item in global_prep_matches
+        if (bounds := _bbox(item)) is not None
+        and 0.50 <= _center(bounds)[0] / width <= 0.80
+        and 0.05 <= _center(bounds)[1] / height <= 0.22
+    ]
+    if len(left_rail_global_prep) == 1:
         facts.add("global_prep_entry_unique")
+    if len(page_title_global_prep) == 1:
+        facts.add("global_prep_page_title")
 
     home = resident_home_state(list(items))
     if home is ResidentHomeState.HOME_READY:
@@ -1250,6 +1475,7 @@ def observe_action_summary(frame: object) -> ActionSummaryObservation:
             capture_id,
             items,
             tuple(f"overlay:{name.casefold()}" for name in normalized.overlays),
+            confidence=normalized.confidence,
             source_frame=frame,
         )
     state_map = {
@@ -1265,6 +1491,7 @@ def observe_action_summary(frame: object) -> ActionSummaryObservation:
             capture_id,
             items,
             normalized.evidence,
+            confidence=normalized.confidence,
             source_frame=frame,
         )
     if not normalized.is_unknown:
@@ -1275,11 +1502,13 @@ def observe_action_summary(frame: object) -> ActionSummaryObservation:
             items,
             (),
             tuple(f"foreign:{cue}" for cue in normalized.evidence),
+            confidence=normalized.confidence,
             source_frame=frame,
         )
     return ActionSummaryObservation(
         ActionSummaryState.UNKNOWN, normalized.frame_hash, capture_id, items, (),
-        ("recognized_state_absent",), source_frame=frame,
+        ("recognized_state_absent",), confidence=normalized.confidence,
+        source_frame=frame,
     )
 
 
@@ -1646,7 +1875,9 @@ class ActionSummaryNavigator:
         hit_target_resolutions: list[HitTargetResolutionEvidence] = []
         global_prep_candidate_resolutions: list[GlobalPrepResolutionEvidence] = []
         global_prep_hit_target_resolutions: list[GlobalPrepHitTargetEvidence] = []
+        action_summary_entry_resolutions: list[ActionSummaryEntryResolutionEvidence] = []
         dispatches = 0
+        contract_dispatches: dict[str, int] = {}
         if self.cancellation():
             return ActionSummaryResult(False, ActionSummaryState.UNKNOWN, "cancelled", 0, 0, [], [])
         try:
@@ -1668,9 +1899,16 @@ class ActionSummaryNavigator:
                 False, current.state, "global_prep_precondition_failed",
                 0, 0, [], [],
             )
-        if current.state is not ActionSummaryState.HOME_READY and not start_at_global_prep:
-            return ActionSummaryResult(False, current.state, "home_ready_precondition_failed", 0, 0, [], [])
-        if not start_at_global_prep:
+        start_stage = {
+            ActionSummaryState.HOME_READY: 0,
+            ActionSummaryState.ACTIVITY_OVERVIEW_VISIBLE: 1,
+            ActionSummaryState.ACTION_SUMMARY_ENTRY_VISIBLE: 2,
+        }.get(current.state)
+        if start_stage is None:
+            return ActionSummaryResult(
+                False, current.state, "trusted_start_precondition_failed", 0, 0, [], []
+            )
+        if current.state is ActionSummaryState.HOME_READY:
             initial_terminal, initial_resolution = resolve_action_terminal_candidate(
                 initial_frame, phase="initial"
             )
@@ -1704,12 +1942,15 @@ class ActionSummaryNavigator:
             (ActionSummaryState.ACTIVITY_OVERVIEW_VISIBLE, "全域整备", {ActionSummaryState.ACTION_SUMMARY_ENTRY_VISIBLE, ActionSummaryState.OPTIONAL_OVERLAY_VISIBLE, ActionSummaryState.ACTION_SUMMARY_VISIBLE}, "open_activity_overview"),
             (ActionSummaryState.ACTION_SUMMARY_ENTRY_VISIBLE, "行动汇总", {ActionSummaryState.ACTION_SUMMARY_VISIBLE}, "open_action_summary"),
         )
-        stage_index = 1 if start_at_global_prep else 0
+        stage_index = start_stage
         while True:
             if current.state is ActionSummaryState.ACTION_SUMMARY_VISIBLE:
                 return ActionSummaryResult(
                     True, current.state, "action_summary_visible", dispatches,
                     dispatches, evidences, timeline, candidate_resolutions,
+                    global_prep_candidate_resolutions=global_prep_candidate_resolutions,
+                    global_prep_hit_target_resolutions=global_prep_hit_target_resolutions,
+                    action_summary_entry_resolutions=action_summary_entry_resolutions,
                 )
             if current.state is ActionSummaryState.OPTIONAL_OVERLAY_VISIBLE:
                 marker = "safe_blank"
@@ -1763,6 +2004,35 @@ class ActionSummaryNavigator:
                     ActionSummaryState.ACTION_SUMMARY_VISIBLE,
                 }
                 entry_name = "open_activity_overview"
+                candidate_resolver = None
+            elif stage_index == 2 and current.state is ActionSummaryState.ACTION_SUMMARY_ENTRY_VISIBLE:
+                source_frame = current.source_frame
+                if source_frame is None:
+                    return ActionSummaryResult(
+                        False, current.state, "action_summary_initial_frame_missing",
+                        dispatches, dispatches, evidences, timeline,
+                        candidate_resolutions,
+                        global_prep_candidate_resolutions=global_prep_candidate_resolutions,
+                        global_prep_hit_target_resolutions=global_prep_hit_target_resolutions,
+                        action_summary_entry_resolutions=action_summary_entry_resolutions,
+                    )
+                initial_summary_target, initial_summary_resolution = (
+                    resolve_action_summary_entry_target(source_frame, phase="initial")
+                )
+                action_summary_entry_resolutions.append(initial_summary_resolution)
+                if initial_summary_target is None:
+                    return ActionSummaryResult(
+                        False, current.state,
+                        "action_summary_parent_target_not_unique",
+                        dispatches, dispatches, evidences, timeline,
+                        candidate_resolutions,
+                        global_prep_candidate_resolutions=global_prep_candidate_resolutions,
+                        global_prep_hit_target_resolutions=global_prep_hit_target_resolutions,
+                        action_summary_entry_resolutions=action_summary_entry_resolutions,
+                    )
+                marker = "行动汇总"
+                accepted = {ActionSummaryState.ACTION_SUMMARY_VISIBLE}
+                entry_name = "open_action_summary"
                 candidate_resolver = None
             else:
                 if stage_index >= len(stages) or current.state is not stages[stage_index][0]:
@@ -1896,6 +2166,41 @@ class ActionSummaryNavigator:
                     fresh_global.score,
                     fresh_global_hit_resolution.visual_parent_count,
                 )
+            elif stage_index == 2 and current.state is ActionSummaryState.ACTION_SUMMARY_ENTRY_VISIBLE:
+                fresh_summary_target, fresh_summary_resolution = (
+                    resolve_action_summary_entry_target(planned_frame, phase="fresh")
+                )
+                action_summary_entry_resolutions.append(fresh_summary_resolution)
+                if fresh_summary_target is None:
+                    return ActionSummaryResult(
+                        False, planned.state,
+                        "action_summary_fresh_parent_target_not_unique",
+                        dispatches, dispatches, evidences, timeline,
+                        candidate_resolutions,
+                        global_prep_candidate_resolutions=global_prep_candidate_resolutions,
+                        global_prep_hit_target_resolutions=global_prep_hit_target_resolutions,
+                        action_summary_entry_resolutions=action_summary_entry_resolutions,
+                    )
+                target_confirmation = confirm_fresh_target(
+                    initial_summary_target, fresh_summary_target
+                )
+                if not target_confirmation.allowed:
+                    return ActionSummaryResult(
+                        False, planned.state,
+                        f"action_summary_{target_confirmation.reason}",
+                        dispatches, dispatches, evidences, timeline,
+                        candidate_resolutions,
+                        global_prep_candidate_resolutions=global_prep_candidate_resolutions,
+                        global_prep_hit_target_resolutions=global_prep_hit_target_resolutions,
+                        action_summary_entry_resolutions=action_summary_entry_resolutions,
+                    )
+                candidate = (
+                    fresh_summary_target.hit_target_point,
+                    fresh_summary_target.hit_target_bbox,
+                    "exact_ocr+parent_visual_action_card",
+                    1.0,
+                    fresh_summary_target.candidate_count,
+                )
             else:
                 assert candidate_resolver is not None
                 candidate = candidate_resolver(planned_frame, planned)
@@ -1906,6 +2211,29 @@ class ActionSummaryNavigator:
                     candidate_resolutions,
                 )
             point, bounds, candidate_type, candidate_score, candidate_count = candidate
+            contract_key = {
+                "open_action_entry": "OPEN_ACTION_TERMINAL",
+                "open_activity_overview": "OPEN_GLOBAL_PREP",
+                "open_action_summary": "OPEN_ACTION_SUMMARY",
+            }.get(entry_name)
+            if contract_key is not None:
+                contract = PROVEN_NAVIGATION_CONTRACTS[contract_key]
+                contract_decision = confirm_fresh_capability(
+                    current.to_ui_state(),
+                    planned.to_ui_state(),
+                    contract,
+                    dispatch_count=contract_dispatches.get(contract_key, 0),
+                )
+                if not contract_decision.allowed:
+                    return ActionSummaryResult(
+                        False, planned.state,
+                        f"action_contract_{contract_decision.reason}",
+                        dispatches, dispatches, evidences, timeline,
+                        candidate_resolutions,
+                        global_prep_candidate_resolutions=global_prep_candidate_resolutions,
+                        global_prep_hit_target_resolutions=global_prep_hit_target_resolutions,
+                        action_summary_entry_resolutions=action_summary_entry_resolutions,
+                    )
             try:
                 chain = self._coordinate_chain(planned_frame, point)
             except (TypeError, ValueError):
@@ -1942,6 +2270,10 @@ class ActionSummaryNavigator:
                 return ActionSummaryResult(False, planned.state, "dispatch_failure", dispatches, dispatches, evidences, timeline, candidate_resolutions)
             evidence.mark_dispatch(requested=True, acknowledged=True, result="call_returned")
             self.budget.record_dispatch(decision)
+            if contract_key is not None:
+                contract_dispatches[contract_key] = (
+                    contract_dispatches.get(contract_key, 0) + 1
+                )
             dispatches += 1
             started = self.monotonic()
             if self.stop_after_first_stage and entry_name == "open_action_entry":
@@ -2031,8 +2363,11 @@ class ActionSummaryNavigator:
                     dispatches, evidences, timeline, candidate_resolutions,
                 )
             current = observed
-            if current.state is not ActionSummaryState.OPTIONAL_OVERLAY_VISIBLE:
-                stage_index += 1
+            stage_index = {
+                ActionSummaryState.HOME_READY: 0,
+                ActionSummaryState.ACTIVITY_OVERVIEW_VISIBLE: 1,
+                ActionSummaryState.ACTION_SUMMARY_ENTRY_VISIBLE: 2,
+            }.get(current.state, stage_index)
 
 
 __all__ = [
@@ -2045,7 +2380,11 @@ __all__ = [
     "CandidateResolutionEvidence", "HitTargetResolutionEvidence",
     "GlobalPrepCandidate", "GlobalPrepHitTarget",
     "GlobalPrepHitTargetEvidence", "GlobalPrepResolutionEvidence",
+    "ActionSummaryEntryResolutionEvidence",
+    "ACTION_SUMMARY_ENTRY_LABEL_REGION_NORMALIZED",
+    "ACTION_SUMMARY_ENTRY_PARENT_REGION_NORMALIZED",
     "observe_action_summary", "resolve_action_terminal_candidate",
     "resolve_action_terminal_hit_target",
     "resolve_global_prep_candidate", "resolve_global_prep_hit_target",
+    "resolve_action_summary_entry_target",
 ]

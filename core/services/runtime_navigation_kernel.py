@@ -124,8 +124,29 @@ class UiState:
     def is_unknown(self) -> bool:
         return self.base_page == UNKNOWN_PAGE
 
-    def has_capability(self, capability: str) -> bool:
-        return str(capability) in self.capabilities and not self.overlays
+    def has_capability(
+        self,
+        capability: str,
+        *,
+        current_capture_id: str,
+        current_frame_hash: str = "",
+    ) -> bool:
+        """Return a capability only for the capture that proved this state.
+
+        The explicit current identity prevents a caller from retaining a
+        capability after a later capture has replaced the page.  Capabilities
+        are also unavailable through overlays or medium/unknown confidence.
+        """
+
+        if self.confidence is not Confidence.HIGH or self.overlays:
+            return False
+        if not self.capture_id or not self.frame_hash:
+            return False
+        if str(current_capture_id) != self.capture_id:
+            return False
+        if current_frame_hash and str(current_frame_hash) != self.frame_hash:
+            return False
+        return str(capability) in self.capabilities
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,7 +195,13 @@ class RuntimeNavigationKernel:
             if evidence is not None:
                 matches[signature.kind].append(_SignatureMatch(signature, evidence))
 
-        trusted = self._best(matches[PageKind.TRUSTED])
+        trusted_pages = {
+            match.signature.base_page for match in matches[PageKind.TRUSTED]
+        }
+        ambiguous_trusted = len(trusted_pages) > 1
+        trusted = (
+            None if ambiguous_trusted else self._best(matches[PageKind.TRUSTED])
+        )
         overlays = sorted(
             {
                 match.signature.base_page
@@ -186,10 +213,12 @@ class RuntimeNavigationKernel:
             selected = self._best(matches[PageKind.FOREIGN])
 
         if selected is None:
-            reason = "overlay_without_committed_base" if overlays else (
+            reason = "ambiguous_trusted_page_signatures" if ambiguous_trusted else (
+                "overlay_without_committed_base" if overlays else (
                 "ambiguous_or_unknown_page_signature"
                 if matches[PageKind.TRUSTED] or matches[PageKind.FOREIGN]
                 else "page_signature_absent"
+                )
             )
             return UiState(
                 base_page=UNKNOWN_PAGE,
@@ -227,6 +256,9 @@ class RuntimeNavigationKernel:
 class ContractDecision:
     allowed: bool
     reason: str
+    action_id: str = ""
+    capture_id: str = ""
+    frame_hash: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,11 +278,26 @@ class ActionContract:
     transition_timeout_seconds: float = 30.0
     irreversible: bool = False
 
-    def authorize(self, state: UiState, *, dispatch_count: int = 0) -> ContractDecision:
+    def authorize(
+        self,
+        state: UiState,
+        *,
+        current_capture_id: str,
+        current_frame_hash: str = "",
+        dispatch_count: int = 0,
+    ) -> ContractDecision:
         if state.is_unknown:
             return ContractDecision(False, "unknown_pre_state")
         if state.overlays:
             return ContractDecision(False, "overlay_blocks_action")
+        if state.confidence is not Confidence.HIGH:
+            return ContractDecision(False, "capability_confidence_not_high")
+        if not state.capture_id or not state.frame_hash:
+            return ContractDecision(False, "capability_capture_identity_missing")
+        if str(current_capture_id) != state.capture_id:
+            return ContractDecision(False, "capability_capture_identity_stale")
+        if current_frame_hash and str(current_frame_hash) != state.frame_hash:
+            return ContractDecision(False, "capability_frame_identity_stale")
         if state.base_page not in self.allowed_pre_pages:
             return ContractDecision(False, "pre_state_not_allowed")
         missing = self.required_capabilities - state.capabilities
@@ -260,7 +307,51 @@ class ActionContract:
             return ContractDecision(False, "action_dispatch_budget_exhausted")
         if self.random_offset:
             return ContractDecision(False, "random_offset_contract_forbidden")
-        return ContractDecision(True, "authorized")
+        return ContractDecision(
+            True,
+            "authorized",
+            action_id=self.action_id,
+            capture_id=state.capture_id,
+            frame_hash=state.frame_hash,
+        )
+
+
+def confirm_fresh_capability(
+    initial: UiState,
+    fresh: UiState,
+    contract: ActionContract,
+    *,
+    dispatch_count: int = 0,
+) -> ContractDecision:
+    """Re-authorize one action contract against a distinct fresh capture."""
+
+    if not initial.capture_id or not initial.frame_hash:
+        return ContractDecision(False, "initial_capture_identity_missing")
+    if not fresh.capture_id or not fresh.frame_hash:
+        return ContractDecision(False, "fresh_capture_identity_missing")
+    if initial.capture_id == fresh.capture_id:
+        return ContractDecision(False, "fresh_capture_identity_stale")
+    initial_decision = contract.authorize(
+        initial,
+        current_capture_id=initial.capture_id,
+        current_frame_hash=initial.frame_hash,
+        dispatch_count=dispatch_count,
+    )
+    if not initial_decision.allowed:
+        return ContractDecision(False, f"initial_{initial_decision.reason}")
+    fresh_decision = contract.authorize(
+        fresh,
+        current_capture_id=fresh.capture_id,
+        current_frame_hash=fresh.frame_hash,
+        dispatch_count=dispatch_count,
+    )
+    if not fresh_decision.allowed:
+        return ContractDecision(False, f"fresh_{fresh_decision.reason}")
+    if initial.base_page != fresh.base_page:
+        return ContractDecision(False, "fresh_base_page_changed")
+    if initial.overlays != fresh.overlays:
+        return ContractDecision(False, "fresh_overlay_set_changed")
+    return fresh_decision
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,16 +422,34 @@ class TransitionClassifier:
         self._unknown_hash = ""
         self._unknown_count = 0
         self.any_changed = False
+        self._last_capture_id = source_state.capture_id
 
     def observe(self, state: UiState) -> TransitionDecision:
-        if state.capture_id and state.capture_id == self.source_state.capture_id:
+        if state.capture_id and state.capture_id == self._last_capture_id:
             return TransitionDecision(
                 TransitionClassification.STALE, False, False, "stale_capture_ignored"
             )
+        if state.capture_id:
+            self._last_capture_id = state.capture_id
         frame_changed = bool(
             state.frame_hash and state.frame_hash != self.source_state.frame_hash
         )
         self.any_changed = self.any_changed or frame_changed
+        optional_overlays = set(state.overlays) & self.contract.optional_post_overlays
+        if optional_overlays:
+            return TransitionDecision(
+                TransitionClassification.OPTIONAL_OVERLAY_REACHED,
+                True,
+                True,
+                "optional_post_overlay_reached",
+            )
+        if state.overlays:
+            return TransitionDecision(
+                TransitionClassification.KNOWN_FOREIGN_PAGE,
+                True,
+                False,
+                "unexpected_post_overlay_reached",
+            )
         if state.base_page in self.contract.allowed_post_pages:
             return TransitionDecision(
                 TransitionClassification.EXPECTED_POST_STATE,
@@ -354,13 +463,6 @@ class TransitionClassifier:
                 False,
                 False,
                 "known_transition_pending",
-            )
-        if set(state.overlays) & self.contract.optional_post_overlays:
-            return TransitionDecision(
-                TransitionClassification.OPTIONAL_OVERLAY_REACHED,
-                True,
-                True,
-                "optional_post_overlay_reached",
             )
         if state.base_page in self.contract.forbidden_post_pages:
             return TransitionDecision(
@@ -425,11 +527,15 @@ DEFAULT_CAPABILITIES: Mapping[str, frozenset[str]] = {
     "HOME_READY": frozenset({"OPEN_CITY", "OPEN_ACTION_TERMINAL", "OPEN_INVENTORY"}),
     "ACTIVITY_OVERVIEW_VISIBLE": frozenset({"OPEN_GLOBAL_PREP"}),
     "GLOBAL_PREP_PAGE": frozenset({"OPEN_ACTION_SUMMARY"}),
-    "ACTION_SUMMARY_ENTRY_VISIBLE": frozenset({"OPEN_ACTION_SUMMARY"}),
     "ACTION_SUMMARY_VISIBLE": frozenset({"SELECT_ACTION_TASK"}),
     "INVENTORY": frozenset({"READ_INVENTORY", "OPEN_ITEM_DETAIL"}),
     "CITY_ENTRY_VISIBLE": frozenset({"ENTER_CITY"}),
     "CITY_DETAIL": frozenset({"OPEN_CITY_FACILITY"}),
+}
+
+
+LEGACY_BASE_PAGE_ALIASES: Mapping[str, str] = {
+    "ACTION_SUMMARY_ENTRY_VISIBLE": "GLOBAL_PREP_PAGE",
 }
 
 
@@ -499,6 +605,23 @@ PROVEN_NAVIGATION_CONTRACTS: Mapping[str, ActionContract] = {
         transition_timeout_seconds=30.0,
         irreversible=False,
     ),
+    "OPEN_ACTION_SUMMARY": ActionContract(
+        action_id="open_action_summary",
+        primitive=ActionPrimitive.OPEN_ENTRY,
+        allowed_pre_pages=frozenset({"GLOBAL_PREP_PAGE"}),
+        required_capabilities=frozenset({"OPEN_ACTION_SUMMARY"}),
+        candidate_policy="UNIQUE_EXACT_ACTION_SUMMARY_ANCHOR",
+        hit_target_policy="UNIQUE_PARENT_CARD_ACTION_REGION",
+        max_dispatches=1,
+        random_offset=False,
+        allowed_post_pages=frozenset({"ACTION_SUMMARY_VISIBLE"}),
+        forbidden_post_pages=frozenset({
+            "INVENTORY", "EXCHANGE_PAGE", "EXTERNAL_BROWSER", "LOGIN_PAGE",
+            "FOREIGN_PAGE", "BATTLE_PAGE",
+        }),
+        transition_timeout_seconds=30.0,
+        irreversible=False,
+    ),
 }
 
 
@@ -514,7 +637,8 @@ def normalize_legacy_state(
 ) -> UiState:
     """Bridge an already-proven adapter state into the shared state model."""
 
-    page = str(base_page)
+    legacy_page = str(base_page)
+    page = LEGACY_BASE_PAGE_ALIASES.get(legacy_page, legacy_page)
     try:
         normalized_confidence = (
             confidence if isinstance(confidence, Confidence) else Confidence(str(confidence))
@@ -541,6 +665,7 @@ __all__ = [
     "ContractDecision",
     "DEFAULT_CAPABILITIES",
     "InteractionTarget",
+    "LEGACY_BASE_PAGE_ALIASES",
     "PageKind",
     "PagePerception",
     "PageSignature",
@@ -551,6 +676,7 @@ __all__ = [
     "TransitionDecision",
     "UiState",
     "UNKNOWN_PAGE",
+    "confirm_fresh_capability",
     "confirm_fresh_target",
     "normalize_legacy_state",
 ]

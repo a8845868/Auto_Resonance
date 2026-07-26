@@ -44,6 +44,11 @@ authorization by default. Common domain words such as `材料`, `奖励`, `活�
 `任务` are not page signatures. A foreign page requires a layout fact or
 multiple independent cues.
 
+If signatures for two different trusted base pages match the same capture,
+classification fails closed regardless of their numeric priority. Priority is
+used only to choose the strongest signature among alternatives for the *same*
+base page, so registration order cannot silently resolve a page conflict.
+
 The first production migration is Global Prep. The page containing a unique
 `行动汇总` entry is classified as `GLOBAL_PREP_PAGE` even when its descriptive
 copy also contains `材料`. The existing adapter continues to expose
@@ -56,6 +61,9 @@ copy also contains `材料`. The existing adapter continues to expose
 - `UiState`: normalized composable state and capabilities.
 - `ActionContract`: allowed pre-state/capability, candidate and target policy,
   at-most-N dispatch, allowed/forbidden post-state and irreversibility.
+- `confirm_fresh_capability()`: binds authorization to one action contract,
+  high-confidence `UiState`, empty overlay set, frame hash and capture identity,
+  then re-authorizes against a distinct fresh capture before dispatch.
 - `InteractionTarget` / `confirm_fresh_target`: semantic and normalized
   geometry confirmation across initial/fresh captures.
 - `TransitionClassifier`: stale-frame rejection, retained source state,
@@ -78,6 +86,12 @@ V1 bridges four proven adapters into the shared state/capability model:
 | Unique city entry | `ENTER_CITY` |
 | Action terminal on `HOME_READY` | `OPEN_ACTION_TERMINAL` |
 | Global Prep page | `OPEN_ACTION_SUMMARY` |
+
+The legacy `ACTION_SUMMARY_ENTRY_VISIBLE` enum is mapped centrally to normalized
+`GLOBAL_PREP_PAGE`; adapters do not maintain private aliases. The corresponding
+`OPEN_ACTION_SUMMARY` action contract requires one exact semantic anchor, one
+enclosing right-side action card, a deterministic lower action-band target and
+at most one dispatch. The OCR label center is never the physical point.
 
 Assets and city keep their proven OCR/CV and dispatch implementations. Action
 terminal and Global Prep use the shared page-signature classifier; the Global

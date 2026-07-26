@@ -10,6 +10,7 @@ from core.services.action_summary_navigation import (
     observe_action_summary,
     resolve_action_terminal_candidate,
     resolve_action_terminal_hit_target,
+    resolve_action_summary_entry_target,
     resolve_global_prep_candidate,
     resolve_global_prep_hit_target,
 )
@@ -28,11 +29,16 @@ def item(text, x, y, width=100, height=24):
 
 
 class Frame:
-    def __init__(self, labels, *, size=(1280, 720), capture_id="", draw_terminal_visual=True, draw_global_visual=True, pixel=0):
+    _capture_sequence = 0
+
+    def __init__(self, labels, *, size=(1280, 720), capture_id="", draw_terminal_visual=True, draw_global_visual=True, draw_summary_visual=True, pixel=0):
         self.image = np.zeros((size[1], size[0], 3), dtype=np.uint8)
         if pixel:
             self.image[:] = pixel
         self._labels = labels
+        if not capture_id:
+            Frame._capture_sequence += 1
+            capture_id = f"fixture-{Frame._capture_sequence}"
         self.source_capture_id = capture_id
         if draw_terminal_visual:
             for label in labels:
@@ -71,6 +77,25 @@ class Frame:
                 x0, y0, x1, y1 = card
                 self.image[y0:y1 + 1, x0:x1 + 1] = 255
                 self.image[y0 + 2:y1 - 1, x0 + 2:x1 - 1] = 40
+        if draw_summary_visual:
+            for label in labels:
+                if str(label.get("text", "")).replace(" ", "") != "\u884c\u52a8\u6c47\u603b":
+                    continue
+                points = label["position"]
+                left = int(min(point[0] for point in points))
+                top = int(min(point[1] for point in points))
+                right = int(max(point[0] for point in points))
+                bottom = int(max(point[1] for point in points))
+                height = max(4, bottom - top)
+                card = (
+                    max(0, left - 12 * height),
+                    max(0, top - 3 * height),
+                    min(size[0] - 1, right + 4 * height),
+                    min(size[1] - 1, bottom + 4 * height),
+                )
+                x0, y0, x1, y1 = card
+                self.image[y0:y1 + 1, x0:x1 + 1] = (240, 120, 30)
+                self.image[y0 + 3:y1 - 2, x0 + 3:x1 - 2] = (130, 70, 15)
 
     def ocr(self):
         return list(self._labels)
@@ -113,7 +138,11 @@ def overview(capture_id="", size=(1280, 720)):
 
 
 def entry(capture_id="", size=(1280, 720)):
-    return Frame([item("行动汇总", 1060, 380)], size=size, capture_id=capture_id)
+    sx, sy = size[0] / 1280, size[1] / 720
+    return Frame([
+        item("全域整备", round(820 * sx), round(92 * sy), round(120 * sx), round(32 * sy)),
+        item("行动汇总", round(1060 * sx), round(380 * sy), round(100 * sx), round(24 * sy)),
+    ], size=size, capture_id=capture_id)
 
 
 def summary(capture_id="", size=(1280, 720)):
@@ -196,7 +225,8 @@ def test_complete_navigation_has_three_single_dispatch_stages_and_stops():
     assert len(taps) == len(evidence) == 3
     assert taps[0][0] != (1191, 410)
     assert taps[1][0] != (60, 314)
-    assert taps[2][0] == (1060, 380)
+    assert taps[2][0] != (1060, 380)
+    assert evidence[2].candidate_type == "exact_ocr+parent_visual_action_card"
     assert all(call[1]["random_offset"] is False for call in taps)
     assert all(attempt.coordinate_chain.complete for attempt in evidence)
     assert all(attempt.dispatch_acknowledged for attempt in evidence)
@@ -649,6 +679,107 @@ def test_old_single_title_is_not_action_summary_success():
     assert observed.state is ActionSummaryState.UNKNOWN
 
 
+def test_action_summary_entry_binds_unique_parent_and_uses_action_band():
+    frame = entry("entry-target")
+
+    target, evidence = resolve_action_summary_entry_target(frame, phase="test")
+
+    assert target is not None
+    assert evidence.exact_match_count == 1
+    assert evidence.parent_container_count == 1
+    assert target.candidate_count == 1
+    assert target.semantic_id == "ACTION_SUMMARY_ENTRY"
+    assert target.hit_target_point != (1060, 380)
+    assert target.parent_bbox[0] <= target.hit_target_point[0] < target.parent_bbox[2]
+    assert target.parent_bbox[1] <= target.hit_target_point[1] < target.parent_bbox[3]
+
+
+def test_action_summary_entry_duplicate_semantic_anchor_has_zero_target():
+    frame = Frame([
+        item("\u884c\u52a8\u6c47\u603b", 1060, 380),
+        item("\u884c\u52a8\u6c47\u603b", 900, 500),
+    ])
+
+    target, evidence = resolve_action_summary_entry_target(frame, phase="test")
+
+    assert target is None
+    assert evidence.failure_class == "SEMANTIC_ANCHOR_NOT_UNIQUE"
+
+
+def test_full_navigation_can_start_at_global_prep_with_one_dispatch():
+    result, taps, evidence = run([
+        entry("entry-1"), entry("entry-2"), summary("summary-1"),
+    ])
+
+    assert result.success
+    assert result.state is ActionSummaryState.ACTION_SUMMARY_VISIBLE
+    assert result.dispatch_count == 1
+    assert len(taps) == len(evidence) == 1
+    assert taps[0][0] != (1060, 380)
+
+
+def test_full_navigation_can_start_at_activity_overview_with_two_dispatches():
+    result, taps, evidence = run([
+        overview("overview-1"), overview("overview-2"),
+        entry("entry-1"), entry("entry-2"), summary("summary-1"),
+    ])
+
+    assert result.success
+    assert result.state is ActionSummaryState.ACTION_SUMMARY_VISIBLE
+    assert result.dispatch_count == 2
+    assert len(taps) == len(evidence) == 2
+
+
+def test_already_visible_is_zero_input_success():
+    result, taps, evidence = run([summary("summary-visible")])
+
+    assert result.success
+    assert result.reason == "already_visible"
+    assert result.dispatch_count == 0
+    assert taps == evidence == []
+
+
+def test_real_global_prep_shape_with_header_and_left_rail_is_high_confidence():
+    frame = Frame([
+        item("全域整备", 832, 90, 112, 35),
+        item("全域整备", 58, 290, 46, 17),
+        item("行动汇总", 974, 268, 104, 33),
+        item("收集装备、材料等物资", 974, 315, 220, 20),
+    ], capture_id="real-shape")
+
+    observed = observe_action_summary(frame)
+    state = observed.to_ui_state()
+
+    assert observed.state is ActionSummaryState.ACTION_SUMMARY_ENTRY_VISIBLE
+    assert state.base_page == "GLOBAL_PREP_PAGE"
+    assert state.confidence.value == "HIGH"
+    assert state.capabilities == frozenset({"OPEN_ACTION_SUMMARY"})
+
+
+def test_entry_only_legacy_bridge_preserves_medium_confidence_and_denies_action():
+    from core.services.runtime_navigation_kernel import PROVEN_NAVIGATION_CONTRACTS
+
+    frame = Frame([
+        item("行动汇总", 1060, 380),
+    ], capture_id="entry-only")
+    observed = observe_action_summary(frame)
+    state = observed.to_ui_state()
+
+    assert observed.state is ActionSummaryState.ACTION_SUMMARY_ENTRY_VISIBLE
+    assert state.base_page == "GLOBAL_PREP_PAGE"
+    assert state.confidence.value == "MEDIUM"
+    assert not state.has_capability(
+        "OPEN_ACTION_SUMMARY",
+        current_capture_id="entry-only",
+        current_frame_hash=state.frame_hash,
+    )
+    assert PROVEN_NAVIGATION_CONTRACTS["OPEN_ACTION_SUMMARY"].authorize(
+        state,
+        current_capture_id="entry-only",
+        current_frame_hash=state.frame_hash,
+    ).reason == "capability_confidence_not_high"
+
+
 @pytest.mark.parametrize("size", [(1280, 720), (851, 480), (853, 480)])
 def test_coordinate_chain_is_complete_for_current_capture_sizes(size):
     scale_x, scale_y = size[0] / 1280, size[1] / 720
@@ -666,8 +797,14 @@ def test_coordinate_chain_is_complete_for_current_capture_sizes(size):
         Frame([item("常规活动", scaled(180, scale_x), scaled(150, scale_y)),
                item("全域整备", scaled(60, scale_x), scaled(314, scale_y),
                     scaled(58, scale_x), scaled(17, scale_y))], size=size),
-        Frame([item("行动汇总", scaled(1060, scale_x), scaled(380, scale_y))], size=size),
-        Frame([item("行动汇总", scaled(1060, scale_x), scaled(380, scale_y))], size=size),
+        Frame([
+            item("全域整备", scaled(820, scale_x), scaled(92, scale_y), scaled(120, scale_x), scaled(32, scale_y)),
+            item("行动汇总", scaled(1060, scale_x), scaled(380, scale_y), scaled(100, scale_x), scaled(24, scale_y)),
+        ], size=size),
+        Frame([
+            item("全域整备", scaled(820, scale_x), scaled(92, scale_y), scaled(120, scale_x), scaled(32, scale_y)),
+            item("行动汇总", scaled(1060, scale_x), scaled(380, scale_y), scaled(100, scale_x), scaled(24, scale_y)),
+        ], size=size),
         summary(size=size),
     ]
     result, _, evidence = run(frames)
@@ -676,12 +813,12 @@ def test_coordinate_chain_is_complete_for_current_capture_sizes(size):
 
 
 def test_optional_overlay_uses_computed_safe_blank_not_legacy_fixed_point():
-    overlay = Frame([
+    overlay = lambda: Frame([
         item("首次进入说明", 640, 180, 400, 80),
         item("触碰空白区域退出", 640, 680, 180, 24),
     ])
     result, taps, _ = run([
-        home(), home(), overview(), overview(), overlay, overlay, entry(), entry(), summary(),
+        home(), home(), overview(), overview(), overlay(), overlay(), entry(), entry(), summary(),
     ])
     assert result.success
     assert result.dispatch_count == 4
