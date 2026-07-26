@@ -81,6 +81,19 @@ def run(*, adb_port: int = 16384) -> dict:
         evidence_recorder=recorded.append,
         dispatch_backend=type(control_module.control).__name__,
     ).navigate()
+    resolutions = [item.to_dict() for item in result.candidate_resolutions]
+    fresh_resolution = next(
+        (item for item in resolutions if item["phase"] == "fresh"),
+        resolutions[-1] if resolutions else None,
+    )
+    first_evidence = result.evidences[0] if result.evidences else None
+    terminal_dispatches = sum(
+        evidence.entry_name == "open_action_entry" and evidence.dispatch_requested
+        for evidence in result.evidences
+    )
+    terminal_postcondition = "NOT_RUN"
+    if first_evidence and first_evidence.post_observations:
+        terminal_postcondition = first_evidence.post_observations[-1].postcondition_result
     return {
         "status": "PASS" if result.success else "BLOCKED",
         "probe": "action_summary_entry_isolation_v1",
@@ -96,7 +109,35 @@ def run(*, adb_port: int = 16384) -> dict:
         "reason": result.reason,
         "action_summary_total_dispatches": result.dispatch_count,
         "action_summary_stage_count": result.stage_count,
+        "action_terminal_candidate_count": (
+            fresh_resolution["safe_candidate_count"] if fresh_resolution else 0
+        ),
+        "action_terminal_candidate_type": (
+            fresh_resolution["candidate_type"] if fresh_resolution else None
+        ),
+        "action_terminal_candidate_bbox": (
+            fresh_resolution["candidate_bbox"] if fresh_resolution else None
+        ),
+        "action_terminal_device_point": (
+            list(first_evidence.coordinate_chain.device_point)
+            if first_evidence else None
+        ),
+        "action_terminal_dispatches": terminal_dispatches,
+        "action_terminal_dispatch_acknowledged": (
+            bool(first_evidence.dispatch_acknowledged) if first_evidence else None
+        ),
+        "action_terminal_postcondition": terminal_postcondition,
+        "candidate_resolution_evidence": resolutions,
         "random_offset_enabled": False,
+        "post_state_sequence": [
+            item["post_state"] for item in result.timeline
+            if item["transition_classification"] != "STALE"
+        ],
+        "action_summary_postcondition": "PASS" if result.success else (
+            "FAIL" if result.dispatch_count else "NOT_RUN"
+        ),
+        "action_summary_visible": result.success,
+        "real_ui_actions": result.dispatch_count,
         "sweep_executed": False,
         "real_sweep_actions": 0,
         "battle_actions": 0,

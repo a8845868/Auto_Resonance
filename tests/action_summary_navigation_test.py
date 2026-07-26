@@ -7,6 +7,7 @@ from core.services.action_summary_navigation import (
     ActionSummaryNavigator,
     ActionSummaryState,
     observe_action_summary,
+    resolve_action_terminal_candidate,
 )
 
 
@@ -57,7 +58,7 @@ class Frames:
 def home(capture_id="", size=(1280, 720), *, duplicate=False):
     labels = [item("访问城市", 1172, 486), item("作战终端", 1191, 410)]
     if duplicate:
-        labels.append(item("作战终端", 600, 300))
+        labels.append(item("作战终端", 1120, 400))
     return Frame(labels, size=size, capture_id=capture_id)
 
 
@@ -136,8 +137,158 @@ def test_stale_fresh_confirmation_has_zero_input():
 def test_multiple_home_candidates_have_zero_input():
     result, taps, evidence = run([home("1"), home("2", duplicate=True)])
     assert not result.success
-    assert result.reason == "candidate_not_unique_or_safe"
+    assert result.reason == "action_terminal_fresh_confirmation_failed"
     assert taps == evidence == []
+
+
+def test_unique_exact_terminal_ocr_resolves_inside_target_region():
+    candidate, evidence = resolve_action_terminal_candidate(home(), phase="test")
+    assert candidate is not None
+    assert candidate.candidate_type == "exact_ocr"
+    assert evidence.exact_match_count == 1
+    assert evidence.safe_candidate_count == 1
+
+
+def test_nfkc_whitespace_and_ocr_separator_normalization_remains_exact():
+    frame = Frame([
+        item("访问城市", 1172, 486),
+        item("作 战｜终端", 1191, 410),
+    ])
+    candidate, evidence = resolve_action_terminal_candidate(frame, phase="test")
+    assert candidate is not None
+    assert evidence.exact_match_count == 1
+
+
+def test_two_exact_matches_inside_target_region_are_blocked():
+    frame = Frame([
+        item("访问城市", 1172, 486),
+        item("作战终端", 1120, 400, 70),
+        item("作战终端", 1230, 420, 70),
+    ])
+    candidate, evidence = resolve_action_terminal_candidate(frame, phase="test")
+    assert candidate is None
+    assert evidence.failure_class == "OCR_MULTIPLE_MATCHES"
+    assert evidence.safe_candidate_count == 2
+
+
+def test_same_text_outside_terminal_region_does_not_compete():
+    frame = Frame([
+        item("访问城市", 1172, 486),
+        item("作战终端", 1191, 410),
+        item("作战终端", 700, 200),
+    ])
+    candidate, evidence = resolve_action_terminal_candidate(frame, phase="test")
+    assert candidate is not None
+    assert evidence.deduplicated_candidate_count == 2
+    assert evidence.region_filtered_candidate_count == 1
+
+
+def test_high_iou_duplicate_boxes_collapse_to_one_candidate():
+    frame = Frame([
+        item("访问城市", 1172, 486),
+        item("作战终端", 1190, 408),
+        item("作战终端", 1192, 410),
+    ])
+    candidate, evidence = resolve_action_terminal_candidate(frame, phase="test")
+    assert candidate is not None
+    assert evidence.exact_match_count == 2
+    assert evidence.deduplicated_candidate_count == 1
+    assert "duplicate_bbox_collapsed" in evidence.rejected_candidate_reasons
+
+
+def test_adjacent_same_line_fragments_merge_exactly():
+    frame = Frame([
+        item("访问城市", 1172, 486),
+        item("作战", 1160, 410, 40),
+        item("终端", 1205, 410, 40),
+    ])
+    candidate, evidence = resolve_action_terminal_candidate(frame, phase="test")
+    assert candidate is not None
+    assert candidate.candidate_type == "merged_ocr_fragments"
+    assert evidence.fragment_match_count == 2
+    assert evidence.merged_candidate_count == 1
+    assert len(candidate.evidence_ids) == 2
+
+
+def test_fragments_in_different_regions_do_not_merge():
+    frame = Frame([item("访问城市", 1172, 486), item("作战", 1160, 410), item("终端", 700, 200)])
+    candidate, evidence = resolve_action_terminal_candidate(frame, phase="test")
+    assert candidate is None
+    assert evidence.failure_class == "OCR_FRAGMENTED"
+
+
+def test_intervening_text_blocks_fragment_merge():
+    frame = Frame([
+        item("访问城市", 1172, 486),
+        item("作战", 1150, 410, 40), item("其他", 1185, 410, 20),
+        item("终端", 1210, 410, 40),
+    ])
+    candidate, evidence = resolve_action_terminal_candidate(frame, phase="test")
+    assert candidate is None
+    assert "fragment_crosses_other_item" in evidence.rejected_candidate_reasons
+
+
+def test_reversed_fragment_order_is_blocked():
+    frame = Frame([item("访问城市", 1172, 486), item("终端", 1160, 410), item("作战", 1205, 410)])
+    candidate, evidence = resolve_action_terminal_candidate(frame, phase="test")
+    assert candidate is None
+    assert evidence.failure_class == "OCR_FRAGMENTED"
+
+
+def test_nonexact_fragment_text_is_not_widened_into_match():
+    frame = Frame([item("访问城市", 1172, 486), item("作站", 1160, 410), item("终端", 1205, 410)])
+    candidate, evidence = resolve_action_terminal_candidate(frame, phase="test")
+    assert candidate is None
+    assert evidence.failure_class in {"OCR_NO_MATCH", "OCR_FRAGMENTED"}
+
+
+def test_multiple_mergeable_fragment_groups_are_blocked():
+    frame = Frame([
+        item("访问城市", 1172, 486),
+        item("作战", 1115, 395, 30), item("终端", 1150, 395, 30),
+        item("作战", 1190, 430, 30), item("终端", 1225, 430, 30),
+    ])
+    candidate, evidence = resolve_action_terminal_candidate(frame, phase="test")
+    assert candidate is None
+    assert evidence.failure_class == "OCR_MULTIPLE_MATCHES"
+
+
+def test_out_of_bounds_bbox_is_blocked():
+    frame = home()
+    frame._labels[1]["position"] = [[1180, 390], [1300, 390], [1300, 425], [1180, 425]]
+    candidate, evidence = resolve_action_terminal_candidate(frame, phase="test")
+    assert candidate is None
+    assert evidence.failure_class == "BBOX_INVALID"
+
+
+def test_abnormal_bbox_area_is_blocked():
+    frame = Frame([item("访问城市", 1172, 486), item("作战终端", 1190, 410, 2, 2)])
+    candidate, evidence = resolve_action_terminal_candidate(frame, phase="test")
+    assert candidate is None
+    assert evidence.failure_class == "BBOX_INVALID"
+
+
+def test_center_overlapping_other_ocr_is_blocked():
+    frame = Frame([
+        item("访问城市", 1172, 486),
+        item("作战终端", 1190, 410),
+        item("其他按钮", 1190, 410, 140, 50),
+    ])
+    candidate, evidence = resolve_action_terminal_candidate(frame, phase="test")
+    assert candidate is None
+    assert evidence.failure_class == "SAFE_POINT_REJECTED"
+
+
+def test_quest_copy_containing_target_does_not_create_second_candidate():
+    frame = Frame([
+        item("访问城市", 1172, 486),
+        item("前往作战终端", 1097, 285, 112, 27),
+        item("作战终端", 1190, 408, 83, 28),
+    ])
+    candidate, evidence = resolve_action_terminal_candidate(frame, phase="test")
+    assert candidate is not None
+    assert evidence.exact_match_count == 1
+    assert evidence.safe_candidate_count == 1
 
 
 def test_nonempty_unknown_waits_until_deadline_without_more_input():
@@ -156,6 +307,47 @@ def test_stale_post_frame_is_ignored_until_fresh_postcondition():
     assert result.success
     assert len(taps) == len(evidence) == 3
     assert result.timeline[0]["transition_classification"] == "STALE"
+
+
+def test_fresh_terminal_bbox_jitter_preserves_semantic_identity():
+    jittered = Frame([item("访问城市", 1172, 486), item("作战终端", 1188, 407)])
+    result, taps, _ = run([
+        home("1"), jittered, overview("3"), overview("4"),
+        entry("5"), entry("6"), summary("7"),
+    ])
+    assert result.success
+    assert taps[0][0] == (1188, 407)
+
+
+def test_fresh_terminal_disappearance_has_zero_input():
+    missing = Frame([item("访问城市", 1172, 486)])
+    result, taps, evidence = run([home("1"), missing])
+    assert not result.success
+    assert result.reason == "action_terminal_fresh_confirmation_failed"
+    assert taps == evidence == []
+
+
+def test_fresh_terminal_becoming_multiple_has_zero_input():
+    result, taps, evidence = run([home("1"), home("2", duplicate=True)])
+    assert not result.success
+    assert result.reason == "action_terminal_fresh_confirmation_failed"
+    assert taps == evidence == []
+
+
+def test_fresh_state_change_has_zero_input():
+    result, taps, evidence = run([home("1"), overview("2")])
+    assert not result.success
+    assert result.reason == "fresh_confirmation_state_changed"
+    assert taps == evidence == []
+
+
+def test_fresh_semantic_identity_large_position_change_has_zero_input():
+    initial = Frame([item("访问城市", 1172, 486), item("作战终端", 1220, 410, 60)])
+    fresh = Frame([item("访问城市", 1172, 486), item("作战终端", 1110, 410, 60)])
+    result, taps, evidence = run([initial, fresh])
+    assert not result.success
+    assert result.reason == "action_terminal_fresh_confirmation_failed"
+    assert taps == evidence == []
 
 
 def test_foreign_inventory_page_fails_immediately():
