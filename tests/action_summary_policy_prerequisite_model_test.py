@@ -125,6 +125,7 @@ def complete_inputs(model: ActionSummaryPageModel) -> ActionSummaryPolicyPrerequ
             reward_target_id="ACTIVITY_PROGRESS",
             current_amount=20,
             target_amount=100,
+            candidate_reward_amount=30,
             provenance=page_provenance(FactSource.USER_CONFIGURED),
         ),
         fatigue_budget=FatigueBudgetFact(
@@ -163,6 +164,7 @@ def test_complete_facts_are_ready_for_policy_evaluation_only():
     assert result.status is PrerequisiteModelStatus.READY_FOR_POLICY_EVALUATION
     assert result.reason_codes == ()
     assert result.policy_evaluation_allowed is True
+    assert result.candidate_available_action_types == frozenset({"CHALLENGE"})
     assert result.bounded_candidate_executions == 2
     assert result.execution_authorized is False
     assert result.selected_action is None
@@ -479,6 +481,7 @@ def test_serialization_is_machine_readable_and_contains_no_action():
     assert document["reward_target"]["remaining_to_target"] == 80
     assert document["fatigue_budget"]["spendable_fatigue"] == 100
     assert document["strategy"]["allowed_action_types"] == ["CHALLENGE"]
+    assert document["candidate_available_action_types"] == ["CHALLENGE"]
     assert document["execution_authorized"] is False
     assert document["selected_action"] is None
     assert document["business_dispatches"] == 0

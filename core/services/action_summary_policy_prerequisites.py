@@ -101,6 +101,7 @@ class RewardTargetFact:
     reward_target_id: str | None = None
     current_amount: int | None = None
     target_amount: int | None = None
+    candidate_reward_amount: int | None = None
     provenance: FactProvenance | None = None
 
     @property
@@ -162,6 +163,7 @@ class ActionSummaryPolicyPrerequisiteModel:
     source_capture_id: str | None
     source_frame_sha256: str | None
     source_model_freshness_token: str | None
+    source_policy_candidate_count: int
     candidate_card_match_key: str | None
     status: PrerequisiteModelStatus
     reason_codes: tuple[str, ...]
@@ -171,6 +173,7 @@ class ActionSummaryPolicyPrerequisiteModel:
     reward_target: RewardTargetFact
     fatigue_budget: FatigueBudgetFact
     strategy: StrategyInputContract
+    candidate_available_action_types: frozenset[str]
     bounded_candidate_executions: int | None
     policy_evaluation_allowed: bool
     execution_authorized: bool
@@ -212,6 +215,9 @@ class ActionSummaryPolicyPrerequisiteModel:
             sorted(self.strategy.allowed_action_types)
             if isinstance(self.strategy.allowed_action_types, frozenset)
             else []
+        )
+        document["candidate_available_action_types"] = sorted(
+            self.candidate_available_action_types
         )
         for fact_name in (
             "remaining_attempts",
@@ -482,12 +488,14 @@ def evaluate_action_summary_policy_prerequisites(
             or not reward.reward_target_id.strip()
             or not _exact_int(reward.current_amount)
             or not _exact_int(reward.target_amount)
+            or not _exact_int(reward.candidate_reward_amount)
         ):
             incomplete.append("reward_target_value_missing")
         elif (
             reward.current_amount < 0
             or reward.target_amount <= 0
             or reward.current_amount > reward.target_amount
+            or reward.candidate_reward_amount <= 0
         ):
             conflicts.append("reward_target_invalid")
         _record_provenance_findings(_provenance_errors(
@@ -591,6 +599,14 @@ def evaluate_action_summary_policy_prerequisites(
             limits.append(fatigue.max_policy_spend // resource.unit_cost)
         if all(value is not None for value in limits):
             bounded_candidate_executions = min(int(value) for value in limits)
+    candidate_available_action_types = frozenset(
+        action
+        for action, capability in (
+            ("CHALLENGE", "CHALLENGE_AVAILABLE"),
+            ("SWEEP", "SWEEP_AVAILABLE"),
+        )
+        if card is not None and capability in card.available_actions
+    )
     return ActionSummaryPolicyPrerequisiteModel(
         schema_version=_SCHEMA_VERSION,
         model_scope=_MODEL_SCOPE,
@@ -598,6 +614,12 @@ def evaluate_action_summary_policy_prerequisites(
         source_capture_id=page_model.source_capture_id,
         source_frame_sha256=page_model.source_frame_sha256,
         source_model_freshness_token=page_model.model_freshness_token,
+        source_policy_candidate_count=sum(
+            1
+            for source_card in page_model.task_cards
+            if source_card.state is TaskCardState.AVAILABLE
+            and "TASK_EXECUTION_AVAILABLE" in source_card.available_actions
+        ),
         candidate_card_match_key=inputs.task_identity.card_match_key,
         status=status,
         reason_codes=reason_codes,
@@ -607,6 +629,7 @@ def evaluate_action_summary_policy_prerequisites(
         reward_target=reward,
         fatigue_budget=fatigue,
         strategy=strategy,
+        candidate_available_action_types=candidate_available_action_types,
         bounded_candidate_executions=bounded_candidate_executions,
         policy_evaluation_allowed=(
             status is PrerequisiteModelStatus.READY_FOR_POLICY_EVALUATION

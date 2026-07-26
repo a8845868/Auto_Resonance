@@ -34,7 +34,7 @@ irreversible_actions=0
 | Task semantic identity | activity family, semantic task id, card match key, title hash, exact source model/capture/frame/freshness binding | immutable page model |
 | Remaining attempts | remaining and total attempt counts | fresh game observation |
 | Resource identity and balance | non-`UNKNOWN` resource id, available amount, positive unit cost | fresh game observation, reconciled with visible card cost |
-| Reward target | target id, current amount, desired amount | explicit user configuration |
+| Reward target | target id, current amount, desired amount, candidate reward per execution | explicit user configuration |
 | Fatigue budget | available, reserved, and maximum policy spend | fresh game observation |
 | Strategy input | schema, strategy id/version, objective, bounded action types and execution count | explicit user configuration |
 
@@ -53,6 +53,8 @@ unbounded inputs produce `BLOCKED_CONFLICTING_FACTS`.
   total; a page-observed count must agree with the supplied fact.
 - Resource identity may not be `UNKNOWN`; unit cost must agree with the page
   model when a page cost exists.
+- Candidate action types are descriptive intersections derived from the page
+  card (`CHALLENGE`/`SWEEP`); they are not execution permissions.
 - If the cost resource is `FATIGUE`, the resource balance and fatigue balance
   must reconcile.
 - Reserved fatigue cannot be spent, and maximum policy spend cannot exceed
