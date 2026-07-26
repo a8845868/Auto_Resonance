@@ -15,13 +15,19 @@ from core.services.action_summary_policy_prerequisites import (
 )
 from core.services.action_summary_policy_runtime_inputs import (
     ActionSummaryRuntimeResourceObservation,
+    AssemblyIntegrityStatus,
+    PolicyInputReadiness,
+    PolicyTargetMatchStatus,
     RuntimeInputAssemblyStatus,
+    SourceRelationship,
+    action_summary_policy_config_fingerprint,
     assemble_action_summary_policy_runtime_inputs,
     load_action_summary_user_policy_config,
     parse_action_summary_user_policy_config,
 )
 from core.services.action_summary_product_model import (
     TaskCardState,
+    action_summary_title_hash,
     observe_action_summary_page,
 )
 from tests.action_summary_policy_prerequisite_model_test import card, page_model
@@ -272,6 +278,155 @@ def test_policy_hash_is_deterministic_and_changes_with_user_policy():
     assert first.policy_config_sha256 != third.policy_config_sha256
 
 
+def test_different_capture_within_freshness_window_is_explicitly_bound():
+    result = assemble()
+
+    assert result.assembly_status is AssemblyIntegrityStatus.PASS
+    assert result.policy_input_readiness is PolicyInputReadiness.READY_FOR_POLICY_EVALUATION
+    assert result.source_relationship is SourceRelationship.DIFFERENT_CAPTURE_WITHIN_WINDOW
+    assert result.source_age_seconds == 60.0
+    assert result.stale_resource_input_accepted is False
+
+
+def test_same_capture_is_not_inferred_from_timestamp_only():
+    page = runtime_page()
+    resource = observation(
+        source_capture_id=page.source_capture_id,
+        source_frame_sha256=page.source_frame_sha256,
+        observed_at=page.captured_at,
+    )
+    result = assemble(page=page, resource=resource)
+
+    assert result.source_relationship is SourceRelationship.SAME_CAPTURE
+    assert result.source_age_seconds == 0.0
+
+
+def test_stale_resource_observation_is_preserved_but_not_used_for_readiness():
+    resource = observation(
+        observed_at="2026-07-26T11:00:00+08:00",
+        valid_until="2026-07-26T11:05:00+08:00",
+    )
+    result = assemble(resource=resource)
+
+    assert result.assembly_status is AssemblyIntegrityStatus.PASS
+    assert result.policy_input_readiness is PolicyInputReadiness.BLOCKED_MISSING_FACTS
+    assert result.source_relationship is SourceRelationship.DIFFERENT_CAPTURE_STALE
+    assert result.source_age_seconds == 3600.0
+    assert result.resource_observation_capture_id == "resource-capture-9"
+    assert result.stale_resource_input_accepted is False
+    assert "runtime_resource_observation_stale" in result.reason_codes
+    assert all(
+        candidate.resource_balance.status.value == "UNKNOWN"
+        for candidate in result.candidate_prerequisites
+    )
+
+
+def test_missing_resource_capture_id_remains_none_and_relationship_unknown():
+    result = assemble(resource=observation(source_capture_id=""))
+
+    assert result.resource_observation_capture_id == ""
+    assert result.source_relationship is SourceRelationship.UNKNOWN
+    assert result.policy_input_readiness is PolicyInputReadiness.BLOCKED_MISSING_FACTS
+    assert result.stale_resource_input_accepted is False
+
+
+def test_assembled_at_and_policy_snapshot_fingerprint_are_frozen():
+    policy = policy_document()
+    assembled_at = "2026-07-26T12:00:01+08:00"
+    result = assemble_action_summary_policy_runtime_inputs(
+        runtime_page(),
+        policy,
+        resource_observation=observation(),
+        assembled_at=assembled_at,
+    )
+
+    assert result.assembled_at == assembled_at
+    assert result.policy_config_fingerprint_bound is True
+    assert result.policy_config_sha256 == action_summary_policy_config_fingerprint(policy)
+    assert result.matches_policy_config(policy) is True
+    changed = policy_document()
+    changed["ActionSummaryPolicy"]["max_task_executions"] = 1
+    assert result.matches_policy_config(changed) is False
+
+
+def test_partial_policy_snapshot_is_valid_assembly_but_missing_facts():
+    partial = {
+        "ActionSummaryPolicy": {
+            "schema_version": "1.0",
+            "policy_id": "gui-snapshot",
+            "policy_version": "config-v1",
+            "captured_at": "2026-07-26T12:00:00+08:00",
+        }
+    }
+    result = assemble_action_summary_policy_runtime_inputs(
+        runtime_page(), partial, resource_observation=None
+    )
+
+    assert result.assembly_status is AssemblyIntegrityStatus.PASS
+    assert result.policy_input_readiness is PolicyInputReadiness.BLOCKED_MISSING_FACTS
+    assert result.policy_config_id == "gui-snapshot"
+    assert result.policy_config_version == "config-v1"
+    assert result.policy_config_captured_at == "2026-07-26T12:00:00+08:00"
+    assert "objective_missing" in result.missing_runtime_inputs
+    assert "runtime_resource_observation_missing" in result.missing_runtime_inputs
+
+
+def test_malformed_policy_section_fails_closed_without_snapshot_reuse():
+    malformed = {"ActionSummaryPolicy": []}
+    result = assemble(policy=malformed)
+
+    assert result.assembly_status is AssemblyIntegrityStatus.FAIL
+    assert result.policy_input_readiness is PolicyInputReadiness.BLOCKED_CONFLICTING_INPUTS
+    assert result.matches_policy_config({"not": {"json": {1, 2}}}) is False
+
+
+def test_unique_policy_target_binds_current_fresh_card_match_key():
+    title_hash = action_summary_title_hash("特殊订单")
+    first, second = runtime_page().task_cards
+    page = page_model(replace(first, title_hash=title_hash), second)
+    policy = policy_document()
+    policy["ActionSummaryPolicy"].update({
+        "requested_known_task_id": "TASK_A",
+        "requested_task_title_hash": title_hash,
+    })
+    result = assemble(page=page, policy=policy)
+
+    assert result.policy_target_match_status is PolicyTargetMatchStatus.UNIQUE
+    assert result.policy_target_card_match_key == "MATCH_A"
+    assert result.assembly_status is AssemblyIntegrityStatus.PASS
+
+
+def test_duplicate_semantic_target_is_ambiguous_not_index_bound():
+    title_hash = action_summary_title_hash("特殊订单")
+    first, second = runtime_page().task_cards
+    page = page_model(
+        replace(first, title_hash=title_hash),
+        replace(second, semantic_id="TASK_A", title_hash=title_hash),
+    )
+    policy = policy_document()
+    policy["ActionSummaryPolicy"].update({
+        "requested_known_task_id": "TASK_A",
+        "requested_task_title_hash": title_hash,
+    })
+    result = assemble(page=page, policy=policy)
+
+    assert result.policy_target_match_status is PolicyTargetMatchStatus.AMBIGUOUS
+    assert result.policy_target_card_match_key is None
+    assert result.assembly_status is AssemblyIntegrityStatus.FAIL
+    assert result.policy_input_readiness is PolicyInputReadiness.BLOCKED_CONFLICTING_INPUTS
+
+
+def test_unknown_activity_cannot_bind_known_policy_target():
+    page = replace(runtime_page(), activity_family="UNKNOWN")
+    policy = policy_document()
+    policy["ActionSummaryPolicy"]["requested_known_task_id"] = "TASK_A"
+    result = assemble(page=page, policy=policy)
+
+    assert result.policy_target_match_status is PolicyTargetMatchStatus.UNSUPPORTED
+    assert result.policy_target_card_match_key is None
+    assert result.assembly_status is AssemblyIntegrityStatus.FAIL
+
+
 def test_parser_accepts_direct_or_app_section_documents():
     nested = parse_action_summary_user_policy_config(policy_document())
     direct = parse_action_summary_user_policy_config(
@@ -381,6 +536,26 @@ def test_import_does_not_initialize_real_backend():
                 "import core.services.action_summary_policy_runtime_inputs; "
                 "assert 'core.control.control' not in sys.modules; "
                 "assert 'auto' not in sys.modules"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_live_gate_import_does_not_load_runtime_backend_or_automation():
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "import tools.action_summary_policy_runtime_input_live_gate; "
+                "assert 'core.control.control' not in sys.modules; "
+                "assert 'auto.resident_activity' not in sys.modules"
             ),
         ],
         check=False,

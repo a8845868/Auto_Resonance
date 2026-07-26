@@ -223,6 +223,12 @@ def _hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def action_summary_title_hash(text: str) -> str:
+    """Return the exact normalized title hash used by the read-only model."""
+
+    return _hash_text(_normalize(text))
+
+
 def _evidence_id(kind: str, text_hash: str, bounds: tuple[int, ...]) -> str:
     payload = f"{kind}|{text_hash}|{','.join(str(value) for value in bounds)}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
@@ -767,6 +773,7 @@ __all__ = [
     "ActionSummaryPageActions",
     "ActionSummaryPageModel",
     "ActionSummaryTaskCard",
+    "action_summary_title_hash",
     "PageConfidence",
     "RewardState",
     "TaskCardState",

@@ -9,7 +9,7 @@ fresh ACTION_SUMMARY page model
   + fresh read-only resource observation
   + explicit user policy configuration
   -> one prerequisite model per visible executable card
-  -> READY_FOR_POLICY_EVALUATION | BLOCKED_*
+  -> assembly integrity + independent policy-input readiness
 ```
 
 It does not call the business-policy evaluator, select or execute a
@@ -33,6 +33,12 @@ Missing attempt totals, balances, per-card rewards, provenance, capture
 identity, or freshness stay unknown and block evaluation.  No default resource,
 reward yield, attempt count, or budget is invented.
 
+The output preserves page and resource capture ids, frame hashes, timestamps,
+freshness tokens, their measured age, and one explicit relationship:
+`SAME_CAPTURE`, `DIFFERENT_CAPTURE_WITHIN_WINDOW`,
+`DIFFERENT_CAPTURE_STALE`, or `UNKNOWN`. A stale resource observation remains
+visible as provenance but is never promoted to a known prerequisite fact.
+
 ## User policy document
 
 The parser accepts either the section below or a document whose
@@ -44,6 +50,7 @@ The parser accepts either the section below or a document whose
   "policy_id": "personal-siege-policy",
   "policy_version": "1",
   "revision": "user-config-rev-1",
+  "captured_at": "2026-07-26T11:50:00+08:00",
   "effective_at": "2026-07-26T11:50:00+08:00",
   "valid_until": "2026-07-26T12:10:00+08:00",
   "objective": "MAXIMIZE_TARGET_REWARD",
@@ -68,11 +75,18 @@ rejected, execution count is capped at 10, candidate identities must be
 unique, and no fallback defaults are applied.  The file loader reads only an
 explicit path and never creates, rewrites, or migrates configuration.
 
+An optional policy target binds by exact semantic task id and, when supplied,
+the current title hash. The matching fresh card must be unique; no array index,
+substring, or previous bounding box is accepted. The result records the
+current `card_match_key` only after that unique match.
+
 ## Output contract
 
-A ready assembly contains the complete candidate prerequisite set expected by
-the existing advisory evaluator.  Ready means only that evaluation inputs are
-coherent.  Every result fixes these fields:
+`assembly_status=PASS` means the sources were assembled without contradiction.
+It is independent from `policy_input_readiness`, which may remain
+`BLOCKED_MISSING_FACTS`. A ready assembly contains the complete candidate
+prerequisite set expected by the existing advisory evaluator. Ready means only
+that evaluation inputs are coherent. Every result fixes these fields:
 
 ```text
 business_policy_evaluated=false
@@ -83,9 +97,16 @@ business_dispatches=0
 irreversible_actions=0
 ```
 
-The canonical normalized user configuration is SHA-256 bound as
-`policy_config_sha256`.  Actual runtime call-site wiring and GUI configuration
-editing remain outside V1.
+The exact normalized user configuration snapshot, including an incomplete
+snapshot, is SHA-256 bound as `policy_config_sha256`. `matches_policy_config()`
+rejects later reuse after any snapshot change. Actual policy evaluation and
+GUI configuration editing remain outside V1.
+
+The opt-in live gate tool may use the proven V2A product navigator and then
+capture at most two ACTION_SUMMARY frames. That orchestration is outside the
+assembler: the assembler itself still has no capture, backend, retry, input,
+or persistence authority. The gate never sends input on the action-summary
+page and never evaluates policy.
 
 ## Explicit non-goals
 
@@ -97,6 +118,6 @@ CHALLENGE_EXECUTION=NO
 SWEEP_EXECUTION=NO
 REWARD_CLAIM=NO
 FATIGUE_ITEM_USE=NO
-REAL_CAPTURE=NO
+ASSEMBLER_REAL_CAPTURE=NO
 REAL_INPUT=NO
 ```
