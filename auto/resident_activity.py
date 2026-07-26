@@ -27,6 +27,12 @@ from core.services.action_summary_product_model import (
     decide_action_summary,
     observe_action_summary_page,
 )
+from core.services.action_summary_execution_interlock import (
+    ActionSummaryExecutionAuthorization,
+    ActionSummaryExecutionMode,
+    ActionSummaryExecutionResult,
+    evaluate_execution_interlock,
+)
 from core.services.personal_action_budget import EpisodeActionBudget
 from core.services.proven_capability_navigation import (
     CapabilityNavigationResult,
@@ -363,11 +369,19 @@ class ResidentActivityAutomation:
         driver: Optional[ScreenDriver] = None,
         *,
         use_proven_edge_planner: bool = True,
+        execution_mode: ActionSummaryExecutionMode | str = (
+            ActionSummaryExecutionMode.READ_ONLY
+        ),
     ):
         self.driver = driver or ScreenDriver()
         self.reward_history: list[RewardObservation] = []
         self.use_proven_edge_planner = bool(use_proven_edge_planner)
+        self.execution_mode = ActionSummaryExecutionMode(execution_mode)
         self.last_capability_navigation_result: CapabilityNavigationResult | None = None
+
+    def _require_legacy_execution(self) -> None:
+        if self.execution_mode is not ActionSummaryExecutionMode.LEGACY_COMPATIBILITY:
+            raise PermissionError("legacy_compatibility_disabled")
 
     def open_action_summary(self) -> bool:
         capture = getattr(self.driver, "capture_frame", None)
@@ -427,6 +441,7 @@ class ResidentActivityAutomation:
 
     def _reward_attempts(self, fallback: int = 3) -> int:
         """Read an ``n/3`` reward counter; use the safe activity cap on OCR miss."""
+        self._require_legacy_execution()
         for item in self.driver.texts():
             match = re.search(r"([0-3])\s*/\s*3", item["text"])
             if match:
@@ -476,6 +491,7 @@ class ResidentActivityAutomation:
 
     def enter_first_visible_challenge(self) -> bool:
         """Enter the leftmost visible card through its full blue button."""
+        self._require_legacy_execution()
         for _ in range(3):
             items = self.driver.texts()
             candidates = [
@@ -524,6 +540,7 @@ class ResidentActivityAutomation:
 
     def verify_activity_detail(self, stage: str, reward: str) -> bool:
         """Verify both the detail title and its expected reward preview."""
+        self._require_legacy_execution()
         items = self.driver.texts()
         title_ok = any(
             _matches(item["text"], stage, exact=True)
@@ -549,6 +566,7 @@ class ResidentActivityAutomation:
 
     def select_activity_stage(self, stage: str, reward: str) -> bool:
         """Locate a card by OCR title plus reward icon, then verify its detail."""
+        self._require_legacy_execution()
         for _ in range(7):
             items = self.driver.texts()
             stage_items = [
@@ -582,6 +600,7 @@ class ResidentActivityAutomation:
         return False
 
     def sweep_current_activity(self, max_attempts: int) -> int:
+        self._require_legacy_execution()
         completed = 0
         for _ in range(max_attempts):
             # Strict region-locked state machine:
@@ -618,6 +637,7 @@ class ResidentActivityAutomation:
     def run_limited_activity(
         self, name: str, stage: Optional[str] = None, reward: Optional[str] = None
     ) -> int:
+        self._require_legacy_execution()
         if not self.click_activity_tab(name):
             logger.warning(f"未找到活动：{name}")
             return 0
@@ -643,6 +663,7 @@ class ResidentActivityAutomation:
         return completed
 
     def select_siege_task(self, task: str) -> bool:
+        self._require_legacy_execution()
         if task not in SIEGE_TASKS:
             raise ValueError(f"未知利刃围剿任务：{task}")
 
@@ -690,6 +711,7 @@ class ResidentActivityAutomation:
         return False
 
     def run_siege(self, task: str, safety_limit: int = 100) -> int:
+        self._require_legacy_execution()
         if not self.select_siege_task(task):
             return 0
 
@@ -699,7 +721,10 @@ class ResidentActivityAutomation:
         logger.info(f"{task}完成 {completed} 次")
         return completed
 
-    def run(self, task: str, full_realm_reward: str = "学会装备箱") -> dict[str, int]:
+    def _run_legacy(
+        self, task: str, full_realm_reward: str = "学会装备箱"
+    ) -> dict[str, int]:
+        self._require_legacy_execution()
         if not connect_resonance():
             raise RuntimeError("ADB连接失败")
         if not self.open_action_summary():
@@ -719,8 +744,70 @@ class ResidentActivityAutomation:
         results[task] = self.run_siege(task)
         return results
 
-    def run_once(self, task: str) -> dict[str, int]:
-        """Run exactly one selected siege sweep for end-to-end verification."""
+    def _run_interlocked(
+        self,
+        *,
+        authorization: ActionSummaryExecutionAuthorization | None = None,
+        requested_action: str | None = None,
+        fresh_model: ActionSummaryPageModel | None = None,
+    ) -> ActionSummaryExecutionResult:
+        if not connect_resonance():
+            raise RuntimeError("ADB连接失败")
+        model, decision = self.read_action_summary_product_model()
+        return evaluate_execution_interlock(
+            model,
+            decision,
+            mode=self.execution_mode,
+            authorization=authorization,
+            requested_action=requested_action,
+            fresh_model=fresh_model,
+        )
+
+    def run(
+        self,
+        task: str,
+        full_realm_reward: str = "学会装备箱",
+        *,
+        authorization: ActionSummaryExecutionAuthorization | None = None,
+        requested_action: str | None = None,
+        fresh_model: ActionSummaryPageModel | None = None,
+    ) -> dict[str, object]:
+        """Public product entry; READ_ONLY is the fail-closed default."""
+
+        if self.execution_mode is ActionSummaryExecutionMode.LEGACY_COMPATIBILITY:
+            legacy_result: dict[str, object] = dict(
+                self._run_legacy(task, full_realm_reward)
+            )
+            legacy_result["execution_mode"] = self.execution_mode.value
+            return legacy_result
+        return self._run_interlocked(
+            authorization=authorization,
+            requested_action=requested_action,
+            fresh_model=fresh_model,
+        ).to_dict()
+
+    def run_once(
+        self,
+        task: str,
+        *,
+        authorization: ActionSummaryExecutionAuthorization | None = None,
+        requested_action: str | None = None,
+        fresh_model: ActionSummaryPageModel | None = None,
+    ) -> dict[str, object]:
+        """One-shot public entry; still READ_ONLY unless legacy is explicit."""
+
+        if self.execution_mode is not ActionSummaryExecutionMode.LEGACY_COMPATIBILITY:
+            return self._run_interlocked(
+                authorization=authorization,
+                requested_action=requested_action,
+                fresh_model=fresh_model,
+            ).to_dict()
+        legacy_result: dict[str, object] = dict(self._run_once_legacy(task))
+        legacy_result["execution_mode"] = self.execution_mode.value
+        return legacy_result
+
+    def _run_once_legacy(self, task: str) -> dict[str, int]:
+        self._require_legacy_execution()
         if not connect_resonance():
             raise RuntimeError("ADB连接失败")
         if not self.open_action_summary():
@@ -735,12 +822,21 @@ class ResidentActivityAutomation:
 
 
 def run_resident_activity(
-    task: str, full_realm_reward: str = "学会装备箱"
-) -> dict[str, int]:
+    task: str,
+    full_realm_reward: str = "学会装备箱",
+    *,
+    execution_mode: ActionSummaryExecutionMode | str = ActionSummaryExecutionMode.READ_ONLY,
+) -> dict[str, object]:
     """GUI entry point."""
-    return ResidentActivityAutomation().run(task, full_realm_reward)
+    return ResidentActivityAutomation(execution_mode=execution_mode).run(
+        task, full_realm_reward
+    )
 
 
-def run_resident_activity_once(task: str) -> dict[str, int]:
+def run_resident_activity_once(
+    task: str,
+    *,
+    execution_mode: ActionSummaryExecutionMode | str = ActionSummaryExecutionMode.READ_ONLY,
+) -> dict[str, object]:
     """GUI entry point for one non-repeating verification sweep."""
-    return ResidentActivityAutomation().run_once(task)
+    return ResidentActivityAutomation(execution_mode=execution_mode).run_once(task)

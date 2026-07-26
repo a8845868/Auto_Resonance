@@ -54,6 +54,43 @@ def recover_startup_fatigue_schedules() -> bool:
         return False
 
 
+def action_summary_execution_status(result: object) -> tuple[str, str] | None:
+    """Format the structured interlock result without implying execution."""
+
+    if not isinstance(result, dict) or "execution_status" not in result:
+        return None
+    decision = result.get("decision")
+    decision_name = (
+        decision.get("decision", "UNKNOWN")
+        if isinstance(decision, dict)
+        else "UNKNOWN"
+    )
+    reason = str(result.get("reason", "unknown"))
+    status = str(result.get("execution_status", "UNKNOWN"))
+    if status == "BLOCKED":
+        return (
+            f"■  行动汇总已安全阻断：{reason}（{decision_name}）",
+            "#f0a44b",
+        )
+    return (
+        f"✓  行动汇总只读评估完成：{reason}（{decision_name}）",
+        "#65c466",
+    )
+
+
+def build_resident_activity_task(
+    activity_task: str,
+    full_reward: str,
+) -> QueuedTask:
+    """Build the queue entry through the default-safe public wrapper."""
+
+    return QueuedTask(
+        "扫荡与全域整备",
+        lambda: run_resident_activity(activity_task, full_reward),
+        key="resident_activity",
+    )
+
+
 def select_reward_dependency_tasks(
     capabilities: list[DailyCapability],
     snapshot: DailyProgressSnapshot | None,
@@ -299,11 +336,7 @@ class DashboardInterface(ScrollArea):
         if bool(cfg.enableResidentActivity.value):
             activity_task = cfg.residentActivityTask.value
             reward = cfg.residentActivityFullRealmReward.value
-            tasks.append(QueuedTask(
-                "扫荡与全域整备",
-                lambda task=activity_task, full_reward=reward: run_resident_activity(task, full_reward),
-                key="resident_activity",
-            ))
+            tasks.append(build_resident_activity_task(activity_task, reward))
         business = self.businessTaskProvider()
         if business:
             tasks.append(business)
@@ -499,7 +532,9 @@ class DashboardInterface(ScrollArea):
         self.currentTask = name
         self.runningPanel.setTasks([f"{index}/{total}  {name}"])
         if name == "扫荡与全域整备":
-            self.activityStateChanged.emit("●  运行中：正在执行全域整备", "#43a5ff")
+            self.activityStateChanged.emit(
+                "●  运行中：正在只读评估行动汇总", "#43a5ff"
+            )
         elif name == "启动任务前自动准备游戏":
             self.personalStartupStatusLabel.setText(
                 "自动准备游戏：运行中 · 当前页面：其他 · 当前城市：未知 · "
@@ -515,6 +550,10 @@ class DashboardInterface(ScrollArea):
 
     def _taskResult(self, name, result):
         if name != "扫荡与全域整备" or not isinstance(result, dict):
+            return
+        interlock_status = action_summary_execution_status(result)
+        if interlock_status is not None:
+            self.activityStateChanged.emit(*interlock_status)
             return
         details = "，".join(f"{task} {count} 次" for task, count in result.items())
         self.activityStateChanged.emit(f"✓  已完成：{details}", "#65c466")

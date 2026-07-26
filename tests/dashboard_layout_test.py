@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -8,6 +9,10 @@ from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import QApplication, QTextEdit
 
 from app.view.logger_interface import LoguruHandler, StructuredLogWidget
+from app.view.dashboard_interface import (
+    action_summary_execution_status,
+    build_resident_activity_task,
+)
 
 
 def _app():
@@ -23,6 +28,38 @@ def test_structured_log_parses_live_and_historical_formats():
     assert StructuredLogWidget.parseLine(
         "23:45:15 - ERROR | task_queue.run:139 - failed"
     ) == ("ERROR", "23:45:15", "failed")
+
+
+def test_action_summary_block_is_not_rendered_as_completed_sweeps():
+    status = action_summary_execution_status({
+        "execution_status": "BLOCKED",
+        "reason": "business_policy_required",
+        "decision": {"decision": "TASK_AVAILABLE_NEEDS_POLICY"},
+        "business_dispatches": 0,
+    })
+
+    assert status == (
+        "■  行动汇总已安全阻断：business_policy_required（TASK_AVAILABLE_NEEDS_POLICY）",
+        "#f0a44b",
+    )
+
+
+def test_dashboard_queue_entry_uses_default_safe_public_wrapper():
+    blocked = {
+        "execution_status": "BLOCKED",
+        "reason": "business_policy_required",
+        "business_dispatches": 0,
+    }
+    with patch(
+        "app.view.dashboard_interface.run_resident_activity",
+        return_value=blocked,
+    ) as public_entry:
+        task = build_resident_activity_task("特殊订单", "学会装备箱")
+        result = task.run()
+
+    public_entry.assert_called_once_with("特殊订单", "学会装备箱")
+    assert task.key == "resident_activity"
+    assert result == blocked
 
 
 def test_structured_log_keeps_columns_colours_and_latest_rows():

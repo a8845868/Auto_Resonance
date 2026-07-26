@@ -12,6 +12,9 @@ from auto.resident_activity import (
     _find_resonance_port,
     _matches,
 )
+from core.services.action_summary_execution_interlock import (
+    ActionSummaryExecutionMode,
+)
 from core.control.adb_port import EmulatorInfo, EmulatorType
 
 
@@ -20,6 +23,13 @@ def item(text, x=600, y=420):
         "text": text,
         "position": [[x - 20, y - 10], [x + 20, y - 10], [x + 20, y + 10], [x - 20, y + 10]],
     }
+
+
+def legacy_automation(driver):
+    return ResidentActivityAutomation(
+        driver,
+        execution_mode=ActionSummaryExecutionMode.LEGACY_COMPATIBILITY,
+    )
 
 
 class FakeDriver:
@@ -129,7 +139,7 @@ class ResidentActivityTests(unittest.TestCase):
             ],
             [item("扫荡", 870, 490), item("难度选择", 110, 677)],
         ])
-        automation = ResidentActivityAutomation(driver)
+        automation = legacy_automation(driver)
         self.assertTrue(automation.select_siege_task("武器材质分析"))
         self.assertEqual(driver.taps[-1], (700, ENTER_CHALLENGE_Y))
 
@@ -148,30 +158,30 @@ class ResidentActivityTests(unittest.TestCase):
             [item("扫荡", 872, 490), item("难度选择", 110, 677)],
         ])
         self.assertTrue(
-            ResidentActivityAutomation(driver).enter_first_visible_challenge()
+            legacy_automation(driver).enter_first_visible_challenge()
         )
         self.assertEqual(driver.taps, [(593, ENTER_CHALLENGE_Y)])
 
     def test_reward_attempts_uses_ocr_counter_and_safe_fallback(self):
         driver = FakeDriver([[item("本日可获取奖励次数 2/3")]])
-        self.assertEqual(ResidentActivityAutomation(driver)._reward_attempts(), 2)
+        self.assertEqual(legacy_automation(driver)._reward_attempts(), 2)
         driver.pages = [[item("无法识别")]]
-        self.assertEqual(ResidentActivityAutomation(driver)._reward_attempts(), 3)
+        self.assertEqual(legacy_automation(driver)._reward_attempts(), 3)
 
     def test_sweep_stops_when_initial_button_disappears(self):
         driver = SweepFlowDriver(max_sweeps=2)
-        self.assertEqual(ResidentActivityAutomation(driver).sweep_current_activity(3), 2)
+        self.assertEqual(legacy_automation(driver).sweep_current_activity(3), 2)
         self.assertEqual(driver.taps.count(SWEEP_BUTTON_CENTER), 2)
         self.assertEqual(driver.taps.count(START_SWEEP_BUTTON_CENTER), 2)
 
     def test_single_sweep_has_hard_limit_of_one(self):
         driver = SweepFlowDriver(max_sweeps=3)
-        self.assertEqual(ResidentActivityAutomation(driver).sweep_current_activity(1), 1)
+        self.assertEqual(legacy_automation(driver).sweep_current_activity(1), 1)
         self.assertEqual(driver.taps, [SWEEP_BUTTON_CENTER, START_SWEEP_BUTTON_CENTER])
 
     def test_sweep_is_not_counted_when_team_confirmation_is_missing(self):
         driver = SweepFlowDriver(team_available=False)
-        self.assertEqual(ResidentActivityAutomation(driver).sweep_current_activity(1), 0)
+        self.assertEqual(legacy_automation(driver).sweep_current_activity(1), 0)
         self.assertEqual(driver.taps, [SWEEP_BUTTON_CENTER])
 
     def test_matching_text_outside_expected_roi_never_unlocks_a_click(self):
@@ -180,7 +190,7 @@ class ResidentActivityTests(unittest.TestCase):
             item("难度选择", 110, 677),
             item("开始扫荡", 772, 526),
         ]])
-        self.assertEqual(ResidentActivityAutomation(driver).sweep_current_activity(1), 0)
+        self.assertEqual(legacy_automation(driver).sweep_current_activity(1), 0)
         self.assertEqual(driver.taps, [])
 
     def test_reward_title_animation_positions_are_both_accepted(self):
@@ -217,7 +227,7 @@ class ResidentActivityTests(unittest.TestCase):
             ],
         ])
         self.assertTrue(
-            ResidentActivityAutomation(driver).select_activity_stage(
+            legacy_automation(driver).select_activity_stage(
                 "特供·救世", "学会装备箱"
             )
         )
@@ -245,7 +255,7 @@ class ResidentActivityTests(unittest.TestCase):
             ],
         ])
         self.assertFalse(
-            ResidentActivityAutomation(driver).select_activity_stage(
+            legacy_automation(driver).select_activity_stage(
                 "特供·救世", "学会装备箱"
             )
         )
@@ -254,7 +264,7 @@ class ResidentActivityTests(unittest.TestCase):
     def test_home_navigation_failure_is_not_reported_as_zero_completion(self):
         driver = FakeDriver([[]])
         driver.go_home = lambda: False
-        automation = ResidentActivityAutomation(driver)
+        automation = legacy_automation(driver)
 
         with patch("auto.resident_activity.connect", return_value=True):
             with self.assertRaisesRegex(RuntimeError, "无法打开活动总览"):

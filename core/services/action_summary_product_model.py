@@ -67,6 +67,7 @@ class ActionSummaryPageActions:
 class ActionSummaryTaskCard:
     semantic_id: str
     card_instance_id: str
+    card_match_key: str
     title_hash: str
     bbox: tuple[int, int, int, int]
     state: TaskCardState
@@ -123,6 +124,12 @@ class ActionSummaryDecision:
     evidence_ids: tuple[str, ...]
     confidence: PageConfidence
     required_future_authorization: tuple[str, ...]
+    model_freshness_token: str | None
+    source_frame_sha256: str | None
+    activity_family: str
+    selected_card_match_key: str | None
+    policy_status: str
+    execution_authorized: bool
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -133,6 +140,12 @@ class ActionSummaryDecision:
             "required_future_authorization": list(
                 self.required_future_authorization
             ),
+            "model_freshness_token": self.model_freshness_token,
+            "source_frame_sha256": self.source_frame_sha256,
+            "activity_family": self.activity_family,
+            "selected_card_match_key": self.selected_card_match_key,
+            "policy_status": self.policy_status,
+            "execution_authorized": self.execution_authorized,
         }
 
 
@@ -312,6 +325,33 @@ def _card_instance_id(
     return f"CARD_{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:24].upper()}"
 
 
+def _card_match_key(
+    *,
+    activity_family: str,
+    title_hash: str,
+    anchor_bbox: tuple[int, int, int, int],
+    page_index: int,
+    frame_size: tuple[int, int],
+) -> str:
+    """Build a jitter-tolerant cross-frame key without retaining coordinates."""
+
+    width, height = frame_size
+    center_x, center_y = _center(anchor_bbox)
+    if width > 0 and height > 0:
+        # Ten normalized buckets tolerate ordinary 1-2 px OCR jitter on the
+        # supported captures while still separating the visible card columns.
+        spatial_slot = f"{round(center_x / width * 10)}:{round(center_y / height * 10)}"
+    else:
+        spatial_slot = "UNSCALED"
+    payload = "|".join((
+        activity_family,
+        title_hash,
+        spatial_slot,
+        str(page_index),
+    ))
+    return f"MATCH_{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:24].upper()}"
+
+
 def _captured_at(frame: object) -> str | None:
     value = getattr(frame, "captured_at", None)
     if value is None:
@@ -475,7 +515,7 @@ def observe_action_summary_page(frame: object) -> ActionSummaryPageModel:
         if activity_family == _SIEGE_ACTIVITY_FAMILY
         else []
     )
-    for anchor_text, anchor_bbox in parsed_anchors:
+    for page_index, (anchor_text, anchor_bbox) in enumerate(parsed_anchors):
         anchor_x, _anchor_y = _center(anchor_bbox)
         candidates = [
             (text, bounds)
@@ -519,6 +559,13 @@ def observe_action_summary_page(frame: object) -> ActionSummaryPageModel:
                 title_hash=title_hash,
                 anchor_bbox=anchor_bbox,
                 title_ordinal=title_ordinal,
+                frame_size=frame_size,
+            ),
+            card_match_key=_card_match_key(
+                activity_family=activity_family,
+                title_hash=title_hash,
+                anchor_bbox=anchor_bbox,
+                page_index=page_index,
                 frame_size=frame_size,
             ),
             title_hash=title_hash,
@@ -632,6 +679,12 @@ def decide_action_summary(model: ActionSummaryPageModel) -> ActionSummaryDecisio
                 if future_authorization
                 else ()
             ),
+            model.model_freshness_token,
+            model.source_frame_sha256,
+            model.activity_family,
+            None,
+            "NOT_STARTED",
+            False,
         )
 
     if model.page_state != "ACTION_SUMMARY_VISIBLE" or model.overlay_states:
