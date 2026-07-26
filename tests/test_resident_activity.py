@@ -282,6 +282,38 @@ class ResidentActivityTests(unittest.TestCase):
         navigator.navigate.assert_called_once_with()
         self.assertEqual(driver.taps, [])
 
+    def test_read_only_product_model_never_clicks_action_summary_page(self):
+        class ModelFrame:
+            source_capture_id = "read-only-model"
+
+            class Image:
+                shape = (720, 1280, 3)
+
+            image = Image()
+
+            @staticmethod
+            def ocr():
+                return [
+                    item("利刃围剿", 680, 84),
+                    item("特殊订单", 580, 420),
+                    item("利刃行动", 860, 420),
+                    item("进入挑战", 580, 606),
+                    item("进入挑战", 860, 606),
+                ]
+
+        driver = FakeDriver([[]])
+        driver.capture_frame = Mock(return_value=ModelFrame())
+        automation = ResidentActivityAutomation(driver)
+        automation.open_action_summary = Mock(return_value=True)
+
+        model, decision = automation.read_action_summary_product_model()
+
+        self.assertEqual(model.page_state, "ACTION_SUMMARY_VISIBLE")
+        self.assertEqual(decision.decision.value, "TASK_AVAILABLE_NEEDS_POLICY")
+        automation.open_action_summary.assert_called_once_with()
+        driver.capture_frame.assert_called_once_with()
+        self.assertEqual(driver.taps, [])
+
 
 if __name__ == "__main__":
     unittest.main()

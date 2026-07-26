@@ -21,6 +21,12 @@ from core.control.control import (
 from core.control.adb_port import EmulatorInfo, get_adb_port
 from core.services.read_only_policy import ActionIntent
 from core.services.action_summary_navigation import ActionSummaryNavigator
+from core.services.action_summary_product_model import (
+    ActionSummaryDecision,
+    ActionSummaryPageModel,
+    decide_action_summary,
+    observe_action_summary_page,
+)
 from core.services.personal_action_budget import EpisodeActionBudget
 from core.services.proven_capability_navigation import (
     CapabilityNavigationResult,
@@ -402,6 +408,22 @@ class ResidentActivityAutomation:
         if not result.success:
             logger.error(f"进入行动汇总失败: {result.reason}")
         return result.success
+
+    def read_action_summary_product_model(
+        self,
+    ) -> tuple[ActionSummaryPageModel, ActionSummaryDecision]:
+        """Navigate with V2A, then capture one page for read-only product facts.
+
+        No task card, challenge, sweep, reward, or other page element is
+        clicked here.  The returned decision is advisory and carries no input
+        authority.
+        """
+
+        if not self.open_action_summary():
+            model = observe_action_summary_page(self.driver.capture_frame())
+            return model, decide_action_summary(model)
+        model = observe_action_summary_page(self.driver.capture_frame())
+        return model, decide_action_summary(model)
 
     def _reward_attempts(self, fallback: int = 3) -> int:
         """Read an ``n/3`` reward counter; use the safe activity cap on OCR miss."""

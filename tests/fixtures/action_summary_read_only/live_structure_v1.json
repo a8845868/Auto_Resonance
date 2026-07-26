@@ -1,0 +1,34 @@
+{
+  "fixture_kind": "sanitized_live_structure",
+  "capture_size": [1280, 720],
+  "raw_image_included": false,
+  "raw_ocr_text_included": false,
+  "page_title": {
+    "text_sha256": "acf78ba3ceff52f2a26c6b161e0de6ba09f90dc2993ecfd38b51759eb97deeb7",
+    "bbox": [617, 66, 743, 102]
+  },
+  "task_title_hashes": [
+    "8c443028a26c0433b1ea03238f1cadd990721bb847fecfd3b68155ae52131dc2",
+    "ac460035a129259c46d8c8679af49f9274bc220a43157a37b8c6700ef41ed6b2",
+    "5f1f79ea214c0debab76cf67f2a8c14947e6791811b77db5f32f35a03cdebda2"
+  ],
+  "challenge_button_bboxes": [
+    [549, 593, 639, 619],
+    [831, 593, 919, 619],
+    [1079, 593, 1197, 619]
+  ],
+  "cost_observations": [40, 40, 40],
+  "expected": {
+    "page_state": "ACTION_SUMMARY_VISIBLE",
+    "visible_task_cards": 3,
+    "task_states": ["available", "available", "available"],
+    "page_capabilities": [
+      "CHALLENGE_AVAILABLE",
+      "SELECT_TASK_AVAILABLE",
+      "VIEW_TASK_LIST"
+    ],
+    "decision": "TASK_AVAILABLE_NEEDS_POLICY",
+    "remaining_attempts": [null, null, null],
+    "reward_states": ["unknown", "unknown", "unknown"]
+  }
+}
