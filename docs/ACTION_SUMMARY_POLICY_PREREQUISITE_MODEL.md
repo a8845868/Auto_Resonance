@@ -32,10 +32,10 @@ irreversible_actions=0
 | Contract | Required facts | Accepted provenance |
 |---|---|---|
 | Task semantic identity | activity family, semantic task id, card match key, title hash, exact source model/capture/frame/freshness binding | immutable page model |
-| Remaining attempts | remaining and total attempt counts | fresh game observation |
+| Remaining attempts | remaining and total attempt counts | immutable page model or fresh game observation |
 | Resource identity and balance | non-`UNKNOWN` resource id, available amount, positive unit cost | fresh game observation, reconciled with visible card cost |
 | Reward target | target id, current amount, desired amount, candidate reward per execution | explicit user configuration |
-| Fatigue budget | available, reserved, and maximum policy spend | fresh game observation |
+| Fatigue budget | available, reserved, and maximum policy spend | fresh game observation, or the runtime assembler's explicit observed/configured composition |
 | Strategy input | schema, strategy id/version, objective, bounded action types and execution count | explicit user configuration |
 
 Known facts require a revision plus an aware `observed_at..valid_until` window

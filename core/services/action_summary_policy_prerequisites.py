@@ -35,6 +35,7 @@ class FactSource(str, Enum):
     PAGE_MODEL = "PAGE_MODEL"
     GAME_OBSERVED = "GAME_OBSERVED"
     USER_CONFIGURED = "USER_CONFIGURED"
+    RUNTIME_ASSEMBLED = "RUNTIME_ASSEMBLED"
 
 
 class StrategyObjective(str, Enum):
@@ -439,7 +440,10 @@ def evaluate_action_summary_policy_prerequisites(
         _record_provenance_findings(_provenance_errors(
             "remaining_attempts",
             attempts.provenance,
-            allowed_sources=frozenset({FactSource.GAME_OBSERVED}),
+            allowed_sources=frozenset({
+                FactSource.GAME_OBSERVED,
+                FactSource.PAGE_MODEL,
+            }),
             captured_at=page_model.captured_at,
         ), incomplete=incomplete, conflicts=conflicts)
 
@@ -537,7 +541,10 @@ def evaluate_action_summary_policy_prerequisites(
         _record_provenance_findings(_provenance_errors(
             "fatigue_budget",
             fatigue.provenance,
-            allowed_sources=frozenset({FactSource.GAME_OBSERVED}),
+            allowed_sources=frozenset({
+                FactSource.GAME_OBSERVED,
+                FactSource.RUNTIME_ASSEMBLED,
+            }),
             captured_at=page_model.captured_at,
         ), incomplete=incomplete, conflicts=conflicts)
 

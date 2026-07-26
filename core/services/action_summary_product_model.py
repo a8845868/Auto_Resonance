@@ -78,6 +78,7 @@ class ActionSummaryTaskCard:
     reward_state: RewardState
     confidence: PageConfidence
     evidence_ids: tuple[str, ...]
+    total_attempts: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -431,12 +432,12 @@ def _available_actions(texts: Sequence[str], state: TaskCardState) -> frozenset[
     return frozenset(actions)
 
 
-def _parse_quantity(texts: Sequence[str]) -> int | None:
+def _parse_attempts(texts: Sequence[str]) -> tuple[int | None, int | None]:
     for text in texts:
-        match = re.fullmatch(r"(\d+)\s*/\s*\d+", text)
+        match = re.fullmatch(r"(\d+)\s*/\s*(\d+)", text)
         if match:
-            return int(match.group(1))
-    return None
+            return int(match.group(1)), int(match.group(2))
+    return None, None
 
 
 def _parse_cost(texts: Sequence[str]) -> int | None:
@@ -547,6 +548,7 @@ def observe_action_summary_page(frame: object) -> ActionSummaryPageModel:
             max(bounds[3] for bounds in all_bounds),
         )
         state = _card_state(card_texts)
+        remaining_attempts, total_attempts = _parse_attempts(card_texts)
         evidence_ids = (
             _evidence_id("task_title", title_hash, title_bbox),
             _evidence_id("task_anchor", _hash_text(anchor_text), anchor_bbox),
@@ -572,7 +574,7 @@ def observe_action_summary_page(frame: object) -> ActionSummaryPageModel:
             bbox=card_bbox,
             state=state,
             available_actions=_available_actions(card_texts, state),
-            remaining_attempts=_parse_quantity(card_texts),
+            remaining_attempts=remaining_attempts,
             cost=cost,
             cost_resource_id="UNKNOWN" if cost is not None else None,
             reward_state=_reward_state(card_texts),
@@ -582,6 +584,7 @@ def observe_action_summary_page(frame: object) -> ActionSummaryPageModel:
                 else PageConfidence.MEDIUM
             ),
             evidence_ids=evidence_ids,
+            total_attempts=total_attempts,
         ))
 
     navigation_visible = bool(
