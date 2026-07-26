@@ -1,0 +1,31 @@
+{
+  "fixture_scope": "SANITIZED_CANONICAL_RUNTIME_INPUT_V1",
+  "source_run_role": "canonical",
+  "live_read_only_observations_in_source_run": 1,
+  "activity_family": "SIEGE",
+  "visible_task_card_count": 3,
+  "known_task_count": 3,
+  "card_attempts_resolved": 0,
+  "card_attempts_unknown": 3,
+  "cost_amounts": [40, 40, 40],
+  "cost_resource_ids": ["UNKNOWN", "UNKNOWN", "UNKNOWN"],
+  "resource_balances": [null, null, null],
+  "reward_targets": [null, null, null],
+  "fatigue_current": null,
+  "fatigue_budget": null,
+  "policy_target_match_status": "UNIQUE",
+  "assembly_status": "PASS",
+  "policy_input_readiness": "BLOCKED_MISSING_FACTS",
+  "expected_advisory_status": "BLOCKED_MISSING_FACTS",
+  "expected_recommendation": null,
+  "required_missing_facts": [
+    "objective_missing",
+    "strategy_identity_missing",
+    "strategy_provenance_missing",
+    "remaining_attempts_unknown",
+    "resource_identity_unknown",
+    "resource_balance_unknown",
+    "reward_target_unknown",
+    "fatigue_budget_unknown"
+  ]
+}
