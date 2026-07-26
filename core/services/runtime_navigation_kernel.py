@@ -524,10 +524,11 @@ class TransitionClassifier:
 
 
 DEFAULT_CAPABILITIES: Mapping[str, frozenset[str]] = {
+    "DAILY_CHECKIN": frozenset({"DISMISS_CLAIMED_DAILY_CHECKIN"}),
     "HOME_READY": frozenset({"OPEN_CITY", "OPEN_ACTION_TERMINAL", "OPEN_INVENTORY"}),
     "ACTIVITY_OVERVIEW_VISIBLE": frozenset({"OPEN_GLOBAL_PREP"}),
     "GLOBAL_PREP_PAGE": frozenset({"OPEN_ACTION_SUMMARY"}),
-    "ACTION_SUMMARY_VISIBLE": frozenset({"SELECT_ACTION_TASK"}),
+    "ACTION_SUMMARY_VISIBLE": frozenset({"ACTION_SUMMARY_VISIBLE", "SELECT_ACTION_TASK"}),
     "INVENTORY": frozenset({"READ_INVENTORY", "OPEN_ITEM_DETAIL"}),
     "CITY_ENTRY_VISIBLE": frozenset({"ENTER_CITY"}),
     "CITY_DETAIL": frozenset({"OPEN_CITY_FACILITY"}),
@@ -540,6 +541,23 @@ LEGACY_BASE_PAGE_ALIASES: Mapping[str, str] = {
 
 
 PROVEN_NAVIGATION_CONTRACTS: Mapping[str, ActionContract] = {
+    "DISMISS_CLAIMED_DAILY_CHECKIN": ActionContract(
+        action_id="dismiss_claimed_daily_checkin",
+        primitive=ActionPrimitive.DISMISS_CLAIMED_OVERLAY,
+        allowed_pre_pages=frozenset({"DAILY_CHECKIN"}),
+        required_capabilities=frozenset({"DISMISS_CLAIMED_DAILY_CHECKIN"}),
+        candidate_policy="CLAIMED_DAILY_CHECKIN_SAFE_BLANK_REGION",
+        hit_target_policy="UNIQUE_NON_DIALOG_SAFE_REGION",
+        max_dispatches=1,
+        random_offset=False,
+        allowed_post_pages=frozenset({"HOME_READY"}),
+        forbidden_post_pages=frozenset({
+            "INVENTORY", "EXCHANGE_PAGE", "EXTERNAL_BROWSER", "LOGIN_PAGE",
+            "FOREIGN_PAGE", "BATTLE_PAGE",
+        }),
+        transition_timeout_seconds=10.0,
+        irreversible=False,
+    ),
     "OPEN_INVENTORY": ActionContract(
         action_id="open_inventory",
         primitive=ActionPrimitive.OPEN_ENTRY,

@@ -1819,7 +1819,7 @@ class ActionSummaryNavigator:
             target_page_changed = observed.state is not ActionSummaryState.ACTIVITY_OVERVIEW_VISIBLE
             frame_changed = bool(
                 observed.frame_hash and observed.frame_hash != evidence.pre_frame_sha256
-            ) or target_page_changed
+            )
             evidence.mark_post_effect(
                 frame_changed=frame_changed,
                 target_page_changed=target_page_changed,

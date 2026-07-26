@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from core.services.navigation_evidence import (
     CoordinateChain,
@@ -90,7 +92,10 @@ def test_attempt_id_binds_dispatch_and_post_frames_and_redacts_raw_ocr():
     assert document["dispatch_acknowledged_semantics"] == "COMMAND_RETURN_ONLY"
     assert document["dispatch_command_returned"] is True
     assert document["dispatch_backend_error"] is None
-    assert document["touch_effect_observed"] is False
+    assert document["evidence_schema_version"] == "2.0"
+    assert document["touch_effect_observed"] is True
+    assert document["post_frame_changed"] is True
+    assert document["target_page_changed"] is True
     assert document["device_width"] == 1280
     assert document["device_height"] == 720
     assert document["actual_dispatched_point"] == (1101, 51)
@@ -132,6 +137,61 @@ def test_command_return_is_not_touch_effect_until_a_frame_changes():
     assert evidence.touch_effect_observed is True
     assert evidence.post_frame_changed is True
     assert evidence.target_page_changed is False
+
+
+def test_multiframe_post_window_aggregates_effects_across_all_observations():
+    chain = CoordinateChain.from_capture_point(
+        (1101, 51), capture_size=(1280, 720), render_client_size=(1280, 720)
+    )
+    evidence = _evidence(chain)
+    evidence.pre_state = "ACTION_SUMMARY_ENTRY_VISIBLE"
+    evidence.pre_frame_sha256 = "pre"
+    evidence.add_post_observation(
+        frame=SimpleNamespace(raw_frame_hash="changed-1"),
+        state="ACTION_SUMMARY_ENTRY_VISIBLE",
+        postcondition_result="PENDING",
+    )
+    evidence.add_post_observation(
+        frame=SimpleNamespace(raw_frame_hash="changed-2"),
+        state="ACTION_SUMMARY_VISIBLE",
+        postcondition_result="PASS",
+    )
+
+    assert evidence.post_frame_changed is True
+    assert evidence.target_page_changed is True
+    assert evidence.touch_effect_observed is True
+
+
+def test_postcondition_pass_with_all_effect_flags_false_is_impossible():
+    chain = CoordinateChain.from_capture_point(
+        (1101, 51), capture_size=(1280, 720), render_client_size=(1280, 720)
+    )
+    evidence = _evidence(chain)
+    evidence.pre_frame_sha256 = "same"
+
+    with pytest.raises(ValueError, match="postcondition_pass_without_observed_effect"):
+        evidence.add_post_observation(
+            frame=SimpleNamespace(raw_frame_hash="same"),
+            state=evidence.pre_state,
+            postcondition_result="PASS",
+        )
+
+
+def test_same_page_pass_requires_a_credible_equivalent_postcondition():
+    chain = CoordinateChain.from_capture_point(
+        (1101, 51), capture_size=(1280, 720), render_client_size=(1280, 720)
+    )
+    evidence = _evidence(chain)
+    evidence.pre_frame_sha256 = "same"
+    evidence.add_post_observation(
+        frame=SimpleNamespace(raw_frame_hash="same"),
+        state=evidence.pre_state,
+        postcondition_result="PASS",
+        target_control_disappeared=True,
+    )
+
+    assert evidence.target_control_disappeared is True
+    assert evidence.touch_effect_observed is True
 
 
 def test_backend_exception_is_recorded_without_command_return():

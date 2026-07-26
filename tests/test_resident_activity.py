@@ -272,7 +272,11 @@ class ResidentActivityTests(unittest.TestCase):
             "auto.resident_activity.ActionSummaryNavigator",
             return_value=navigator,
         ) as factory:
-            self.assertTrue(ResidentActivityAutomation(driver).open_action_summary())
+            self.assertTrue(
+                ResidentActivityAutomation(
+                    driver, use_proven_edge_planner=False
+                ).open_action_summary()
+            )
 
         factory.assert_called_once()
         navigator.navigate.assert_called_once_with()

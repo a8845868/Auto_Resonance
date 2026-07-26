@@ -716,6 +716,9 @@ def test_full_navigation_can_start_at_global_prep_with_one_dispatch():
     assert result.dispatch_count == 1
     assert len(taps) == len(evidence) == 1
     assert taps[0][0] != (1060, 380)
+    assert evidence[0].post_frame_changed is True
+    assert evidence[0].target_page_changed is True
+    assert evidence[0].touch_effect_observed is True
 
 
 def test_full_navigation_can_start_at_activity_overview_with_two_dispatches():

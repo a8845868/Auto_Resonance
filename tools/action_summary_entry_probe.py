@@ -86,6 +86,30 @@ def blocked(reason: str) -> dict:
     }
 
 
+def _top_level_stage_points(evidences) -> dict[str, list[int] | None]:
+    def point_for(entry_name: str):
+        evidence = next(
+            (item for item in evidences if item.entry_name == entry_name), None
+        )
+        point = evidence.actual_dispatched_point if evidence else None
+        return list(point) if point else None
+
+    last = evidences[-1] if evidences else None
+    actual = last.actual_dispatched_point if last else None
+    return {
+        "actual_dispatched_point": list(actual) if actual else None,
+        "action_terminal_device_point": point_for("open_action_entry"),
+        "action_summary_entry_device_point": point_for("open_action_summary"),
+    }
+
+
+def _evidence_for_entry(evidences, entry_name: str):
+    return next(
+        (evidence for evidence in evidences if evidence.entry_name == entry_name),
+        None,
+    )
+
+
 def run(*, adb_port: int = 16384) -> dict:
     device = get_runtime_device()
     if int(device.index) != 0:
@@ -155,7 +179,11 @@ def run(*, adb_port: int = 16384) -> dict:
         (item for item in resolutions if item["phase"] == "fresh"),
         resolutions[-1] if resolutions else None,
     )
-    first_evidence = result.evidences[0] if result.evidences else None
+    action_terminal_evidence = _evidence_for_entry(
+        result.evidences,
+        "open_action_entry",
+    )
+    stage_points = _top_level_stage_points(result.evidences)
     terminal_dispatches = sum(
         evidence.entry_name == "open_action_entry" and evidence.dispatch_requested
         for evidence in result.evidences
@@ -180,8 +208,10 @@ def run(*, adb_port: int = 16384) -> dict:
     if real_ui_actions > 5:
         return blocked("real_ui_action_budget_exceeded")
     terminal_postcondition = "NOT_RUN"
-    if first_evidence and first_evidence.post_observations:
-        terminal_postcondition = first_evidence.post_observations[-1].postcondition_result
+    if action_terminal_evidence and action_terminal_evidence.post_observations:
+        terminal_postcondition = (
+            action_terminal_evidence.post_observations[-1].postcondition_result
+        )
     return {
         "status": "PASS" if result.success else "BLOCKED",
         "probe": "action_summary_entry_isolation_v1",
@@ -208,13 +238,13 @@ def run(*, adb_port: int = 16384) -> dict:
         "action_terminal_candidate_bbox": (
             fresh_resolution["candidate_bbox"] if fresh_resolution else None
         ),
-        "action_terminal_device_point": (
-            list(first_evidence.coordinate_chain.device_point)
-            if first_evidence else None
-        ),
+        "evidence_schema_version": "2.0",
+        **stage_points,
         "action_terminal_dispatches": terminal_dispatches,
         "action_terminal_dispatch_acknowledged": (
-            bool(first_evidence.dispatch_acknowledged) if first_evidence else None
+            bool(action_terminal_evidence.dispatch_acknowledged)
+            if action_terminal_evidence
+            else None
         ),
         "action_terminal_postcondition": terminal_postcondition,
         "candidate_resolution_evidence": resolutions,

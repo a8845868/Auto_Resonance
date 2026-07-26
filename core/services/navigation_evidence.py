@@ -21,7 +21,11 @@ from loguru import logger
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_EVIDENCE_DIR = ROOT / "logs" / "navigation_attempts"
+EVIDENCE_SCHEMA_VERSION = "2.0"
 _SAFE_CODE = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,95}$")
+_NORMALIZED_BASE_PAGE_ALIASES = {
+    "ACTION_SUMMARY_ENTRY_VISIBLE": "GLOBAL_PREP_PAGE",
+}
 
 
 def _now() -> str:
@@ -178,6 +182,8 @@ class NavigationAttemptEvidence:
     touch_effect_observed: bool = False
     post_frame_changed: bool = False
     target_page_changed: bool = False
+    target_control_disappeared: bool = False
+    trusted_postcondition_observed: bool = False
     dispatch_result: str = "not_requested"
     dispatch_timestamp: str = ""
     post_observations: list[PostNavigationObservation] = field(default_factory=list)
@@ -196,13 +202,30 @@ class NavigationAttemptEvidence:
         self.dispatch_timestamp = _now()
 
     def mark_post_effect(
-        self, *, frame_changed: bool, target_page_changed: bool
+        self,
+        *,
+        frame_changed: bool,
+        target_page_changed: bool,
+        target_control_disappeared: bool = False,
+        trusted_postcondition_observed: bool = False,
     ) -> None:
         """Record visual effect without inferring touch delivery or hitbox cause."""
 
         self.post_frame_changed = self.post_frame_changed or bool(frame_changed)
         self.target_page_changed = self.target_page_changed or bool(target_page_changed)
-        self.touch_effect_observed = self.touch_effect_observed or bool(frame_changed)
+        self.target_control_disappeared = (
+            self.target_control_disappeared or bool(target_control_disappeared)
+        )
+        self.trusted_postcondition_observed = (
+            self.trusted_postcondition_observed
+            or bool(trusted_postcondition_observed)
+        )
+        self.touch_effect_observed = self.touch_effect_observed or any((
+            frame_changed,
+            target_page_changed,
+            target_control_disappeared,
+            trusted_postcondition_observed,
+        ))
 
     def mark_station_detection(
         self,
@@ -226,10 +249,43 @@ class NavigationAttemptEvidence:
         negative_cues: Iterable[str] = (),
         reason_codes: Iterable[str] = (),
         postcondition_result: str,
+        source_base_page: str | None = None,
+        normalized_base_page: str | None = None,
+        target_control_disappeared: bool = False,
+        trusted_postcondition_observed: bool = False,
     ) -> PostNavigationObservation:
+        post_hash = frame_sha256(frame)
+        source_page = _NORMALIZED_BASE_PAGE_ALIASES.get(
+            str(source_base_page or self.pre_state),
+            str(source_base_page or self.pre_state),
+        )
+        current_page = _NORMALIZED_BASE_PAGE_ALIASES.get(
+            str(normalized_base_page or state),
+            str(normalized_base_page or state),
+        )
+        page_changed = bool(
+            source_page
+            and current_page
+            and source_page != "UNKNOWN"
+            and current_page != "UNKNOWN"
+            and source_page != current_page
+        )
+        self.mark_post_effect(
+            frame_changed=bool(post_hash and post_hash != self.pre_frame_sha256),
+            target_page_changed=page_changed,
+            target_control_disappeared=target_control_disappeared,
+            trusted_postcondition_observed=trusted_postcondition_observed,
+        )
+        if str(postcondition_result).casefold() == "pass" and not any((
+            self.post_frame_changed,
+            self.target_page_changed,
+            self.target_control_disappeared,
+            self.trusted_postcondition_observed,
+        )):
+            raise ValueError("postcondition_pass_without_observed_effect")
         observation = PostNavigationObservation(
             post_observation_index=len(self.post_observations) + 1,
-            post_frame_sha256=frame_sha256(frame),
+            post_frame_sha256=post_hash,
             post_state=str(state),
             positive_cues=_codes(positive_cues),
             negative_cues=_codes(negative_cues),
@@ -244,6 +300,7 @@ class NavigationAttemptEvidence:
         latest = self.post_observations[-1] if self.post_observations else None
         document.update(
             {
+                "evidence_schema_version": EVIDENCE_SCHEMA_VERSION,
                 "capture_width": self.coordinate_chain.capture_width,
                 "capture_height": self.coordinate_chain.capture_height,
                 "render_client_width": self.coordinate_chain.render_client_width,

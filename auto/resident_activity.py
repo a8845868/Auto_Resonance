@@ -21,6 +21,15 @@ from core.control.control import (
 from core.control.adb_port import EmulatorInfo, get_adb_port
 from core.services.read_only_policy import ActionIntent
 from core.services.action_summary_navigation import ActionSummaryNavigator
+from core.services.personal_action_budget import EpisodeActionBudget
+from core.services.proven_capability_navigation import (
+    CapabilityNavigationResult,
+    ensure_capability,
+)
+from core.services.resident_activity_capability_navigation import (
+    ResidentActivityEdgeAdapters,
+    observe_resident_navigation_state,
+)
 from core.services.screen_state import (
     RESOURCE_DOWNLOAD_CONFIRM_TAP,
     RESOURCE_DOWNLOAD_WAIT_ATTEMPTS,
@@ -343,9 +352,16 @@ class ScreenDriver:
 
 
 class ResidentActivityAutomation:
-    def __init__(self, driver: Optional[ScreenDriver] = None):
+    def __init__(
+        self,
+        driver: Optional[ScreenDriver] = None,
+        *,
+        use_proven_edge_planner: bool = True,
+    ):
         self.driver = driver or ScreenDriver()
         self.reward_history: list[RewardObservation] = []
+        self.use_proven_edge_planner = bool(use_proven_edge_planner)
+        self.last_capability_navigation_result: CapabilityNavigationResult | None = None
 
     def open_action_summary(self) -> bool:
         capture = getattr(self.driver, "capture_frame", None)
@@ -353,6 +369,30 @@ class ResidentActivityAutomation:
         if not callable(capture) or not callable(dispatch):
             logger.error("行动汇总导航驱动不支持分阶段帧证据")
             return False
+        if self.use_proven_edge_planner:
+            budget = EpisodeActionBudget()
+            adapters = ResidentActivityEdgeAdapters(
+                frame_provider=capture,
+                tap=dispatch,
+                geometry_provider=current_display_geometry,
+                action_budget=budget,
+                sleep=self.driver.sleep,
+            )
+            capability_result = ensure_capability(
+                "ACTION_SUMMARY_VISIBLE",
+                frame_provider=capture,
+                state_resolver=observe_resident_navigation_state,
+                adapter_registry=adapters.registry(),
+                action_budget=budget,
+                max_steps=4,
+            )
+            self.last_capability_navigation_result = capability_result
+            if not capability_result.success:
+                logger.error(
+                    f"proven-edge action summary navigation failed: "
+                    f"{capability_result.reason}"
+                )
+            return capability_result.success
         result = ActionSummaryNavigator(
             frame_provider=capture,
             tap=dispatch,
