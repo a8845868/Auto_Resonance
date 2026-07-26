@@ -10,6 +10,7 @@ import time
 import hashlib
 import re
 import unicodedata
+import cv2 as cv
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Mapping, Sequence
@@ -56,6 +57,8 @@ class ActionSummaryResult:
     evidences: list[NavigationAttemptEvidence] = field(default_factory=list)
     timeline: list[dict] = field(default_factory=list)
     candidate_resolutions: list["CandidateResolutionEvidence"] = field(default_factory=list)
+    hit_target_resolutions: list["HitTargetResolutionEvidence"] = field(default_factory=list)
+    first_stage_result: str = "NOT_RUN"
 
 
 @dataclass(frozen=True)
@@ -109,6 +112,60 @@ class CandidateResolutionEvidence:
         }
 
 
+@dataclass(frozen=True)
+class ActionTerminalHitTarget:
+    label_bbox: tuple[int, int, int, int]
+    label_center: tuple[int, int]
+    container_bbox: tuple[int, int, int, int]
+    container_detection_method: str
+    container_confidence: float
+    icon_bbox: tuple[int, int, int, int]
+    icon_relation_to_label: str
+    hit_target_bbox: tuple[int, int, int, int]
+    hit_target_point: tuple[int, int]
+    hit_target_reason: str
+    occlusion_detected: bool
+    occlusion_bboxes: tuple[tuple[int, int, int, int], ...]
+
+    def to_dict(self) -> dict:
+        return {
+            "label_bbox": self.label_bbox,
+            "label_center": self.label_center,
+            "container_bbox": self.container_bbox,
+            "container_detection_method": self.container_detection_method,
+            "container_confidence": self.container_confidence,
+            "icon_bbox": self.icon_bbox,
+            "icon_relation_to_label": self.icon_relation_to_label,
+            "hit_target_bbox": self.hit_target_bbox,
+            "hit_target_point": self.hit_target_point,
+            "hit_target_reason": self.hit_target_reason,
+            "occlusion_detected": self.occlusion_detected,
+            "occlusion_bboxes": self.occlusion_bboxes,
+        }
+
+
+@dataclass(frozen=True)
+class HitTargetResolutionEvidence:
+    phase: str
+    label_bbox: tuple[int, int, int, int]
+    visual_component_count: int
+    parent_container_count: int
+    trusted_expanded_region: tuple[float, float, float, float]
+    target: ActionTerminalHitTarget | None
+    rejected_reasons: tuple[str, ...]
+
+    def to_dict(self) -> dict:
+        return {
+            "phase": self.phase,
+            "label_bbox": self.label_bbox,
+            "visual_component_count": self.visual_component_count,
+            "parent_container_count": self.parent_container_count,
+            "trusted_expanded_region": self.trusted_expanded_region,
+            "target": self.target.to_dict() if self.target else None,
+            "rejected_reasons": self.rejected_reasons,
+        }
+
+
 _SIEGE_PAGE_LABELS = (
     "特殊订单", "利刃行动", "挑灯看剑", "武器材质分析", "骑士小说",
     "我思我在", "所知所闻", "大的！", "总体围剿",
@@ -119,9 +176,18 @@ _FOREIGN_MARKERS = ("道具", "材料", "交易所", "买入", "卖出", "浏览
 # measured point (1180,415) is inside the same region.  The quest copy containing
 # the same words was above y=298, outside this normalized target region.
 ACTION_TERMINAL_REGION_NORMALIZED = (0.86, 0.52, 0.99, 0.62)
+ACTION_TERMINAL_PARENT_REGION_NORMALIZED = (0.83, 0.50, 1.0, 0.66)
 _ACTION_TERMINAL_TEXT = "作战终端"
 _ACTION_TERMINAL_FRAGMENTS = ("作战", "终端")
 _OCR_SEPARATOR = re.compile(r"[\s|｜:：·•._\-—]+")
+
+
+def _intersection_area(
+    first: tuple[int, int, int, int], second: tuple[int, int, int, int]
+) -> int:
+    return max(0, min(first[2], second[2]) - max(first[0], second[0])) * max(
+        0, min(first[3], second[3]) - max(first[1], second[1])
+    )
 
 
 def _bbox(item: Mapping[str, object]) -> tuple[int, int, int, int] | None:
@@ -356,6 +422,185 @@ def resolve_action_terminal_candidate(
     return candidate, evidence
 
 
+def resolve_action_terminal_hit_target(
+    frame: object,
+    candidate: ActionTerminalCandidate,
+    *,
+    phase: str,
+) -> tuple[ActionTerminalHitTarget | None, HitTargetResolutionEvidence]:
+    """Bind the semantic label to one visual icon/card and derive one safe point.
+
+    The HOME shortcut is a right-edge card: a circular high-contrast icon sits
+    immediately left of the OCR label.  The label remains the semantic anchor,
+    while the click is derived from the icon's visual component.  No coordinate
+    fallback is used when that relationship cannot be proved uniquely.
+    """
+
+    image = getattr(frame, "image", None)
+    label = candidate.bbox
+    rejected: list[str] = []
+    if image is None or not hasattr(image, "shape") or len(image.shape) < 2:
+        evidence = HitTargetResolutionEvidence(
+            phase, label, 0, 0, ACTION_TERMINAL_PARENT_REGION_NORMALIZED,
+            None, ("capture_pixels_missing",),
+        )
+        return None, evidence
+    height, width = map(int, image.shape[:2])
+    label_height = max(1, label[3] - label[1])
+    search = (
+        max(0, label[0] - round(2.0 * label_height)),
+        max(0, label[1] - round(0.5 * label_height)),
+        label[0],
+        min(height, label[3] + round(0.75 * label_height)),
+    )
+    if search[2] <= search[0] or search[3] <= search[1]:
+        evidence = HitTargetResolutionEvidence(
+            phase, label, 0, 0, ACTION_TERMINAL_PARENT_REGION_NORMALIZED,
+            None, ("icon_search_region_invalid",),
+        )
+        return None, evidence
+
+    roi = image[search[1]:search[3], search[0]:search[2]]
+    gray = cv.cvtColor(roi, cv.COLOR_BGR2GRAY) if len(roi.shape) == 3 else roi
+    edges = cv.Canny(gray, 60, 160)
+    edges = cv.dilate(
+        edges, cv.getStructuringElement(cv.MORPH_ELLIPSE, (3, 3)), iterations=1,
+    )
+    contours, _ = cv.findContours(edges, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+    components: list[tuple[tuple[int, int, int, int], float]] = []
+    min_side = max(6, round(label_height * 0.65))
+    max_side = max(min_side, round(label_height * 2.2))
+    label_center = _center(label)
+    trusted_left, trusted_top, trusted_right, trusted_bottom = (
+        ACTION_TERMINAL_PARENT_REGION_NORMALIZED
+    )
+    for contour in contours:
+        x, y, component_width, component_height = cv.boundingRect(contour)
+        if not (
+            min_side <= component_width <= max_side
+            and min_side <= component_height <= max_side
+        ):
+            continue
+        aspect = component_width / float(max(1, component_height))
+        if not 0.65 <= aspect <= 1.45:
+            continue
+        bounds = (
+            search[0] + x, search[1] + y,
+            search[0] + x + component_width, search[1] + y + component_height,
+        )
+        center = _center(bounds)
+        if center[0] >= label[0] or abs(center[1] - label_center[1]) > label_height:
+            continue
+        if label[0] - bounds[2] > label_height * 0.75:
+            continue
+        if not (
+            trusted_left <= center[0] / width <= trusted_right
+            and trusted_top <= center[1] / height <= trusted_bottom
+        ):
+            rejected.append("icon_component_outside_trusted_region")
+            continue
+        fill = cv.contourArea(contour) / float(max(1, component_width * component_height))
+        if fill < 0.05:
+            continue
+        confidence = min(1.0, 0.55 + fill + max(0.0, 0.2 - abs(aspect - 1.0)))
+        components.append((bounds, round(confidence, 6)))
+
+    if len(components) != 1:
+        rejected.append(
+            "visual_parent_missing" if not components else "visual_parent_not_unique"
+        )
+        evidence = HitTargetResolutionEvidence(
+            phase, label, len(components), len(components),
+            ACTION_TERMINAL_PARENT_REGION_NORMALIZED, None,
+            tuple(dict.fromkeys(rejected)),
+        )
+        return None, evidence
+
+    icon_bbox, confidence = components[0]
+    margin_y = max(2, round(label_height * 0.25))
+    container = (
+        icon_bbox[0],
+        max(0, min(icon_bbox[1], label[1]) - margin_y),
+        min(width, label[2] + max(label_height, label[2] - label[0])),
+        min(height, max(icon_bbox[3], label[3]) + margin_y),
+    )
+    if not (
+        container[0] / width >= trusted_left
+        and container[1] / height >= trusted_top
+        and container[2] / width <= trusted_right
+        and container[3] / height <= trusted_bottom
+    ):
+        evidence = HitTargetResolutionEvidence(
+            phase, label, 1, 0, ACTION_TERMINAL_PARENT_REGION_NORMALIZED,
+            None, ("parent_container_outside_trusted_region",),
+        )
+        return None, evidence
+
+    inset_x = max(2, round((icon_bbox[2] - icon_bbox[0]) * 0.25))
+    inset_y = max(2, round((icon_bbox[3] - icon_bbox[1]) * 0.25))
+    hit_bbox = (
+        icon_bbox[0] + inset_x, icon_bbox[1] + inset_y,
+        icon_bbox[2] - inset_x, icon_bbox[3] - inset_y,
+    )
+    if hit_bbox[0] >= hit_bbox[2] or hit_bbox[1] >= hit_bbox[3]:
+        evidence = HitTargetResolutionEvidence(
+            phase, label, 1, 0, ACTION_TERMINAL_PARENT_REGION_NORMALIZED,
+            None, ("safe_icon_inset_empty",),
+        )
+        return None, evidence
+
+    items = _items(frame)
+    modal_markers = (
+        "触碰空白区域退出", "每日签到奖励", "资讯", "公告",
+    )
+    modal_present = any(
+        marker in _normalized_text(item.get("text", ""))
+        for marker in modal_markers for item in items
+    )
+    occlusions: list[tuple[int, int, int, int]] = []
+    for index, item in enumerate(items):
+        bounds = _bbox(item)
+        if bounds is None or index in candidate.source_indices:
+            continue
+        if _intersection_area(bounds, hit_bbox) > 0:
+            occlusions.append(bounds)
+        container_overlap = _intersection_area(bounds, container)
+        container_area = max(1, (container[2] - container[0]) * (container[3] - container[1]))
+        if container_overlap / container_area >= 0.35:
+            rejected.append("parent_overlaps_adjacent_recognized_control")
+    if modal_present:
+        rejected.append("known_modal_present")
+    occluded = modal_present or bool(occlusions)
+    target = ActionTerminalHitTarget(
+        label_bbox=label,
+        label_center=label_center,
+        container_bbox=container,
+        container_detection_method="left_icon_edge_component_plus_text_alignment",
+        container_confidence=confidence,
+        icon_bbox=icon_bbox,
+        icon_relation_to_label="LEFT_ALIGNED_SAME_HORIZONTAL_CARD",
+        hit_target_bbox=hit_bbox,
+        hit_target_point=_center(hit_bbox),
+        hit_target_reason="safe_inset_of_unique_parent_icon_away_from_label_and_card_edges",
+        occlusion_detected=occluded,
+        occlusion_bboxes=tuple(occlusions),
+    )
+    parent_count = 1
+    if occluded or "parent_overlaps_adjacent_recognized_control" in rejected:
+        evidence = HitTargetResolutionEvidence(
+            phase, label, 1, parent_count,
+            ACTION_TERMINAL_PARENT_REGION_NORMALIZED, target,
+            tuple(dict.fromkeys(rejected)),
+        )
+        return None, evidence
+    evidence = HitTargetResolutionEvidence(
+        phase, label, 1, parent_count,
+        ACTION_TERMINAL_PARENT_REGION_NORMALIZED, target,
+        tuple(dict.fromkeys(rejected)),
+    )
+    return target, evidence
+
+
 def _action_terminal_failure_reason(evidence: CandidateResolutionEvidence) -> str:
     return {
         "OCR_NO_MATCH": "action_terminal_ocr_no_match",
@@ -380,6 +625,22 @@ def _same_normalized_terminal_identity(
     delta_x = abs(initial_center[0] / initial_size[0] - fresh_center[0] / fresh_size[0])
     delta_y = abs(initial_center[1] / initial_size[1] - fresh_center[1] / fresh_size[1])
     return delta_x <= 0.03 and delta_y <= 0.03
+
+
+def _same_normalized_hit_target_identity(
+    initial: ActionTerminalHitTarget,
+    fresh: ActionTerminalHitTarget,
+    *,
+    initial_size: tuple[int, int],
+    fresh_size: tuple[int, int],
+) -> bool:
+    initial_point = initial.hit_target_point
+    fresh_point = fresh.hit_target_point
+    return (
+        abs(initial_point[0] / initial_size[0] - fresh_point[0] / fresh_size[0]) <= 0.03
+        and abs(initial_point[1] / initial_size[1] - fresh_point[1] / fresh_size[1]) <= 0.03
+        and initial.container_detection_method == fresh.container_detection_method
+    )
 
 
 def _items(frame: object) -> tuple[dict, ...]:
@@ -459,6 +720,7 @@ class ActionSummaryNavigator:
         postcondition_timeout: float = 4.0,
         poll_interval: float = 0.4,
         dispatch_backend: str = "device_control",
+        stop_after_first_stage: bool = False,
     ) -> None:
         self.frame_provider = frame_provider
         self.tap = tap
@@ -471,6 +733,7 @@ class ActionSummaryNavigator:
         self.postcondition_timeout = float(postcondition_timeout)
         self.poll_interval = float(poll_interval)
         self.dispatch_backend = dispatch_backend
+        self.stop_after_first_stage = bool(stop_after_first_stage)
         self.safe_selector = AnnouncementSafeRegionSelector()
 
     @staticmethod
@@ -604,10 +867,105 @@ class ActionSummaryNavigator:
                 return observed, "postcondition_reached"
         return None, "postcondition_timeout"
 
+    def _wait_first_stage_after_dispatch(
+        self,
+        evidence: NavigationAttemptEvidence,
+        *,
+        dispatch_started: float,
+        pre_capture_id: str,
+        timeline: list[dict],
+    ) -> tuple[ActionSummaryObservation | None, str]:
+        """Classify touch effect for the one-action diagnostic probe only."""
+
+        deadline = dispatch_started + self.postcondition_timeout
+        last_capture_id = pre_capture_id
+        stable_changed_hash = ""
+        stable_changed_count = 0
+        any_changed = False
+        while self.monotonic() < deadline:
+            if self.cancellation():
+                return None, "CANCELLED"
+            self.sleep(min(self.poll_interval, max(0.0, deadline - self.monotonic())))
+            if self.monotonic() >= deadline:
+                break
+            try:
+                frame = self.frame_provider()
+                observed = observe_action_summary(frame)
+            except Exception:  # noqa: BLE001 - exact diagnostic stop class
+                return None, "POST_OBSERVATION_FAILURE"
+            elapsed = max(0.0, self.monotonic() - dispatch_started)
+            if observed.capture_id and observed.capture_id == last_capture_id:
+                timeline.append({
+                    "attempt_id": evidence.attempt_id,
+                    "post_observation_index": len(evidence.post_observations),
+                    "elapsed_since_dispatch_seconds": round(elapsed, 6),
+                    "post_state": observed.state.value,
+                    "transition_classification": "STALE",
+                    "post_frame_sha256": observed.frame_hash,
+                    "positive_cues": [],
+                    "negative_cues": ["stale_capture"],
+                    "reason_codes": ["stale_post_frame_ignored"],
+                })
+                continue
+            last_capture_id = observed.capture_id or last_capture_id
+            frame_changed = bool(
+                observed.frame_hash and observed.frame_hash != evidence.pre_frame_sha256
+            )
+            target_page_changed = observed.state is not ActionSummaryState.HOME_READY
+            evidence.mark_post_effect(
+                frame_changed=frame_changed,
+                target_page_changed=target_page_changed,
+            )
+            any_changed = any_changed or frame_changed
+            classification = "PENDING"
+            if observed.state is ActionSummaryState.ACTIVITY_OVERVIEW_VISIBLE:
+                classification = "EXPECTED_PAGE"
+            elif observed.state is ActionSummaryState.FOREIGN_PAGE:
+                classification = "KNOWN_FOREIGN_PAGE"
+            elif frame_changed and observed.state is ActionSummaryState.UNKNOWN:
+                if observed.frame_hash == stable_changed_hash:
+                    stable_changed_count += 1
+                else:
+                    stable_changed_hash = observed.frame_hash
+                    stable_changed_count = 1
+                if stable_changed_count >= 2:
+                    classification = "STABLE_CHANGED_UNKNOWN"
+            else:
+                stable_changed_hash = ""
+                stable_changed_count = 0
+            evidence.add_post_observation(
+                frame=frame,
+                state=observed.state.value,
+                positive_cues=observed.positive_cues,
+                negative_cues=observed.negative_cues,
+                reason_codes=(f"first_stage_{classification.casefold()}",),
+                postcondition_result=classification,
+            )
+            timeline.append({
+                "attempt_id": evidence.attempt_id,
+                "post_observation_index": len(evidence.post_observations),
+                "elapsed_since_dispatch_seconds": round(elapsed, 6),
+                "post_state": observed.state.value,
+                "transition_classification": classification,
+                "post_frame_sha256": observed.frame_hash,
+                "frame_changed": frame_changed,
+                "home_anchor_changed": target_page_changed,
+                "action_terminal_label_disappeared": target_page_changed,
+                "positive_cues": list(observed.positive_cues),
+                "negative_cues": list(observed.negative_cues),
+                "reason_codes": [f"first_stage_{classification.casefold()}"],
+            })
+            if classification != "PENDING":
+                return observed, classification
+        return None, (
+            "TRANSITION_TIMEOUT" if any_changed else "NO_TOUCH_EFFECT_OBSERVED"
+        )
+
     def navigate(self) -> ActionSummaryResult:
         evidences: list[NavigationAttemptEvidence] = []
         timeline: list[dict] = []
         candidate_resolutions: list[CandidateResolutionEvidence] = []
+        hit_target_resolutions: list[HitTargetResolutionEvidence] = []
         dispatches = 0
         if self.cancellation():
             return ActionSummaryResult(False, ActionSummaryState.UNKNOWN, "cancelled", 0, 0, [], [])
@@ -634,6 +992,22 @@ class ActionSummaryNavigator:
                 0, 0, [], [], candidate_resolutions,
             )
         initial_terminal_size = self._frame_size(initial_frame)
+        initial_hit_target, initial_hit_resolution = resolve_action_terminal_hit_target(
+            initial_frame, initial_terminal, phase="initial"
+        )
+        hit_target_resolutions.append(initial_hit_resolution)
+        if initial_hit_target is None:
+            reason = (
+                "action_terminal_target_occluded"
+                if initial_hit_resolution.target
+                and initial_hit_resolution.target.occlusion_detected
+                else "action_terminal_hit_target_not_unique"
+            )
+            return ActionSummaryResult(
+                False, current.state, reason, 0, 0, [], [],
+                candidate_resolutions, hit_target_resolutions,
+            )
+        initial_hit_target_size = initial_terminal_size
 
         stages = (
             (ActionSummaryState.HOME_READY, "作战终端", {ActionSummaryState.ACTIVITY_OVERVIEW_VISIBLE}, "open_action_entry"),
@@ -699,12 +1073,40 @@ class ActionSummaryNavigator:
                         dispatches, dispatches, evidences, timeline,
                         candidate_resolutions,
                     )
+                fresh_hit_target, fresh_hit_resolution = resolve_action_terminal_hit_target(
+                    planned_frame, fresh_terminal, phase="fresh"
+                )
+                hit_target_resolutions.append(fresh_hit_resolution)
+                if fresh_hit_target is None:
+                    reason = (
+                        "action_terminal_target_occluded"
+                        if fresh_hit_resolution.target
+                        and fresh_hit_resolution.target.occlusion_detected
+                        else "action_terminal_fresh_confirmation_failed"
+                    )
+                    return ActionSummaryResult(
+                        False, planned.state, reason, dispatches, dispatches,
+                        evidences, timeline, candidate_resolutions,
+                        hit_target_resolutions,
+                    )
+                if not _same_normalized_hit_target_identity(
+                    initial_hit_target,
+                    fresh_hit_target,
+                    initial_size=initial_hit_target_size,
+                    fresh_size=self._frame_size(planned_frame),
+                ):
+                    return ActionSummaryResult(
+                        False, planned.state,
+                        "action_terminal_fresh_confirmation_failed",
+                        dispatches, dispatches, evidences, timeline,
+                        candidate_resolutions, hit_target_resolutions,
+                    )
                 candidate = (
-                    fresh_terminal.point,
-                    fresh_terminal.bbox,
-                    fresh_terminal.candidate_type,
-                    fresh_terminal.score,
-                    fresh_resolution.safe_candidate_count,
+                    fresh_hit_target.hit_target_point,
+                    fresh_hit_target.hit_target_bbox,
+                    f"{fresh_terminal.candidate_type}+parent_visual_icon",
+                    fresh_hit_target.container_confidence,
+                    fresh_hit_resolution.parent_container_count,
                 )
             else:
                 candidate = candidate_resolver(planned_frame, planned)
@@ -753,6 +1155,38 @@ class ActionSummaryNavigator:
             self.budget.record_dispatch(decision)
             dispatches += 1
             started = self.monotonic()
+            if self.stop_after_first_stage and entry_name == "open_action_entry":
+                observed, first_stage_result = self._wait_first_stage_after_dispatch(
+                    evidence,
+                    dispatch_started=started,
+                    pre_capture_id=planned.capture_id,
+                    timeline=timeline,
+                )
+                self.budget.record_result(
+                    decision,
+                    "PASS" if first_stage_result == "EXPECTED_PAGE" else "FAIL",
+                )
+                self.evidence_recorder(evidence)
+                reason = {
+                    "EXPECTED_PAGE": "first_stage_expected_page",
+                    "STABLE_CHANGED_UNKNOWN": "action_terminal_stable_changed_unknown",
+                    "NO_TOUCH_EFFECT_OBSERVED": "action_terminal_no_touch_effect_observed",
+                    "KNOWN_FOREIGN_PAGE": "action_terminal_known_foreign_page",
+                    "TRANSITION_TIMEOUT": "action_terminal_transition_timeout",
+                }.get(first_stage_result, "external_runtime_blocker")
+                state = observed.state if observed is not None else planned.state
+                return ActionSummaryResult(
+                    first_stage_result == "EXPECTED_PAGE",
+                    state,
+                    reason,
+                    dispatches,
+                    dispatches,
+                    evidences,
+                    timeline,
+                    candidate_resolutions,
+                    hit_target_resolutions,
+                    "PASS" if first_stage_result == "EXPECTED_PAGE" else first_stage_result,
+                )
             observed, wait_reason = self._wait_after_dispatch(
                 evidence, accepted=accepted, dispatch_started=started,
                 pre_capture_id=planned.capture_id, timeline=timeline,
@@ -775,8 +1209,11 @@ class ActionSummaryNavigator:
 
 
 __all__ = [
+    "ACTION_TERMINAL_PARENT_REGION_NORMALIZED",
     "ACTION_TERMINAL_REGION_NORMALIZED", "ActionSummaryNavigator",
     "ActionSummaryObservation", "ActionSummaryResult", "ActionSummaryState",
-    "ActionTerminalCandidate", "CandidateResolutionEvidence",
+    "ActionTerminalCandidate", "ActionTerminalHitTarget",
+    "CandidateResolutionEvidence", "HitTargetResolutionEvidence",
     "observe_action_summary", "resolve_action_terminal_candidate",
+    "resolve_action_terminal_hit_target",
 ]

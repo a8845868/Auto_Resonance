@@ -172,15 +172,37 @@ class NavigationAttemptEvidence:
     attempt_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     dispatch_requested: bool = False
     dispatch_acknowledged: bool = False
+    dispatch_acknowledged_semantics: str = "COMMAND_RETURN_ONLY"
+    dispatch_command_returned: bool = False
+    dispatch_backend_error: str | None = None
+    touch_effect_observed: bool = False
+    post_frame_changed: bool = False
+    target_page_changed: bool = False
     dispatch_result: str = "not_requested"
     dispatch_timestamp: str = ""
     post_observations: list[PostNavigationObservation] = field(default_factory=list)
 
     def mark_dispatch(self, *, requested: bool, acknowledged: bool, result: str) -> None:
         self.dispatch_requested = bool(requested)
+        # Compatibility: ``dispatch_acknowledged`` used to be interpreted as
+        # device/game acknowledgement.  The backend only proves that its call
+        # returned, so retain the field while publishing its exact semantics.
         self.dispatch_acknowledged = bool(acknowledged)
+        self.dispatch_command_returned = bool(acknowledged)
+        self.dispatch_backend_error = (
+            None if acknowledged else (str(result) if requested else None)
+        )
         self.dispatch_result = str(result)
         self.dispatch_timestamp = _now()
+
+    def mark_post_effect(
+        self, *, frame_changed: bool, target_page_changed: bool
+    ) -> None:
+        """Record visual effect without inferring touch delivery or hitbox cause."""
+
+        self.post_frame_changed = self.post_frame_changed or bool(frame_changed)
+        self.target_page_changed = self.target_page_changed or bool(target_page_changed)
+        self.touch_effect_observed = self.touch_effect_observed or bool(frame_changed)
 
     def mark_station_detection(
         self,

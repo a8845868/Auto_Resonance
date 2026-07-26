@@ -8,6 +8,7 @@ from core.services.action_summary_navigation import (
     ActionSummaryState,
     observe_action_summary,
     resolve_action_terminal_candidate,
+    resolve_action_terminal_hit_target,
 )
 
 
@@ -24,10 +25,30 @@ def item(text, x, y, width=100, height=24):
 
 
 class Frame:
-    def __init__(self, labels, *, size=(1280, 720), capture_id=""):
+    def __init__(self, labels, *, size=(1280, 720), capture_id="", draw_terminal_visual=True, pixel=0):
         self.image = np.zeros((size[1], size[0], 3), dtype=np.uint8)
+        if pixel:
+            self.image[:] = pixel
         self._labels = labels
         self.source_capture_id = capture_id
+        if draw_terminal_visual:
+            for label in labels:
+                if str(label.get("text", "")).replace(" ", "") != "作战终端":
+                    continue
+                points = label["position"]
+                left = int(min(point[0] for point in points))
+                top = int(min(point[1] for point in points))
+                bottom = int(max(point[1] for point in points))
+                height = max(4, bottom - top)
+                icon_size = max(8, round(height * 1.4))
+                right = max(1, left - max(2, round(height * 0.2)))
+                x0 = max(0, right - icon_size)
+                y0 = max(0, (top + bottom - icon_size) // 2)
+                x1 = min(size[0], right)
+                y1 = min(size[1], y0 + icon_size)
+                self.image[y0:y1, x0:x1] = 255
+                inset = max(2, icon_size // 4)
+                self.image[y0 + inset:y1 - inset, x0 + inset:x1 - inset] = 0
 
     def ocr(self):
         return list(self._labels)
@@ -104,6 +125,25 @@ def run(frames):
     return result, taps, evidence
 
 
+def run_first(frames, *, timeout=1.0):
+    clock = Clock()
+    taps = []
+    evidence = []
+
+    def tap(point, **kwargs):
+        taps.append((point, kwargs))
+        return True
+
+    result = ActionSummaryNavigator(
+        frame_provider=Frames(frames), tap=tap,
+        evidence_recorder=evidence.append,
+        monotonic=clock, sleep=clock.sleep,
+        postcondition_timeout=timeout, poll_interval=0.2,
+        stop_after_first_stage=True,
+    ).navigate()
+    return result, taps, evidence
+
+
 def test_complete_navigation_has_three_single_dispatch_stages_and_stops():
     result, taps, evidence = run([
         home("1"), home("2"), overview("3"), overview("4"),
@@ -113,7 +153,8 @@ def test_complete_navigation_has_three_single_dispatch_stages_and_stops():
     assert result.state is ActionSummaryState.ACTION_SUMMARY_VISIBLE
     assert result.dispatch_count == result.stage_count == 3
     assert len(taps) == len(evidence) == 3
-    assert [call[0] for call in taps] == [(1191, 410), (110, 285), (1060, 380)]
+    assert taps[0][0] != (1191, 410)
+    assert [call[0] for call in taps[1:]] == [(110, 285), (1060, 380)]
     assert all(call[1]["random_offset"] is False for call in taps)
     assert all(attempt.coordinate_chain.complete for attempt in evidence)
     assert all(attempt.dispatch_acknowledged for attempt in evidence)
@@ -147,6 +188,86 @@ def test_unique_exact_terminal_ocr_resolves_inside_target_region():
     assert candidate.candidate_type == "exact_ocr"
     assert evidence.exact_match_count == 1
     assert evidence.safe_candidate_count == 1
+
+
+def test_label_binds_to_unique_left_visual_parent_and_safe_point_differs():
+    frame = home()
+    candidate, _ = resolve_action_terminal_candidate(frame, phase="test")
+    target, evidence = resolve_action_terminal_hit_target(frame, candidate, phase="test")
+
+    assert target is not None
+    assert evidence.parent_container_count == 1
+    assert target.label_center == candidate.point
+    assert target.hit_target_point != target.label_center
+    assert target.icon_bbox[2] <= target.label_bbox[0]
+    assert target.hit_target_bbox[0] < target.hit_target_point[0] < target.hit_target_bbox[2]
+    assert target.container_bbox[0] <= target.icon_bbox[0]
+    assert target.container_bbox[2] >= target.label_bbox[2]
+
+
+def test_missing_visual_parent_blocks_hit_target():
+    frame = Frame(
+        [item("访问城市", 1172, 486), item("作战终端", 1191, 410)],
+        draw_terminal_visual=False,
+    )
+    candidate, _ = resolve_action_terminal_candidate(frame, phase="test")
+    target, evidence = resolve_action_terminal_hit_target(frame, candidate, phase="test")
+
+    assert target is None
+    assert evidence.parent_container_count == 0
+    assert "visual_parent_missing" in evidence.rejected_reasons
+
+
+def test_multiple_visual_parents_block_hit_target():
+    frame = home()
+    # A second independent square component in the label-relative search band.
+    frame.image[398:422, 1079:1103] = 255
+    candidate, _ = resolve_action_terminal_candidate(frame, phase="test")
+    target, evidence = resolve_action_terminal_hit_target(frame, candidate, phase="test")
+
+    assert target is None
+    assert evidence.parent_container_count > 1
+    assert "visual_parent_not_unique" in evidence.rejected_reasons
+
+
+def test_recognized_overlay_covering_icon_blocks_hit_target():
+    frame = home()
+    frame._labels.append(item("资讯", 1115, 410, 45, 45))
+    candidate, _ = resolve_action_terminal_candidate(frame, phase="test")
+    target, evidence = resolve_action_terminal_hit_target(frame, candidate, phase="test")
+
+    assert target is None
+    assert evidence.target is not None
+    assert evidence.target.occlusion_detected
+    assert "known_modal_present" in evidence.rejected_reasons
+
+
+def test_icon_outside_trusted_parent_region_cannot_back_label():
+    frame = Frame(
+        [item("访问城市", 1172, 486), item("作战终端", 1191, 410)],
+        draw_terminal_visual=False,
+    )
+    frame.image[396:424, 1040:1068] = 255
+    candidate, _ = resolve_action_terminal_candidate(frame, phase="test")
+    target, evidence = resolve_action_terminal_hit_target(frame, candidate, phase="test")
+
+    assert target is None
+    assert evidence.parent_container_count == 0
+
+
+@pytest.mark.parametrize("size", [(1280, 720), (851, 480), (853, 480)])
+def test_hit_target_normalizes_consistently_for_supported_capture_sizes(size):
+    sx, sy = size[0] / 1280, size[1] / 720
+    frame = Frame([
+        item("访问城市", round(1172 * sx), round(486 * sy), round(100 * sx), round(24 * sy)),
+        item("作战终端", round(1191 * sx), round(410 * sy), round(100 * sx), round(24 * sy)),
+    ], size=size)
+    candidate, _ = resolve_action_terminal_candidate(frame, phase="test")
+    target, _ = resolve_action_terminal_hit_target(frame, candidate, phase="test")
+
+    assert target is not None
+    assert target.hit_target_point[0] / size[0] == pytest.approx(0.87, abs=0.02)
+    assert target.hit_target_point[1] / size[1] == pytest.approx(0.57, abs=0.02)
 
 
 def test_nfkc_whitespace_and_ocr_separator_normalization_remains_exact():
@@ -316,7 +437,7 @@ def test_fresh_terminal_bbox_jitter_preserves_semantic_identity():
         entry("5"), entry("6"), summary("7"),
     ])
     assert result.success
-    assert taps[0][0] == (1188, 407)
+    assert taps[0][0] != (1188, 407)
 
 
 def test_fresh_terminal_disappearance_has_zero_input():
@@ -324,6 +445,28 @@ def test_fresh_terminal_disappearance_has_zero_input():
     result, taps, evidence = run([home("1"), missing])
     assert not result.success
     assert result.reason == "action_terminal_fresh_confirmation_failed"
+    assert taps == evidence == []
+
+
+def test_fresh_visual_parent_disappearance_has_zero_input():
+    fresh = Frame(
+        [item("访问城市", 1172, 486), item("作战终端", 1191, 410)],
+        capture_id="2", draw_terminal_visual=False,
+    )
+    result, taps, evidence = run([home("1"), fresh])
+
+    assert not result.success
+    assert result.reason == "action_terminal_fresh_confirmation_failed"
+    assert taps == evidence == []
+
+
+def test_fresh_target_occlusion_has_zero_input():
+    fresh = home("2")
+    fresh._labels.append(item("资讯", 1115, 410, 45, 45))
+    result, taps, evidence = run([home("1"), fresh])
+
+    assert not result.success
+    assert result.reason == "action_terminal_target_occluded"
     assert taps == evidence == []
 
 
@@ -369,9 +512,11 @@ def test_coordinate_chain_is_complete_for_current_capture_sizes(size):
     scaled = lambda value, scale: round(value * scale)
     frames = [
         Frame([item("访问城市", scaled(1172, scale_x), scaled(486, scale_y)),
-               item("作战终端", scaled(1191, scale_x), scaled(410, scale_y))], size=size),
+               item("作战终端", scaled(1191, scale_x), scaled(410, scale_y),
+                    scaled(100, scale_x), scaled(24, scale_y))], size=size),
         Frame([item("访问城市", scaled(1172, scale_x), scaled(486, scale_y)),
-               item("作战终端", scaled(1191, scale_x), scaled(410, scale_y))], size=size),
+               item("作战终端", scaled(1191, scale_x), scaled(410, scale_y),
+                    scaled(100, scale_x), scaled(24, scale_y))], size=size),
         Frame([item("常规活动", scaled(180, scale_x), scaled(150, scale_y)),
                item("全域整备", scaled(110, scale_x), scaled(285, scale_y))], size=size),
         Frame([item("常规活动", scaled(180, scale_x), scaled(150, scale_y)),
@@ -401,3 +546,73 @@ def test_optional_overlay_uses_computed_safe_blank_not_legacy_fixed_point():
 def test_import_does_not_initialize_backend():
     # Reaching this module and constructing pure frames must not connect ADB.
     assert observe_action_summary(home()).state is ActionSummaryState.HOME_READY
+
+
+def test_first_stage_expected_overview_stops_after_one_dispatch():
+    result, taps, evidence = run_first([
+        home("1"), home("2"), overview("3",),
+    ])
+
+    assert result.success
+    assert result.first_stage_result == "PASS"
+    assert result.state is ActionSummaryState.ACTIVITY_OVERVIEW_VISIBLE
+    assert len(taps) == len(evidence) == result.dispatch_count == 1
+    assert evidence[0].dispatch_command_returned is True
+    assert evidence[0].touch_effect_observed is True
+    assert evidence[0].post_frame_changed is True
+    assert evidence[0].target_page_changed is True
+
+
+def test_first_stage_stable_changed_unknown_is_precise_and_stops():
+    changed = Frame([item("新页面", 640, 360)], capture_id="3", pixel=17)
+    result, taps, evidence = run_first([
+        home("1"), home("2"), changed,
+        Frame([item("新页面", 640, 360)], capture_id="4", pixel=17),
+    ])
+
+    assert not result.success
+    assert result.first_stage_result == "STABLE_CHANGED_UNKNOWN"
+    assert result.reason == "action_terminal_stable_changed_unknown"
+    assert len(taps) == len(evidence) == 1
+    assert evidence[0].touch_effect_observed is True
+
+
+def test_first_stage_three_equivalent_home_frames_are_no_touch_effect():
+    result, taps, evidence = run_first([
+        home("1"), home("2"), home("3"), home("4"), home("5"), home("6"),
+    ])
+
+    assert not result.success
+    assert result.first_stage_result == "NO_TOUCH_EFFECT_OBSERVED"
+    assert result.reason == "action_terminal_no_touch_effect_observed"
+    assert len(taps) == len(evidence) == 1
+    assert evidence[0].dispatch_command_returned is True
+    assert evidence[0].touch_effect_observed is False
+    assert evidence[0].post_frame_changed is False
+
+
+def test_first_stage_known_foreign_page_is_precise():
+    foreign = Frame(
+        [item("道具", 1000, 100), item("材料", 1000, 200)],
+        capture_id="3", pixel=23,
+    )
+    result, taps, evidence = run_first([home("1"), home("2"), foreign])
+
+    assert not result.success
+    assert result.first_stage_result == "KNOWN_FOREIGN_PAGE"
+    assert result.reason == "action_terminal_known_foreign_page"
+    assert len(taps) == len(evidence) == 1
+
+
+def test_first_stage_changing_transition_times_out_without_later_dispatch():
+    frames = [home("1"), home("2")]
+    frames.extend(
+        Frame([item("加载中", 640, 360)], capture_id=str(index), pixel=index)
+        for index in range(3, 10)
+    )
+    result, taps, evidence = run_first(frames, timeout=0.8)
+
+    assert not result.success
+    assert result.first_stage_result == "TRANSITION_TIMEOUT"
+    assert result.reason == "action_terminal_transition_timeout"
+    assert len(taps) == len(evidence) == result.dispatch_count == 1

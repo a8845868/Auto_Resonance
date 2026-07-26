@@ -87,6 +87,10 @@ def test_attempt_id_binds_dispatch_and_post_frames_and_redacts_raw_ocr():
 
     assert document["attempt_id"] == evidence.attempt_id
     assert document["dispatch_acknowledged"] is True
+    assert document["dispatch_acknowledged_semantics"] == "COMMAND_RETURN_ONLY"
+    assert document["dispatch_command_returned"] is True
+    assert document["dispatch_backend_error"] is None
+    assert document["touch_effect_observed"] is False
     assert document["device_width"] == 1280
     assert document["device_height"] == 720
     assert document["actual_dispatched_point"] == (1101, 51)
@@ -113,6 +117,35 @@ def test_writer_failure_does_not_change_attempt_result(tmp_path):
 
     assert record_navigation_attempt(evidence, directory=blocking_file) is False
     assert evidence.dispatch_result == "not_requested"
+
+
+def test_command_return_is_not_touch_effect_until_a_frame_changes():
+    chain = CoordinateChain.from_capture_point(
+        (1101, 51), capture_size=(1280, 720), render_client_size=(1280, 720)
+    )
+    evidence = _evidence(chain)
+    evidence.mark_dispatch(requested=True, acknowledged=True, result="call_returned")
+
+    assert evidence.dispatch_command_returned is True
+    assert evidence.touch_effect_observed is False
+    evidence.mark_post_effect(frame_changed=True, target_page_changed=False)
+    assert evidence.touch_effect_observed is True
+    assert evidence.post_frame_changed is True
+    assert evidence.target_page_changed is False
+
+
+def test_backend_exception_is_recorded_without_command_return():
+    chain = CoordinateChain.from_capture_point(
+        (1101, 51), capture_size=(1280, 720), render_client_size=(1280, 720)
+    )
+    evidence = _evidence(chain)
+    evidence.mark_dispatch(
+        requested=True, acknowledged=False, result="dispatch_exception:RuntimeError"
+    )
+
+    assert evidence.dispatch_command_returned is False
+    assert evidence.dispatch_backend_error == "dispatch_exception:RuntimeError"
+    assert evidence.touch_effect_observed is False
 
 
 def test_writer_persists_privacy_safe_attempt(tmp_path):
