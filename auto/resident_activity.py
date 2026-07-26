@@ -11,9 +11,16 @@ from typing import Callable, Optional
 import cv2 as cv
 from loguru import logger
 
-from core.control.control import connect, input_swipe, input_tap, screenshot
+from core.control.control import (
+    connect,
+    current_display_geometry,
+    input_swipe,
+    input_tap,
+    screenshot,
+)
 from core.control.adb_port import EmulatorInfo, get_adb_port
 from core.services.read_only_policy import ActionIntent
+from core.services.action_summary_navigation import ActionSummaryNavigator
 from core.services.screen_state import (
     RESOURCE_DOWNLOAD_CONFIRM_TAP,
     RESOURCE_DOWNLOAD_WAIT_ATTEMPTS,
@@ -153,8 +160,15 @@ class ScreenDriver:
 
     sleep: Callable[[float], None] = time.sleep
 
+    def capture_frame(self):
+        return screenshot()
+
     def texts(self) -> list[dict]:
-        return screenshot().ocr()
+        return self.capture_frame().ocr()
+
+    @staticmethod
+    def dispatch_navigation(pos, *, random_offset: bool, intent: ActionIntent):
+        return input_tap(pos, random_offset=random_offset, intent=intent)
 
     def observe_home_state(self, items: list[dict] | None = None) -> ResidentHomeState | None:
         return resident_home_state(self.texts() if items is None else items)
@@ -334,32 +348,20 @@ class ResidentActivityAutomation:
         self.reward_history: list[RewardObservation] = []
 
     def open_action_summary(self) -> bool:
-        if not self.driver.go_home():
-            logger.error("无法返回主界面")
+        capture = getattr(self.driver, "capture_frame", None)
+        dispatch = getattr(self.driver, "dispatch_navigation", None)
+        if not callable(capture) or not callable(dispatch):
+            logger.error("行动汇总导航驱动不支持分阶段帧证据")
             return False
-        # The home shortcut is visually stable and avoids OCR accidentally
-        # matching the same words in a quest description.
-        self.driver.tap((1180, 415))
-        self.driver.sleep(2)
-        # 常规活动 is an expand/collapse header. Do not click it when the target
-        # card is already visible, otherwise it would hide 全域整备.
-        if not self.driver.has_text("全域整备"):
-            if not self.driver.click_text("常规活动", attempts=2):
-                self.driver.tap((180, 150))
-                self.driver.sleep(0.8)
-        # Fixed card position in the required 1280x720 layout.
-        self.driver.tap((110, 285))
-        self.driver.sleep(2)
-        # First entry can show a dialogue overlay; dismiss it once if needed.
-        if not self.driver.has_text("行动汇总"):
-            self.driver.tap((800, 100))
-            self.driver.sleep(0.8)
-        self.driver.tap((1060, 380))
-        self.driver.sleep(2)
-        if not self.driver.has_text("利刃围剿"):
-            logger.error("进入行动汇总失败")
-            return False
-        return True
+        result = ActionSummaryNavigator(
+            frame_provider=capture,
+            tap=dispatch,
+            geometry_provider=current_display_geometry,
+            sleep=self.driver.sleep,
+        ).navigate()
+        if not result.success:
+            logger.error(f"进入行动汇总失败: {result.reason}")
+        return result.success
 
     def _reward_attempts(self, fallback: int = 3) -> int:
         """Read an ``n/3`` reward counter; use the safe activity cap on OCR miss."""

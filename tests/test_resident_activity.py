@@ -260,6 +260,24 @@ class ResidentActivityTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "无法打开活动总览"):
                 automation.run("挑灯看剑")
 
+    def test_open_action_summary_uses_bounded_navigator(self):
+        driver = FakeDriver([[]])
+        driver.capture_frame = Mock()
+        driver.dispatch_navigation = Mock()
+        result = Mock(success=True)
+        navigator = Mock()
+        navigator.navigate.return_value = result
+
+        with patch(
+            "auto.resident_activity.ActionSummaryNavigator",
+            return_value=navigator,
+        ) as factory:
+            self.assertTrue(ResidentActivityAutomation(driver).open_action_summary())
+
+        factory.assert_called_once()
+        navigator.navigate.assert_called_once_with()
+        self.assertEqual(driver.taps, [])
+
 
 if __name__ == "__main__":
     unittest.main()
