@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import core.services.action_summary_navigation as action_nav
 
 from core.services.action_summary_navigation import (
     ActionSummaryNavigator,
@@ -9,6 +10,8 @@ from core.services.action_summary_navigation import (
     observe_action_summary,
     resolve_action_terminal_candidate,
     resolve_action_terminal_hit_target,
+    resolve_global_prep_candidate,
+    resolve_global_prep_hit_target,
 )
 
 
@@ -25,7 +28,7 @@ def item(text, x, y, width=100, height=24):
 
 
 class Frame:
-    def __init__(self, labels, *, size=(1280, 720), capture_id="", draw_terminal_visual=True, pixel=0):
+    def __init__(self, labels, *, size=(1280, 720), capture_id="", draw_terminal_visual=True, draw_global_visual=True, pixel=0):
         self.image = np.zeros((size[1], size[0], 3), dtype=np.uint8)
         if pixel:
             self.image[:] = pixel
@@ -49,6 +52,25 @@ class Frame:
                 self.image[y0:y1, x0:x1] = 255
                 inset = max(2, icon_size // 4)
                 self.image[y0 + inset:y1 - inset, x0 + inset:x1 - inset] = 0
+        if draw_global_visual:
+            for label in labels:
+                if str(label.get("text", "")).replace(" ", "") != "全域整备":
+                    continue
+                points = label["position"]
+                left = int(min(point[0] for point in points))
+                top = int(min(point[1] for point in points))
+                right = int(max(point[0] for point in points))
+                bottom = int(max(point[1] for point in points))
+                height = max(4, bottom - top)
+                card = (
+                    max(0, left - round(0.2 * height)),
+                    max(0, top - 3 * height),
+                    min(size[0] - 1, right + round(6.3 * height)),
+                    min(size[1] - 1, bottom + 1),
+                )
+                x0, y0, x1, y1 = card
+                self.image[y0:y1 + 1, x0:x1 + 1] = 255
+                self.image[y0 + 2:y1 - 1, x0 + 2:x1 - 1] = 40
 
     def ocr(self):
         return list(self._labels)
@@ -85,7 +107,7 @@ def home(capture_id="", size=(1280, 720), *, duplicate=False):
 
 def overview(capture_id="", size=(1280, 720)):
     return Frame(
-        [item("常规活动", 180, 150), item("全域整备", 110, 285)],
+        [item("常规活动", 180, 150), item("全域整备", 60, 314, 58, 17)],
         size=size, capture_id=capture_id,
     )
 
@@ -144,6 +166,25 @@ def run_first(frames, *, timeout=1.0):
     return result, taps, evidence
 
 
+def run_global(frames, *, timeout=1.0):
+    clock = Clock()
+    taps = []
+    evidence = []
+
+    def tap(point, **kwargs):
+        taps.append((point, kwargs))
+        return True
+
+    result = ActionSummaryNavigator(
+        frame_provider=Frames(frames), tap=tap,
+        evidence_recorder=evidence.append,
+        monotonic=clock, sleep=clock.sleep,
+        postcondition_timeout=timeout, poll_interval=0.2,
+        stop_after_global_prep_stage=True,
+    ).navigate()
+    return result, taps, evidence
+
+
 def test_complete_navigation_has_three_single_dispatch_stages_and_stops():
     result, taps, evidence = run([
         home("1"), home("2"), overview("3"), overview("4"),
@@ -154,7 +195,8 @@ def test_complete_navigation_has_three_single_dispatch_stages_and_stops():
     assert result.dispatch_count == result.stage_count == 3
     assert len(taps) == len(evidence) == 3
     assert taps[0][0] != (1191, 410)
-    assert [call[0] for call in taps[1:]] == [(110, 285), (1060, 380)]
+    assert taps[1][0] != (60, 314)
+    assert taps[2][0] == (1060, 380)
     assert all(call[1]["random_offset"] is False for call in taps)
     assert all(attempt.coordinate_chain.complete for attempt in evidence)
     assert all(attempt.dispatch_acknowledged for attempt in evidence)
@@ -203,6 +245,103 @@ def test_label_binds_to_unique_left_visual_parent_and_safe_point_differs():
     assert target.hit_target_bbox[0] < target.hit_target_point[0] < target.hit_target_bbox[2]
     assert target.container_bbox[0] <= target.icon_bbox[0]
     assert target.container_bbox[2] >= target.label_bbox[2]
+
+
+def test_unique_exact_global_prep_candidate_and_parent_card_resolve():
+    frame = overview()
+    candidate, resolution = resolve_global_prep_candidate(frame, phase="test")
+    target, hit_evidence = resolve_global_prep_hit_target(frame, candidate, phase="test")
+
+    assert candidate is not None
+    assert resolution.exact_match_count == resolution.safe_candidate_count == 1
+    assert resolution.broad_match_count == 0
+    assert target is not None
+    assert hit_evidence.visual_parent_count == 1
+    assert target.hit_target_point != target.label_center
+    assert target.parent_container_bbox[0] <= target.label_bbox[0]
+
+
+def test_global_prep_description_substring_is_counted_but_never_authorizes():
+    frame = overview()
+    frame._labels.append(item("完成全域整备后领取奖励", 600, 200, 240, 24))
+    candidate, resolution = resolve_global_prep_candidate(frame, phase="test")
+
+    assert candidate is not None
+    assert resolution.exact_match_count == 1
+    assert resolution.broad_match_count == 1
+    assert resolution.safe_candidate_count == 1
+
+
+def test_two_independent_global_prep_exact_candidates_are_blocked():
+    frame = Frame([
+        item("全域整备", 60, 314, 58, 17),
+        item("全域整备", 180, 314, 58, 17),
+    ])
+    candidate, resolution = resolve_global_prep_candidate(frame, phase="test")
+
+    assert candidate is None
+    assert resolution.failure_class == "OCR_MULTIPLE_MATCHES"
+
+
+def test_global_prep_high_iou_duplicate_collapses():
+    frame = Frame([
+        item("全域整备", 60, 314, 58, 17),
+        item("全域整备", 61, 314, 58, 17),
+    ])
+    candidate, resolution = resolve_global_prep_candidate(frame, phase="test")
+
+    assert candidate is not None
+    assert resolution.deduplicated_candidate_count == 1
+    assert "duplicate_bbox_collapsed" in resolution.rejected_reasons
+
+
+def test_strict_global_prep_fragments_merge():
+    frame = Frame([
+        item("全域", 45, 314, 28, 17), item("整备", 77, 314, 28, 17),
+    ], draw_global_visual=False)
+    # The visual parent remains independent of semantic fragment construction.
+    frame.image[255:324, 28:197] = 255
+    frame.image[257:322, 30:195] = 40
+    candidate, resolution = resolve_global_prep_candidate(frame, phase="test")
+
+    assert candidate is not None
+    assert candidate.candidate_type == "merged_ocr_fragments"
+    assert resolution.fragment_match_count == 2
+
+
+def test_global_prep_same_text_outside_region_does_not_authorize():
+    frame = Frame([item("全域整备", 700, 200, 58, 17)])
+    candidate, resolution = resolve_global_prep_candidate(frame, phase="test")
+
+    assert candidate is None
+    assert resolution.failure_class == "REGION_FILTER_REJECTED"
+
+
+def test_global_prep_missing_or_multiple_parent_blocks(monkeypatch):
+    missing = Frame([item("全域整备", 60, 314, 58, 17)], draw_global_visual=False)
+    candidate, _ = resolve_global_prep_candidate(missing, phase="test")
+    target, evidence = resolve_global_prep_hit_target(missing, candidate, phase="test")
+    assert target is None and evidence.visual_parent_count == 0
+
+    multiple = overview()
+    contours = [
+        np.array([[[13, 13]], [[181, 13]], [[181, 82]], [[13, 82]]], dtype=np.int32),
+        np.array([[[5, 3]], [[190, 3]], [[190, 86]], [[5, 86]]], dtype=np.int32),
+    ]
+    monkeypatch.setattr(action_nav.cv, "findContours", lambda *_args, **_kwargs: (contours, None))
+    candidate, _ = resolve_global_prep_candidate(multiple, phase="test")
+    target, evidence = resolve_global_prep_hit_target(multiple, candidate, phase="test")
+    assert target is None and evidence.visual_parent_count > 1
+
+
+def test_global_prep_overlay_occlusion_blocks_target():
+    frame = overview()
+    frame._labels.append(item("资讯", 110, 290, 80, 40))
+    candidate, _ = resolve_global_prep_candidate(frame, phase="test")
+    target, evidence = resolve_global_prep_hit_target(frame, candidate, phase="test")
+
+    assert target is None
+    assert evidence.target is not None and evidence.target.occlusion_detected
 
 
 def test_missing_visual_parent_blocks_hit_target():
@@ -518,9 +657,11 @@ def test_coordinate_chain_is_complete_for_current_capture_sizes(size):
                item("作战终端", scaled(1191, scale_x), scaled(410, scale_y),
                     scaled(100, scale_x), scaled(24, scale_y))], size=size),
         Frame([item("常规活动", scaled(180, scale_x), scaled(150, scale_y)),
-               item("全域整备", scaled(110, scale_x), scaled(285, scale_y))], size=size),
+               item("全域整备", scaled(60, scale_x), scaled(314, scale_y),
+                    scaled(58, scale_x), scaled(17, scale_y))], size=size),
         Frame([item("常规活动", scaled(180, scale_x), scaled(150, scale_y)),
-               item("全域整备", scaled(110, scale_x), scaled(285, scale_y))], size=size),
+               item("全域整备", scaled(60, scale_x), scaled(314, scale_y),
+                    scaled(58, scale_x), scaled(17, scale_y))], size=size),
         Frame([item("行动汇总", scaled(1060, scale_x), scaled(380, scale_y))], size=size),
         Frame([item("行动汇总", scaled(1060, scale_x), scaled(380, scale_y))], size=size),
         summary(size=size),
@@ -616,3 +757,115 @@ def test_first_stage_changing_transition_times_out_without_later_dispatch():
     assert result.first_stage_result == "TRANSITION_TIMEOUT"
     assert result.reason == "action_terminal_transition_timeout"
     assert len(taps) == len(evidence) == result.dispatch_count == 1
+
+
+def test_global_prep_expected_entry_passes_and_stops_after_one_dispatch():
+    result, taps, evidence = run_global([
+        overview("1"), overview("2"), entry("3"),
+    ])
+
+    assert result.success
+    assert result.global_prep_stage_result == "PASS"
+    assert result.state is ActionSummaryState.ACTION_SUMMARY_ENTRY_VISIBLE
+    assert len(taps) == len(evidence) == result.dispatch_count == 1
+    assert taps[0][0] != (60, 314)
+    assert taps[0][1]["random_offset"] is False
+    assert evidence[0].dispatch_command_returned is True
+    assert evidence[0].touch_effect_observed is True
+
+
+def test_global_prep_probe_on_home_blocks_without_replaying_first_stage():
+    result, taps, evidence = run_global([home("1")])
+
+    assert not result.success
+    assert result.reason == "global_prep_precondition_failed"
+    assert result.dispatch_count == 0
+    assert taps == evidence == []
+
+
+def test_global_prep_optional_overlay_is_reported_without_dismissal():
+    overlay = Frame([
+        item("首次进入说明", 640, 180, 400, 80),
+        item("触碰空白区域退出", 640, 680, 180, 24),
+    ], capture_id="3", pixel=19)
+    result, taps, evidence = run_global([overview("1"), overview("2"), overlay])
+
+    assert result.success
+    assert result.global_prep_stage_result == "OPTIONAL_OVERLAY_REACHED"
+    assert result.state is ActionSummaryState.OPTIONAL_OVERLAY_VISIBLE
+    assert len(taps) == len(evidence) == 1
+
+
+def test_global_prep_direct_action_summary_is_reported_and_stops():
+    result, taps, evidence = run_global([
+        overview("1"), overview("2"), summary("3"),
+    ])
+
+    assert result.success
+    assert result.global_prep_stage_result == "ACTION_SUMMARY_REACHED"
+    assert result.state is ActionSummaryState.ACTION_SUMMARY_VISIBLE
+    assert len(taps) == len(evidence) == 1
+
+
+def test_global_prep_stable_changed_unknown_is_precise():
+    changed = Frame([item("新页面", 640, 360)], capture_id="3", pixel=31)
+    result, taps, evidence = run_global([
+        overview("1"), overview("2"), changed,
+        Frame([item("新页面", 640, 360)], capture_id="4", pixel=31),
+    ])
+
+    assert not result.success
+    assert result.global_prep_stage_result == "STABLE_CHANGED_UNKNOWN"
+    assert result.reason == "global_prep_stable_changed_unknown"
+    assert len(taps) == len(evidence) == 1
+
+
+def test_global_prep_no_visual_effect_is_precise():
+    result, taps, evidence = run_global([
+        overview("1"), overview("2"), overview("3"), overview("4"), overview("5"),
+    ])
+
+    assert not result.success
+    assert result.global_prep_stage_result == "NO_TOUCH_EFFECT"
+    assert result.reason == "global_prep_no_touch_effect_observed"
+    assert len(taps) == len(evidence) == 1
+    assert evidence[0].touch_effect_observed is False
+
+
+def test_global_prep_known_foreign_page_is_precise():
+    foreign = Frame(
+        [item("道具", 1000, 100), item("材料", 1000, 200)],
+        capture_id="3", pixel=41,
+    )
+    result, taps, evidence = run_global([overview("1"), overview("2"), foreign])
+
+    assert not result.success
+    assert result.reason == "global_prep_known_foreign_page"
+    assert len(taps) == len(evidence) == 1
+
+
+def test_global_prep_fresh_candidate_disappearance_has_zero_input():
+    missing = Frame([item("常规活动", 180, 150)], capture_id="2")
+    # Preserve the proven overview state independently while removing the target.
+    missing._labels.append(item("全域整备说明", 100, 300, 120, 17))
+    result, taps, evidence = run_global([overview("1"), missing])
+
+    assert not result.success
+    assert taps == evidence == []
+
+
+@pytest.mark.parametrize("size", [(1280, 720), (851, 480), (853, 480)])
+def test_global_prep_coordinate_mapping_is_normalized(size):
+    sx, sy = size[0] / 1280, size[1] / 720
+    make = lambda capture: Frame([
+        item("常规活动", round(180 * sx), round(150 * sy)),
+        item("全域整备", round(60 * sx), round(314 * sy),
+             round(58 * sx), round(17 * sy)),
+    ], size=size, capture_id=capture)
+    result, taps, evidence = run_global([make("1"), make("2"), entry("3", size=size)])
+
+    assert result.success
+    assert len(taps) == len(evidence) == 1
+    normalized = evidence[0].coordinate_chain.normalized_point
+    assert normalized[0] == pytest.approx(0.0875, abs=0.02)
+    assert normalized[1] == pytest.approx(0.403, abs=0.03)
