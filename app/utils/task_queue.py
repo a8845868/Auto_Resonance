@@ -19,7 +19,12 @@ from core.services.runtime_errors import (
     RecoverableAutomationError,
     classify_runtime_error,
 )
-from core.services.task_schedule_state import next_daily_reset, task_result_succeeded
+from core.services.task_schedule_state import (
+    next_daily_reset,
+    task_result_halt_eligible,
+    task_result_incident_eligible,
+    task_result_succeeded,
+)
 
 
 @dataclass(frozen=True)
@@ -168,6 +173,7 @@ class TaskQueueWorker(QThread):
                 succeeded = True
                 result = None
                 attempt = 0
+                halt_eligible = True
                 while True:
                     try:
                         if task.run_with_context is not None:
@@ -188,13 +194,19 @@ class TaskQueueWorker(QThread):
                                 and result.get("terminal") is True
                             )
                         )
+                        result_succeeded = task_result_succeeded(result)
+                        incident_eligible = task_result_incident_eligible(result)
+                        halt_eligible = task_result_halt_eligible(result)
+                        if terminal_contract_failed:
+                            incident_eligible = True
+                            halt_eligible = True
                         if (
                             self._stop_requested
-                            or not task_result_succeeded(result)
+                            or not result_succeeded
                             or terminal_contract_failed
                         ):
                             succeeded = False
-                            if not self._stop_requested:
+                            if not self._stop_requested and incident_eligible:
                                 self._queue_incident(
                                     task=task,
                                     failure_kind="unexpected_result",
@@ -207,7 +219,12 @@ class TaskQueueWorker(QThread):
                                     observed=self._safe_observed(result),
                                     context={"task_index": index, "task_total": len(self.tasks)},
                                 )
-                                logger.warning(f"任务未返回明确成功结果，按失败处理: {task.name}")
+                            if not self._stop_requested:
+                                logger.warning(
+                                    f"任务未达到队列成功语义：{task.name}; "
+                                    f"incident_eligible={incident_eligible}; "
+                                    f"halt_eligible={halt_eligible}"
+                                )
                         break
                     except StopExecution:
                         succeeded = False
@@ -286,13 +303,13 @@ class TaskQueueWorker(QThread):
                 else:
                     self._run_failed = True
                     self._transition_one_shot(task, "FAILED")
-                self.taskFinished.emit(task.name, succeeded)
-                if succeeded:
+                if result is not None:
                     self.taskResult.emit(task.name, result)
+                self.taskFinished.emit(task.name, succeeded)
                 self.taskCompleted.emit(task, succeeded, result)
                 if self._fatal_error is not None:
                     break
-                if not succeeded and not self._stop_requested and (
+                if not succeeded and halt_eligible and not self._stop_requested and (
                     self.halt_on_failure or task.halt_queue_on_failure
                 ):
                     if self.halt_on_failure:

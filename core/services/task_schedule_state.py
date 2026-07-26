@@ -6,6 +6,7 @@ import shutil
 import threading
 import uuid
 from datetime import datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,14 @@ DATETIME_FIELDS = frozenset({
     "next_run", "last_run", "last_attempt", "completed_at", "progress_at",
 })
 TASK_STATUSES = frozenset({"completed", "deferred", "failed_or_stopped"})
+
+
+class TaskOutcome(str, Enum):
+    COMPLETED_PROGRESS = "COMPLETED_PROGRESS"
+    COMPLETED_NO_PROGRESS = "COMPLETED_NO_PROGRESS"
+    DEFERRED_EXPECTED = "DEFERRED_EXPECTED"
+    BLOCKED_SAFETY = "BLOCKED_SAFETY"
+    FAILED_RUNTIME = "FAILED_RUNTIME"
 
 
 class TaskScheduleStateCorrupt(RuntimeError):
@@ -54,7 +63,7 @@ def _validate_task_timing(task_key: str, entry: object) -> None:
         raise ValueError(f"tasks.{task_key} must be an object")
     string_fields = {
         "key", "name", "next_run", "last_run", "last_attempt",
-        "completed_at", "progress_at", "status",
+        "completed_at", "progress_at", "status", "next_run_reason",
     }
     for field in string_fields:
         if field in entry and not isinstance(entry[field], str):
@@ -82,7 +91,7 @@ def _validate_completed_entry(index: int, entry: object) -> None:
         raise ValueError(f"completed.{index} must be an object")
     for field in (
         "key", "name", "next_run", "last_run", "last_attempt",
-        "completed_at", "progress_at", "status",
+        "completed_at", "progress_at", "status", "next_run_reason",
     ):
         if field in entry and not isinstance(entry[field], str):
             raise ValueError(f"completed.{index}.{field} must be a string")
@@ -158,31 +167,92 @@ def _save_unlocked(state: dict[str, Any], path: Path) -> None:
     os.replace(temporary, path)
 
 
-def task_result_succeeded(result: object) -> bool:
-    """Honor an explicit result status before falling back to truthiness.
+def task_result_outcome(result: object) -> TaskOutcome:
+    """Classify queue semantics without inferring progress from payload values."""
 
-    Once a task returns a ``success`` field it is part of the task contract, so
-    malformed values fail closed instead of making strings such as ``"false"``
-    look successful merely because they are non-empty.
-    """
-    if isinstance(result, dict) and "success" in result:
-        return result.get("success") is True
-    return bool(result)
+    if isinstance(result, dict):
+        explicit = result.get("task_outcome")
+        if explicit is not None:
+            if isinstance(explicit, TaskOutcome):
+                return explicit
+            try:
+                return TaskOutcome(str(explicit))
+            except ValueError:
+                return TaskOutcome.FAILED_RUNTIME
+        if "success" in result:
+            if result.get("success") is not True:
+                return TaskOutcome.FAILED_RUNTIME
+            if result.get("deferred") is True:
+                return TaskOutcome.DEFERRED_EXPECTED
+            if (
+                result.get("progress_made") is True
+                or result.get("business_progress_made") is True
+            ):
+                return TaskOutcome.COMPLETED_PROGRESS
+            return TaskOutcome.COMPLETED_NO_PROGRESS
+        return (
+            TaskOutcome.COMPLETED_NO_PROGRESS
+            if result
+            else TaskOutcome.FAILED_RUNTIME
+        )
+    return (
+        TaskOutcome.COMPLETED_NO_PROGRESS
+        if bool(result)
+        else TaskOutcome.FAILED_RUNTIME
+    )
+
+
+def task_result_succeeded(result: object) -> bool:
+    """Return queue success for completed work or an expected deferral."""
+
+    return task_result_outcome(result) in {
+        TaskOutcome.COMPLETED_PROGRESS,
+        TaskOutcome.COMPLETED_NO_PROGRESS,
+        TaskOutcome.DEFERRED_EXPECTED,
+    }
 
 
 def task_result_deferred(result: object) -> bool:
-    """Return whether a successful task intentionally requested a retry.
+    """Return whether a task intentionally stopped for a later recheck."""
 
-    A deferral is not a runtime failure and must not trigger self-healing, but
-    it also must not advance the task's completion timestamp or normal
-    schedule.  Requiring both fields to be the boolean ``True`` keeps malformed
-    result documents fail-closed.
-    """
+    return task_result_outcome(result) is TaskOutcome.DEFERRED_EXPECTED
+
+
+def task_result_progress_made(result: object) -> bool:
+    """Return explicitly reported progress for durable attempt history."""
+
     return (
         isinstance(result, dict)
-        and result.get("success") is True
-        and result.get("deferred") is True
+        and (
+            result.get("progress_made") is True
+            or result.get("business_progress_made") is True
+        )
     )
+
+
+def task_result_business_progress_made(result: object) -> bool:
+    """Return progress allowed to trigger downstream business rechecks."""
+
+    return (
+        task_result_outcome(result) is TaskOutcome.COMPLETED_PROGRESS
+        and task_result_progress_made(result)
+    )
+
+
+def task_result_incident_eligible(result: object) -> bool:
+    if task_result_outcome(result) is TaskOutcome.FAILED_RUNTIME:
+        return True
+    if isinstance(result, dict) and type(result.get("incident_eligible")) is bool:
+        return result["incident_eligible"]
+    return False
+
+
+def task_result_halt_eligible(result: object) -> bool:
+    if task_result_outcome(result) is TaskOutcome.FAILED_RUNTIME:
+        return True
+    if isinstance(result, dict) and type(result.get("halt_eligible")) is bool:
+        return result["halt_eligible"]
+    return False
 
 
 def load_task_schedule(path: Path = STATE_PATH) -> dict[str, Any]:
@@ -298,10 +368,15 @@ def record_task_execution(
             "completed_at": attempt_time if completed else previous_completed_at,
             "progress_at": (
                 attempt_time
-                if isinstance(result, dict) and result.get("progress_made") is True
+                if task_result_progress_made(result)
                 else previous_progress_at
             ),
             "next_run": next_run.isoformat(timespec="seconds") if next_run else "",
+            "next_run_reason": (
+                str(result.get("next_run_reason", ""))
+                if isinstance(result, dict)
+                else ""
+            ),
             "status": (
                 "deferred"
                 if succeeded and deferred

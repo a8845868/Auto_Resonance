@@ -269,6 +269,14 @@ def test_available_task_returns_structured_business_policy_block():
     assert result.authorization_valid is False
     assert result.business_dispatches == 0
     assert result.irreversible_actions == 0
+    assert result.task_outcome.value == "DEFERRED_EXPECTED"
+    assert result.task_terminal is True
+    assert result.task_deferred is True
+    assert result.progress_made is False
+    assert result.business_progress_made is False
+    assert result.next_run_reason == "business_policy_required"
+    assert result.incident_eligible is False
+    assert result.halt_eligible is False
 
 
 @pytest.mark.parametrize("method,args", [

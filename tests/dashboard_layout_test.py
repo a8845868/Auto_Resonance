@@ -10,8 +10,12 @@ from PySide6.QtWidgets import QApplication, QTextEdit
 
 from app.view.logger_interface import LoguruHandler, StructuredLogWidget
 from app.view.dashboard_interface import (
+    ACTION_SUMMARY_READ_ONLY_TASK_NAME,
     action_summary_execution_status,
     build_resident_activity_task,
+)
+from core.services.action_summary_execution_interlock import (
+    ActionSummaryExecutionMode,
 )
 
 
@@ -36,10 +40,11 @@ def test_action_summary_block_is_not_rendered_as_completed_sweeps():
         "reason": "business_policy_required",
         "decision": {"decision": "TASK_AVAILABLE_NEEDS_POLICY"},
         "business_dispatches": 0,
+        "task_outcome": "DEFERRED_EXPECTED",
     })
 
     assert status == (
-        "■  行动汇总已安全阻断：business_policy_required（TASK_AVAILABLE_NEEDS_POLICY）",
+        "■  行动汇总评估完成，等待业务策略",
         "#f0a44b",
     )
 
@@ -57,8 +62,13 @@ def test_dashboard_queue_entry_uses_default_safe_public_wrapper():
         task = build_resident_activity_task("特殊订单", "学会装备箱")
         result = task.run()
 
-    public_entry.assert_called_once_with("特殊订单", "学会装备箱")
+    public_entry.assert_called_once_with(
+        "特殊订单",
+        "学会装备箱",
+        execution_mode=ActionSummaryExecutionMode.READ_ONLY,
+    )
     assert task.key == "resident_activity"
+    assert task.name == ACTION_SUMMARY_READ_ONLY_TASK_NAME
     assert result == blocked
 
 

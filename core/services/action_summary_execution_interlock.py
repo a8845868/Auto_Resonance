@@ -16,6 +16,7 @@ from core.services.action_summary_product_model import (
     ActionSummaryDecisionType,
     ActionSummaryPageModel,
 )
+from core.services.task_schedule_state import TaskOutcome
 
 
 class ActionSummaryExecutionMode(str, Enum):
@@ -64,6 +65,14 @@ class ActionSummaryExecutionResult:
     irreversible_actions: int
     reason: str
     reason_codes: tuple[str, ...]
+    task_outcome: TaskOutcome
+    task_terminal: bool
+    task_deferred: bool
+    progress_made: bool
+    business_progress_made: bool
+    next_run_reason: str
+    incident_eligible: bool
+    halt_eligible: bool
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -81,6 +90,14 @@ class ActionSummaryExecutionResult:
             "irreversible_actions": self.irreversible_actions,
             "reason": self.reason,
             "reason_codes": list(self.reason_codes),
+            "task_outcome": self.task_outcome.value,
+            "task_terminal": self.task_terminal,
+            "task_deferred": self.task_deferred,
+            "progress_made": self.progress_made,
+            "business_progress_made": self.business_progress_made,
+            "next_run_reason": self.next_run_reason,
+            "incident_eligible": self.incident_eligible,
+            "halt_eligible": self.halt_eligible,
         }
 
 
@@ -163,6 +180,18 @@ def evaluate_execution_interlock(
         reason_codes: tuple[str, ...],
         validation: AuthorizationValidation | None = None,
     ) -> ActionSummaryExecutionResult:
+        expected_deferral_reasons = {
+            "business_policy_required",
+            "reward_policy_not_started",
+            "execution_authorization_required",
+            "execution_authority_not_implemented",
+        }
+        if reason in expected_deferral_reasons:
+            task_outcome = TaskOutcome.DEFERRED_EXPECTED
+        elif status == "READ_ONLY_COMPLETE":
+            task_outcome = TaskOutcome.COMPLETED_NO_PROGRESS
+        else:
+            task_outcome = TaskOutcome.BLOCKED_SAFETY
         return ActionSummaryExecutionResult(
             success=success,
             terminal=True,
@@ -180,6 +209,16 @@ def evaluate_execution_interlock(
             irreversible_actions=0,
             reason=reason,
             reason_codes=reason_codes,
+            task_outcome=task_outcome,
+            task_terminal=True,
+            task_deferred=task_outcome is TaskOutcome.DEFERRED_EXPECTED,
+            progress_made=False,
+            business_progress_made=False,
+            next_run_reason=(
+                reason if task_outcome is TaskOutcome.DEFERRED_EXPECTED else ""
+            ),
+            incident_eligible=False,
+            halt_eligible=False,
         )
 
     if mode is ActionSummaryExecutionMode.LEGACY_COMPATIBILITY:
@@ -200,7 +239,7 @@ def evaluate_execution_interlock(
         return result(
             success=False,
             status="BLOCKED",
-            reason="business_policy_required",
+            reason="reward_policy_not_started",
             reason_codes=("reward_policy_not_started",),
         )
     if mode is ActionSummaryExecutionMode.POLICY_GATED:

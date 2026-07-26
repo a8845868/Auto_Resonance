@@ -212,7 +212,7 @@ def task_registry() -> dict[str, DebugTask]:
         ),
         DebugTask(
             "resident_activity",
-            "扫荡与全域整备",
+            "行动汇总只读评估",
             _resident_activity,
             enabled=lambda: bool(cfg.enableResidentActivity.value),
         ),

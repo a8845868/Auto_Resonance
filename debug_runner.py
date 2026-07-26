@@ -89,7 +89,12 @@ def _run_debug_task(
         LifecycleOptions,
     )
     from core.services.task_schedule_state import (
+        TaskOutcome,
         record_task_execution,
+        task_result_deferred,
+        task_result_incident_eligible,
+        task_result_next_run,
+        task_result_outcome,
         task_result_succeeded,
     )
 
@@ -121,6 +126,7 @@ def _run_debug_task(
     logger.info(f"后台调试开始: {task.name} ({task.key})")
     result = None
     success = False
+    deferred = False
     error_text = ""
     cleanup_error = ""
     lifecycle = None
@@ -144,22 +150,29 @@ def _run_debug_task(
         stage = "task"
         result = task.run()
         success = task_result_succeeded(result)
+        deferred = bool(success and task_result_deferred(result))
         if not success:
-            error_text = "任务未返回明确成功结果"
-            incident = {
-                "source": "debug_runner",
-                "task_key": task.key,
-                "task_name": task.name,
-                "failure_kind": "unexpected_result",
-                "message": error_text,
-                "expected": "task_result_succeeded(result) == True",
-                "observed": _safe_repr(result),
-                "traceback": "",
-                "context": {
-                    "command_id": command_id,
-                    "dispatch_allowed": True,
-                },
-            }
+            outcome = task_result_outcome(result)
+            error_text = (
+                "任务按页面安全门禁停止"
+                if outcome is TaskOutcome.BLOCKED_SAFETY
+                else "任务未返回明确成功结果"
+            )
+            if task_result_incident_eligible(result):
+                incident = {
+                    "source": "debug_runner",
+                    "task_key": task.key,
+                    "task_name": task.name,
+                    "failure_kind": "unexpected_result",
+                    "message": error_text,
+                    "expected": "task_result_succeeded(result) == True",
+                    "observed": _safe_repr(result),
+                    "traceback": "",
+                    "context": {
+                        "command_id": command_id,
+                        "dispatch_allowed": True,
+                    },
+                }
             logger.warning(f"后台调试未完成: {task.name}；{error_text}")
     except StopExecution:
         error_text = "任务收到停止请求"
@@ -223,15 +236,18 @@ def _run_debug_task(
             )
 
     if bool(command.get("record")):
+        explicit_next_run = task_result_next_run(result)
         record_task_execution(
             task.key,
             task.name,
             success,
-            task.next_run_after(success),
+            explicit_next_run or task.next_run_after(success and not deferred),
             result,
+            deferred=deferred,
         )
     response = {
         "success": success,
+        "deferred": deferred,
         "task": task.key,
         "result": _serializable(result),
         "error": error_text,

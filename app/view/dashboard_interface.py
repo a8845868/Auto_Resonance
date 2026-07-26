@@ -24,12 +24,18 @@ from core.services.self_healing import (
     discover_log_incidents,
     submit_incident,
 )
+from core.services.action_summary_execution_interlock import (
+    ActionSummaryExecutionMode,
+)
 from core.services.task_schedule_state import (
+    TaskOutcome,
     completed_history,
     is_task_due,
     record_task_execution,
+    task_result_business_progress_made,
     task_result_deferred,
     task_result_next_run,
+    task_result_outcome,
     task_timing,
 )
 from core.services.daily_capabilities import (
@@ -42,6 +48,10 @@ from core.services.daily_capabilities import (
 from core.services.daily_rewards import DailyProgressSnapshot, RewardStrategy
 from core.services.server_calendar import SERVER_CLOCK
 from core.services.fatigue_triggers import recover_pending_fatigue_schedules
+
+
+ACTION_SUMMARY_READ_ONLY_TASK_NAME = "行动汇总只读评估"
+ACTION_SUMMARY_LEGACY_TASK_NAME = "扫荡与全域整备"
 
 
 def recover_startup_fatigue_schedules() -> bool:
@@ -66,27 +76,53 @@ def action_summary_execution_status(result: object) -> tuple[str, str] | None:
         else "UNKNOWN"
     )
     reason = str(result.get("reason", "unknown"))
-    status = str(result.get("execution_status", "UNKNOWN"))
-    if status == "BLOCKED":
+    outcome = task_result_outcome(result)
+    if outcome is TaskOutcome.DEFERRED_EXPECTED:
+        suffix = {
+            "business_policy_required": "等待业务策略",
+            "reward_policy_not_started": "等待奖励策略",
+            "execution_authorization_required": "等待执行授权",
+            "execution_authority_not_implemented": "等待执行授权",
+        }.get(reason, "等待后续条件")
         return (
-            f"■  行动汇总已安全阻断：{reason}（{decision_name}）",
+            f"■  行动汇总评估完成，{suffix}",
             "#f0a44b",
         )
-    return (
-        f"✓  行动汇总只读评估完成：{reason}（{decision_name}）",
-        "#65c466",
-    )
+    if outcome is TaskOutcome.COMPLETED_NO_PROGRESS:
+        return (
+            "✓  行动汇总评估完成，当前无需执行",
+            "#65c466",
+        )
+    if outcome is TaskOutcome.BLOCKED_SAFETY:
+        return (
+            f"■  行动汇总因页面安全门禁停止（{decision_name}）",
+            "#f0a44b",
+        )
+    if outcome is TaskOutcome.FAILED_RUNTIME:
+        return ("✗  行动汇总运行异常", "#ff6b6b")
+    return ("✓  行动汇总评估完成", "#65c466")
 
 
 def build_resident_activity_task(
     activity_task: str,
     full_reward: str,
+    *,
+    execution_mode: ActionSummaryExecutionMode | str = ActionSummaryExecutionMode.READ_ONLY,
 ) -> QueuedTask:
     """Build the queue entry through the default-safe public wrapper."""
 
+    mode = ActionSummaryExecutionMode(execution_mode)
     return QueuedTask(
-        "扫荡与全域整备",
-        lambda: run_resident_activity(activity_task, full_reward),
+        (
+            ACTION_SUMMARY_LEGACY_TASK_NAME
+            if mode is ActionSummaryExecutionMode.LEGACY_COMPATIBILITY
+            else ACTION_SUMMARY_READ_ONLY_TASK_NAME
+        ),
+        lambda: run_resident_activity(
+            activity_task,
+            full_reward,
+            execution_mode=mode,
+        ),
         key="resident_activity",
     )
 
@@ -512,7 +548,10 @@ class DashboardInterface(ScrollArea):
         self._setControlRunning(False)
         if self.queueWorker and self.queueWorker.isRunning():
             self.queueWorker.stop()
-            if self.currentTask == "扫荡与全域整备":
+            if self.currentTask in {
+                ACTION_SUMMARY_READ_ONLY_TASK_NAME,
+                ACTION_SUMMARY_LEGACY_TASK_NAME,
+            }:
                 self.activityStateChanged.emit("■  已请求停止", "#f0a44b")
         from core.services.fatigue_triggers import cancel_deferred_fatigue_actions
 
@@ -531,7 +570,7 @@ class DashboardInterface(ScrollArea):
     def _taskStarted(self, name, index, total):
         self.currentTask = name
         self.runningPanel.setTasks([f"{index}/{total}  {name}"])
-        if name == "扫荡与全域整备":
+        if name == ACTION_SUMMARY_READ_ONLY_TASK_NAME:
             self.activityStateChanged.emit(
                 "●  运行中：正在只读评估行动汇总", "#43a5ff"
             )
@@ -542,18 +581,28 @@ class DashboardInterface(ScrollArea):
             )
 
     def _taskFinished(self, name, succeeded):
-        if name == "扫荡与全域整备":
+        if name == ACTION_SUMMARY_READ_ONLY_TASK_NAME:
+            if getattr(self, "_actionSummaryResultSeen", False):
+                self._actionSummaryResultSeen = False
+                return
+            if not succeeded and not self.queueWorker.stop_requested:
+                self.activityStateChanged.emit(
+                    "✗  行动汇总运行异常", "#ff6b6b"
+                )
+        elif name == ACTION_SUMMARY_LEGACY_TASK_NAME:
             if succeeded:
                 self.activityStateChanged.emit("✓  扫荡方案执行完成", "#65c466")
             elif not self.queueWorker.stop_requested:
                 self.activityStateChanged.emit("✕  扫荡方案执行失败", "#ff6b6b")
 
     def _taskResult(self, name, result):
-        if name != "扫荡与全域整备" or not isinstance(result, dict):
+        if name == ACTION_SUMMARY_READ_ONLY_TASK_NAME and isinstance(result, dict):
+            self._actionSummaryResultSeen = True
+            interlock_status = action_summary_execution_status(result)
+            if interlock_status is not None:
+                self.activityStateChanged.emit(*interlock_status)
             return
-        interlock_status = action_summary_execution_status(result)
-        if interlock_status is not None:
-            self.activityStateChanged.emit(*interlock_status)
+        if name != ACTION_SUMMARY_LEGACY_TASK_NAME or not isinstance(result, dict):
             return
         details = "，".join(f"{task} {count} 次" for task, count in result.items())
         self.activityStateChanged.emit(f"✓  已完成：{details}", "#65c466")
@@ -593,13 +642,7 @@ class DashboardInterface(ScrollArea):
             "run_business",
             "passenger_build",
         }:
-            progress_made = result is True or (
-                isinstance(result, dict)
-                and (
-                    result.get("progress_made") is True
-                    or any(isinstance(value, int) and value > 0 for value in result.values())
-                )
-            )
+            progress_made = task_result_business_progress_made(result)
             if progress_made:
                 from core.services.daily_rewards import schedule_debounced_reward_recheck
 
