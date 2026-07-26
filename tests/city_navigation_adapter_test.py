@@ -18,10 +18,15 @@ from core.services.city_navigation import (
     detect_current_station,
     observe_city_frame,
 )
+from core.services.personal_runtime_episode import RuntimeState, StateDetector
 from core.services.read_only_policy import DEFAULT_POLICY_SPECS
 from tools import sixth_read_only_probe as live_probe
 from tools import city_entry_single_action_probe as single_city_probe
 from tools import eighteenth_city_read_only_probe as city_probe
+from tests.personal_runtime_fixtures import (
+    daily_frame as claimed_daily_checkin_frame,
+    home_frame as runtime_home_frame,
+)
 
 
 NOW = datetime(2026, 7, 20, 13, 10, tzinfo=timezone(timedelta(hours=8)))
@@ -695,6 +700,62 @@ def test_single_action_probe_stops_before_exchange_or_other_product_features():
     assert blocked["city_entry_dispatches"] == 0
     assert blocked["transition_observation_count"] == 0
     assert blocked["transition_result"] == "NOT_RUN"
+
+
+def test_city_probe_dismisses_claimed_daily_checkin_once_then_returns_home():
+    frames = iter([claimed_daily_checkin_frame(), runtime_home_frame()])
+    taps = []
+    clock = _Clock()
+    prepared, details = single_city_probe._prepare_home_from_claimed_daily_checkin(
+        claimed_daily_checkin_frame(),
+        frame_provider=lambda: next(frames),
+        tap=lambda point, **kwargs: taps.append((point, kwargs)) or True,
+        geometry_provider=lambda: SimpleNamespace(
+            physical_width=1280, physical_height=720,
+        ),
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+        timeout_seconds=2.0,
+        interval_seconds=0.5,
+    )
+
+    assert details["status"] == "PASS"
+    assert details["daily_checkin_detected"] is True
+    assert details["daily_checkin_dismiss_count"] == 1
+    assert details["daily_checkin_dispatch_acknowledged"] is True
+    assert details["daily_checkin_state_sequence"] == [
+        "DAILY_CHECKIN", "DAILY_CHECKIN", "HOME_READY",
+    ]
+    assert len(taps) == 1
+    point, kwargs = taps[0]
+    assert point == details["daily_checkin_device_point"]
+    assert kwargs["random_offset"] is False
+    assert kwargs["intent"].action_key == "dialog_cancel"
+    assert StateDetector().detect(prepared).state is RuntimeState.HOME_READY
+
+
+def test_city_probe_never_reclicks_persistent_daily_checkin():
+    daily = claimed_daily_checkin_frame()
+    taps = []
+    clock = _Clock()
+    prepared, details = single_city_probe._prepare_home_from_claimed_daily_checkin(
+        daily,
+        frame_provider=lambda: daily,
+        tap=lambda point, **kwargs: taps.append((point, kwargs)) or True,
+        geometry_provider=lambda: SimpleNamespace(
+            physical_width=1280, physical_height=720,
+        ),
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+        timeout_seconds=1.5,
+        interval_seconds=0.5,
+    )
+
+    assert prepared is daily
+    assert details["status"] == "BLOCKED"
+    assert details["reason"] == "daily_checkin_postcondition_timeout"
+    assert details["daily_checkin_dismiss_count"] == 1
+    assert len(taps) == 1
 
 
 def test_screenshot_preserves_backend_capture_identity(monkeypatch):

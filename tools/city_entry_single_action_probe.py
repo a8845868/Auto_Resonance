@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 from loguru import logger
@@ -26,6 +27,15 @@ from core.services.city_navigation import (  # noqa: E402
     CityNavigationState,
     observe_city_frame,
 )
+from core.services.navigation_evidence import CoordinateChain  # noqa: E402
+from core.services.personal_action_budget import EpisodeActionBudget  # noqa: E402
+from core.services.personal_runtime_episode import (  # noqa: E402
+    ActionPlanner,
+    RuntimeAction,
+    RuntimeState,
+    StateDetector,
+)
+from core.services.read_only_policy import ActionIntent  # noqa: E402
 from core.services.emulator_lifecycle import (  # noqa: E402
     GAME_PACKAGE,
     MuMuManagerClient,
@@ -53,7 +63,172 @@ def _blocked(reason: str) -> dict[str, object]:
         "station_defaulted_to_lanxin": False,
         "real_ui_actions": 0,
         "unknown_state_actions": 0,
+        "initial_runtime_state": "UNKNOWN",
+        "daily_checkin_detected": False,
+        "daily_checkin_dismiss_count": 0,
+        "daily_checkin_dispatch_acknowledged": False,
+        "daily_checkin_device_point": None,
+        "daily_checkin_random_offset_enabled": False,
+        "daily_checkin_state_sequence": [],
     }
+
+
+def _inside(point: tuple[int, int], bbox: tuple[int, int, int, int]) -> bool:
+    return bbox[0] <= point[0] < bbox[2] and bbox[1] <= point[1] < bbox[3]
+
+
+def _prepare_home_from_claimed_daily_checkin(
+    initial_frame,
+    *,
+    frame_provider,
+    tap,
+    geometry_provider,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+    timeout_seconds: float = 10.0,
+    interval_seconds: float = 0.5,
+):
+    """Dismiss one proven claimed check-in overlay, then observe HOME only.
+
+    This recovery owns at most one physical action.  UNKNOWN and a still-visible
+    check-in remain observation-only until the bounded deadline.
+    """
+
+    detector = StateDetector()
+    planner = ActionPlanner()
+    budget = EpisodeActionBudget(clock=monotonic)
+    detected = detector.detect(initial_frame)
+    details = {
+        "status": "NOT_APPLICABLE",
+        "reason": "daily_checkin_not_present",
+        "initial_runtime_state": detected.state.value,
+        "daily_checkin_detected": detected.state is RuntimeState.DAILY_CHECKIN,
+        "daily_checkin_dismiss_count": 0,
+        "daily_checkin_dispatch_acknowledged": False,
+        "daily_checkin_device_point": None,
+        "daily_checkin_random_offset_enabled": False,
+        "daily_checkin_state_sequence": [detected.state.value],
+    }
+    if detected.state is not RuntimeState.DAILY_CHECKIN:
+        return initial_frame, details
+
+    first_plan = planner.plan(detected, budget=budget)
+    if (
+        first_plan.action is not RuntimeAction.DISMISS_DAILY_CHECKIN
+        or first_plan.capture_point is None
+    ):
+        details.update(
+            status="BLOCKED",
+            reason="daily_checkin_safe_blank_region_unavailable",
+        )
+        return initial_frame, details
+
+    try:
+        fresh_frame = frame_provider()
+        fresh = detector.detect(fresh_frame)
+    except Exception:  # noqa: BLE001 - precise pre-dispatch stop class
+        details.update(status="BLOCKED", reason="daily_checkin_fresh_capture_failed")
+        return initial_frame, details
+    details["daily_checkin_state_sequence"].append(fresh.state.value)
+    fresh_plan = planner.plan(fresh, budget=budget)
+    if (
+        fresh.state is not RuntimeState.DAILY_CHECKIN
+        or fresh_plan.action is not RuntimeAction.DISMISS_DAILY_CHECKIN
+        or fresh_plan.capture_point is None
+    ):
+        details.update(status="BLOCKED", reason="daily_checkin_fresh_confirmation_failed")
+        return fresh_frame, details
+
+    capture_point = fresh_plan.capture_point
+    if (
+        fresh.dialog_bbox is None
+        or _inside(capture_point, fresh.dialog_bbox)
+        or any(_inside(capture_point, bbox) for bbox in fresh.ocr_bboxes)
+    ):
+        details.update(status="BLOCKED", reason="daily_checkin_safe_point_invalid")
+        return fresh_frame, details
+
+    geometry = geometry_provider()
+    chain = CoordinateChain.from_capture_point(
+        capture_point,
+        capture_size=fresh.frame_dimensions,
+        render_client_size=(
+            int(getattr(geometry, "physical_width")),
+            int(getattr(geometry, "physical_height")),
+        ),
+        device_size=(
+            int(getattr(geometry, "physical_width")),
+            int(getattr(geometry, "physical_height")),
+        ),
+        source_coordinate_space="CAPTURE_PIXELS",
+    )
+    decision = budget.authorize(
+        state=RuntimeState.DAILY_CHECKIN.value,
+        action_type=RuntimeAction.DISMISS_DAILY_CHECKIN.value,
+        normalized_point=chain.render_client_point,
+    )
+    if not decision.allowed:
+        details.update(status="BLOCKED", reason=decision.reason_code)
+        return fresh_frame, details
+
+    try:
+        acknowledged = tap(
+            chain.device_point,
+            random_offset=False,
+            intent=ActionIntent(
+                "dialog_cancel",
+                "claimed_daily_checkin_blank_region",
+                "CITY-ENTRY-SINGLE-ACTION",
+            ),
+        )
+    except Exception:  # noqa: BLE001 - delivery may have happened; never retry
+        budget.record_dispatch(decision)
+        budget.record_result(decision, "DELIVERY_UNKNOWN")
+        details.update(
+            status="BLOCKED",
+            reason="daily_checkin_delivery_unknown",
+            daily_checkin_dismiss_count=1,
+            daily_checkin_device_point=chain.device_point,
+        )
+        return fresh_frame, details
+    if acknowledged is False:
+        budget.record_result(decision, "DISPATCH_REJECTED")
+        details.update(status="BLOCKED", reason="daily_checkin_dispatch_rejected")
+        return fresh_frame, details
+
+    budget.record_dispatch(decision)
+    budget.record_result(decision, "DISPATCHED")
+    details.update(
+        daily_checkin_dismiss_count=1,
+        daily_checkin_dispatch_acknowledged=True,
+        daily_checkin_device_point=chain.device_point,
+    )
+    deadline = monotonic() + max(0.0, float(timeout_seconds))
+    interval = max(0.001, float(interval_seconds))
+    while monotonic() < deadline:
+        sleep(min(interval, max(0.0, deadline - monotonic())))
+        if monotonic() >= deadline:
+            break
+        try:
+            observed_frame = frame_provider()
+            observed = detector.detect(observed_frame)
+        except Exception:  # noqa: BLE001 - no second action after delivery
+            details.update(status="BLOCKED", reason="daily_checkin_post_capture_failed")
+            return fresh_frame, details
+        details["daily_checkin_state_sequence"].append(observed.state.value)
+        if observed.state is RuntimeState.HOME_READY:
+            details.update(status="PASS", reason="home_ready_after_daily_checkin")
+            return observed_frame, details
+        if observed.state in {RuntimeState.DAILY_CHECKIN, RuntimeState.UNKNOWN}:
+            continue
+        details.update(
+            status="BLOCKED",
+            reason=f"daily_checkin_unexpected_post_state:{observed.state.value}",
+        )
+        return observed_frame, details
+
+    details.update(status="BLOCKED", reason="daily_checkin_postcondition_timeout")
+    return fresh_frame, details
 
 
 def run(output: Path, *, adb_port: int = 16384) -> dict[str, object]:
@@ -73,7 +248,21 @@ def run(output: Path, *, adb_port: int = 16384) -> dict[str, object]:
     if not connect_adb(adb_port):
         return _blocked("instance_zero_backend_connect_failed")
 
-    before = observe_city_frame(screenshot())
+    initial_frame = screenshot()
+    prepared_frame, checkin = _prepare_home_from_claimed_daily_checkin(
+        initial_frame,
+        frame_provider=screenshot,
+        tap=input_tap,
+        geometry_provider=current_display_geometry,
+    )
+    result.update(checkin)
+    if checkin["status"] == "BLOCKED":
+        result["reason"] = checkin["reason"]
+        result["real_ui_actions"] = checkin["daily_checkin_dismiss_count"]
+        result["post_state_sequence"] = checkin["daily_checkin_state_sequence"]
+        return result
+
+    before = observe_city_frame(prepared_frame)
     result["city_entry_candidate_count"] = before.city_entry.candidate_count
     if before.state is not CityNavigationState.CITY_ENTRY_VISIBLE:
         result["reason"] = f"home_ready_unavailable:{before.state.value}"
@@ -148,7 +337,7 @@ def run(output: Path, *, adb_port: int = 16384) -> dict[str, object]:
             "station_confirmed": navigation.station_confirmed,
             "station_id": navigation.station_id,
             "station_defaulted_to_lanxin": False,
-            "real_ui_actions": dispatches,
+            "real_ui_actions": dispatches + int(checkin["daily_checkin_dismiss_count"]),
             "unknown_state_actions": 0,
             "coordinate_chain_complete": bool(
                 evidence and evidence.coordinate_chain.complete
