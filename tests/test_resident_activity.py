@@ -305,12 +305,20 @@ class ResidentActivityTests(unittest.TestCase):
         driver.capture_frame = Mock(return_value=ModelFrame())
         automation = ResidentActivityAutomation(driver)
         automation.open_action_summary = Mock(return_value=True)
+        automation.select_siege_task = Mock(
+            side_effect=AssertionError("legacy business selection must not run")
+        )
+        automation.sweep_current_activity = Mock(
+            side_effect=AssertionError("legacy sweep must not run")
+        )
 
         model, decision = automation.read_action_summary_product_model()
 
         self.assertEqual(model.page_state, "ACTION_SUMMARY_VISIBLE")
         self.assertEqual(decision.decision.value, "TASK_AVAILABLE_NEEDS_POLICY")
         automation.open_action_summary.assert_called_once_with()
+        automation.select_siege_task.assert_not_called()
+        automation.sweep_current_activity.assert_not_called()
         driver.capture_frame.assert_called_once_with()
         self.assertEqual(driver.taps, [])
 

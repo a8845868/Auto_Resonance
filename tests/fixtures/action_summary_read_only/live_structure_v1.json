@@ -19,12 +19,16 @@
   ],
   "cost_observations": [40, 40, 40],
   "expected": {
+    "model_scope": "ACTION_SUMMARY_READ_ONLY_V1",
+    "activity_family": "SIEGE",
     "page_state": "ACTION_SUMMARY_VISIBLE",
     "visible_task_cards": 3,
     "task_states": ["available", "available", "available"],
     "page_capabilities": [
+      "CARD_SELECTABLE",
       "CHALLENGE_AVAILABLE",
       "SELECT_TASK_AVAILABLE",
+      "TASK_EXECUTION_AVAILABLE",
       "VIEW_TASK_LIST"
     ],
     "decision": "TASK_AVAILABLE_NEEDS_POLICY",

@@ -17,6 +17,7 @@ from core.services.action_summary_navigation import (
     ActionSummaryState,
     observe_action_summary,
 )
+from core.services.navigation_evidence import frame_sha256
 
 
 class PageConfidence(str, Enum):
@@ -65,6 +66,7 @@ class ActionSummaryPageActions:
 @dataclass(frozen=True, slots=True)
 class ActionSummaryTaskCard:
     semantic_id: str
+    card_instance_id: str
     title_hash: str
     bbox: tuple[int, int, int, int]
     state: TaskCardState
@@ -79,6 +81,13 @@ class ActionSummaryTaskCard:
 
 @dataclass(frozen=True, slots=True)
 class ActionSummaryPageModel:
+    model_scope: str
+    activity_family: str
+    activity_title_hash: str | None
+    source_capture_id: str | None
+    source_frame_sha256: str | None
+    captured_at: str | None
+    model_freshness_token: str | None
     page_state: str
     page_confidence: PageConfidence
     overlay_states: tuple[str, ...]
@@ -127,7 +136,10 @@ class ActionSummaryDecision:
         }
 
 
-_PAGE_TITLE = "利刃围剿"
+_MODEL_SCOPE = "ACTION_SUMMARY_READ_ONLY_V1"
+_SIEGE_ACTIVITY_TITLE = "利刃围剿"
+_UNKNOWN_ACTIVITY_FAMILY = "UNKNOWN"
+_SIEGE_ACTIVITY_FAMILY = "SIEGE"
 _CHALLENGE = "进入挑战"
 _SWEEP = "扫荡"
 _CLAIM_MARKERS = ("领取奖励", "可领取")
@@ -141,7 +153,7 @@ _OVERLAY_MARKERS = {
     "公告": "ANNOUNCEMENT",
 }
 _NON_TITLE_MARKERS = {
-    _PAGE_TITLE,
+    _SIEGE_ACTIVITY_TITLE,
     _CHALLENGE,
     _SWEEP,
     "REWARD",
@@ -202,6 +214,122 @@ def _evidence_id(kind: str, text_hash: str, bounds: tuple[int, ...]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
 
+def _iou(
+    first: tuple[int, int, int, int], second: tuple[int, int, int, int]
+) -> float:
+    left, top = max(first[0], second[0]), max(first[1], second[1])
+    right, bottom = min(first[2], second[2]), min(first[3], second[3])
+    intersection = max(0, right - left) * max(0, bottom - top)
+    first_area = max(0, first[2] - first[0]) * max(0, first[3] - first[1])
+    second_area = max(0, second[2] - second[0]) * max(
+        0, second[3] - second[1]
+    )
+    union = first_area + second_area - intersection
+    return float(intersection) / float(union) if union else 0.0
+
+
+def _deduplicate_items(
+    items: Sequence[tuple[str, tuple[int, int, int, int], Mapping[str, object]]],
+) -> list[tuple[str, tuple[int, int, int, int], Mapping[str, object]]]:
+    """Merge only same-text OCR observations occupying the same visual box."""
+
+    result: list[
+        tuple[str, tuple[int, int, int, int], Mapping[str, object]]
+    ] = []
+    for candidate in items:
+        text, bounds, _item = candidate
+        if any(
+            text == existing_text and _iou(bounds, existing_bounds) >= 0.80
+            for existing_text, existing_bounds, _existing_item in result
+        ):
+            continue
+        result.append(candidate)
+    return result
+
+
+def _resolve_card_anchors(
+    anchors: Sequence[tuple[str, tuple[int, int, int, int]]],
+) -> list[tuple[str, tuple[int, int, int, int]]]:
+    """Choose one stable interaction anchor per spatial card instance."""
+
+    groups: list[list[tuple[str, tuple[int, int, int, int]]]] = []
+    for candidate in sorted(
+        anchors, key=lambda item: (_center(item[1])[0], _center(item[1])[1])
+    ):
+        x, y = _center(candidate[1])
+        group = next((
+            existing
+            for existing in groups
+            if abs(_center(existing[0][1])[0] - x) <= 80
+            and abs(_center(existing[0][1])[1] - y) <= 100
+        ), None)
+        if group is None:
+            groups.append([candidate])
+        else:
+            group.append(candidate)
+    return sorted(
+        (max(group, key=lambda item: (_center(item[1])[1], item[0])) for group in groups),
+        key=lambda item: (_center(item[1])[0], _center(item[1])[1]),
+    )
+
+
+def _frame_size(frame: object) -> tuple[int, int]:
+    image = getattr(frame, "image", None)
+    if image is None or not hasattr(image, "shape") or len(image.shape) < 2:
+        return 0, 0
+    height, width = map(int, image.shape[:2])
+    return width, height
+
+
+def _normalized_anchor_identity(
+    bounds: tuple[int, int, int, int], width: int, height: int
+) -> str:
+    if width > 0 and height > 0:
+        values = (
+            bounds[0] / width,
+            bounds[1] / height,
+            bounds[2] / width,
+            bounds[3] / height,
+        )
+        return ",".join(f"{value:.6f}" for value in values)
+    return "unscaled:" + ",".join(str(value) for value in bounds)
+
+
+def _card_instance_id(
+    *,
+    activity_family: str,
+    title_hash: str,
+    anchor_bbox: tuple[int, int, int, int],
+    title_ordinal: int,
+    frame_size: tuple[int, int],
+) -> str:
+    payload = "|".join((
+        activity_family,
+        title_hash,
+        _normalized_anchor_identity(anchor_bbox, *frame_size),
+        str(title_ordinal),
+    ))
+    return f"CARD_{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:24].upper()}"
+
+
+def _captured_at(frame: object) -> str | None:
+    value = getattr(frame, "captured_at", None)
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return str(value.isoformat())
+    text = str(value).strip()
+    return text or None
+
+
+def _freshness_token(capture_id: str | None, frame_hash: str | None) -> str | None:
+    if not capture_id or not frame_hash:
+        return None
+    return hashlib.sha256(
+        f"{capture_id}|{frame_hash}".encode("utf-8")
+    ).hexdigest()
+
+
 def _is_title_candidate(text: str) -> bool:
     if not text or text in _NON_TITLE_MARKERS:
         return False
@@ -241,7 +369,14 @@ def _reward_state(texts: Sequence[str]) -> RewardState:
 def _available_actions(texts: Sequence[str], state: TaskCardState) -> frozenset[str]:
     joined = "|".join(texts)
     actions: set[str] = set()
-    if state is not TaskCardState.LOCKED:
+    selectable = state is not TaskCardState.LOCKED and any(
+        marker in joined
+        for marker in (_CHALLENGE, _SWEEP, "查看详情", *_CLAIM_MARKERS)
+    )
+    if selectable:
+        actions.add("CARD_SELECTABLE")
+        # Deprecated compatibility alias: means only that a card selection
+        # affordance is visible; it is not task-execution authority.
         actions.add("SELECT_TASK_AVAILABLE")
     if _CHALLENGE in joined:
         actions.add("CHALLENGE_AVAILABLE")
@@ -249,6 +384,10 @@ def _available_actions(texts: Sequence[str], state: TaskCardState) -> frozenset[
         actions.add("SWEEP_AVAILABLE")
     if any(marker in joined for marker in _CLAIM_MARKERS):
         actions.add("CLAIM_AVAILABLE")
+    if state is TaskCardState.AVAILABLE and any(
+        marker in joined for marker in (_CHALLENGE, _SWEEP)
+    ):
+        actions.add("TASK_EXECUTION_AVAILABLE")
     return frozenset(actions)
 
 
@@ -272,6 +411,8 @@ class _FrameProxy:
     def __init__(self, frame: object, items: Sequence[Mapping[str, object]]) -> None:
         self.image = getattr(frame, "image", None)
         self.source_capture_id = getattr(frame, "source_capture_id", "")
+        self.raw_frame_hash = getattr(frame, "raw_frame_hash", "")
+        self.captured_at = getattr(frame, "captured_at", None)
         self._items = tuple(items)
 
     def ocr(self) -> list[Mapping[str, object]]:
@@ -285,14 +426,17 @@ def observe_action_summary_page(frame: object) -> ActionSummaryPageModel:
         raw_items = tuple(frame.ocr())
     except Exception:
         raw_items = ()
-    items: list[tuple[str, tuple[int, int, int, int], Mapping[str, object]]] = []
+    parsed_items: list[
+        tuple[str, tuple[int, int, int, int], Mapping[str, object]]
+    ] = []
     for item in raw_items:
         if not isinstance(item, Mapping):
             continue
         bounds = _bbox(item)
         if bounds is None:
             continue
-        items.append((_normalize(item.get("text", "")), bounds, item))
+        parsed_items.append((_normalize(item.get("text", "")), bounds, item))
+    items = _deduplicate_items(parsed_items)
 
     try:
         navigation_observation = observe_action_summary(_FrameProxy(frame, raw_items))
@@ -305,7 +449,17 @@ def observe_action_summary_page(frame: object) -> ActionSummaryPageModel:
         for marker, overlay in _OVERLAY_MARKERS.items()
         if marker in text
     }))
-    title_items = [(text, bounds) for text, bounds, _item in items if _PAGE_TITLE in text]
+    title_items = [
+        (text, bounds)
+        for text, bounds, _item in items
+        if _SIEGE_ACTIVITY_TITLE in text
+    ]
+    activity_family = (
+        _SIEGE_ACTIVITY_FAMILY if title_items else _UNKNOWN_ACTIVITY_FAMILY
+    )
+    activity_title_hash = (
+        _hash_text(title_items[0][0]) if title_items else None
+    )
     anchors = [
         (text, bounds)
         for text, bounds, _item in items
@@ -314,8 +468,14 @@ def observe_action_summary_page(frame: object) -> ActionSummaryPageModel:
     ]
 
     cards: list[ActionSummaryTaskCard] = []
-    used_titles: set[str] = set()
-    for anchor_text, anchor_bbox in sorted(anchors, key=lambda item: _center(item[1])[0]):
+    title_ordinals: dict[str, int] = {}
+    frame_size = _frame_size(frame)
+    parsed_anchors = (
+        _resolve_card_anchors(anchors)
+        if activity_family == _SIEGE_ACTIVITY_FAMILY
+        else []
+    )
+    for anchor_text, anchor_bbox in parsed_anchors:
         anchor_x, _anchor_y = _center(anchor_bbox)
         candidates = [
             (text, bounds)
@@ -330,9 +490,8 @@ def observe_action_summary_page(frame: object) -> ActionSummaryPageModel:
             continue
         title, title_bbox = max(candidates, key=lambda item: item[1][3])
         title_hash = _hash_text(title)
-        if title_hash in used_titles:
-            continue
-        used_titles.add(title_hash)
+        title_ordinal = title_ordinals.get(title_hash, 0)
+        title_ordinals[title_hash] = title_ordinal + 1
         band_items = [
             (text, bounds)
             for text, bounds, _item in items
@@ -355,6 +514,13 @@ def observe_action_summary_page(frame: object) -> ActionSummaryPageModel:
         cost = _parse_cost(card_texts)
         cards.append(ActionSummaryTaskCard(
             semantic_id=f"TASK_{title_hash[:16].upper()}",
+            card_instance_id=_card_instance_id(
+                activity_family=activity_family,
+                title_hash=title_hash,
+                anchor_bbox=anchor_bbox,
+                title_ordinal=title_ordinal,
+                frame_size=frame_size,
+            ),
             title_hash=title_hash,
             bbox=card_bbox,
             state=state,
@@ -376,10 +542,10 @@ def observe_action_summary_page(frame: object) -> ActionSummaryPageModel:
         and navigation_observation.state is ActionSummaryState.ACTION_SUMMARY_VISIBLE
     )
     structurally_visible = bool(title_items and len(cards) >= 2)
-    if navigation_visible and structurally_visible:
+    if navigation_visible:
         page_state = "ACTION_SUMMARY_VISIBLE"
         page_confidence = PageConfidence.HIGH
-    elif structurally_visible:
+    elif overlays and structurally_visible:
         page_state = "ACTION_SUMMARY_VISIBLE"
         page_confidence = PageConfidence.MEDIUM
     else:
@@ -389,8 +555,12 @@ def observe_action_summary_page(frame: object) -> ActionSummaryPageModel:
     capabilities: set[str] = set()
     if page_state == "ACTION_SUMMARY_VISIBLE":
         capabilities.add("VIEW_TASK_LIST")
-    if any("SELECT_TASK_AVAILABLE" in card.available_actions for card in cards):
+    if any("CARD_SELECTABLE" in card.available_actions for card in cards):
+        capabilities.add("CARD_SELECTABLE")
+        # Deprecated compatibility alias for CARD_SELECTABLE.
         capabilities.add("SELECT_TASK_AVAILABLE")
+    if any("TASK_EXECUTION_AVAILABLE" in card.available_actions for card in cards):
+        capabilities.add("TASK_EXECUTION_AVAILABLE")
     if any("CHALLENGE_AVAILABLE" in card.available_actions for card in cards):
         capabilities.add("CHALLENGE_AVAILABLE")
     if any("SWEEP_AVAILABLE" in card.available_actions for card in cards):
@@ -409,7 +579,18 @@ def observe_action_summary_page(frame: object) -> ActionSummaryPageModel:
     resource_insufficient = True if any(
         marker in joined for marker in ("资源不足", "体力不足", "疲劳不足", "澄清度不足")
     ) else None
+    source_capture_id = str(getattr(frame, "source_capture_id", "") or "").strip() or None
+    source_frame_sha256 = frame_sha256(frame) or None
     return ActionSummaryPageModel(
+        model_scope=_MODEL_SCOPE,
+        activity_family=activity_family,
+        activity_title_hash=activity_title_hash,
+        source_capture_id=source_capture_id,
+        source_frame_sha256=source_frame_sha256,
+        captured_at=_captured_at(frame),
+        model_freshness_token=_freshness_token(
+            source_capture_id, source_frame_sha256
+        ),
         page_state=page_state,
         page_confidence=page_confidence,
         overlay_states=overlays,
@@ -417,7 +598,7 @@ def observe_action_summary_page(frame: object) -> ActionSummaryPageModel:
         selected_task_id=None,
         task_cards=tuple(cards),
         page_actions=ActionSummaryPageActions(
-            can_open_task="SELECT_TASK_AVAILABLE" in capabilities,
+            can_open_task="CARD_SELECTABLE" in capabilities,
             can_sweep="SWEEP_AVAILABLE" in capabilities,
             can_challenge="CHALLENGE_AVAILABLE" in capabilities,
             can_claim="CLAIM_AVAILABLE" in capabilities,
@@ -459,21 +640,21 @@ def decide_action_summary(model: ActionSummaryPageModel) -> ActionSummaryDecisio
             "page_not_trusted" if model.page_state != "ACTION_SUMMARY_VISIBLE" else "overlay_present",
             confidence=PageConfidence.UNKNOWN,
         )
-    if model.resource_insufficient:
+    if any(card.reward_state is RewardState.AVAILABLE for card in model.task_cards):
         return decision(
-            ActionSummaryDecisionType.RESOURCE_INSUFFICIENT,
-            "explicit_resource_insufficient_cue",
+            ActionSummaryDecisionType.COMPLETED_REWARD_AVAILABLE,
+            "claimable_reward_observed",
+            future_authorization=True,
         )
     if model.attempts_exhausted:
         return decision(
             ActionSummaryDecisionType.ATTEMPTS_EXHAUSTED,
             "explicit_attempts_exhausted_cue",
         )
-    if any(card.reward_state is RewardState.AVAILABLE for card in model.task_cards):
+    if model.resource_insufficient:
         return decision(
-            ActionSummaryDecisionType.COMPLETED_REWARD_AVAILABLE,
-            "claimable_reward_observed",
-            future_authorization=True,
+            ActionSummaryDecisionType.RESOURCE_INSUFFICIENT,
+            "explicit_resource_insufficient_cue",
         )
     if model.task_cards and all(
         card.state is TaskCardState.LOCKED for card in model.task_cards
@@ -486,11 +667,20 @@ def decide_action_summary(model: ActionSummaryPageModel) -> ActionSummaryDecisio
             ActionSummaryDecisionType.NO_ACTION_REQUIRED,
             "all_visible_tasks_completed_without_claimable_reward",
         )
-    if any(card.state is TaskCardState.AVAILABLE for card in model.task_cards):
+    if any(
+        "TASK_EXECUTION_AVAILABLE" in card.available_actions
+        for card in model.task_cards
+    ):
         return decision(
             ActionSummaryDecisionType.TASK_AVAILABLE_NEEDS_POLICY,
             "available_task_requires_business_policy",
             future_authorization=True,
+        )
+    if model.activity_family == _UNKNOWN_ACTIVITY_FAMILY:
+        return decision(
+            ActionSummaryDecisionType.UNSUPPORTED_TASK,
+            "activity_family_not_supported",
+            confidence=PageConfidence.UNKNOWN,
         )
     if any(
         card.state is TaskCardState.UNKNOWN

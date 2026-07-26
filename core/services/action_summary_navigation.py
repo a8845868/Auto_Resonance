@@ -1383,12 +1383,31 @@ def observe_action_summary(frame: object) -> ActionSummaryObservation:
 
     task_count = sum(any(label in text for text in texts) for label in _SIEGE_PAGE_LABELS)
     challenge_count = sum("进入挑战" in text for text in texts)
+    card_anchor_count = sum(any(
+        marker in text
+        for marker in (
+            "进入挑战", "扫荡", "查看详情", "领取奖励", "可领取",
+            "已完成", "完成", "未解锁", "锁定", "进行中",
+        )
+    ) for text in texts)
+    cost_count = sum(bool(re.fullmatch(
+        r"-\s*\d+", str(item.get("text", "")).strip()
+    )) for item in items)
+    repeated_reward_count = sum(text in {"REWARD", "REWARDS", "奖励预览"} for text in texts)
     has_old_title = "利刃围剿" in joined
     has_blank_exit = "触碰空白区域退出" in joined
     facts: set[str] = set()
     # One historical title is deliberately insufficient. A page needs a list
     # structure and a stable action affordance as independent cues.
-    if (has_old_title or task_count >= 2) and task_count >= 2 and challenge_count >= 1:
+    siege_layout = (
+        (has_old_title and card_anchor_count >= 2)
+        or (task_count >= 2 and challenge_count >= 1)
+    )
+    generic_card_layout = (
+        challenge_count >= 2
+        and (cost_count >= 2 or repeated_reward_count >= 2)
+    )
+    if siege_layout or generic_card_layout:
         facts.add("action_summary_layout")
 
     image = getattr(frame, "image", None)

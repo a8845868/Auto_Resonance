@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import subprocess
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -28,9 +32,18 @@ def item(text: str, x: int, y: int, width: int = 100, height: int = 24) -> dict:
 
 
 class Frame:
-    def __init__(self, labels: list[dict], capture_id: str = "model-fixture") -> None:
+    def __init__(
+        self,
+        labels: list[dict],
+        capture_id: str | None = "model-fixture",
+        *,
+        raw_frame_hash: str = "",
+        captured_at: object | None = None,
+    ) -> None:
         self.image = np.zeros((720, 1280, 3), dtype=np.uint8)
         self.source_capture_id = capture_id
+        self.raw_frame_hash = raw_frame_hash
+        self.captured_at = captured_at
         self.labels = labels
 
     def ocr(self) -> list[dict]:
@@ -59,6 +72,11 @@ def test_trusted_page_builds_three_read_only_task_cards():
     model = observe_action_summary_page(Frame(trusted_items()))
 
     assert model.page_state == "ACTION_SUMMARY_VISIBLE"
+    assert model.model_scope == "ACTION_SUMMARY_READ_ONLY_V1"
+    assert model.activity_family == "SIEGE"
+    assert model.activity_title_hash == hashlib.sha256(
+        "利刃围剿".encode("utf-8")
+    ).hexdigest()
     assert model.page_confidence is PageConfidence.HIGH
     assert model.visible_task_cards == 3
     assert [card.state for card in model.task_cards] == [
@@ -127,8 +145,10 @@ def test_visible_capabilities_are_descriptive_only():
 
     assert model.page_capabilities == frozenset({
         "VIEW_TASK_LIST",
+        "CARD_SELECTABLE",
         "SELECT_TASK_AVAILABLE",
         "CHALLENGE_AVAILABLE",
+        "TASK_EXECUTION_AVAILABLE",
     })
     assert model.page_actions.can_open_task is True
     assert model.page_actions.can_challenge is True
@@ -155,6 +175,17 @@ def test_claimable_reward_is_advisory_and_never_an_action():
 
     assert decision.decision is ActionSummaryDecisionType.COMPLETED_REWARD_AVAILABLE
     assert decision.required_future_authorization
+
+
+def test_claimable_reward_precedes_resource_insufficient():
+    labels = trusted_items() + [
+        item("可领取", 594, 560),
+        item("资源不足", 680, 200),
+    ]
+
+    decision = decide_action_summary(observe_action_summary_page(Frame(labels)))
+
+    assert decision.decision is ActionSummaryDecisionType.COMPLETED_REWARD_AVAILABLE
 
 
 def test_explicit_resource_and_attempt_failures_are_distinct_decisions():
@@ -233,12 +264,34 @@ def test_page_model_has_no_input_authority_or_control_dependency():
     assert not any(hasattr(model, name) for name in ("tap", "click", "dispatch"))
 
 
+def test_model_import_does_not_initialize_control_backend():
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "import core.services.action_summary_product_model; "
+                "assert 'core.control.control' not in sys.modules; "
+                "assert 'auto' not in sys.modules"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_sanitized_live_fixture_contains_no_raw_ocr_or_image():
     path = Path("tests/fixtures/action_summary_read_only/live_structure_v1.json")
     fixture = json.loads(path.read_text(encoding="utf-8"))
 
     assert fixture["raw_image_included"] is False
     assert fixture["raw_ocr_text_included"] is False
+    assert fixture["expected"]["model_scope"] == "ACTION_SUMMARY_READ_ONLY_V1"
+    assert fixture["expected"]["activity_family"] == "SIEGE"
     assert fixture["expected"]["visible_task_cards"] == 3
     assert fixture["cost_observations"] == [40, 40, 40]
     assert all(len(value) == 64 for value in fixture["task_title_hashes"])
@@ -251,6 +304,118 @@ def test_serialized_model_contains_enums_not_execution_objects():
     assert document["task_cards"][0]["state"] == "available"
     assert document["task_cards"][0]["reward_state"] == "unknown"
     assert document["task_cards"][0]["available_actions"] == [
+        "CARD_SELECTABLE",
         "CHALLENGE_AVAILABLE",
         "SELECT_TASK_AVAILABLE",
+        "TASK_EXECUTION_AVAILABLE",
     ]
+
+
+def test_trusted_generic_page_does_not_parse_unknown_activity_as_siege():
+    labels = [
+        item("未来活动", 680, 84),
+        item("未知任务", 500, 420), item("进入挑战", 500, 600),
+        item("-30", 500, 636),
+        item("未知任务", 800, 420), item("进入挑战", 800, 600),
+        item("-30", 800, 636),
+    ]
+
+    model = observe_action_summary_page(Frame(labels))
+    decision = decide_action_summary(model)
+
+    assert model.page_state == "ACTION_SUMMARY_VISIBLE"
+    assert model.activity_family == "UNKNOWN"
+    assert model.activity_title_hash is None
+    assert model.task_cards == ()
+    assert model.visible_task_cards == 0
+    assert model.page_capabilities == frozenset({"VIEW_TASK_LIST"})
+    assert decision.decision is ActionSummaryDecisionType.UNSUPPORTED_TASK
+    assert decision.required_future_authorization == ()
+
+
+def test_duplicate_title_cards_at_different_positions_are_preserved():
+    labels = [
+        item("利刃围剿", 680, 84),
+        item("同名任务", 500, 420), item("进入挑战", 500, 600),
+        item("同名任务", 800, 420), item("进入挑战", 800, 600),
+    ]
+
+    model = observe_action_summary_page(Frame(labels))
+
+    assert model.visible_task_cards == 2
+    assert model.task_cards[0].title_hash == model.task_cards[1].title_hash
+    assert model.task_cards[0].card_instance_id != model.task_cards[1].card_instance_id
+
+
+def test_duplicate_ocr_bbox_is_deduplicated_without_losing_other_card():
+    first_title = item("同名任务", 500, 420)
+    first_anchor = item("进入挑战", 500, 600)
+    labels = [
+        item("利刃围剿", 680, 84),
+        first_title,
+        dict(first_title),
+        first_anchor,
+        dict(first_anchor),
+        item("同名任务", 800, 420),
+        item("进入挑战", 800, 600),
+    ]
+
+    model = observe_action_summary_page(Frame(labels))
+
+    assert model.visible_task_cards == 2
+
+
+def test_card_instance_id_is_stable_for_same_structure():
+    first = observe_action_summary_page(Frame(trusted_items()))
+    second = observe_action_summary_page(Frame(trusted_items()))
+
+    assert [card.card_instance_id for card in first.task_cards] == [
+        card.card_instance_id for card in second.task_cards
+    ]
+
+
+def test_model_binds_real_capture_identity_and_frame_hash():
+    timestamp = datetime(2026, 7, 26, 12, 34, 56, tzinfo=timezone.utc)
+    model = observe_action_summary_page(Frame(
+        trusted_items(),
+        "capture-42",
+        raw_frame_hash="a" * 64,
+        captured_at=timestamp,
+    ))
+
+    expected_token = hashlib.sha256(
+        f"capture-42|{'a' * 64}".encode("utf-8")
+    ).hexdigest()
+    assert model.source_capture_id == "capture-42"
+    assert model.source_frame_sha256 == "a" * 64
+    assert model.captured_at == timestamp.isoformat()
+    assert model.model_freshness_token == expected_token
+
+
+def test_missing_capture_id_remains_none_and_grants_no_freshness_token():
+    model = observe_action_summary_page(Frame(trusted_items(), None))
+
+    assert model.source_capture_id is None
+    assert model.source_frame_sha256 is not None
+    assert model.model_freshness_token is None
+    assert not any(hasattr(model, name) for name in ("tap", "dispatch", "authorize"))
+
+
+def test_selectability_and_execution_capabilities_are_separate():
+    labels = [
+        item("利刃围剿", 680, 84),
+        item("可执行", 350, 420), item("进入挑战", 350, 600),
+        item("未知", 650, 420), item("查看详情", 650, 600),
+        item("已结束", 950, 420), item("已完成", 950, 570),
+        item("查看详情", 950, 600),
+    ]
+
+    model = observe_action_summary_page(Frame(labels))
+    available, unknown, completed = model.task_cards
+
+    assert "CARD_SELECTABLE" in available.available_actions
+    assert "TASK_EXECUTION_AVAILABLE" in available.available_actions
+    assert "CARD_SELECTABLE" in unknown.available_actions
+    assert "TASK_EXECUTION_AVAILABLE" not in unknown.available_actions
+    assert "CARD_SELECTABLE" in completed.available_actions
+    assert "TASK_EXECUTION_AVAILABLE" not in completed.available_actions
