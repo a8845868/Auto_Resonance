@@ -1,0 +1,22 @@
+{
+  "ActionSummaryAcquisitionPolicy": {
+    "schema_version": "1.0",
+    "config_id": "canonical-observe-only",
+    "config_version": "1",
+    "captured_at": "2026-07-26T12:00:00+08:00",
+    "valid_until": "2026-07-26T13:00:00+08:00",
+    "activity_family": "SIEGE",
+    "objective": "OBSERVE_ONLY",
+    "strategy_id": "observe-only",
+    "strategy_version": "1",
+    "strategy_source": "USER_CONFIGURED_FIXTURE",
+    "reason": "canonical read-only acquisition fixture",
+    "preferred_task_ids": [],
+    "reward_priority_ids": [],
+    "maximum_cost_per_run": 0,
+    "maximum_total_cost": 0,
+    "minimum_resource_reserve": 0,
+    "maximum_task_runs": 0,
+    "fatigue_reserve": 0
+  }
+}
