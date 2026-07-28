@@ -158,6 +158,11 @@ def test_legacy_valid_weekly_plan_still_loads_without_schema_migration(tmp_path)
 
 
 def test_reopened_saved_plan_uses_stable_progress_contract(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        weekly_state,
+        "current_week_start",
+        lambda today=None: "2026-07-20",
+    )
     path = tmp_path / "weekly_plan.json"
     state = _state()
     path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
