@@ -36,6 +36,13 @@ class AcquisitionPlanStatus(str, Enum):
     BLOCKED_CONTRACT_INVALID = "BLOCKED_CONTRACT_INVALID"
 
 
+class ObserverImplementationStatus(str, Enum):
+    NOT_IMPLEMENTED = "NOT_IMPLEMENTED"
+    IMPLEMENTED = "IMPLEMENTED"
+    OFFLINE_PROVEN = "OFFLINE_PROVEN"
+    LIVE_PROVEN = "LIVE_PROVEN"
+
+
 @dataclass(frozen=True, slots=True)
 class FactAcquisitionContract:
     fact_id: str
@@ -52,6 +59,9 @@ class FactAcquisitionContract:
     maximum_dispatches: int
     freshness_seconds: int
     observer_id: str | None
+    observer_status: ObserverImplementationStatus
+    normalizer_only: bool
+    observer_callable_id: str | None
     output_schema: str
     confidence_requirement: str
     provenance_requirements: tuple[str, ...]
@@ -61,6 +71,7 @@ class FactAcquisitionContract:
     def to_dict(self) -> dict[str, object]:
         document = asdict(self)
         document["source_level"] = self.source_level.value
+        document["observer_status"] = self.observer_status.value
         document["required_navigation_edges"] = list(
             self.required_navigation_edges
         )
@@ -124,6 +135,8 @@ class CurrentActionSummaryVisualSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class AcquiredFact:
+    schema_version: str
+    output_schema: str
     fact_id: str
     source_level: FactSourceLevel
     observer_id: str
@@ -142,9 +155,33 @@ class AcquiredFact:
     def to_dict(self) -> dict[str, object]:
         document = asdict(self)
         document["source_level"] = self.source_level.value
+        document.pop("value_json", None)
         document["value"] = self.value()
         document["provenance_ids"] = list(self.provenance_ids)
         return document
+
+    @property
+    def observation_id(self) -> str:
+        document = asdict(self)
+        document["source_level"] = self.source_level.value
+        document["provenance_ids"] = list(self.provenance_ids)
+        payload = json.dumps(
+            document,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class RejectedObservation:
+    fact_id: str
+    observation_id: str
+    reason: str
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,11 +198,24 @@ class MissingFactAcquisitionPlan:
     requires_level_3: tuple[str, ...]
     unavailable: tuple[str, ...]
     zero_input_collectable_facts: tuple[str, ...]
+    zero_input_contract_facts: tuple[str, ...]
+    zero_input_executable_facts: tuple[str, ...]
+    zero_input_normalizer_only_facts: tuple[str, ...]
     navigation_only_collectable_facts: tuple[str, ...]
     page_input_required_facts: tuple[str, ...]
     unavailable_facts: tuple[str, ...]
     resolved_facts: tuple[AcquiredFact, ...]
     unresolved_facts: tuple[str, ...]
+    contract_registered_facts: tuple[str, ...]
+    observer_implemented_facts: tuple[str, ...]
+    observer_offline_proven_facts: tuple[str, ...]
+    observer_live_proven_facts: tuple[str, ...]
+    normalizer_only_facts: tuple[str, ...]
+    not_implemented_facts: tuple[str, ...]
+    conflicting_facts: tuple[str, ...]
+    rejected_observations: tuple[RejectedObservation, ...]
+    deduplicated_observations: tuple[str, ...]
+    accepted_observation_ids: tuple[str, ...]
     recommended_next_observers: tuple[str, ...]
     blocked_reasons: tuple[str, ...]
     policy_evaluation_still_blocked: bool
@@ -192,6 +242,16 @@ class MissingFactAcquisitionPlan:
             "zero_input_collectable_facts": list(
                 self.zero_input_collectable_facts
             ),
+            "zero_input_collectable_facts_compatibility": (
+                "contract_registered_zero_input_candidates"
+            ),
+            "zero_input_contract_facts": list(self.zero_input_contract_facts),
+            "zero_input_executable_facts": list(
+                self.zero_input_executable_facts
+            ),
+            "zero_input_normalizer_only_facts": list(
+                self.zero_input_normalizer_only_facts
+            ),
             "navigation_only_collectable_facts": list(
                 self.navigation_only_collectable_facts
             ),
@@ -201,6 +261,22 @@ class MissingFactAcquisitionPlan:
             "unavailable_facts": list(self.unavailable_facts),
             "resolved_facts": [fact.to_dict() for fact in self.resolved_facts],
             "unresolved_facts": list(self.unresolved_facts),
+            "contract_registered_facts": list(self.contract_registered_facts),
+            "observer_implemented_facts": list(self.observer_implemented_facts),
+            "observer_offline_proven_facts": list(
+                self.observer_offline_proven_facts
+            ),
+            "observer_live_proven_facts": list(self.observer_live_proven_facts),
+            "normalizer_only_facts": list(self.normalizer_only_facts),
+            "not_implemented_facts": list(self.not_implemented_facts),
+            "conflicting_facts": list(self.conflicting_facts),
+            "rejected_observations": [
+                item.to_dict() for item in self.rejected_observations
+            ],
+            "deduplicated_observations": list(
+                self.deduplicated_observations
+            ),
+            "accepted_observation_ids": list(self.accepted_observation_ids),
             "recommended_next_observers": list(self.recommended_next_observers),
             "blocked_reasons": list(self.blocked_reasons),
             "policy_evaluation_still_blocked": (
@@ -234,6 +310,11 @@ def _contract(
     maximum_dispatches: int = 0,
     freshness_seconds: int = 300,
     observer_id: str | None = None,
+    observer_status: ObserverImplementationStatus = (
+        ObserverImplementationStatus.NOT_IMPLEMENTED
+    ),
+    normalizer_only: bool = False,
+    observer_callable_id: str | None = None,
     output_schema: str = "ACTION_SUMMARY_ACQUIRED_FACT_V1",
     confidence_requirement: str = "EXPLICIT",
     provenance_requirements: Sequence[str] = (),
@@ -255,6 +336,9 @@ def _contract(
         maximum_dispatches=maximum_dispatches,
         freshness_seconds=freshness_seconds,
         observer_id=observer_id,
+        observer_status=observer_status,
+        normalizer_only=normalizer_only,
+        observer_callable_id=observer_callable_id,
         output_schema=output_schema,
         confidence_requirement=confidence_requirement,
         provenance_requirements=tuple(provenance_requirements),
@@ -268,6 +352,12 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         "objective_missing", "USER_POLICY", "explicit_user_policy_config",
         FactSourceLevel.LEVEL_0_EXISTING_CONFIG,
         observer_id="action_summary_policy_config_observer",
+        observer_status=ObserverImplementationStatus.OFFLINE_PROVEN,
+        observer_callable_id=(
+            "core.services.action_summary_missing_fact_acquisition."
+            "observe_action_summary_policy_config"
+        ),
+        freshness_seconds=3600,
         provenance_requirements=("config_id", "config_version", "config_fingerprint"),
         failure_reason="objective must remain UNKNOWN until explicitly configured",
     ),
@@ -275,6 +365,12 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         "strategy_identity_missing", "USER_POLICY", "versioned_strategy_config",
         FactSourceLevel.LEVEL_0_EXISTING_CONFIG,
         observer_id="action_summary_strategy_config_observer",
+        observer_status=ObserverImplementationStatus.OFFLINE_PROVEN,
+        observer_callable_id=(
+            "core.services.action_summary_missing_fact_acquisition."
+            "observe_action_summary_policy_config"
+        ),
+        freshness_seconds=3600,
         provenance_requirements=("strategy_id", "strategy_version", "config_fingerprint"),
         failure_reason="strategy identity cannot be inferred from legacy task lists",
     ),
@@ -282,6 +378,12 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         "strategy_provenance_missing", "USER_POLICY", "versioned_strategy_config",
         FactSourceLevel.LEVEL_0_EXISTING_CONFIG,
         observer_id="action_summary_strategy_config_observer",
+        observer_status=ObserverImplementationStatus.OFFLINE_PROVEN,
+        observer_callable_id=(
+            "core.services.action_summary_missing_fact_acquisition."
+            "observe_action_summary_policy_config"
+        ),
+        freshness_seconds=3600,
         provenance_requirements=("strategy_source", "config_fingerprint"),
         failure_reason="strategy provenance must be explicit and fingerprint-bound",
     ),
@@ -313,6 +415,12 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         required_page="ACTION_SUMMARY_VISIBLE",
         requires_capture=True,
         observer_id="action_summary_current_page_visual_observer",
+        observer_status=ObserverImplementationStatus.OFFLINE_PROVEN,
+        normalizer_only=True,
+        observer_callable_id=(
+            "core.services.action_summary_missing_fact_acquisition."
+            "observe_current_action_summary_page_facts"
+        ),
         provenance_requirements=("capture_id", "frame_sha256", "icon_id", "resource_name"),
         failure_reason="resource identity requires a stable icon and name contract",
     ),
@@ -322,6 +430,12 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         required_page="ACTION_SUMMARY_VISIBLE",
         requires_capture=True,
         observer_id="action_summary_current_page_visual_observer",
+        observer_status=ObserverImplementationStatus.OFFLINE_PROVEN,
+        normalizer_only=True,
+        observer_callable_id=(
+            "core.services.action_summary_missing_fact_acquisition."
+            "observe_current_action_summary_page_facts"
+        ),
         provenance_requirements=("capture_id", "frame_sha256", "resource_identity"),
         failure_reason="absence of an insufficiency warning is not a balance",
     ),
@@ -338,6 +452,12 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         required_page="ACTION_SUMMARY_VISIBLE",
         requires_capture=True,
         observer_id="action_summary_current_page_visual_observer",
+        observer_status=ObserverImplementationStatus.OFFLINE_PROVEN,
+        normalizer_only=True,
+        observer_callable_id=(
+            "core.services.action_summary_missing_fact_acquisition."
+            "observe_current_action_summary_page_facts"
+        ),
         provenance_requirements=("capture_id", "frame_sha256", "card_match_key", "reward_identity"),
         failure_reason="a catalog reward is not a live task-bound reward fact",
     ),
@@ -345,6 +465,12 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         "fatigue_budget_unknown", "FATIGUE", "explicit_fatigue_config_or_state",
         FactSourceLevel.LEVEL_0_EXISTING_CONFIG,
         observer_id="action_summary_fatigue_config_observer",
+        observer_status=ObserverImplementationStatus.OFFLINE_PROVEN,
+        observer_callable_id=(
+            "core.services.action_summary_missing_fact_acquisition."
+            "observe_action_summary_fatigue_config"
+        ),
+        freshness_seconds=3600,
         provenance_requirements=("config_fingerprint", "fatigue_unit_id", "available_fatigue"),
         failure_reason="fatigue budget must come from explicit config or state",
     ),
@@ -352,6 +478,12 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         "fatigue_cost_unknown", "TASK_COST", "explicit_task_fatigue_config",
         FactSourceLevel.LEVEL_0_EXISTING_CONFIG,
         observer_id="action_summary_fatigue_config_observer",
+        observer_status=ObserverImplementationStatus.OFFLINE_PROVEN,
+        observer_callable_id=(
+            "core.services.action_summary_missing_fact_acquisition."
+            "observe_action_summary_fatigue_config"
+        ),
+        freshness_seconds=3600,
         provenance_requirements=("config_fingerprint", "fatigue_unit_id", "fatigue_cost_per_run"),
         failure_reason="fatigue cost must be independent from resource cost",
     ),
@@ -361,7 +493,15 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         required_page="ACTION_SUMMARY_VISIBLE",
         requires_capture=True,
         observer_id="action_summary_current_page_visual_observer",
-        provenance_requirements=("capture_id", "frame_sha256", "resource_identity"),
+        observer_status=ObserverImplementationStatus.OFFLINE_PROVEN,
+        normalizer_only=True,
+        observer_callable_id=(
+            "core.services.action_summary_missing_fact_acquisition."
+            "observe_current_action_summary_page_facts"
+        ),
+        provenance_requirements=(
+            "capture_id", "frame_sha256", "card_match_key", "resource_identity"
+        ),
         failure_reason="resource cost requires a task-bound resource identity",
     ),
     "recommended_run_count_limit_unknown": _contract(
@@ -400,6 +540,12 @@ def _optional_integer(value: object, field: str) -> int | None:
     if value is None:
         return None
     return _integer(value, field)
+
+
+def _optional_text(value: object, field: str) -> str | None:
+    if value is None:
+        return None
+    return _text(value, field)
 
 
 def _string_tuple(value: object, field: str) -> tuple[str, ...]:
@@ -490,6 +636,15 @@ def parse_action_summary_acquisition_policy_config(
         fatigue_cost_applicable=fatigue_applicable,
         resource_cost_per_run=_optional_integer(raw.get("resource_cost_per_run"), "resource_cost_per_run"),
     )
+    if normalized.fatigue_cost_applicable is True and (
+        normalized.fatigue_cost_per_run is None
+        or normalized.fatigue_cost_per_run <= 0
+    ):
+        raise ValueError("fatigue_cost_contract_invalid")
+    if normalized.fatigue_cost_applicable is False and (
+        normalized.fatigue_cost_per_run not in (None, 0)
+    ):
+        raise ValueError("fatigue_cost_contract_invalid")
     payload = normalized.to_dict()
     payload.pop("config_fingerprint", None)
     return replace(normalized, config_fingerprint=_canonical_hash(payload))
@@ -508,7 +663,10 @@ def _fact(
     runtime_input_fingerprint: str | None,
     provenance_ids: Sequence[str],
 ) -> AcquiredFact:
+    contract = FACT_ACQUISITION_CONTRACTS[fact_id]
     return AcquiredFact(
+        schema_version=_SCHEMA_VERSION,
+        output_schema=contract.output_schema,
         fact_id=fact_id,
         source_level=source_level,
         observer_id=observer_id,
@@ -530,7 +688,11 @@ def observe_action_summary_policy_config(
 ) -> tuple[AcquiredFact, ...]:
     """Resolve only explicit objective and strategy facts from a config snapshot."""
 
-    provenance = (config.config_id, config.config_version, config.config_fingerprint)
+    provenance = (
+        f"config_id:{config.config_id}",
+        f"config_version:{config.config_version}",
+        f"config_fingerprint:{config.config_fingerprint}",
+    )
     common = {
         "source_level": FactSourceLevel.LEVEL_0_EXISTING_CONFIG,
         "observed_at": config.captured_at,
@@ -575,7 +737,11 @@ def observe_action_summary_fatigue_config(
         "source_fingerprint": config.config_fingerprint,
         "policy_fingerprint": config.config_fingerprint,
         "runtime_input_fingerprint": None,
-        "provenance_ids": (config.config_id, config.config_version, config.config_fingerprint),
+        "provenance_ids": (
+            f"config_id:{config.config_id}",
+            f"config_version:{config.config_version}",
+            f"config_fingerprint:{config.config_fingerprint}",
+        ),
     }
     if config.available_fatigue is not None and config.fatigue_unit_id:
         facts.append(_fact(
@@ -614,12 +780,29 @@ def observe_current_action_summary_page_facts(
 ) -> tuple[AcquiredFact, ...]:
     """Normalize high-confidence facts from an already captured page snapshot."""
 
-    if snapshot.page_state != "ACTION_SUMMARY_VISIBLE":
-        return ()
-    if not _is_hash(snapshot.frame_sha256) or not _is_hash(runtime_input_fingerprint):
+    _text(snapshot.capture_id, "capture_id")
+    if not _is_hash(snapshot.frame_sha256):
         raise ValueError("visual_snapshot_fingerprint_invalid")
-    _aware(snapshot.captured_at, "captured_at")
-    _aware(snapshot.valid_until, "valid_until")
+    captured_at = _aware(snapshot.captured_at, "captured_at")
+    valid_until = _aware(snapshot.valid_until, "valid_until")
+    if valid_until < captured_at:
+        raise ValueError("visual_snapshot_window_invalid")
+    if not _is_hash(runtime_input_fingerprint):
+        raise ValueError("runtime_input_fingerprint_invalid")
+    page_state = _text(snapshot.page_state, "page_state")
+    for field in (
+        "card_match_key",
+        "resource_icon_id",
+        "resource_name",
+        "reward_icon_id",
+        "reward_name",
+    ):
+        _optional_text(getattr(snapshot, field), field)
+    for field in ("resource_available_amount", "displayed_resource_cost"):
+        _optional_integer(getattr(snapshot, field), field)
+    _string_tuple(snapshot.evidence_ids, "evidence_ids")
+    if page_state != "ACTION_SUMMARY_VISIBLE":
+        return ()
     facts: list[AcquiredFact] = []
     common = {
         "source_level": FactSourceLevel.LEVEL_1_CURRENT_PAGE_READ_ONLY,
@@ -629,7 +812,20 @@ def observe_current_action_summary_page_facts(
         "source_fingerprint": snapshot.frame_sha256,
         "policy_fingerprint": None,
         "runtime_input_fingerprint": runtime_input_fingerprint,
-        "provenance_ids": (snapshot.capture_id, snapshot.frame_sha256, *snapshot.evidence_ids),
+        "provenance_ids": tuple(
+            value
+            for value in (
+                f"capture_id:{snapshot.capture_id}",
+                f"frame_sha256:{snapshot.frame_sha256}",
+                (
+                    f"card_match_key:{snapshot.card_match_key}"
+                    if snapshot.card_match_key
+                    else None
+                ),
+                *snapshot.evidence_ids,
+            )
+            if value
+        ),
     }
     resource_identity = bool(snapshot.resource_icon_id and snapshot.resource_name)
     if resource_identity:
@@ -671,7 +867,188 @@ def observe_current_action_summary_page_facts(
     return tuple(facts)
 
 
+def _fact_value_mapping(fact: AcquiredFact) -> Mapping[str, object]:
+    try:
+        value = fact.value()
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError("fact_value_invalid") from error
+    if not isinstance(value, Mapping):
+        raise ValueError("fact_value_invalid")
+    return value
+
+
+def _has_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _fact_value_valid(fact: AcquiredFact) -> bool:
+    try:
+        value = _fact_value_mapping(fact)
+    except ValueError:
+        return False
+    integer_fields = {
+        "available_amount",
+        "resource_cost_per_run",
+        "available_fatigue",
+        "fatigue_reserve",
+        "fatigue_cost_per_run",
+        "maximum_task_runs",
+    }
+    for field in integer_fields.intersection(value):
+        if type(value[field]) is not int or value[field] < 0:
+            return False
+    if "fatigue_cost_applicable" in value and (
+        type(value["fatigue_cost_applicable"]) is not bool
+    ):
+        return False
+    return True
+
+
+def _provenance_complete(
+    fact: AcquiredFact,
+    contract: FactAcquisitionContract,
+) -> bool:
+    if not fact.provenance_ids or not all(
+        _has_text(item) for item in fact.provenance_ids
+    ):
+        return False
+    try:
+        value = _fact_value_mapping(fact)
+    except ValueError:
+        return False
+    provenance = set(fact.provenance_ids)
+    for requirement in contract.provenance_requirements:
+        if requirement == "config_fingerprint":
+            if (
+                not fact.policy_fingerprint
+                or f"config_fingerprint:{fact.policy_fingerprint}" not in provenance
+            ):
+                return False
+        elif requirement in {"capture_id", "detail_capture_id"}:
+            prefix = f"{requirement}:"
+            if not any(item.startswith(prefix) and item != prefix for item in provenance):
+                return False
+        elif requirement == "frame_sha256":
+            if f"frame_sha256:{fact.source_fingerprint}" not in provenance:
+                return False
+        elif requirement == "card_match_key":
+            card_key = value.get("card_match_key")
+            if (
+                not _has_text(card_key)
+                or f"card_match_key:{card_key}" not in provenance
+            ):
+                return False
+        elif requirement in {"icon_id", "resource_name", "resource_identity"}:
+            if not (
+                _has_text(value.get("resource_icon_id"))
+                and _has_text(value.get("resource_name"))
+            ):
+                return False
+        elif requirement == "reward_identity":
+            if not (
+                _has_text(value.get("reward_icon_id"))
+                and _has_text(value.get("reward_name"))
+            ):
+                return False
+        elif requirement == "valid_until":
+            continue
+        elif requirement in {"config_id", "config_version"}:
+            prefix = f"{requirement}:"
+            if not any(item.startswith(prefix) and item != prefix for item in provenance):
+                return False
+        elif requirement not in value:
+            return False
+        elif value[requirement] is None:
+            return False
+    return True
+
+
+def validate_acquired_fact(
+    fact: AcquiredFact,
+    contract: FactAcquisitionContract,
+    policy_fingerprint: str,
+    runtime_input_fingerprint: str,
+    generated_at: str,
+) -> str | None:
+    """Return an exact rejection reason, or ``None`` for a valid fact."""
+
+    if fact.fact_id != contract.fact_id:
+        return "fact_id_mismatch"
+    if not contract.enabled:
+        return "contract_disabled"
+    if fact.schema_version != _SCHEMA_VERSION:
+        return "schema_version_mismatch"
+    if fact.output_schema != contract.output_schema:
+        return "output_schema_mismatch"
+    if fact.confidence != contract.confidence_requirement:
+        return "confidence_mismatch"
+    if fact.source_level is not contract.source_level:
+        return "source_level_mismatch"
+    if not contract.observer_id or fact.observer_id != contract.observer_id:
+        return "observer_mismatch"
+    if not _is_hash(fact.source_fingerprint):
+        return "source_fingerprint_invalid"
+    try:
+        observed = _aware(fact.observed_at, "observed_at")
+        valid_until = _aware(fact.valid_until, "valid_until")
+        generated = _aware(generated_at, "generated_at")
+    except ValueError:
+        return "observation_window_invalid"
+    if valid_until < observed:
+        return "observation_window_invalid"
+    if observed > generated:
+        return "observation_from_future"
+    if generated > valid_until:
+        return "observation_stale"
+    if (generated - observed).total_seconds() > contract.freshness_seconds:
+        return "observation_stale"
+    if fact.policy_fingerprint is None and fact.runtime_input_fingerprint is None:
+        return "provenance_incomplete"
+    if fact.policy_fingerprint is not None:
+        if fact.policy_fingerprint != policy_fingerprint:
+            return "policy_fingerprint_mismatch"
+    if fact.runtime_input_fingerprint is not None:
+        if fact.runtime_input_fingerprint != runtime_input_fingerprint:
+            return "runtime_fingerprint_mismatch"
+    if contract.source_level is FactSourceLevel.LEVEL_0_EXISTING_CONFIG:
+        if fact.policy_fingerprint != policy_fingerprint:
+            return "policy_fingerprint_mismatch"
+    elif fact.runtime_input_fingerprint != runtime_input_fingerprint:
+        return "runtime_fingerprint_mismatch"
+    if not _fact_value_valid(fact):
+        return "fact_value_invalid"
+    if not _provenance_complete(fact, contract):
+        return "provenance_incomplete"
+    return None
+
+
+_OBSERVER_CALLABLES = {
+    (
+        "core.services.action_summary_missing_fact_acquisition."
+        "observe_action_summary_policy_config"
+    ): observe_action_summary_policy_config,
+    (
+        "core.services.action_summary_missing_fact_acquisition."
+        "observe_action_summary_fatigue_config"
+    ): observe_action_summary_fatigue_config,
+    (
+        "core.services.action_summary_missing_fact_acquisition."
+        "observe_current_action_summary_page_facts"
+    ): observe_current_action_summary_page_facts,
+}
+
+
 def _validate_contract(contract: FactAcquisitionContract) -> bool:
+    if (
+        contract.observer_status is ObserverImplementationStatus.NOT_IMPLEMENTED
+        and contract.observer_callable_id is not None
+    ):
+        return False
+    if contract.observer_status is not ObserverImplementationStatus.NOT_IMPLEMENTED:
+        if not contract.observer_id or not contract.observer_callable_id:
+            return False
+        if contract.observer_callable_id not in _OBSERVER_CALLABLES:
+            return False
     if contract.enabled and (
         contract.requires_page_input
         or contract.requires_business_input
@@ -715,24 +1092,74 @@ def build_missing_fact_acquisition_plan(
             invalid.append(contract.fact_id)
         contracts.append(contract)
 
-    by_fact: dict[str, AcquiredFact] = {}
+    requested_ids = tuple(contract.fact_id for contract in contracts)
+    grouped: dict[str, list[AcquiredFact]] = {}
+    rejected: list[RejectedObservation] = []
     for observation in observations:
         contract = FACT_ACQUISITION_CONTRACTS.get(observation.fact_id)
-        if contract is None or not contract.enabled:
+        if contract is None or observation.fact_id not in requested_ids:
             continue
-        if observation.policy_fingerprint not in (None, policy_fingerprint):
+        rejection = validate_acquired_fact(
+            observation,
+            contract,
+            policy_fingerprint,
+            runtime_input_fingerprint,
+            generated_at,
+        )
+        if rejection is not None:
+            rejected.append(RejectedObservation(
+                fact_id=observation.fact_id,
+                observation_id=observation.observation_id,
+                reason=rejection,
+            ))
             continue
-        if observation.runtime_input_fingerprint not in (
-            None, runtime_input_fingerprint
-        ):
-            continue
-        if not _is_hash(observation.source_fingerprint):
-            continue
-        if _aware(observation.valid_until, "valid_until") < generated:
-            continue
-        by_fact[observation.fact_id] = observation
+        grouped.setdefault(observation.fact_id, []).append(observation)
 
-    requested_ids = tuple(contract.fact_id for contract in contracts)
+    by_fact: dict[str, AcquiredFact] = {}
+    conflicting: list[str] = []
+    deduplicated: list[str] = []
+    accepted_ids: list[str] = []
+    for fact_id in requested_ids:
+        candidates = grouped.get(fact_id, [])
+        if not candidates:
+            continue
+        by_value: dict[str, list[AcquiredFact]] = {}
+        for candidate in candidates:
+            canonical_value = json.dumps(
+                candidate.value(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            by_value.setdefault(canonical_value, []).append(candidate)
+        if len(by_value) != 1:
+            conflicting.append(fact_id)
+            rejected.extend(
+                RejectedObservation(
+                    fact_id=fact_id,
+                    observation_id=candidate.observation_id,
+                    reason="fact_conflict",
+                )
+                for candidate in candidates
+            )
+            continue
+        equivalent = next(iter(by_value.values()))
+        equivalent.sort(key=lambda item: (
+            _aware(item.observed_at, "observed_at"), item.observation_id
+        ))
+        winner = equivalent[-1]
+        corroborating = tuple(sorted({
+            provenance
+            for candidate in equivalent
+            for provenance in candidate.provenance_ids
+        }))
+        winner = replace(winner, provenance_ids=corroborating)
+        by_fact[fact_id] = winner
+        accepted_ids.append(winner.observation_id)
+        deduplicated.extend(
+            candidate.observation_id for candidate in equivalent[:-1]
+        )
+
     resolved = tuple(by_fact[fact_id] for fact_id in requested_ids if fact_id in by_fact)
     unresolved = tuple(fact_id for fact_id in requested_ids if fact_id not in by_fact)
 
@@ -750,13 +1177,25 @@ def build_missing_fact_acquisition_plan(
     requires_level_2 = facts_at(FactSourceLevel.LEVEL_2_PROVEN_NAVIGATION_READ_ONLY)
     requires_level_3 = facts_at(FactSourceLevel.LEVEL_3_REVERSIBLE_DETAIL_OBSERVATION)
     unavailable = facts_at(FactSourceLevel.LEVEL_4_UNAVAILABLE)
-    zero_input = tuple(
+    zero_input_contract = tuple(
         contract.fact_id
         for contract in contracts
-        if contract.fact_id in unresolved
-        and contract.enabled
+        if contract.enabled
         and not contract.requires_page_input
         and not contract.required_navigation_edges
+    )
+    zero_input_executable = tuple(
+        contract.fact_id
+        for contract in contracts
+        if contract.fact_id in zero_input_contract
+        and contract.observer_status
+        is not ObserverImplementationStatus.NOT_IMPLEMENTED
+        and not contract.normalizer_only
+    )
+    zero_input_normalizer = tuple(
+        contract.fact_id
+        for contract in contracts
+        if contract.fact_id in zero_input_contract and contract.normalizer_only
     )
     navigation_only = tuple(
         contract.fact_id
@@ -772,12 +1211,44 @@ def build_missing_fact_acquisition_plan(
         if contract.fact_id in unresolved and contract.requires_page_input
     )
     observers = tuple(dict.fromkeys(
-        contract.observer_id
+        contract.observer_callable_id
         for contract in contracts
-        if contract.fact_id in unresolved and contract.enabled and contract.observer_id
+        if contract.fact_id in unresolved
+        and contract.fact_id in zero_input_executable
+        and contract.observer_callable_id
     ))
+    contract_registered = tuple(
+        fact_id for fact_id in requested_ids if fact_id in FACT_ACQUISITION_CONTRACTS
+    )
+    implemented = tuple(
+        contract.fact_id
+        for contract in contracts
+        if contract.observer_status is not ObserverImplementationStatus.NOT_IMPLEMENTED
+    )
+    offline_proven = tuple(
+        contract.fact_id
+        for contract in contracts
+        if contract.observer_status in {
+            ObserverImplementationStatus.OFFLINE_PROVEN,
+            ObserverImplementationStatus.LIVE_PROVEN,
+        }
+    )
+    live_proven = tuple(
+        contract.fact_id
+        for contract in contracts
+        if contract.observer_status is ObserverImplementationStatus.LIVE_PROVEN
+    )
+    normalizer_only = tuple(
+        contract.fact_id for contract in contracts if contract.normalizer_only
+    )
+    not_implemented = tuple(
+        contract.fact_id
+        for contract in contracts
+        if contract.observer_status is ObserverImplementationStatus.NOT_IMPLEMENTED
+    )
     blocked = tuple(
         [f"CONTRACT_INVALID:{fact_id}" for fact_id in invalid]
+        + [f"FACT_CONFLICT:{fact_id}" for fact_id in conflicting]
         + [f"UNRESOLVED:{fact_id}" for fact_id in unresolved]
     )
     return MissingFactAcquisitionPlan(
@@ -796,15 +1267,31 @@ def build_missing_fact_acquisition_plan(
         requires_level_2=requires_level_2,
         requires_level_3=requires_level_3,
         unavailable=unavailable,
-        zero_input_collectable_facts=zero_input,
+        zero_input_collectable_facts=zero_input_contract,
+        zero_input_contract_facts=zero_input_contract,
+        zero_input_executable_facts=zero_input_executable,
+        zero_input_normalizer_only_facts=zero_input_normalizer,
         navigation_only_collectable_facts=navigation_only,
         page_input_required_facts=page_input,
         unavailable_facts=unavailable,
         resolved_facts=resolved,
         unresolved_facts=unresolved,
+        contract_registered_facts=contract_registered,
+        observer_implemented_facts=implemented,
+        observer_offline_proven_facts=offline_proven,
+        observer_live_proven_facts=live_proven,
+        normalizer_only_facts=normalizer_only,
+        not_implemented_facts=not_implemented,
+        conflicting_facts=tuple(conflicting),
+        rejected_observations=tuple(sorted(
+            rejected,
+            key=lambda item: (item.fact_id, item.observation_id, item.reason),
+        )),
+        deduplicated_observations=tuple(sorted(deduplicated)),
+        accepted_observation_ids=tuple(sorted(accepted_ids)),
         recommended_next_observers=observers,
         blocked_reasons=blocked,
-        policy_evaluation_still_blocked=bool(unresolved),
+        policy_evaluation_still_blocked=bool(unresolved or conflicting),
     )
 
 
@@ -827,10 +1314,13 @@ __all__ = [
     "FactAcquisitionContract",
     "FactSourceLevel",
     "MissingFactAcquisitionPlan",
+    "ObserverImplementationStatus",
+    "RejectedObservation",
     "build_missing_fact_acquisition_plan",
     "observe_action_summary_fatigue_config",
     "observe_action_summary_policy_config",
     "observe_current_action_summary_page_facts",
     "parse_action_summary_acquisition_policy_config",
+    "validate_acquired_fact",
     "validate_contract_registry",
 ]

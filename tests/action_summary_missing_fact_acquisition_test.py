@@ -12,11 +12,13 @@ from core.services.action_summary_missing_fact_acquisition import (
     CurrentActionSummaryVisualSnapshot,
     FACT_ACQUISITION_CONTRACTS,
     FactSourceLevel,
+    ObserverImplementationStatus,
     build_missing_fact_acquisition_plan,
     observe_action_summary_fatigue_config,
     observe_action_summary_policy_config,
     observe_current_action_summary_page_facts,
     parse_action_summary_acquisition_policy_config,
+    validate_acquired_fact,
     validate_contract_registry,
 )
 
@@ -29,6 +31,7 @@ POLICY_HASH = "a" * 64
 RUNTIME_HASH = "b" * 64
 FRAME_HASH = "c" * 64
 NOW = "2026-07-26T12:30:00+08:00"
+VISUAL_NOW = "2026-07-26T12:24:00+08:00"
 
 
 def config_document(**changes):
@@ -368,3 +371,268 @@ def test_module_has_no_backend_executor_or_legacy_imports():
         "ActionSummaryExecutionInterlock",
     ):
         assert forbidden not in source
+
+
+def test_observer_statuses_distinguish_executable_normalizer_and_missing():
+    assert FACT_ACQUISITION_CONTRACTS["objective_missing"].observer_status is (
+        ObserverImplementationStatus.OFFLINE_PROVEN
+    )
+    visual_contract = FACT_ACQUISITION_CONTRACTS["resource_balance_unknown"]
+    assert visual_contract.observer_status is ObserverImplementationStatus.OFFLINE_PROVEN
+    assert visual_contract.normalizer_only is True
+    attempts = FACT_ACQUISITION_CONTRACTS["remaining_attempts_unknown"]
+    assert attempts.observer_status is ObserverImplementationStatus.NOT_IMPLEMENTED
+    assert attempts.observer_callable_id is None
+
+
+def test_plan_reports_contract_executable_and_normalizer_sets_separately():
+    requested = (
+        request("objective_missing"),
+        request("resource_balance_unknown"),
+        request("remaining_attempts_unknown"),
+    )
+    plan = build_missing_fact_acquisition_plan(
+        requested,
+        policy_fingerprint=POLICY_HASH,
+        runtime_input_fingerprint=RUNTIME_HASH,
+        generated_at=VISUAL_NOW,
+    )
+    assert plan.zero_input_contract_facts == (
+        "objective_missing", "resource_balance_unknown"
+    )
+    assert plan.zero_input_executable_facts == ("objective_missing",)
+    assert plan.zero_input_normalizer_only_facts == (
+        "resource_balance_unknown",
+    )
+    assert plan.normalizer_only_facts == ("resource_balance_unknown",)
+    assert plan.not_implemented_facts == ("remaining_attempts_unknown",)
+
+
+def _visual_balance_fact(**snapshot_changes):
+    facts = observe_current_action_summary_page_facts(
+        visual(**snapshot_changes), runtime_input_fingerprint=RUNTIME_HASH
+    )
+    return next(fact for fact in facts if fact.fact_id == "resource_balance_unknown")
+
+
+def _validate(fact, fact_id="resource_balance_unknown", generated_at=VISUAL_NOW):
+    return validate_acquired_fact(
+        fact,
+        FACT_ACQUISITION_CONTRACTS[fact_id],
+        POLICY_HASH,
+        RUNTIME_HASH,
+        generated_at,
+    )
+
+
+def test_acquired_fact_schema_is_explicit_and_contract_bound():
+    fact = _visual_balance_fact()
+    assert fact.schema_version == "1.0"
+    assert fact.output_schema == "ACTION_SUMMARY_ACQUIRED_FACT_V1"
+    assert fact.to_dict()["output_schema"] == fact.output_schema
+    assert _validate(fact) is None
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected"),
+    [
+        ({"observer_id": "wrong"}, "observer_mismatch"),
+        ({"source_fingerprint": "not-a-sha256"}, "source_fingerprint_invalid"),
+        (
+            {"source_level": FactSourceLevel.LEVEL_0_EXISTING_CONFIG},
+            "source_level_mismatch",
+        ),
+        ({"output_schema": "WRONG"}, "output_schema_mismatch"),
+        ({"runtime_input_fingerprint": "d" * 64}, "runtime_fingerprint_mismatch"),
+        (
+            {"policy_fingerprint": None, "runtime_input_fingerprint": None},
+            "provenance_incomplete",
+        ),
+    ],
+)
+def test_strict_fact_contract_rejections(changes, expected):
+    assert _validate(replace(_visual_balance_fact(), **changes)) == expected
+
+
+def test_config_fact_policy_fingerprint_mismatch_is_rejected():
+    parsed = config()
+    fact = observe_action_summary_policy_config(parsed)[0]
+    assert validate_acquired_fact(
+        fact,
+        FACT_ACQUISITION_CONTRACTS["objective_missing"],
+        POLICY_HASH,
+        RUNTIME_HASH,
+        NOW,
+    ) == "policy_fingerprint_mismatch"
+
+
+def test_future_observation_is_rejected():
+    fact = replace(
+        _visual_balance_fact(),
+        observed_at="2026-07-26T12:25:00+08:00",
+    )
+    assert _validate(fact) == "observation_from_future"
+
+
+def test_inverted_observation_window_is_rejected():
+    fact = replace(
+        _visual_balance_fact(),
+        valid_until="2026-07-26T12:19:00+08:00",
+    )
+    assert _validate(fact) == "observation_window_invalid"
+
+
+def test_timezone_naive_observation_is_rejected():
+    fact = replace(
+        _visual_balance_fact(),
+        observed_at="2026-07-26T12:20:00",
+    )
+    assert _validate(fact) == "observation_window_invalid"
+
+
+def test_contract_freshness_is_enforced_before_valid_until():
+    fact = replace(
+        _visual_balance_fact(),
+        valid_until="2026-07-26T13:00:00+08:00",
+    )
+    assert _validate(
+        fact, generated_at="2026-07-26T12:26:00+08:00"
+    ) == "observation_stale"
+
+
+def test_capture_provenance_is_required():
+    fact = _visual_balance_fact()
+    fact = replace(
+        fact,
+        provenance_ids=(f"frame_sha256:{fact.source_fingerprint}",),
+    )
+    assert _validate(fact) == "provenance_incomplete"
+
+
+@pytest.mark.parametrize("invalid_amount", [True, -1])
+def test_forged_fact_numeric_value_is_rejected(invalid_amount):
+    fact = _visual_balance_fact()
+    value = fact.value()
+    value["available_amount"] = invalid_amount
+    fact = replace(
+        fact,
+        value_json=json.dumps(value, sort_keys=True, separators=(",", ":")),
+    )
+    assert _validate(fact) == "fact_value_invalid"
+
+
+def test_task_bound_reward_requires_card_key_provenance():
+    reward = next(
+        fact
+        for fact in observe_current_action_summary_page_facts(
+            visual(), runtime_input_fingerprint=RUNTIME_HASH
+        )
+        if fact.fact_id == "reward_target_unknown"
+    )
+    value = reward.value()
+    value.pop("card_match_key")
+    reward = replace(
+        reward,
+        value_json=json.dumps(value, sort_keys=True, separators=(",", ":")),
+        provenance_ids=("capture_id:CAPTURE-1", f"frame_sha256:{FRAME_HASH}"),
+    )
+    assert _validate(
+        reward, fact_id="reward_target_unknown"
+    ) == "provenance_incomplete"
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"capture_id": ""}, "capture_id_missing"),
+        ({"resource_available_amount": True}, "resource_available_amount_invalid"),
+        ({"resource_available_amount": -1}, "resource_available_amount_invalid"),
+        ({"displayed_resource_cost": False}, "displayed_resource_cost_invalid"),
+        ({"displayed_resource_cost": -40}, "displayed_resource_cost_invalid"),
+        ({"card_match_key": "  "}, "card_match_key_missing"),
+    ],
+)
+def test_snapshot_rejects_invalid_identity_and_numeric_values(changes, message):
+    with pytest.raises(ValueError, match=message):
+        observe_current_action_summary_page_facts(
+            visual(**changes), runtime_input_fingerprint=RUNTIME_HASH
+        )
+
+
+def _balance_plan(facts):
+    return build_missing_fact_acquisition_plan(
+        (request("resource_balance_unknown"),),
+        observations=facts,
+        policy_fingerprint=POLICY_HASH,
+        runtime_input_fingerprint=RUNTIME_HASH,
+        generated_at=VISUAL_NOW,
+    )
+
+
+def test_conflicting_facts_fail_closed_without_last_write_wins():
+    first = _visual_balance_fact(resource_available_amount=120)
+    second = _visual_balance_fact(
+        resource_available_amount=80,
+        capture_id="CAPTURE-2",
+        frame_sha256="d" * 64,
+    )
+    plan = _balance_plan((first, second))
+    assert plan.resolved_facts == ()
+    assert plan.conflicting_facts == ("resource_balance_unknown",)
+    assert plan.policy_evaluation_still_blocked is True
+    assert {item.reason for item in plan.rejected_observations} == {
+        "fact_conflict"
+    }
+
+
+def test_observation_order_does_not_change_conflict_result():
+    first = _visual_balance_fact(resource_available_amount=120)
+    second = _visual_balance_fact(
+        resource_available_amount=80,
+        capture_id="CAPTURE-2",
+        frame_sha256="d" * 64,
+    )
+    assert _balance_plan((first, second)).to_dict() == _balance_plan(
+        (second, first)
+    ).to_dict()
+
+
+def test_identical_observations_are_deduplicated_deterministically():
+    first = _visual_balance_fact()
+    second = replace(
+        first,
+        observed_at="2026-07-26T12:21:00+08:00",
+    )
+    plan = _balance_plan((second, first))
+    assert len(plan.resolved_facts) == 1
+    assert len(plan.deduplicated_observations) == 1
+    assert len(plan.accepted_observation_ids) == 1
+    assert plan.conflicting_facts == ()
+
+
+def test_same_value_different_provenance_is_corroborated():
+    first = _visual_balance_fact()
+    second = _visual_balance_fact(
+        capture_id="CAPTURE-2",
+        frame_sha256="d" * 64,
+    )
+    plan = _balance_plan((first, second))
+    assert len(plan.resolved_facts) == 1
+    provenance = set(plan.resolved_facts[0].provenance_ids)
+    assert {
+        "capture_id:CAPTURE-1",
+        "capture_id:CAPTURE-2",
+        f"frame_sha256:{FRAME_HASH}",
+        f"frame_sha256:{'d' * 64}",
+    }.issubset(
+        provenance
+    )
+    assert len(plan.deduplicated_observations) == 1
+
+
+def test_rejected_observation_records_exact_reason_and_remains_unresolved():
+    bad = replace(_visual_balance_fact(), observer_id="wrong")
+    plan = _balance_plan((bad,))
+    assert plan.resolved_facts == ()
+    assert plan.rejected_observations[0].reason == "observer_mismatch"
+    assert plan.unresolved_facts == ("resource_balance_unknown",)
