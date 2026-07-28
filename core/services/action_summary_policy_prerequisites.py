@@ -122,6 +122,9 @@ class FatigueBudgetFact:
     available_fatigue: int | None = None
     reserved_fatigue: int | None = None
     max_policy_spend: int | None = None
+    fatigue_unit_id: str | None = None
+    fatigue_cost_per_run: int | None = None
+    fatigue_cost_applicable: bool | None = None
     provenance: FactProvenance | None = None
 
     @property
@@ -174,6 +177,8 @@ class ActionSummaryPolicyPrerequisiteModel:
     reward_target: RewardTargetFact
     fatigue_budget: FatigueBudgetFact
     strategy: StrategyInputContract
+    candidate_task_state: str
+    candidate_execution_supported: bool
     candidate_available_action_types: frozenset[str]
     bounded_candidate_executions: int | None
     policy_evaluation_allowed: bool
@@ -547,6 +552,24 @@ def evaluate_action_summary_policy_prerequisites(
             }),
             captured_at=page_model.captured_at,
         ), incomplete=incomplete, conflicts=conflicts)
+    if fatigue.fatigue_cost_applicable is None:
+        incomplete.append("fatigue_cost_unknown")
+    elif type(fatigue.fatigue_cost_applicable) is not bool:
+        conflicts.append("fatigue_cost_applicability_invalid")
+    elif (
+        not isinstance(fatigue.fatigue_unit_id, str)
+        or not fatigue.fatigue_unit_id.strip()
+        or fatigue.fatigue_unit_id == "UNKNOWN"
+    ):
+        incomplete.append("fatigue_unit_identity_unknown")
+    elif fatigue.fatigue_cost_applicable:
+        if (
+            not _exact_int(fatigue.fatigue_cost_per_run)
+            or fatigue.fatigue_cost_per_run <= 0
+        ):
+            incomplete.append("fatigue_cost_unknown")
+    elif fatigue.fatigue_cost_per_run != 0:
+        conflicts.append("non_applicable_fatigue_cost_must_be_zero")
 
     if not isinstance(strategy.objective, StrategyObjective):
         conflicts.append("strategy_objective_invalid")
@@ -590,22 +613,6 @@ def evaluate_action_summary_policy_prerequisites(
         status = PrerequisiteModelStatus.BLOCKED_INCOMPLETE_FACTS
     else:
         status = PrerequisiteModelStatus.READY_FOR_POLICY_EVALUATION
-    bounded_candidate_executions: int | None = None
-    if status is PrerequisiteModelStatus.READY_FOR_POLICY_EVALUATION:
-        limits = [
-            attempts.remaining_attempts,
-            resource.affordable_attempts,
-            strategy.max_task_executions,
-        ]
-        if (
-            resource.resource_id == "FATIGUE"
-            and fatigue.max_policy_spend is not None
-            and resource.unit_cost is not None
-            and resource.unit_cost > 0
-        ):
-            limits.append(fatigue.max_policy_spend // resource.unit_cost)
-        if all(value is not None for value in limits):
-            bounded_candidate_executions = min(int(value) for value in limits)
     candidate_available_action_types = frozenset(
         action
         for action, capability in (
@@ -614,6 +621,25 @@ def evaluate_action_summary_policy_prerequisites(
         )
         if card is not None and capability in card.available_actions
     )
+    candidate_execution_supported = bool(
+        card is not None
+        and card.state is TaskCardState.AVAILABLE
+        and "TASK_EXECUTION_AVAILABLE" in card.available_actions
+        and candidate_available_action_types & strategy.allowed_action_types
+    )
+    bounded_candidate_executions: int | None = None
+    if status is PrerequisiteModelStatus.READY_FOR_POLICY_EVALUATION:
+        limits = [
+            attempts.remaining_attempts,
+            resource.affordable_attempts,
+            strategy.max_task_executions,
+        ]
+        if fatigue.fatigue_cost_applicable is True:
+            fatigue_cost = fatigue.fatigue_cost_per_run
+            if fatigue.max_policy_spend is not None and fatigue_cost:
+                limits.append(fatigue.max_policy_spend // fatigue_cost)
+        if all(value is not None for value in limits):
+            bounded_candidate_executions = min(int(value) for value in limits)
     return ActionSummaryPolicyPrerequisiteModel(
         schema_version=_SCHEMA_VERSION,
         model_scope=_MODEL_SCOPE,
@@ -636,6 +662,8 @@ def evaluate_action_summary_policy_prerequisites(
         reward_target=reward,
         fatigue_budget=fatigue,
         strategy=strategy,
+        candidate_task_state=(card.state.value if card is not None else "UNKNOWN"),
+        candidate_execution_supported=candidate_execution_supported,
         candidate_available_action_types=candidate_available_action_types,
         bounded_candidate_executions=bounded_candidate_executions,
         policy_evaluation_allowed=(

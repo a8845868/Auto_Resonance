@@ -80,6 +80,7 @@ class ActionSummaryRuntimeResourceObservation:
     valid_until: str
     resource_id: str
     available_amount: int
+    fatigue_unit_id: str
     available_fatigue: int
     evidence_ids: tuple[str, ...] = ()
 
@@ -88,6 +89,14 @@ class ActionSummaryRuntimeResourceObservation:
 class CandidateRewardPolicy:
     task_semantic_id: str
     reward_amount_per_execution: int
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateFatiguePolicy:
+    task_semantic_id: str
+    fatigue_unit_id: str
+    fatigue_cost_per_run: int
+    fatigue_cost_applicable: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +116,7 @@ class ActionSummaryUserPolicyConfig:
     reserved_fatigue: int
     max_policy_spend: int
     candidate_rewards: tuple[CandidateRewardPolicy, ...]
+    candidate_fatigue_costs: tuple[CandidateFatiguePolicy, ...]
     captured_at: str | None = None
     requested_known_task_id: str | None = None
     requested_task_title_hash: str | None = None
@@ -303,6 +313,34 @@ def parse_action_summary_user_policy_config(
             ),
         ))
 
+    raw_fatigue_costs = data.get("candidate_fatigue_costs", ())
+    if (
+        not isinstance(raw_fatigue_costs, Sequence)
+        or isinstance(raw_fatigue_costs, (str, bytes))
+    ):
+        raise ValueError("candidate_fatigue_costs_invalid")
+    fatigue_costs: list[CandidateFatiguePolicy] = []
+    fatigue_seen: set[str] = set()
+    for item in raw_fatigue_costs:
+        if not isinstance(item, Mapping):
+            raise ValueError("candidate_fatigue_cost_invalid")
+        semantic_id = _text(item.get("task_semantic_id"), "task_semantic_id")
+        if semantic_id in fatigue_seen:
+            raise ValueError("candidate_fatigue_cost_duplicate")
+        fatigue_seen.add(semantic_id)
+        applicable = item.get("fatigue_cost_applicable")
+        if type(applicable) is not bool:
+            raise ValueError("fatigue_cost_applicable_invalid")
+        cost = _integer(item.get("fatigue_cost_per_run"), "fatigue_cost_per_run")
+        if (applicable and cost <= 0) or (not applicable and cost != 0):
+            raise ValueError("fatigue_cost_contract_invalid")
+        fatigue_costs.append(CandidateFatiguePolicy(
+            task_semantic_id=semantic_id,
+            fatigue_unit_id=_text(item.get("fatigue_unit_id"), "fatigue_unit_id"),
+            fatigue_cost_per_run=cost,
+            fatigue_cost_applicable=applicable,
+        ))
+
     current = _integer(data.get("reward_current_amount"), "reward_current_amount")
     target = _integer(
         data.get("reward_target_amount"), "reward_target_amount", minimum=1
@@ -340,6 +378,7 @@ def parse_action_summary_user_policy_config(
         reserved_fatigue=reserved,
         max_policy_spend=maximum_spend,
         candidate_rewards=tuple(rewards),
+        candidate_fatigue_costs=tuple(fatigue_costs),
         captured_at=captured_at,
         requested_known_task_id=requested_known_task_id,
         requested_task_title_hash=requested_task_title_hash,
@@ -542,6 +581,12 @@ def _resource_observation_errors(
         errors.append("runtime_resource_freshness_invalid")
     if not isinstance(observation.resource_id, str) or not observation.resource_id.strip():
         errors.append("runtime_resource_id_missing")
+    if (
+        not isinstance(observation.fatigue_unit_id, str)
+        or not observation.fatigue_unit_id.strip()
+        or observation.fatigue_unit_id == "UNKNOWN"
+    ):
+        errors.append("runtime_fatigue_unit_id_missing")
     if not _exact_int(observation.available_amount) or observation.available_amount < 0:
         errors.append("runtime_resource_amount_invalid")
     if not _exact_int(observation.available_fatigue) or observation.available_fatigue < 0:
@@ -569,7 +614,12 @@ def _unknown_inputs(
         item.task_semantic_id: item.reward_amount_per_execution
         for item in (config.candidate_rewards if config else ())
     }
+    fatigue_by_task = {
+        item.task_semantic_id: item
+        for item in (config.candidate_fatigue_costs if config else ())
+    }
     reward_amount = reward_by_task.get(card.semantic_id)
+    fatigue_policy = fatigue_by_task.get(card.semantic_id)
     attempts_known = (
         card.remaining_attempts is not None
         and card.total_attempts is not None
@@ -624,6 +674,17 @@ def _unknown_inputs(
             ),
             reserved_fatigue=config.reserved_fatigue if fatigue_known else None,
             max_policy_spend=config.max_policy_spend if fatigue_known else None,
+            fatigue_unit_id=(
+                observation.fatigue_unit_id if fatigue_known else None
+            ),
+            fatigue_cost_per_run=(
+                fatigue_policy.fatigue_cost_per_run
+                if fatigue_policy is not None else None
+            ),
+            fatigue_cost_applicable=(
+                fatigue_policy.fatigue_cost_applicable
+                if fatigue_policy is not None else None
+            ),
             provenance=fatigue_provenance if fatigue_known else None,
         ),
         strategy=StrategyInputContract(
@@ -967,6 +1028,7 @@ __all__ = [
     "ActionSummaryRuntimeInputAssembly",
     "ActionSummaryRuntimeResourceObservation",
     "ActionSummaryUserPolicyConfig",
+    "CandidateFatiguePolicy",
     "CandidateRewardPolicy",
     "PolicyInputReadiness",
     "PolicyTargetMatchStatus",

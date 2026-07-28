@@ -133,6 +133,9 @@ def complete_inputs(model: ActionSummaryPageModel) -> ActionSummaryPolicyPrerequ
             available_fatigue=120,
             reserved_fatigue=20,
             max_policy_spend=80,
+            fatigue_unit_id="FATIGUE",
+            fatigue_cost_per_run=10,
+            fatigue_cost_applicable=True,
             provenance=page_provenance(FactSource.GAME_OBSERVED),
         ),
         strategy=StrategyInputContract(

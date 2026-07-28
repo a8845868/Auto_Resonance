@@ -40,6 +40,9 @@ EVALUATED_AT = "2026-07-26T12:00:02+08:00"
 FIXTURE = Path(
     "tests/fixtures/action_summary_advisory_policy/canonical_incomplete_v1.json"
 )
+OBJECTIVE_FIXTURE = Path(
+    "tests/fixtures/action_summary_advisory_policy/objective_matrix_v1.json"
+)
 
 
 def complete_runtime_input():
@@ -225,16 +228,66 @@ def test_fixed_task_unknown_reward_is_optional_but_recorded():
         candidate_reward_amount=None,
     )
     runtime = replace_candidate(runtime, 0, reward_target=reward)
-    result = evaluate(runtime)
+    result = evaluate(runtime, profile(allow_unknown_reward=True))
     assert result.status is AdvisoryPolicyStatus.ADVISORY_RECOMMENDATION_READY
     assert "reward_target_unknown" in result.warnings
     assert result.ranked_candidates[0].reward_target_id is None
+
+
+def test_generic_assembly_readiness_does_not_hide_fixed_task_requirements():
+    policy = policy_document()
+    policy["ActionSummaryPolicy"]["candidate_rewards"] = [{
+        "task_semantic_id": "TASK_B",
+        "reward_amount_per_execution": 25,
+    }]
+    runtime = assemble_action_summary_policy_runtime_inputs(
+        runtime_page(),
+        policy,
+        resource_observation=observation(),
+        assembled_at="2026-07-26T12:00:01+08:00",
+    )
+    assert runtime.policy_input_readiness is PolicyInputReadiness.BLOCKED_MISSING_FACTS
+
+    result = evaluate(runtime, profile(allow_unknown_reward=True))
+
+    assert result.status is AdvisoryPolicyStatus.ADVISORY_RECOMMENDATION_READY
+    assert result.recommended_known_task_id == "TASK_A"
+    assert "reward_target_unknown" in result.warnings
+
+
+def test_fixed_task_unknown_reward_blocks_when_profile_does_not_allow_it():
+    runtime = complete_runtime_input()
+    reward = replace(
+        runtime.candidate_prerequisites[0].reward_target,
+        status=PrerequisiteFactStatus.UNKNOWN,
+        reward_target_id=None,
+        candidate_reward_amount=None,
+    )
+    runtime = replace_candidate(runtime, 0, reward_target=reward)
+
+    result = evaluate(runtime)
+
+    assert result.status is AdvisoryPolicyStatus.BLOCKED_MISSING_FACTS
+    assert "reward_target_unknown" in result.missing_facts
 
 
 def test_fixed_task_not_found_blocks():
     result = evaluate(selected_profile=profile(preferred_task_ids=("TASK_Z",)))
     assert result.status is AdvisoryPolicyStatus.BLOCKED_TARGET_NOT_FOUND
     assert result.recommended_card_match_key is None
+
+
+def test_fixed_task_unknown_identity_is_missing_not_target_not_found():
+    runtime = complete_runtime_input()
+    identity = replace(
+        runtime.candidate_prerequisites[1].task_identity,
+        status=PrerequisiteFactStatus.UNKNOWN,
+        task_semantic_id=None,
+    )
+    runtime = replace_candidate(runtime, 1, task_identity=identity)
+    result = evaluate(runtime)
+    assert result.status is AdvisoryPolicyStatus.BLOCKED_MISSING_FACTS
+    assert "task_identity_unknown" in result.missing_facts
 
 
 def test_fixed_task_duplicate_semantic_identity_blocks_as_ambiguous():
@@ -410,6 +463,95 @@ def test_recommended_run_count_is_minimum_of_every_hard_limit():
     assert result.recommended_run_count == 2
 
 
+def test_resource_and_fatigue_costs_use_independent_units_and_bounds():
+    runtime = complete_runtime_input()
+    candidate = runtime.candidate_prerequisites[0]
+    resource = replace(
+        candidate.resource_balance,
+        resource_id="ACTIVITY_TOKEN",
+        available_amount=1_000,
+        unit_cost=40,
+    )
+    fatigue = replace(
+        candidate.fatigue_budget,
+        available_fatigue=50,
+        reserved_fatigue=20,
+        max_policy_spend=30,
+        fatigue_unit_id="STAMINA",
+        fatigue_cost_per_run=15,
+        fatigue_cost_applicable=True,
+    )
+    strategy = replace(candidate.strategy, max_task_executions=10)
+    runtime = replace_candidate(
+        runtime,
+        0,
+        resource_balance=resource,
+        fatigue_budget=fatigue,
+        strategy=strategy,
+    )
+    selected_profile = profile(
+        maximum_task_runs=10,
+        maximum_total_cost=400,
+        minimum_resource_reserve=0,
+        fatigue_reserve=20,
+    )
+
+    result = evaluate(runtime, selected_profile)
+
+    assert result.status is AdvisoryPolicyStatus.ADVISORY_RECOMMENDATION_READY
+    assert result.recommended_run_count == 2
+
+
+def test_unknown_fatigue_cost_never_falls_back_to_resource_cost():
+    runtime = complete_runtime_input()
+    fatigue = replace(
+        runtime.candidate_prerequisites[0].fatigue_budget,
+        fatigue_cost_per_run=None,
+        fatigue_cost_applicable=None,
+    )
+    runtime = replace_candidate(runtime, 0, fatigue_budget=fatigue)
+
+    result = evaluate(runtime)
+
+    assert result.status is AdvisoryPolicyStatus.BLOCKED_MISSING_FACTS
+    assert "fatigue_cost_unknown" in result.missing_facts
+    assert result.recommended_run_count is None
+
+
+def test_explicit_zero_non_applicable_fatigue_cost_is_not_a_resource_fallback():
+    runtime = complete_runtime_input()
+    fatigue = replace(
+        runtime.candidate_prerequisites[0].fatigue_budget,
+        available_fatigue=20,
+        reserved_fatigue=20,
+        max_policy_spend=0,
+        fatigue_cost_per_run=0,
+        fatigue_cost_applicable=False,
+    )
+    runtime = replace_candidate(runtime, 0, fatigue_budget=fatigue)
+
+    result = evaluate(runtime)
+
+    assert result.status is AdvisoryPolicyStatus.ADVISORY_RECOMMENDATION_READY
+    assert result.recommended_run_count == 2
+
+
+def test_non_available_candidate_never_enters_ranking():
+    runtime = complete_runtime_input()
+    runtime = replace_candidate(runtime, 0, candidate_task_state="locked")
+    result = evaluate(runtime)
+    assert result.status is AdvisoryPolicyStatus.NO_ELIGIBLE_TASK
+    assert "candidate_task_not_available" in result.block_reason_codes
+
+
+def test_unsupported_execution_entry_never_enters_ranking():
+    runtime = complete_runtime_input()
+    runtime = replace_candidate(runtime, 0, candidate_execution_supported=False)
+    result = evaluate(runtime)
+    assert result.status is AdvisoryPolicyStatus.NO_ELIGIBLE_TASK
+    assert "candidate_execution_unsupported" in result.block_reason_codes
+
+
 def test_unknown_run_count_limit_never_falls_back_to_one():
     runtime = complete_runtime_input()
     resource = replace(runtime.candidate_prerequisites[0].resource_balance, available_amount=None)
@@ -428,10 +570,58 @@ def test_allow_unknown_flags_never_invent_a_run_count():
         total_attempts=None,
     )
     runtime = replace_candidate(runtime, 0, remaining_attempts=attempts)
-    selected_profile = profile(allow_unknown_attempts=True)
-    result = evaluate(runtime, selected_profile)
-    assert result.status is AdvisoryPolicyStatus.BLOCKED_MISSING_FACTS
-    assert result.recommended_run_count is None
+    with pytest.raises(
+        ValueError,
+        match="allow_unknown_attempts_not_supported_for_recommendation",
+    ):
+        profile(allow_unknown_attempts=True)
+
+
+@pytest.mark.parametrize(
+    "changes, reason",
+    [
+        (
+            {"allow_unknown_resource_identity": True},
+            "allow_unknown_resource_identity_not_supported_for_recommendation",
+        ),
+        (
+            {"allow_unknown_resource_balance": True},
+            "allow_unknown_resource_balance_not_supported_for_recommendation",
+        ),
+    ],
+)
+def test_unsupported_allow_unknown_flags_are_policy_invalid(changes, reason):
+    with pytest.raises(ValueError, match=reason):
+        profile(**changes)
+
+
+def test_reward_objective_rejects_allow_unknown_reward():
+    with pytest.raises(
+        ValueError,
+        match="allow_unknown_reward_not_supported_for_objective",
+    ):
+        profile(
+            AdvisoryObjective.MAXIMIZE_PRIORITY_REWARD,
+            preferred_task_ids=(),
+            allow_unknown_reward=True,
+        )
+
+
+def test_observe_only_accepts_unknown_flags_without_issuing_a_recommendation():
+    selected_profile = profile(
+        AdvisoryObjective.OBSERVE_ONLY,
+        preferred_task_ids=(),
+        maximum_cost_per_run=0,
+        maximum_total_cost=0,
+        maximum_task_runs=0,
+        allow_unknown_reward=True,
+        allow_unknown_attempts=True,
+        allow_unknown_resource_identity=True,
+        allow_unknown_resource_balance=True,
+    )
+    result = evaluate(canonical_runtime_input(), selected_profile)
+    assert result.status is AdvisoryPolicyStatus.OBSERVE_ONLY_COMPLETE
+    assert result.recommended_card_match_key is None
 
 
 def test_policy_fingerprint_change_invalidates_old_profile():
@@ -508,6 +698,27 @@ def test_reward_priority_ranking_is_deterministic():
     assert evaluate(runtime, selected_profile).recommended_known_task_id == "TASK_B"
 
 
+@pytest.mark.parametrize(
+    "case",
+    json.loads(OBJECTIVE_FIXTURE.read_text(encoding="utf-8"))["cases"],
+    ids=lambda case: case["objective"],
+)
+def test_complete_synthetic_fixture_for_every_supported_objective(case):
+    objective = AdvisoryObjective(case["objective"])
+    changes = {}
+    if objective is not AdvisoryObjective.FIXED_TASK:
+        changes["preferred_task_ids"] = ()
+    if objective is AdvisoryObjective.OBSERVE_ONLY:
+        changes.update({
+            "maximum_cost_per_run": 0,
+            "maximum_total_cost": 0,
+            "maximum_task_runs": 0,
+        })
+    result = evaluate(selected_profile=profile(objective, **changes))
+    assert result.status.value == case["expected_status"]
+    assert result.recommended_known_task_id == case["expected_task_id"]
+
+
 def test_minimum_cost_ranking_prefers_lower_comparable_cost():
     runtime = complete_runtime_input()
     resource = replace(runtime.candidate_prerequisites[1].resource_balance, unit_cost=20)
@@ -555,6 +766,20 @@ def test_strategy_profile_binding_mismatch_blocks():
     result = evaluate(selected_profile=profile(strategy_version="other"))
     assert result.status is AdvisoryPolicyStatus.BLOCKED_POLICY_INVALID
     assert "strategy_profile_binding_mismatch" in result.block_reason_codes
+
+
+def test_missing_strategy_identity_is_missing_not_binding_mismatch():
+    runtime = complete_runtime_input()
+    strategy = replace(
+        runtime.candidate_prerequisites[0].strategy,
+        strategy_id="",
+        strategy_version="",
+        provenance=None,
+    )
+    runtime = replace_candidate(runtime, 0, strategy=strategy)
+    result = evaluate(runtime)
+    assert result.status is AdvisoryPolicyStatus.BLOCKED_MISSING_FACTS
+    assert "strategy_identity_missing" in result.missing_facts
 
 
 def test_fact_acquisition_requests_are_read_only_and_do_not_execute_collection():

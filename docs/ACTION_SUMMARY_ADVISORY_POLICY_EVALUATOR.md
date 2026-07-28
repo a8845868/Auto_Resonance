@@ -43,9 +43,24 @@ without a conversion contract.
 
 ## Strict readiness
 
-For every non-observe objective, UNKNOWN facts are excluded from ranking and
-block the result. The evaluator never demotes an unknown candidate to the end
-of a ranking. It also never invents a run count.
+Assembly integrity and objective readiness are separate contracts. Invalid
+provenance, stale facts, authority contamination, candidate identity conflicts,
+or an unbound policy fingerprint stop at the integrity gate. The assembler's
+generic `policy_input_readiness` remains diagnostic and does not short-circuit
+the objective matrix.
+
+For every non-observe objective, required UNKNOWN facts are excluded from
+ranking and block the result. `FIXED_TASK`, `MAXIMIZE_AVAILABLE_ATTEMPTS`, and
+`MINIMIZE_RESOURCE_COST` may treat an unknown reward as a warning only when
+`allow_unknown_reward=true`. A reward-maximizing objective always requires
+known reward facts. V1 rejects `allow_unknown_attempts=true`,
+`allow_unknown_resource_identity=true`, and
+`allow_unknown_resource_balance=true` for recommendation objectives instead
+of silently ignoring those options. `OBSERVE_ONLY` may retain all UNKNOWN facts
+as warnings and still never recommends a task.
+
+The evaluator never demotes an unknown required fact to the end of a ranking.
+It also never invents a run count.
 
 The suggested run count is the minimum of every known hard bound:
 
@@ -54,12 +69,24 @@ card remaining attempts
 policy maximum task runs
 policy maximum total cost
 resource balance after reserve
-fatigue budget after reserve
+fatigue budget after reserve divided by an independent fatigue cost per run
 runtime strategy execution limit
 ```
 
+Resource cost and fatigue cost are distinct facts with distinct unit IDs. The
+runtime input contract carries `resource.unit_cost` separately from
+`fatigue_cost_per_run`, `fatigue_unit_id`, and
+`fatigue_cost_applicable`. A task that consumes no fatigue must explicitly use
+`fatigue_cost_applicable=false` and `fatigue_cost_per_run=0`. Unknown fatigue
+cost never falls back to resource cost.
+
 If any required bound is unknown, the result remains
 `BLOCKED_MISSING_FACTS` with `recommended_run_count=None`.
+
+Before ranking, every candidate must be `available`, expose an execution entry
+allowed by the bound strategy, have positive remaining attempts, and pass the
+independent resource and fatigue budget calculations. Non-available,
+unsupported, and explicitly unaffordable candidates never enter the ranking.
 
 ## Provenance binding
 

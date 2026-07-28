@@ -1,0 +1,10 @@
+{
+  "schema_version": "1.0",
+  "cases": [
+    {"objective": "FIXED_TASK", "expected_task_id": "TASK_A", "expected_status": "ADVISORY_RECOMMENDATION_READY"},
+    {"objective": "MAXIMIZE_PRIORITY_REWARD", "expected_task_id": "TASK_A", "expected_status": "ADVISORY_RECOMMENDATION_READY"},
+    {"objective": "MAXIMIZE_AVAILABLE_ATTEMPTS", "expected_task_id": "TASK_A", "expected_status": "ADVISORY_RECOMMENDATION_READY"},
+    {"objective": "MINIMIZE_RESOURCE_COST", "expected_task_id": "TASK_B", "expected_status": "ADVISORY_RECOMMENDATION_READY"},
+    {"objective": "OBSERVE_ONLY", "expected_task_id": null, "expected_status": "OBSERVE_ONLY_COMPLETE"}
+  ]
+}

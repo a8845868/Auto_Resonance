@@ -22,7 +22,6 @@ from core.services.action_summary_policy_prerequisites import (
 from core.services.action_summary_policy_runtime_inputs import (
     ActionSummaryRuntimeInputAssembly,
     AssemblyIntegrityStatus,
-    PolicyInputReadiness,
     PolicyTargetMatchStatus,
     SourceRelationship,
 )
@@ -490,6 +489,36 @@ def _validate_profile(
         or profile.maximum_task_runs <= 0
     ):
         raise ValueError("policy_execution_bounds_invalid")
+    if (
+        profile.allow_unknown_reward
+        and profile.objective
+        not in {
+            AdvisoryObjective.FIXED_TASK,
+            AdvisoryObjective.MAXIMIZE_AVAILABLE_ATTEMPTS,
+            AdvisoryObjective.MINIMIZE_RESOURCE_COST,
+            AdvisoryObjective.OBSERVE_ONLY,
+        }
+    ):
+        raise ValueError("allow_unknown_reward_not_supported_for_objective")
+    if (
+        profile.objective is not AdvisoryObjective.OBSERVE_ONLY
+        and profile.allow_unknown_attempts
+    ):
+        raise ValueError("allow_unknown_attempts_not_supported_for_recommendation")
+    if (
+        profile.objective is not AdvisoryObjective.OBSERVE_ONLY
+        and profile.allow_unknown_resource_identity
+    ):
+        raise ValueError(
+            "allow_unknown_resource_identity_not_supported_for_recommendation"
+        )
+    if (
+        profile.objective is not AdvisoryObjective.OBSERVE_ONLY
+        and profile.allow_unknown_resource_balance
+    ):
+        raise ValueError(
+            "allow_unknown_resource_balance_not_supported_for_recommendation"
+        )
     if fingerprint_required and (
         not _is_hash(profile.policy_fingerprint)
         or profile.policy_fingerprint
@@ -683,6 +712,14 @@ def _normalized_missing_facts(
             missing.append("reward_target_unknown")
         if candidate.fatigue_budget.status is not PrerequisiteFactStatus.KNOWN:
             missing.append("fatigue_budget_unknown")
+        fatigue = candidate.fatigue_budget
+        if (
+            fatigue.fatigue_cost_applicable is None
+            or fatigue.fatigue_cost_per_run is None
+            or not fatigue.fatigue_unit_id
+            or fatigue.fatigue_unit_id == "UNKNOWN"
+        ):
+            missing.append("fatigue_cost_unknown")
         if not candidate.strategy.strategy_id or not candidate.strategy.strategy_version:
             missing.append("strategy_identity_missing")
         if candidate.strategy.provenance is None:
@@ -696,6 +733,10 @@ _ACQUISITION_CONTRACTS: dict[
     "objective_missing": (
         "USER_POLICY", "user_policy_configuration", False, False, 1,
         "objective must be explicitly configured",
+    ),
+    "task_identity_unknown": (
+        "TASK_CARD", "current_page_read_only_model", False, False, 1,
+        "task identity must be bound before target selection",
     ),
     "strategy_identity_missing": (
         "USER_POLICY", "user_policy_configuration", False, False, 1,
@@ -724,6 +765,10 @@ _ACQUISITION_CONTRACTS: dict[
     "fatigue_budget_unknown": (
         "RESOURCE", "existing_read_only_resource_observer", False, False, 1,
         "fatigue balance and reserve are required",
+    ),
+    "fatigue_cost_unknown": (
+        "TASK_COST", "task_cost_read_only_observer", None, None, 2,
+        "fatigue cost per run must be observed independently of resource cost",
     ),
 }
 
@@ -806,7 +851,7 @@ def _empty_result(
 
 def _candidate_missing(
     candidate: ActionSummaryPolicyPrerequisiteModel,
-    objective: AdvisoryObjective,
+    profile: ActionSummaryAdvisoryPolicyProfile,
 ) -> tuple[str, ...]:
     missing: list[str] = []
     identity = candidate.task_identity
@@ -846,21 +891,48 @@ def _candidate_missing(
     ):
         missing.append("fatigue_budget_unknown")
     if (
+        fatigue.fatigue_cost_applicable is None
+        or fatigue.fatigue_cost_per_run is None
+        or not fatigue.fatigue_unit_id
+        or fatigue.fatigue_unit_id == "UNKNOWN"
+    ):
+        missing.append("fatigue_cost_unknown")
+    if (
         not candidate.strategy.strategy_id
         or not candidate.strategy.strategy_version
         or candidate.strategy.provenance is None
         or candidate.strategy.max_task_executions <= 0
     ):
         missing.append("strategy_identity_missing")
-    if objective is AdvisoryObjective.MAXIMIZE_PRIORITY_REWARD:
-        reward = candidate.reward_target
-        if (
-            reward.status is not PrerequisiteFactStatus.KNOWN
-            or not reward.reward_target_id
-            or reward.candidate_reward_amount is None
-        ):
-            missing.append("reward_target_unknown")
+    reward = candidate.reward_target
+    reward_unknown = (
+        reward.status is not PrerequisiteFactStatus.KNOWN
+        or not reward.reward_target_id
+        or reward.candidate_reward_amount is None
+    )
+    if reward_unknown and (
+        profile.objective is AdvisoryObjective.MAXIMIZE_PRIORITY_REWARD
+        or not profile.allow_unknown_reward
+    ):
+        missing.append("reward_target_unknown")
     return _deduplicate(missing)
+
+
+def _candidate_ineligibility(
+    candidate: ActionSummaryPolicyPrerequisiteModel,
+) -> str | None:
+    if candidate.candidate_task_state != "available":
+        return "candidate_task_not_available"
+    strategy = candidate.strategy
+    strategy_complete = bool(
+        strategy.strategy_id
+        and strategy.strategy_version
+        and strategy.provenance is not None
+        and strategy.max_task_executions > 0
+    )
+    if strategy_complete and not candidate.candidate_execution_supported:
+        return "candidate_execution_unsupported"
+    return None
 
 
 def _run_count(
@@ -870,17 +942,24 @@ def _run_count(
     attempts = candidate.remaining_attempts.remaining_attempts
     resource = candidate.resource_balance
     fatigue = candidate.fatigue_budget
-    cost = resource.unit_cost
+    resource_cost = resource.unit_cost
+    fatigue_cost = fatigue.fatigue_cost_per_run
     if any(value is None for value in (
         attempts,
         resource.available_amount,
-        cost,
+        resource_cost,
         fatigue.available_fatigue,
         fatigue.reserved_fatigue,
         fatigue.max_policy_spend,
+        fatigue.fatigue_cost_applicable,
+        fatigue_cost,
     )):
         return None
-    if cost <= 0 or candidate.strategy.max_task_executions <= 0:
+    if resource_cost <= 0 or candidate.strategy.max_task_executions <= 0:
+        return None
+    if fatigue.fatigue_cost_applicable and fatigue_cost <= 0:
+        return None
+    if not fatigue.fatigue_cost_applicable and fatigue_cost != 0:
         return None
     resource_budget = max(
         0, resource.available_amount - profile.minimum_resource_reserve
@@ -893,14 +972,15 @@ def _run_count(
         ),
         fatigue.max_policy_spend,
     )
-    limits = (
+    limits = [
         attempts,
         profile.maximum_task_runs,
-        profile.maximum_total_cost // cost,
-        resource_budget // cost,
-        fatigue_budget // cost,
+        profile.maximum_total_cost // resource_cost,
+        resource_budget // resource_cost,
         candidate.strategy.max_task_executions,
-    )
+    ]
+    if fatigue.fatigue_cost_applicable:
+        limits.append(fatigue_budget // fatigue_cost)
     return min(limits)
 
 
@@ -950,8 +1030,8 @@ def _sort_key(
     if profile.objective is AdvisoryObjective.MAXIMIZE_PRIORITY_REWARD:
         return (_reward_rank(candidate, profile), -attempts, cost, page_order, *tie)
     if profile.objective is AdvisoryObjective.MAXIMIZE_AVAILABLE_ATTEMPTS:
-        return (-attempts, _reward_rank(candidate, profile), cost, page_order, *tie)
-    return (cost, _reward_rank(candidate, profile), page_order, *tie)
+        return (-attempts, cost, page_order, *tie)
+    return (cost, page_order, *tie)
 
 
 def evaluate_action_summary_policy_advisory(
@@ -1050,22 +1130,18 @@ def evaluate_action_summary_policy_advisory(
             block_reasons=("balanced_weights_missing",),
             reason_codes=("balanced_weights_missing",),
         )
-    if runtime_input.policy_input_readiness is not PolicyInputReadiness.READY_FOR_POLICY_EVALUATION:
-        return _empty_result(
-            runtime_input=runtime_input,
-            provenance=provenance,
-            status=AdvisoryPolicyStatus.BLOCKED_MISSING_FACTS,
-            profile=profile,
-            policy_fingerprint=profile.policy_fingerprint,
-            missing_facts=baseline_missing,
-            block_reasons=runtime_input.reason_codes,
-            reason_codes=runtime_input.reason_codes,
-        )
     strategy_bindings = {
         (candidate.strategy.strategy_id, candidate.strategy.strategy_version)
         for candidate in runtime_input.candidate_prerequisites
+        if candidate.strategy.strategy_id and candidate.strategy.strategy_version
     }
-    if strategy_bindings != {(profile.strategy_id, profile.strategy_version)}:
+    complete_strategy_binding = all(
+        candidate.strategy.strategy_id and candidate.strategy.strategy_version
+        for candidate in runtime_input.candidate_prerequisites
+    )
+    if complete_strategy_binding and strategy_bindings != {
+        (profile.strategy_id, profile.strategy_version)
+    }:
         return _empty_result(
             runtime_input=runtime_input, provenance=provenance,
             status=AdvisoryPolicyStatus.BLOCKED_POLICY_INVALID,
@@ -1086,6 +1162,21 @@ def evaluate_action_summary_policy_advisory(
 
     candidates = list(enumerate(runtime_input.candidate_prerequisites))
     if profile.objective is AdvisoryObjective.FIXED_TASK:
+        if any(
+            candidate.task_identity.status is not PrerequisiteFactStatus.KNOWN
+            or not candidate.task_identity.task_semantic_id
+            for _index, candidate in candidates
+        ):
+            return _empty_result(
+                runtime_input=runtime_input,
+                provenance=provenance,
+                status=AdvisoryPolicyStatus.BLOCKED_MISSING_FACTS,
+                profile=profile,
+                policy_fingerprint=profile.policy_fingerprint,
+                missing_facts=("task_identity_unknown",),
+                block_reasons=("task_identity_unknown",),
+                reason_codes=("task_identity_unknown",),
+            )
         preferred = set(profile.preferred_task_ids)
         matches = [
             pair for pair in candidates
@@ -1114,9 +1205,28 @@ def evaluate_action_summary_policy_advisory(
         pair for pair in candidates
         if pair[1].task_identity.task_semantic_id not in profile.excluded_task_ids
     ]
+    filtered_reasons: list[str] = []
+    eligible_candidates: list[tuple[int, ActionSummaryPolicyPrerequisiteModel]] = []
+    for pair in candidates:
+        reason = _candidate_ineligibility(pair[1])
+        if reason is None:
+            eligible_candidates.append(pair)
+        else:
+            filtered_reasons.append(reason)
+    candidates = eligible_candidates
+    if not candidates:
+        return _empty_result(
+            runtime_input=runtime_input,
+            provenance=provenance,
+            status=AdvisoryPolicyStatus.NO_ELIGIBLE_TASK,
+            profile=profile,
+            policy_fingerprint=profile.policy_fingerprint,
+            block_reasons=filtered_reasons or ("no_eligible_task",),
+            reason_codes=filtered_reasons or ("no_eligible_task",),
+        )
     all_missing: list[str] = []
     for _index, candidate in candidates:
-        all_missing.extend(_candidate_missing(candidate, profile.objective))
+        all_missing.extend(_candidate_missing(candidate, profile))
     if all_missing:
         return _empty_result(
             runtime_input=runtime_input,
@@ -1143,7 +1253,6 @@ def evaluate_action_summary_policy_advisory(
             )
 
     eligible: list[tuple[int, ActionSummaryPolicyPrerequisiteModel, int]] = []
-    filtered_reasons: list[str] = []
     for index, candidate in candidates:
         attempts = candidate.remaining_attempts.remaining_attempts
         cost = candidate.resource_balance.unit_cost

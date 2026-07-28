@@ -35,6 +35,16 @@ from tests.action_summary_product_model_test import Frame, item, trusted_items
 
 
 def policy_document(*, rewards: list[dict] | None = None) -> dict:
+    configured_rewards = rewards if rewards is not None else [
+        {
+            "task_semantic_id": "TASK_A",
+            "reward_amount_per_execution": 30,
+        },
+        {
+            "task_semantic_id": "TASK_B",
+            "reward_amount_per_execution": 25,
+        },
+    ]
     return {
         "ActionSummaryPolicy": {
             "schema_version": "1.0",
@@ -51,15 +61,15 @@ def policy_document(*, rewards: list[dict] | None = None) -> dict:
             "reward_target_amount": 100,
             "reserved_fatigue": 20,
             "max_policy_spend": 80,
-            "candidate_rewards": rewards if rewards is not None else [
+            "candidate_rewards": configured_rewards,
+            "candidate_fatigue_costs": [
                 {
-                    "task_semantic_id": "TASK_A",
-                    "reward_amount_per_execution": 30,
-                },
-                {
-                    "task_semantic_id": "TASK_B",
-                    "reward_amount_per_execution": 25,
-                },
+                    "task_semantic_id": item["task_semantic_id"],
+                    "fatigue_unit_id": "FATIGUE",
+                    "fatigue_cost_per_run": 10 + index,
+                    "fatigue_cost_applicable": True,
+                }
+                for index, item in enumerate(configured_rewards)
             ],
         }
     }
@@ -74,6 +84,7 @@ def observation(**changes) -> ActionSummaryRuntimeResourceObservation:
         "valid_until": "2026-07-26T12:05:00+08:00",
         "resource_id": "FATIGUE",
         "available_amount": 120,
+        "fatigue_unit_id": "FATIGUE",
         "available_fatigue": 120,
         "evidence_ids": ("resource-hud-9",),
     }
@@ -127,6 +138,8 @@ def test_real_page_facts_and_user_policy_assemble_all_candidates():
     assert first.reward_target.candidate_reward_amount == 30
     assert second.reward_target.candidate_reward_amount == 25
     assert first.fatigue_budget.provenance.source is FactSource.RUNTIME_ASSEMBLED
+    assert first.fatigue_budget.fatigue_cost_per_run == 10
+    assert second.fatigue_budget.fatigue_cost_per_run == 11
 
 
 def test_assembly_stops_before_business_policy_or_execution():
@@ -226,6 +239,44 @@ def test_candidate_reward_must_be_configured_for_every_visible_candidate():
     assert result.status is RuntimeInputAssemblyStatus.BLOCKED_USER_CONFIG
     assert "reward_target_unknown" in result.reason_codes
     assert result.candidate_prerequisites[1].reward_target.status.value == "UNKNOWN"
+
+
+def test_missing_candidate_fatigue_cost_remains_an_explicit_unknown_fact():
+    policy = policy_document()
+    policy["ActionSummaryPolicy"].pop("candidate_fatigue_costs")
+
+    result = assemble(policy=policy)
+
+    assert result.status is RuntimeInputAssemblyStatus.BLOCKED_RUNTIME_FACTS
+    assert "fatigue_cost_unknown" in result.missing_runtime_inputs
+    assert all(
+        candidate.fatigue_budget.fatigue_cost_per_run is None
+        for candidate in result.candidate_prerequisites
+    )
+
+
+def test_resource_and_fatigue_unit_identities_are_assembled_independently():
+    result = assemble(resource=observation(
+        resource_id="ACTIVITY_TOKEN",
+        fatigue_unit_id="STAMINA",
+    ))
+
+    assert result.status is RuntimeInputAssemblyStatus.READY_FOR_POLICY_EVALUATION
+    assert all(
+        candidate.resource_balance.resource_id == "ACTIVITY_TOKEN"
+        and candidate.fatigue_budget.fatigue_unit_id == "STAMINA"
+        for candidate in result.candidate_prerequisites
+    )
+
+
+def test_invalid_non_applicable_fatigue_cost_contract_is_rejected():
+    policy = policy_document()
+    entry = policy["ActionSummaryPolicy"]["candidate_fatigue_costs"][0]
+    entry["fatigue_cost_applicable"] = False
+    entry["fatigue_cost_per_run"] = 1
+
+    with pytest.raises(ValueError, match="fatigue_cost_contract_invalid"):
+        parse_action_summary_user_policy_config(policy)
 
 
 def test_overlay_or_unknown_page_blocks_before_policy_evaluation():
