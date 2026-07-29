@@ -92,6 +92,7 @@ class FactAcquisitionRequest:
     requires_business_input: bool
     priority: int
     reason: str
+    target_subject_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

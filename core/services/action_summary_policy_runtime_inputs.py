@@ -160,6 +160,8 @@ class ActionSummaryRuntimeInputAssembly:
     authorization_issued: bool
     business_dispatches: int
     irreversible_actions: int
+    scoped_acquired_fact_instance_keys: tuple[str, ...] = ()
+    scoped_acquired_fact_rejections: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -209,6 +211,12 @@ class ActionSummaryRuntimeInputAssembly:
             "authorization_issued": self.authorization_issued,
             "business_dispatches": self.business_dispatches,
             "irreversible_actions": self.irreversible_actions,
+            "scoped_acquired_fact_instance_keys": list(
+                self.scoped_acquired_fact_instance_keys
+            ),
+            "scoped_acquired_fact_rejections": list(
+                self.scoped_acquired_fact_rejections
+            ),
         }
 
     def matches_policy_config(
@@ -600,11 +608,131 @@ def _resource_observation_errors(
     return tuple(errors)
 
 
+def _scope_value(value: object) -> str:
+    candidate = getattr(value, "value", value)
+    return str(candidate)
+
+
+def _scoped_resource_costs(
+    model: ActionSummaryPageModel,
+    acquired_facts: Sequence[object],
+    *,
+    assembled_at: str,
+) -> tuple[dict[str, int], tuple[str, ...], tuple[str, ...]]:
+    """Validate and bind cost facts by stable card key, never page order."""
+
+    # Local import avoids an import cycle: the acquisition module exposes the
+    # canonical validator and itself consumes the advisory request model.
+    from .action_summary_missing_fact_acquisition import (
+        FACT_ACQUISITION_CONTRACTS,
+        validate_acquired_fact,
+    )
+
+    card_keys = {card.card_match_key for card in model.task_cards}
+    candidates: dict[str, set[int]] = {}
+    instance_keys: dict[str, str] = {}
+    rejections: list[str] = []
+    for fact in acquired_facts:
+        if getattr(fact, "fact_id", None) != "resource_cost_unknown":
+            continue
+        policy_fingerprint = getattr(fact, "policy_fingerprint", None)
+        runtime_fingerprint = getattr(fact, "runtime_input_fingerprint", None)
+        validation_reason = None
+        try:
+            validation_reason = validate_acquired_fact(
+                fact,
+                FACT_ACQUISITION_CONTRACTS["resource_cost_unknown"],
+                policy_fingerprint or ("0" * 64),
+                runtime_fingerprint or ("0" * 64),
+                assembled_at,
+            )
+        except (AttributeError, TypeError, ValueError):
+            validation_reason = "invalid_shape"
+        if validation_reason is not None:
+            rejections.append(
+                f"scoped_resource_cost_fact_invalid:{validation_reason}"
+            )
+            continue
+        subject_key = str(getattr(fact, "subject_key", "") or "").strip()
+        instance_key = str(
+            getattr(fact, "fact_instance_key", "") or ""
+        ).strip()
+        expected_instance_key = (
+            f"resource_cost_unknown:TASK_CARD:{subject_key}"
+        )
+        if _scope_value(getattr(fact, "subject_scope", "")) != "TASK_CARD":
+            rejections.append("scoped_resource_cost_scope_invalid")
+            continue
+        if not subject_key or instance_key != expected_instance_key:
+            rejections.append("scoped_resource_cost_instance_key_invalid")
+            continue
+        if subject_key not in card_keys:
+            rejections.append(
+                f"scoped_resource_cost_unexpected_card:{subject_key}"
+            )
+            continue
+        if getattr(fact, "source_fingerprint", None) != model.source_frame_sha256:
+            rejections.append(
+                f"scoped_resource_cost_frame_mismatch:{subject_key}"
+            )
+            continue
+        provenance = tuple(getattr(fact, "provenance_ids", ()) or ())
+        if (
+            f"capture_id:{model.source_capture_id}" not in provenance
+            or f"frame_sha256:{model.source_frame_sha256}" not in provenance
+            or f"card_match_key:{subject_key}" not in provenance
+        ):
+            rejections.append(
+                f"scoped_resource_cost_provenance_invalid:{subject_key}"
+            )
+            continue
+        value_reader = getattr(fact, "value", None)
+        try:
+            value = value_reader() if callable(value_reader) else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            value = None
+        if not isinstance(value, Mapping):
+            rejections.append(
+                f"scoped_resource_cost_value_invalid:{subject_key}"
+            )
+            continue
+        cost = value.get("resource_cost_per_run")
+        if (
+            value.get("card_match_key") != subject_key
+            or not _exact_int(cost)
+            or cost < 0
+        ):
+            rejections.append(
+                f"scoped_resource_cost_value_invalid:{subject_key}"
+            )
+            continue
+        candidates.setdefault(subject_key, set()).add(cost)
+        instance_keys[subject_key] = instance_key
+
+    resolved: dict[str, int] = {}
+    accepted_instances: list[str] = []
+    for subject_key in sorted(candidates):
+        values = candidates[subject_key]
+        if len(values) != 1:
+            rejections.append(
+                f"scoped_resource_cost_conflict:{subject_key}"
+            )
+            continue
+        resolved[subject_key] = next(iter(values))
+        accepted_instances.append(instance_keys[subject_key])
+    return (
+        resolved,
+        tuple(accepted_instances),
+        tuple(sorted(set(rejections))),
+    )
+
+
 def _unknown_inputs(
     model: ActionSummaryPageModel,
     card: ActionSummaryTaskCard,
     config: ActionSummaryUserPolicyConfig | None,
     observation: ActionSummaryRuntimeResourceObservation | None,
+    scoped_resource_costs: Mapping[str, int] | None = None,
 ) -> ActionSummaryPolicyPrerequisiteInput:
     page_provenance = _page_provenance(model, card)
     observed_provenance = _observed_provenance(observation)
@@ -628,6 +756,7 @@ def _unknown_inputs(
     resource_known = observation is not None and observed_provenance is not None
     reward_known = config is not None and reward_amount is not None
     fatigue_known = resource_known and config is not None
+    scoped_cost = (scoped_resource_costs or {}).get(card.card_match_key)
     return ActionSummaryPolicyPrerequisiteInput(
         task_identity=task_identity_from_page_model(model, card.card_match_key),
         remaining_attempts=RemainingAttemptsFact(
@@ -648,7 +777,11 @@ def _unknown_inputs(
             available_amount=(
                 observation.available_amount if resource_known else None
             ),
-            unit_cost=card.cost if resource_known else None,
+            unit_cost=(
+                scoped_cost
+                if scoped_cost is not None
+                else (card.cost if resource_known else None)
+            ),
             provenance=observed_provenance if resource_known else None,
         ),
         reward_target=RewardTargetFact(
@@ -857,6 +990,7 @@ def assemble_action_summary_policy_runtime_inputs(
     resource_observation: ActionSummaryRuntimeResourceObservation | None = None,
     assembled_at: str | None = None,
     maximum_allowed_age_seconds: int = 300,
+    acquired_facts: Sequence[object] = (),
 ) -> ActionSummaryRuntimeInputAssembly:
     """Assemble validated candidate facts without evaluating or executing policy."""
 
@@ -878,6 +1012,15 @@ def assemble_action_summary_policy_runtime_inputs(
         requested_task_title_hash,
     ) = _policy_metadata(user_policy, config)
     cards = _candidate_cards(page_model)
+    (
+        scoped_resource_costs,
+        scoped_fact_instance_keys,
+        scoped_fact_rejections,
+    ) = _scoped_resource_costs(
+        page_model,
+        acquired_facts,
+        assembled_at=assembled_at,
+    )
     observation_errors = _resource_observation_errors(resource_observation)
     source_relationship, source_age_seconds = _source_relationship(
         page_model,
@@ -922,7 +1065,13 @@ def assemble_action_summary_policy_runtime_inputs(
     prerequisites = tuple(
         evaluate_action_summary_policy_prerequisites(
             page_model,
-            _unknown_inputs(page_model, card, config, usable_observation),
+            _unknown_inputs(
+                page_model,
+                card,
+                config,
+                usable_observation,
+                scoped_resource_costs,
+            ),
         )
         for card in cards
     )
@@ -934,6 +1083,7 @@ def assemble_action_summary_policy_runtime_inputs(
     if stale_resource:
         reasons.append("runtime_resource_observation_stale")
     reasons.extend(target_errors)
+    reasons.extend(scoped_fact_rejections)
     reasons.extend(
         reason
         for candidate in prerequisites
@@ -960,7 +1110,12 @@ def assemble_action_summary_policy_runtime_inputs(
     ready = status is RuntimeInputAssemblyStatus.READY_FOR_POLICY_EVALUATION
     assembly_status = (
         AssemblyIntegrityStatus.FAIL
-        if page_errors or target_errors or (config_error and not config_missing)
+        if (
+            page_errors
+            or target_errors
+            or scoped_fact_rejections
+            or (config_error and not config_missing)
+        )
         else AssemblyIntegrityStatus.PASS
     )
     if ready:
@@ -1020,6 +1175,8 @@ def assemble_action_summary_policy_runtime_inputs(
         authorization_issued=False,
         business_dispatches=0,
         irreversible_actions=0,
+        scoped_acquired_fact_instance_keys=scoped_fact_instance_keys,
+        scoped_acquired_fact_rejections=scoped_fact_rejections,
     )
 
 

@@ -44,6 +44,23 @@ class ObserverImplementationStatus(str, Enum):
     LIVE_PROVEN = "LIVE_PROVEN"
 
 
+class FactSubjectScope(str, Enum):
+    CONFIG = "CONFIG"
+    PAGE = "PAGE"
+    ACTIVITY = "ACTIVITY"
+    TASK_CARD = "TASK_CARD"
+    RESOURCE = "RESOURCE"
+    ACCOUNT = "ACCOUNT"
+    UNKNOWN = "UNKNOWN"
+
+
+class FactCardinality(str, Enum):
+    SINGLETON = "SINGLETON"
+    PER_TASK_CARD = "PER_TASK_CARD"
+    PER_RESOURCE = "PER_RESOURCE"
+    SET = "SET"
+
+
 @dataclass(frozen=True, slots=True)
 class FactAcquisitionContract:
     fact_id: str
@@ -68,11 +85,16 @@ class FactAcquisitionContract:
     provenance_requirements: tuple[str, ...]
     failure_reason: str
     enabled: bool
+    subject_scope: FactSubjectScope
+    subject_key_source: str
+    cardinality: FactCardinality
 
     def to_dict(self) -> dict[str, object]:
         document = asdict(self)
         document["source_level"] = self.source_level.value
         document["observer_status"] = self.observer_status.value
+        document["subject_scope"] = self.subject_scope.value
+        document["cardinality"] = self.cardinality.value
         document["required_navigation_edges"] = list(
             self.required_navigation_edges
         )
@@ -149,6 +171,9 @@ class AcquiredFact:
     runtime_input_fingerprint: str | None
     provenance_ids: tuple[str, ...]
     confidence: str
+    subject_scope: FactSubjectScope
+    subject_key: str
+    fact_instance_key: str
 
     def value(self) -> object:
         return json.loads(self.value_json)
@@ -156,6 +181,7 @@ class AcquiredFact:
     def to_dict(self) -> dict[str, object]:
         document = asdict(self)
         document["source_level"] = self.source_level.value
+        document["subject_scope"] = self.subject_scope.value
         document.pop("value_json", None)
         document["value"] = self.value()
         document["provenance_ids"] = list(self.provenance_ids)
@@ -165,6 +191,7 @@ class AcquiredFact:
     def observation_id(self) -> str:
         document = asdict(self)
         document["source_level"] = self.source_level.value
+        document["subject_scope"] = self.subject_scope.value
         document["provenance_ids"] = list(self.provenance_ids)
         payload = json.dumps(
             document,
@@ -183,6 +210,29 @@ class RejectedObservation:
 
     def to_dict(self) -> dict[str, str]:
         return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class FactInstanceCoverage:
+    fact_id: str
+    subject_scope: FactSubjectScope
+    expected_subject_keys: tuple[str, ...]
+    resolved_subject_keys: tuple[str, ...]
+    unresolved_subject_keys: tuple[str, ...]
+    conflicting_subject_keys: tuple[str, ...]
+    complete: bool
+
+    def to_dict(self) -> dict[str, object]:
+        document = asdict(self)
+        document["subject_scope"] = self.subject_scope.value
+        for field in (
+            "expected_subject_keys",
+            "resolved_subject_keys",
+            "unresolved_subject_keys",
+            "conflicting_subject_keys",
+        ):
+            document[field] = list(document[field])
+        return document
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +264,10 @@ class MissingFactAcquisitionPlan:
     normalizer_only_facts: tuple[str, ...]
     not_implemented_facts: tuple[str, ...]
     conflicting_facts: tuple[str, ...]
+    resolved_fact_instances: tuple[AcquiredFact, ...]
+    unresolved_fact_instances: tuple[str, ...]
+    conflicting_fact_instances: tuple[str, ...]
+    fact_instance_coverage: tuple[FactInstanceCoverage, ...]
     rejected_observations: tuple[RejectedObservation, ...]
     deduplicated_observations: tuple[str, ...]
     accepted_observation_ids: tuple[str, ...]
@@ -271,6 +325,18 @@ class MissingFactAcquisitionPlan:
             "normalizer_only_facts": list(self.normalizer_only_facts),
             "not_implemented_facts": list(self.not_implemented_facts),
             "conflicting_facts": list(self.conflicting_facts),
+            "resolved_fact_instances": [
+                fact.to_dict() for fact in self.resolved_fact_instances
+            ],
+            "unresolved_fact_instances": list(
+                self.unresolved_fact_instances
+            ),
+            "conflicting_fact_instances": list(
+                self.conflicting_fact_instances
+            ),
+            "fact_instance_coverage": [
+                coverage.to_dict() for coverage in self.fact_instance_coverage
+            ],
             "rejected_observations": [
                 item.to_dict() for item in self.rejected_observations
             ],
@@ -321,6 +387,9 @@ def _contract(
     provenance_requirements: Sequence[str] = (),
     failure_reason: str,
     enabled: bool = True,
+    subject_scope: FactSubjectScope = FactSubjectScope.UNKNOWN,
+    subject_key_source: str = "unresolved",
+    cardinality: FactCardinality = FactCardinality.SINGLETON,
 ) -> FactAcquisitionContract:
     return FactAcquisitionContract(
         fact_id=fact_id,
@@ -345,6 +414,9 @@ def _contract(
         provenance_requirements=tuple(provenance_requirements),
         failure_reason=failure_reason,
         enabled=enabled,
+        subject_scope=subject_scope,
+        subject_key_source=subject_key_source,
+        cardinality=cardinality,
     )
 
 
@@ -361,6 +433,9 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         freshness_seconds=3600,
         provenance_requirements=("config_id", "config_version", "config_fingerprint"),
         failure_reason="objective must remain UNKNOWN until explicitly configured",
+        subject_scope=FactSubjectScope.CONFIG,
+        subject_key_source="config_fingerprint",
+        cardinality=FactCardinality.SINGLETON,
     ),
     "strategy_identity_missing": _contract(
         "strategy_identity_missing", "USER_POLICY", "versioned_strategy_config",
@@ -374,6 +449,9 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         freshness_seconds=3600,
         provenance_requirements=("strategy_id", "strategy_version", "config_fingerprint"),
         failure_reason="strategy identity cannot be inferred from legacy task lists",
+        subject_scope=FactSubjectScope.CONFIG,
+        subject_key_source="config_fingerprint",
+        cardinality=FactCardinality.SINGLETON,
     ),
     "strategy_provenance_missing": _contract(
         "strategy_provenance_missing", "USER_POLICY", "versioned_strategy_config",
@@ -387,6 +465,9 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         freshness_seconds=3600,
         provenance_requirements=("strategy_source", "config_fingerprint"),
         failure_reason="strategy provenance must be explicit and fingerprint-bound",
+        subject_scope=FactSubjectScope.CONFIG,
+        subject_key_source="config_fingerprint",
+        cardinality=FactCardinality.SINGLETON,
     ),
     "task_identity_unknown": _contract(
         "task_identity_unknown", "TASK_CARD", "current_page_read_only_model",
@@ -396,6 +477,9 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         observer_id="action_summary_task_card_identity_observer",
         provenance_requirements=("capture_id", "frame_sha256", "card_match_key"),
         failure_reason="a unique card-scoped semantic identity is required",
+        subject_scope=FactSubjectScope.TASK_CARD,
+        subject_key_source="card_match_key",
+        cardinality=FactCardinality.PER_TASK_CARD,
     ),
     "remaining_attempts_unknown": _contract(
         "remaining_attempts_unknown", "TASK_CARD", "task_detail_read_only_observer",
@@ -409,6 +493,9 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         provenance_requirements=("card_match_key", "detail_capture_id", "frame_sha256"),
         failure_reason="page-level attempts cannot be copied to a task card",
         enabled=False,
+        subject_scope=FactSubjectScope.TASK_CARD,
+        subject_key_source="card_match_key",
+        cardinality=FactCardinality.PER_TASK_CARD,
     ),
     "resource_identity_unknown": _contract(
         "resource_identity_unknown", "RESOURCE", "current_page_icon_name_contract",
@@ -424,6 +511,9 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         ),
         provenance_requirements=("capture_id", "frame_sha256", "icon_id", "resource_name"),
         failure_reason="resource identity requires a stable icon and name contract",
+        subject_scope=FactSubjectScope.RESOURCE,
+        subject_key_source="resource_identity",
+        cardinality=FactCardinality.PER_RESOURCE,
     ),
     "resource_balance_unknown": _contract(
         "resource_balance_unknown", "RESOURCE", "current_page_resource_balance",
@@ -439,6 +529,9 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         ),
         provenance_requirements=("capture_id", "frame_sha256", "resource_identity"),
         failure_reason="absence of an insufficiency warning is not a balance",
+        subject_scope=FactSubjectScope.RESOURCE,
+        subject_key_source="resource_identity",
+        cardinality=FactCardinality.PER_RESOURCE,
     ),
     "runtime_resource_observation_missing": _contract(
         "runtime_resource_observation_missing", "RESOURCE", "existing_runtime_resource_snapshot",
@@ -446,6 +539,9 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         observer_id="action_summary_runtime_resource_snapshot_observer",
         provenance_requirements=("capture_id", "frame_sha256", "valid_until"),
         failure_reason="a fresh runtime resource snapshot is required",
+        subject_scope=FactSubjectScope.RESOURCE,
+        subject_key_source="resource_identity",
+        cardinality=FactCardinality.PER_RESOURCE,
     ),
     "reward_target_unknown": _contract(
         "reward_target_unknown", "TASK_REWARD", "current_page_task_bound_reward",
@@ -461,6 +557,9 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         ),
         provenance_requirements=("capture_id", "frame_sha256", "card_match_key", "reward_identity"),
         failure_reason="a catalog reward is not a live task-bound reward fact",
+        subject_scope=FactSubjectScope.TASK_CARD,
+        subject_key_source="card_match_key",
+        cardinality=FactCardinality.PER_TASK_CARD,
     ),
     "fatigue_budget_unknown": _contract(
         "fatigue_budget_unknown", "FATIGUE", "explicit_fatigue_config_or_state",
@@ -474,6 +573,9 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         freshness_seconds=3600,
         provenance_requirements=("config_fingerprint", "fatigue_unit_id", "available_fatigue"),
         failure_reason="fatigue budget must come from explicit config or state",
+        subject_scope=FactSubjectScope.CONFIG,
+        subject_key_source="config_fingerprint",
+        cardinality=FactCardinality.SINGLETON,
     ),
     "fatigue_cost_unknown": _contract(
         "fatigue_cost_unknown", "TASK_COST", "explicit_task_fatigue_config",
@@ -487,6 +589,9 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         freshness_seconds=3600,
         provenance_requirements=("config_fingerprint", "fatigue_unit_id", "fatigue_cost_per_run"),
         failure_reason="fatigue cost must be independent from resource cost",
+        subject_scope=FactSubjectScope.CONFIG,
+        subject_key_source="config_fingerprint",
+        cardinality=FactCardinality.SINGLETON,
     ),
     "resource_cost_unknown": _contract(
         "resource_cost_unknown", "TASK_COST", "current_page_resource_cost",
@@ -507,6 +612,9 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
             "resource cost requires an exact non-negative value bound to one "
             "fresh task card; resource identity may remain UNKNOWN"
         ),
+        subject_scope=FactSubjectScope.TASK_CARD,
+        subject_key_source="card_match_key",
+        cardinality=FactCardinality.PER_TASK_CARD,
     ),
     "recommended_run_count_limit_unknown": _contract(
         "recommended_run_count_limit_unknown", "USER_POLICY", "explicit_user_policy_config",
@@ -514,6 +622,9 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         observer_id="action_summary_policy_config_observer",
         provenance_requirements=("config_fingerprint", "maximum_task_runs"),
         failure_reason="run count limit must be explicit",
+        subject_scope=FactSubjectScope.CONFIG,
+        subject_key_source="config_fingerprint",
+        cardinality=FactCardinality.SINGLETON,
     ),
 }
 
@@ -654,6 +765,52 @@ def parse_action_summary_acquisition_policy_config(
     return replace(normalized, config_fingerprint=_canonical_hash(payload))
 
 
+def fact_instance_key(
+    fact_id: str,
+    subject_scope: FactSubjectScope,
+    subject_key: str,
+) -> str:
+    normalized_fact_id = _text(fact_id, "fact_id")
+    if not isinstance(subject_scope, FactSubjectScope):
+        raise ValueError("fact_subject_scope_invalid")
+    normalized_subject_key = _text(subject_key, "fact_subject_key")
+    return ":".join((
+        normalized_fact_id,
+        subject_scope.value,
+        normalized_subject_key,
+    ))
+
+
+def _fact_subject_key(
+    contract: FactAcquisitionContract,
+    value: object,
+    *,
+    policy_fingerprint: str | None,
+    source_fingerprint: str,
+) -> str:
+    mapping = value if isinstance(value, Mapping) else {}
+    if contract.subject_scope is FactSubjectScope.CONFIG:
+        return _text(policy_fingerprint, "fact_subject_key")
+    if contract.subject_scope is FactSubjectScope.PAGE:
+        return _text(source_fingerprint, "fact_subject_key")
+    if contract.subject_scope is FactSubjectScope.ACTIVITY:
+        return _text(mapping.get("activity_family"), "fact_subject_key")
+    if contract.subject_scope is FactSubjectScope.TASK_CARD:
+        return _text(mapping.get("card_match_key"), "fact_subject_key")
+    if contract.subject_scope is FactSubjectScope.RESOURCE:
+        resource_id = mapping.get("resource_id")
+        if _has_text(resource_id) and resource_id != "UNKNOWN":
+            return str(resource_id).strip()
+        icon_id = mapping.get("resource_icon_id")
+        resource_name = mapping.get("resource_name")
+        if _has_text(icon_id) and _has_text(resource_name):
+            return f"{str(icon_id).strip()}:{str(resource_name).strip()}"
+        raise ValueError("fact_subject_key_missing")
+    if contract.subject_scope is FactSubjectScope.ACCOUNT:
+        return _text(mapping.get("account_id"), "fact_subject_key")
+    raise ValueError("fact_subject_scope_unknown")
+
+
 def _fact(
     *,
     fact_id: str,
@@ -668,6 +825,12 @@ def _fact(
     provenance_ids: Sequence[str],
 ) -> AcquiredFact:
     contract = FACT_ACQUISITION_CONTRACTS[fact_id]
+    subject_key = _fact_subject_key(
+        contract,
+        value,
+        policy_fingerprint=policy_fingerprint,
+        source_fingerprint=source_fingerprint,
+    )
     return AcquiredFact(
         schema_version=_SCHEMA_VERSION,
         output_schema=contract.output_schema,
@@ -684,6 +847,11 @@ def _fact(
         runtime_input_fingerprint=runtime_input_fingerprint,
         provenance_ids=tuple(provenance_ids),
         confidence="EXPLICIT",
+        subject_scope=contract.subject_scope,
+        subject_key=subject_key,
+        fact_instance_key=fact_instance_key(
+            fact_id, contract.subject_scope, subject_key
+        ),
     )
 
 
@@ -980,6 +1148,18 @@ def validate_acquired_fact(
 
     if fact.fact_id != contract.fact_id:
         return "fact_id_mismatch"
+    if fact.subject_scope is not contract.subject_scope:
+        return "subject_scope_mismatch"
+    if not _has_text(fact.subject_key):
+        return "subject_key_missing"
+    try:
+        expected_instance_key = fact_instance_key(
+            fact.fact_id, fact.subject_scope, fact.subject_key
+        )
+    except ValueError:
+        return "fact_instance_key_invalid"
+    if fact.fact_instance_key != expected_instance_key:
+        return "fact_instance_key_mismatch"
     if not contract.enabled:
         return "contract_disabled"
     if fact.schema_version != _SCHEMA_VERSION:
@@ -1023,8 +1203,28 @@ def validate_acquired_fact(
         return "runtime_fingerprint_mismatch"
     if not _fact_value_valid(fact):
         return "fact_value_invalid"
+    try:
+        fact_value = _fact_value_mapping(fact)
+    except ValueError:
+        return "fact_value_invalid"
     if not _provenance_complete(fact, contract):
         return "provenance_incomplete"
+    if contract.subject_scope is FactSubjectScope.TASK_CARD and (
+        fact_value.get("card_match_key") != fact.subject_key
+    ):
+        return "subject_key_value_mismatch"
+    if contract.subject_scope is FactSubjectScope.RESOURCE:
+        try:
+            derived_subject_key = _fact_subject_key(
+                contract,
+                fact_value,
+                policy_fingerprint=fact.policy_fingerprint,
+                source_fingerprint=fact.source_fingerprint,
+            )
+        except ValueError:
+            return "subject_key_missing"
+        if derived_subject_key != fact.subject_key:
+            return "subject_key_value_mismatch"
     return None
 
 
@@ -1056,6 +1256,23 @@ def _observer_callable_exists(callable_id: str) -> bool:
 
 
 def _validate_contract(contract: FactAcquisitionContract) -> bool:
+    if (
+        not isinstance(contract.subject_scope, FactSubjectScope)
+        or contract.subject_scope is FactSubjectScope.UNKNOWN
+        or not _has_text(contract.subject_key_source)
+        or not isinstance(contract.cardinality, FactCardinality)
+    ):
+        return False
+    if (
+        contract.cardinality is FactCardinality.PER_TASK_CARD
+        and contract.subject_scope is not FactSubjectScope.TASK_CARD
+    ):
+        return False
+    if (
+        contract.cardinality is FactCardinality.PER_RESOURCE
+        and contract.subject_scope is not FactSubjectScope.RESOURCE
+    ):
+        return False
     if (
         contract.observer_status is ObserverImplementationStatus.NOT_IMPLEMENTED
         and contract.observer_callable_id is not None
@@ -1109,7 +1326,15 @@ def build_missing_fact_acquisition_plan(
             invalid.append(contract.fact_id)
         contracts.append(contract)
 
-    requested_ids = tuple(contract.fact_id for contract in contracts)
+    requested_ids = tuple(dict.fromkeys(
+        contract.fact_id for contract in contracts
+    ))
+    request_by_id = {
+        request.missing_fact: request for request in ordered_requests
+    }
+    contract_by_id = {
+        contract.fact_id: contract for contract in contracts
+    }
     grouped: dict[str, list[AcquiredFact]] = {}
     rejected: list[RejectedObservation] = []
     for observation in observations:
@@ -1130,16 +1355,28 @@ def build_missing_fact_acquisition_plan(
                 reason=rejection,
             ))
             continue
-        grouped.setdefault(observation.fact_id, []).append(observation)
+        request = request_by_id[observation.fact_id]
+        expected_subject_keys = tuple(dict.fromkeys(
+            key.strip()
+            for key in request.target_subject_keys
+            if isinstance(key, str) and key.strip()
+        ))
+        if expected_subject_keys and observation.subject_key not in expected_subject_keys:
+            rejected.append(RejectedObservation(
+                fact_id=observation.fact_id,
+                observation_id=observation.observation_id,
+                reason="unexpected_subject_key",
+            ))
+            continue
+        grouped.setdefault(observation.fact_instance_key, []).append(observation)
 
-    by_fact: dict[str, AcquiredFact] = {}
-    conflicting: list[str] = []
+    by_instance: dict[str, AcquiredFact] = {}
+    conflicting_instances: list[str] = []
     deduplicated: list[str] = []
     accepted_ids: list[str] = []
-    for fact_id in requested_ids:
-        candidates = grouped.get(fact_id, [])
-        if not candidates:
-            continue
+    for instance_key in sorted(grouped):
+        candidates = grouped[instance_key]
+        fact_id = candidates[0].fact_id
         by_value: dict[str, list[AcquiredFact]] = {}
         for candidate in candidates:
             canonical_value = json.dumps(
@@ -1150,7 +1387,7 @@ def build_missing_fact_acquisition_plan(
             )
             by_value.setdefault(canonical_value, []).append(candidate)
         if len(by_value) != 1:
-            conflicting.append(fact_id)
+            conflicting_instances.append(instance_key)
             rejected.extend(
                 RejectedObservation(
                     fact_id=fact_id,
@@ -1171,14 +1408,87 @@ def build_missing_fact_acquisition_plan(
             for provenance in candidate.provenance_ids
         }))
         winner = replace(winner, provenance_ids=corroborating)
-        by_fact[fact_id] = winner
+        by_instance[instance_key] = winner
         accepted_ids.append(winner.observation_id)
         deduplicated.extend(
             candidate.observation_id for candidate in equivalent[:-1]
         )
 
-    resolved = tuple(by_fact[fact_id] for fact_id in requested_ids if fact_id in by_fact)
-    unresolved = tuple(fact_id for fact_id in requested_ids if fact_id not in by_fact)
+    coverage_items: list[FactInstanceCoverage] = []
+    unresolved_instances: list[str] = []
+    for fact_id in requested_ids:
+        contract = contract_by_id[fact_id]
+        request = request_by_id[fact_id]
+        observed_subject_keys = tuple(sorted({
+            candidate.subject_key
+            for candidates in grouped.values()
+            for candidate in candidates
+            if candidate.fact_id == fact_id
+        }))
+        requested_subject_keys = tuple(sorted(dict.fromkeys(
+            key.strip()
+            for key in request.target_subject_keys
+            if isinstance(key, str) and key.strip()
+        )))
+        if requested_subject_keys:
+            expected_subject_keys = requested_subject_keys
+        elif observed_subject_keys:
+            expected_subject_keys = observed_subject_keys
+        elif contract.cardinality is FactCardinality.SINGLETON:
+            expected_subject_keys = ("UNSPECIFIED",)
+        else:
+            expected_subject_keys = ()
+        resolved_subject_keys = tuple(
+            subject_key
+            for subject_key in expected_subject_keys
+            if fact_instance_key(
+                fact_id, contract.subject_scope, subject_key
+            ) in by_instance
+        )
+        conflicting_subject_keys = tuple(
+            subject_key
+            for subject_key in expected_subject_keys
+            if fact_instance_key(
+                fact_id, contract.subject_scope, subject_key
+            ) in conflicting_instances
+        )
+        unresolved_subject_keys = tuple(
+            subject_key
+            for subject_key in expected_subject_keys
+            if subject_key not in resolved_subject_keys
+            and subject_key not in conflicting_subject_keys
+        )
+        unresolved_instances.extend(
+            fact_instance_key(fact_id, contract.subject_scope, subject_key)
+            for subject_key in unresolved_subject_keys
+        )
+        coverage_items.append(FactInstanceCoverage(
+            fact_id=fact_id,
+            subject_scope=contract.subject_scope,
+            expected_subject_keys=expected_subject_keys,
+            resolved_subject_keys=resolved_subject_keys,
+            unresolved_subject_keys=unresolved_subject_keys,
+            conflicting_subject_keys=conflicting_subject_keys,
+            complete=bool(expected_subject_keys) and not (
+                unresolved_subject_keys or conflicting_subject_keys
+            ),
+        ))
+
+    fact_order = {fact_id: index for index, fact_id in enumerate(requested_ids)}
+    resolved = tuple(sorted(
+        by_instance.values(),
+        key=lambda fact: (fact_order[fact.fact_id], fact.subject_key),
+    ))
+    unresolved = tuple(
+        coverage.fact_id
+        for coverage in coverage_items
+        if not coverage.complete
+    )
+    conflicting = tuple(
+        coverage.fact_id
+        for coverage in coverage_items
+        if coverage.conflicting_subject_keys
+    )
 
     def facts_at(level: FactSourceLevel, *, enabled: bool | None = None) -> tuple[str, ...]:
         return tuple(
@@ -1265,7 +1575,10 @@ def build_missing_fact_acquisition_plan(
     )
     blocked = tuple(
         [f"CONTRACT_INVALID:{fact_id}" for fact_id in invalid]
-        + [f"FACT_CONFLICT:{fact_id}" for fact_id in conflicting]
+        + [
+            f"FACT_CONFLICT:{instance_key}"
+            for instance_key in conflicting_instances
+        ]
         + [f"UNRESOLVED:{fact_id}" for fact_id in unresolved]
     )
     return MissingFactAcquisitionPlan(
@@ -1300,6 +1613,10 @@ def build_missing_fact_acquisition_plan(
         normalizer_only_facts=normalizer_only,
         not_implemented_facts=not_implemented,
         conflicting_facts=tuple(conflicting),
+        resolved_fact_instances=resolved,
+        unresolved_fact_instances=tuple(sorted(unresolved_instances)),
+        conflicting_fact_instances=tuple(sorted(conflicting_instances)),
+        fact_instance_coverage=tuple(coverage_items),
         rejected_observations=tuple(sorted(
             rejected,
             key=lambda item: (item.fact_id, item.observation_id, item.reason),
@@ -1328,12 +1645,16 @@ __all__ = [
     "ActionSummaryAcquisitionPolicyConfig",
     "CurrentActionSummaryVisualSnapshot",
     "FACT_ACQUISITION_CONTRACTS",
+    "FactCardinality",
     "FactAcquisitionContract",
+    "FactInstanceCoverage",
     "FactSourceLevel",
+    "FactSubjectScope",
     "MissingFactAcquisitionPlan",
     "ObserverImplementationStatus",
     "RejectedObservation",
     "build_missing_fact_acquisition_plan",
+    "fact_instance_key",
     "observe_action_summary_fatigue_config",
     "observe_action_summary_policy_config",
     "observe_current_action_summary_page_facts",

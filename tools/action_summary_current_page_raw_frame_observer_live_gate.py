@@ -74,7 +74,12 @@ def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="milliseconds")
 
 
-def _request(fact_id: str, priority: int) -> FactAcquisitionRequest:
+def _request(
+    fact_id: str,
+    priority: int,
+    *,
+    target_subject_keys: tuple[str, ...] = (),
+) -> FactAcquisitionRequest:
     return FactAcquisitionRequest(
         missing_fact=fact_id,
         required_scope="CURRENT_ACTION_SUMMARY_PAGE",
@@ -84,6 +89,7 @@ def _request(fact_id: str, priority: int) -> FactAcquisitionRequest:
         requires_business_input=False,
         priority=priority,
         reason="bounded live read-only observer gate",
+        target_subject_keys=target_subject_keys,
     )
 
 
@@ -93,9 +99,12 @@ def _blocked(reason: str) -> dict[str, object]:
         "BLOCK_REASON_CODES": [reason],
         "FRAME_BINDING": "NOT_RUN",
         "NO_FALSE_FACTS_EMITTED": "NOT_RUN",
-        "LIVE_RESOLVED_FACTS": [],
-        "LIVE_UNRESOLVED_FACTS": list(_FACT_IDS),
-        "LIVE_AMBIGUOUS_FACTS": [],
+        "RAW_OBSERVER_EMITTED_FACT_TYPES": [],
+        "RAW_OBSERVER_EMITTED_FACT_INSTANCE_COUNT": 0,
+        "ACQUISITION_RESOLVED_FACT_TYPES": [],
+        "ACQUISITION_RESOLVED_FACT_INSTANCE_COUNT": 0,
+        "ACQUISITION_UNRESOLVED_FACT_INSTANCES": [],
+        "ACQUISITION_CONFLICTING_FACT_INSTANCES": [],
         "LIVE_READ_ONLY_OBSERVATIONS": 0,
         "NAVIGATION_ACTIONS": 0,
         "ACTION_SUMMARY_PAGE_INPUTS": 0,
@@ -162,8 +171,22 @@ def run(*, adb_port: int = 16384) -> dict[str, object]:
         observation, runtime_input_fingerprint=runtime_fingerprint
     )
     generated_at = _now()
+    expected_card_keys = tuple(sorted(
+        card.card_match_key for card in model.task_cards
+    ))
     plan = build_missing_fact_acquisition_plan(
-        tuple(_request(fact_id, index) for index, fact_id in enumerate(_FACT_IDS, 1)),
+        tuple(
+            _request(
+                fact_id,
+                index,
+                target_subject_keys=(
+                    expected_card_keys
+                    if fact_id == "resource_cost_unknown"
+                    else ()
+                ),
+            )
+            for index, fact_id in enumerate(_FACT_IDS, 1)
+        ),
         observations=facts,
         policy_fingerprint=_POLICY_FINGERPRINT,
         runtime_input_fingerprint=runtime_fingerprint,
@@ -184,9 +207,25 @@ def run(*, adb_port: int = 16384) -> dict[str, object]:
     ambiguous = sorted({
         value.fact_type for value in observation.ambiguous_candidates
     })
-    cost_resolved = bool(observation.resource_cost_observations) and not ambiguous
-    resolved = ["resource_cost_unknown"] if cost_resolved else []
-    unresolved = [fact_id for fact_id in _FACT_IDS if fact_id not in resolved]
+    emitted_instance_keys = {
+        fact.fact_instance_key for fact in facts
+    }
+    resolved_cost_instances = tuple(
+        fact
+        for fact in plan.resolved_fact_instances
+        if fact.fact_id == "resource_cost_unknown"
+    )
+    resolved_cost_keys = {
+        fact.subject_key for fact in resolved_cost_instances
+    }
+    cost_instance_coverage_pass = bool(
+        expected_card_keys
+        and emitted_instance_keys
+        == {fact.fact_instance_key for fact in resolved_cost_instances}
+        and resolved_cost_keys == set(expected_card_keys)
+        and not plan.unresolved_fact_instances
+        and not plan.conflicting_fact_instances
+    )
     gate_pass = bool(
         observation.observation_status.startswith("PASS")
         and frame_binding
@@ -196,6 +235,7 @@ def run(*, adb_port: int = 16384) -> dict[str, object]:
         and observation.page_input_dispatches == 0
         and observation.business_dispatches == 0
         and observation.irreversible_actions == 0
+        and cost_instance_coverage_pass
     )
     return {
         "LIVE_OBSERVER_GATE": "PASS" if gate_pass else "FAIL",
@@ -203,9 +243,25 @@ def run(*, adb_port: int = 16384) -> dict[str, object]:
         "FRAME_BINDING": "PASS" if frame_binding else "FAIL",
         "NO_FALSE_FACTS_EMITTED": "YES" if not false_fact else "NO",
         "OBSERVATION_STATUS": observation.observation_status,
-        "LIVE_RESOLVED_FACTS": resolved,
-        "LIVE_UNRESOLVED_FACTS": unresolved,
-        "LIVE_AMBIGUOUS_FACTS": ambiguous,
+        "RAW_OBSERVER_AMBIGUOUS_FACT_TYPES": ambiguous,
+        "RAW_OBSERVER_EMITTED_FACT_TYPES": sorted({
+            fact.fact_id for fact in facts
+        }),
+        "RAW_OBSERVER_EMITTED_FACT_INSTANCE_COUNT": len({
+            fact.fact_instance_key for fact in facts
+        }),
+        "ACQUISITION_RESOLVED_FACT_TYPES": sorted({
+            fact.fact_id for fact in plan.resolved_fact_instances
+        }),
+        "ACQUISITION_RESOLVED_FACT_INSTANCE_COUNT": len(
+            plan.resolved_fact_instances
+        ),
+        "ACQUISITION_UNRESOLVED_FACT_INSTANCES": list(
+            plan.unresolved_fact_instances
+        ),
+        "ACQUISITION_CONFLICTING_FACT_INSTANCES": list(
+            plan.conflicting_fact_instances
+        ),
         "LIVE_READ_ONLY_OBSERVATIONS": 1,
         "UNDERLYING_OCR_CALLS": captured.underlying_ocr_calls,
         "NAVIGATION_ACTIONS": navigation_actions,

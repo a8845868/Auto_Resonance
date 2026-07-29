@@ -327,6 +327,34 @@ def test_raw_cost_normalizes_to_valid_unknown_identity_acquired_facts():
     )
 
 
+def test_three_raw_card_costs_resolve_as_three_scoped_instances():
+    observation = observe_action_summary_current_page_visuals(frame())
+    facts = normalize_raw_action_summary_visual_observation(
+        observation, runtime_input_fingerprint=RUNTIME_HASH
+    )
+    expected_keys = tuple(sorted(
+        value.card_match_key
+        for value in observation.resource_cost_observations
+    ))
+    plan = build_missing_fact_acquisition_plan(
+        (replace(
+            request("resource_cost_unknown"),
+            target_subject_keys=expected_keys,
+        ),),
+        observations=facts,
+        policy_fingerprint=POLICY_HASH,
+        runtime_input_fingerprint=RUNTIME_HASH,
+        generated_at=CAPTURED_AT.isoformat(),
+    )
+
+    assert len(plan.resolved_fact_instances) == 3
+    assert {fact.subject_key for fact in plan.resolved_fact_instances} == set(
+        expected_keys
+    )
+    assert plan.unresolved_fact_instances == ()
+    assert plan.conflicting_fact_instances == ()
+
+
 def test_resource_cost_contract_is_callable_not_normalizer_only():
     contract = FACT_ACQUISITION_CONTRACTS["resource_cost_unknown"]
 
