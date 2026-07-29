@@ -9,6 +9,7 @@ persist state, evaluate business policy, or issue authorization.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
@@ -492,17 +493,20 @@ FACT_ACQUISITION_CONTRACTS: dict[str, FactAcquisitionContract] = {
         FactSourceLevel.LEVEL_1_CURRENT_PAGE_READ_ONLY,
         required_page="ACTION_SUMMARY_VISIBLE",
         requires_capture=True,
-        observer_id="action_summary_current_page_visual_observer",
+        observer_id="action_summary_current_page_raw_frame_observer",
         observer_status=ObserverImplementationStatus.OFFLINE_PROVEN,
-        normalizer_only=True,
+        normalizer_only=False,
         observer_callable_id=(
-            "core.services.action_summary_missing_fact_acquisition."
-            "observe_current_action_summary_page_facts"
+            "core.services.action_summary_raw_frame_observer."
+            "observe_action_summary_current_page_visuals"
         ),
         provenance_requirements=(
-            "capture_id", "frame_sha256", "card_match_key", "resource_identity"
+            "capture_id", "frame_sha256", "card_match_key"
         ),
-        failure_reason="resource cost requires a task-bound resource identity",
+        failure_reason=(
+            "resource cost requires an exact non-negative value bound to one "
+            "fresh task card; resource identity may remain UNKNOWN"
+        ),
     ),
     "recommended_run_count_limit_unknown": _contract(
         "recommended_run_count_limit_unknown", "USER_POLICY", "explicit_user_policy_config",
@@ -840,16 +844,18 @@ def observe_current_action_summary_page_facts(
                 value={**identity, "available_amount": snapshot.resource_available_amount},
                 **common,
             ))
-        if snapshot.displayed_resource_cost is not None and snapshot.card_match_key:
-            facts.append(_fact(
-                fact_id="resource_cost_unknown",
-                value={
-                    **identity,
-                    "card_match_key": snapshot.card_match_key,
-                    "resource_cost_per_run": snapshot.displayed_resource_cost,
-                },
-                **common,
-            ))
+    if snapshot.displayed_resource_cost is not None and snapshot.card_match_key:
+        facts.append(_fact(
+            fact_id="resource_cost_unknown",
+            value={
+                "card_match_key": snapshot.card_match_key,
+                "resource_cost_per_run": snapshot.displayed_resource_cost,
+                "resource_id": (
+                    snapshot.resource_name if resource_identity else "UNKNOWN"
+                ),
+            },
+            **common,
+        ))
     if (
         snapshot.card_match_key
         and snapshot.reward_icon_id
@@ -1038,6 +1044,17 @@ _OBSERVER_CALLABLES = {
 }
 
 
+def _observer_callable_exists(callable_id: str) -> bool:
+    if callable_id in _OBSERVER_CALLABLES:
+        return True
+    try:
+        module_name, attribute_name = callable_id.rsplit(".", 1)
+        observer = getattr(importlib.import_module(module_name), attribute_name)
+    except (AttributeError, ImportError, ValueError):
+        return False
+    return callable(observer)
+
+
 def _validate_contract(contract: FactAcquisitionContract) -> bool:
     if (
         contract.observer_status is ObserverImplementationStatus.NOT_IMPLEMENTED
@@ -1047,7 +1064,7 @@ def _validate_contract(contract: FactAcquisitionContract) -> bool:
     if contract.observer_status is not ObserverImplementationStatus.NOT_IMPLEMENTED:
         if not contract.observer_id or not contract.observer_callable_id:
             return False
-        if contract.observer_callable_id not in _OBSERVER_CALLABLES:
+        if not _observer_callable_exists(contract.observer_callable_id):
             return False
     if contract.enabled and (
         contract.requires_page_input
