@@ -90,32 +90,16 @@ def is_top_level_hud(items: list[dict]) -> bool:
 
 def is_inventory_screen(items: list[dict]) -> bool:
     """Recognize the backpack list by its right-hand category rail."""
-    texts = _texts(items)
-    categories = (
-        "道具",
-        "材料",
-        "装备",
-        "载货",
-        "冰箱",
-        "武装",
-        "凭钥柜",
-        "信物",
-        "私人仓库",
-    )
-    matched = sum(any(category in text for text in texts) for category in categories)
-    return any("道具" in text for text in texts) and matched >= 3
+    from core.services.inventory_page_observer import InventoryPageState, observe_inventory_page
+
+    return observe_inventory_page(items).state is InventoryPageState.INVENTORY_PAGE_VISIBLE
 
 
 def is_inventory_item_detail(items: list[dict]) -> bool:
     """Separate an item detail overlay from the visually similar startup overlay."""
-    texts = _texts(items)
-    has_blank_exit = any("触碰空白区域退出" in text for text in texts)
-    has_item_metadata = any(
-        marker in text
-        for text in texts
-        for marker in ("拥有:", "拥有：", "获取途径")
-    )
-    return has_blank_exit and has_item_metadata
+    from core.services.inventory_page_observer import InventoryPageState, observe_inventory_page
+
+    return observe_inventory_page(items).state is InventoryPageState.INVENTORY_DETAIL_VISIBLE
 
 
 def startup_screen_action(items: list[dict]) -> str | None:

@@ -73,6 +73,8 @@ class CaptureEnvelope:
     instance_id: str
     adb_serial: str
     geometry_revision: str
+    capture_id_provenance: str = "PROCESS_BOUNDARY_MONOTONIC"
+    backend_native_capture_id_available: bool = False
 
 
 class _BoundControlInputExecutor:
@@ -82,7 +84,7 @@ class _BoundControlInputExecutor:
         self.__backend = backend
 
     def tap(self, physical_point: tuple[int, int]):
-        self.__backend.input_tap(int(physical_point[0]), int(physical_point[1]))
+        return self.__backend.input_tap(int(physical_point[0]), int(physical_point[1]))
 
     def swipe(
         self,
@@ -611,11 +613,11 @@ def _legacy_input_tap(
         raise StopExecution()
     offset_x = random.randint(*EXCURSIONX) if random_offset else 0
     offset_y = random.randint(*EXCURSIONY) if random_offset else 0
-    control.input_tap(
+    receipt = control.input_tap(
         int(control.ratio * pos[0] + offset_x),
         int(control.ratio * pos[1] + offset_y),
     )
-    return True
+    return receipt if receipt is not None else True
 
 
 def _linear_trajectory(
@@ -745,6 +747,30 @@ def input_tap(
         )
 
 
+def input_system_back(*, intent=None):
+    """Dispatch one Android KEYCODE_BACK outside coordinate-based input.
+
+    The caller must own the semantic precondition and bounded postcondition
+    contract.  Production read-only policy sessions do not currently issue key
+    permits, so they fail closed instead of silently converting Back to a tap.
+    """
+
+    with _BACKEND_LOCK:
+        action_policy = current_action_policy()
+        if action_policy is not None:
+            _validate_production_session(action_policy)
+            return False
+        if _READ_ONLY_FAIL_CLOSED:
+            raise PermissionError("read_only_session_policy_unavailable")
+        ensure_automation_allowed("dispatch Android system Back")
+        if STOP:
+            raise StopExecution()
+        if intent is None or getattr(intent, "action_key", None) != "close_home_sidebar":
+            return False
+        control.input_keyevent(4)
+        return True
+
+
 def screenshot() -> Image:
     """
     截图
@@ -761,6 +787,13 @@ def screenshot() -> Image:
     frame.captured_at = envelope.captured_at
     frame.backend_generation = envelope.backend_generation
     frame.instance_id = envelope.instance_id
+    frame.capture_sequence = getattr(envelope, "backend_monotonic_sequence", None)
+    frame.capture_id_provenance = getattr(
+        envelope, "capture_id_provenance", "LEGACY_UNSPECIFIED"
+    )
+    frame.backend_native_capture_id_available = bool(
+        getattr(envelope, "backend_native_capture_id_available", False)
+    )
     return frame
 
 

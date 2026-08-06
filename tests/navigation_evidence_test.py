@@ -8,9 +8,149 @@ import pytest
 
 from core.services.navigation_evidence import (
     CoordinateChain,
+    ScreenToDeviceCoordinateTransform,
     NavigationAttemptEvidence,
+    frame_sha256,
     record_navigation_attempt,
 )
+
+
+def test_same_frame_hash_cannot_prove_touch_effect_or_page_change():
+    frame = np.zeros((40, 60, 3), dtype=np.uint8)
+    evidence = NavigationAttemptEvidence(
+        task_name="city",
+        entry_name="visit_city",
+        pre_state="HOME_READY",
+        pre_frame_sha256=frame_sha256(frame),
+        coordinate_chain=CoordinateChain.from_capture_point(
+            (5, 5),
+            capture_size=(60, 40),
+            render_client_size=(60, 40),
+            device_size=(60, 40),
+        ),
+        candidate_type="parent_control",
+        candidate_bbox=(1, 1, 10, 10),
+        candidate_score=1.0,
+        candidate_count=1,
+        dispatch_backend="NEMU",
+    )
+    evidence.add_post_observation(
+        frame=frame,
+        state="CITY_DETAIL_VISIBLE",
+        source_base_page="HOME_READY",
+        normalized_base_page="CITY_DETAIL_VISIBLE",
+        target_control_disappeared=True,
+        trusted_postcondition_observed=True,
+        postcondition_result="blocked",
+    )
+    assert evidence.post_frame_changed is False
+    assert evidence.target_page_changed is False
+    assert evidence.target_control_disappeared is False
+    assert evidence.touch_effect_observed is False
+    assert evidence.detector_nondeterminism is True
+    assert evidence.evidence_invariant_check == "FAIL"
+
+
+def test_nemu_stale_capture_is_distinct_from_no_effect():
+    from core.services.navigation_evidence import classify_native_accepted_no_effect
+
+    assert classify_native_accepted_no_effect(
+        native_accepted=True,
+        nemu_frame_changed=False,
+        adb_crosscheck_available=True,
+        adb_frame_changed=True,
+    ) == "NEMU_CAPTURE_STALE_SUSPECTED"
+    assert classify_native_accepted_no_effect(
+        native_accepted=True,
+        nemu_frame_changed=False,
+        adb_crosscheck_available=True,
+        adb_frame_changed=False,
+    ) == "TOUCH_NO_EFFECT_OR_TARGET_INVALID"
+
+
+def test_screen_to_device_identity_mapping():
+    transform = ScreenToDeviceCoordinateTransform(
+        capture_width=1280,
+        capture_height=720,
+        device_logical_width=1280,
+        device_logical_height=720,
+        device_physical_width=1280,
+        device_physical_height=720,
+    )
+
+    logical, physical, error = transform.map_point((141, 619))
+
+    assert transform.mapping_status == "IDENTITY"
+    assert logical == physical == (141, 619)
+    assert error == 0
+
+
+def test_screen_to_device_scaled_mapping():
+    transform = ScreenToDeviceCoordinateTransform(
+        capture_width=1280,
+        capture_height=720,
+        device_logical_width=1280,
+        device_logical_height=720,
+        device_physical_width=2560,
+        device_physical_height=1440,
+    )
+
+    logical, physical, error = transform.map_point((320, 180))
+
+    assert transform.mapping_status == "TRANSFORMED"
+    assert logical == (320, 180)
+    assert physical == (640, 360)
+    assert error == 0
+
+
+def test_screen_to_device_viewport_offset_mapping():
+    transform = ScreenToDeviceCoordinateTransform(
+        capture_width=1000,
+        capture_height=600,
+        device_logical_width=1280,
+        device_logical_height=720,
+        device_physical_width=1280,
+        device_physical_height=720,
+        viewport_offset=(140, 60),
+        viewport_size=(1000, 600),
+    )
+
+    logical, physical, error = transform.map_point((500, 300))
+
+    assert transform.mapping_status == "TRANSFORMED"
+    assert logical == physical == (640, 360)
+    assert error == 0
+
+
+def test_screen_to_device_rotation_mismatch_blocks():
+    transform = ScreenToDeviceCoordinateTransform(
+        capture_width=1280,
+        capture_height=720,
+        device_logical_width=1280,
+        device_logical_height=720,
+        device_physical_width=1280,
+        device_physical_height=720,
+        rotation=90,
+    )
+
+    assert transform.mapping_status == "BLOCKED"
+    assert transform.reason_codes == ("rotation_mismatch",)
+    with pytest.raises(PermissionError, match="rotation_mismatch"):
+        transform.map_point((141, 619))
+
+
+def test_screen_to_device_unexplained_letterbox_blocks():
+    transform = ScreenToDeviceCoordinateTransform(
+        capture_width=1280,
+        capture_height=720,
+        device_logical_width=1280,
+        device_logical_height=800,
+        device_physical_width=1280,
+        device_physical_height=800,
+    )
+
+    assert transform.mapping_status == "BLOCKED"
+    assert "capture_viewport_aspect_mismatch" in transform.reason_codes
 
 
 def _evidence(chain: CoordinateChain) -> NavigationAttemptEvidence:
@@ -177,14 +317,14 @@ def test_postcondition_pass_with_all_effect_flags_false_is_impossible():
         )
 
 
-def test_same_page_pass_requires_a_credible_equivalent_postcondition():
+def test_changed_frame_same_page_pass_accepts_control_disappearance():
     chain = CoordinateChain.from_capture_point(
         (1101, 51), capture_size=(1280, 720), render_client_size=(1280, 720)
     )
     evidence = _evidence(chain)
     evidence.pre_frame_sha256 = "same"
     evidence.add_post_observation(
-        frame=SimpleNamespace(raw_frame_hash="same"),
+        frame=SimpleNamespace(raw_frame_hash="changed"),
         state=evidence.pre_state,
         postcondition_result="PASS",
         target_control_disappeared=True,

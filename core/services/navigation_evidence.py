@@ -25,6 +25,9 @@ EVIDENCE_SCHEMA_VERSION = "2.0"
 _SAFE_CODE = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,95}$")
 _NORMALIZED_BASE_PAGE_ALIASES = {
     "ACTION_SUMMARY_ENTRY_VISIBLE": "GLOBAL_PREP_PAGE",
+    "INVENTORY": "INVENTORY_PAGE_VISIBLE",
+    "CITY_ENTRY_VISIBLE": "HOME_CITY_ENTRY_CONTROL_VISIBLE",
+    "CITY_DETAIL": "CITY_DETAIL_VISIBLE",
 }
 
 
@@ -132,7 +135,9 @@ class CoordinateChain:
 
     @property
     def complete(self) -> bool:
-        screen_complete = self.screen_point is not None or not self.screen_coordinate_applicable
+        screen_complete = (
+            self.screen_point is not None or not self.screen_coordinate_applicable
+        )
         return bool(
             self.source_coordinate_space
             and self.source_point
@@ -143,6 +148,140 @@ class CoordinateChain:
 
 
 @dataclass(frozen=True, slots=True)
+class ScreenToDeviceCoordinateTransform:
+    """Explicit capture-to-device mapping for a current display viewport."""
+
+    capture_width: int
+    capture_height: int
+    device_logical_width: int
+    device_logical_height: int
+    device_physical_width: int
+    device_physical_height: int
+    rotation: int = 0
+    viewport_offset: tuple[int, int] = (0, 0)
+    viewport_size: tuple[int, int] | None = None
+
+    def __post_init__(self) -> None:
+        dimensions = (
+            self.capture_width,
+            self.capture_height,
+            self.device_logical_width,
+            self.device_logical_height,
+            self.device_physical_width,
+            self.device_physical_height,
+        )
+        if any(int(value) <= 0 for value in dimensions):
+            raise ValueError("coordinate_transform_dimensions_invalid")
+        viewport = self.viewport_size or (
+            self.device_logical_width,
+            self.device_logical_height,
+        )
+        if min(map(int, viewport)) <= 0:
+            raise ValueError("coordinate_transform_viewport_invalid")
+
+    @property
+    def effective_viewport_size(self) -> tuple[int, int]:
+        return self.viewport_size or (
+            self.device_logical_width,
+            self.device_logical_height,
+        )
+
+    @property
+    def reason_codes(self) -> tuple[str, ...]:
+        reasons: list[str] = []
+        if int(self.rotation) % 360 != 0:
+            reasons.append("rotation_mismatch")
+        offset_x, offset_y = map(int, self.viewport_offset)
+        viewport_width, viewport_height = map(int, self.effective_viewport_size)
+        if (
+            offset_x < 0
+            or offset_y < 0
+            or offset_x + viewport_width > self.device_logical_width
+            or offset_y + viewport_height > self.device_logical_height
+        ):
+            reasons.append("viewport_outside_device_logical_bounds")
+        capture_aspect = self.capture_width / self.capture_height
+        viewport_aspect = viewport_width / viewport_height
+        if abs(capture_aspect - viewport_aspect) > 0.005:
+            reasons.append("capture_viewport_aspect_mismatch")
+        return tuple(reasons)
+
+    @property
+    def mapping_status(self) -> str:
+        if self.reason_codes:
+            return "BLOCKED"
+        if (
+            self.capture_width == self.device_logical_width
+            and self.capture_height == self.device_logical_height
+            and self.device_logical_width == self.device_physical_width
+            and self.device_logical_height == self.device_physical_height
+            and self.viewport_offset == (0, 0)
+            and self.effective_viewport_size
+            == (self.device_logical_width, self.device_logical_height)
+        ):
+            return "IDENTITY"
+        return "TRANSFORMED"
+
+    def map_point(
+        self, point: tuple[int, int]
+    ) -> tuple[tuple[int, int], tuple[int, int], float]:
+        if self.mapping_status == "BLOCKED":
+            raise PermissionError(self.reason_codes[0])
+        source_x, source_y = map(int, point)
+        if not (
+            0 <= source_x < self.capture_width
+            and 0 <= source_y < self.capture_height
+        ):
+            raise ValueError("capture_point_outside_bounds")
+        viewport_width, viewport_height = self.effective_viewport_size
+        offset_x, offset_y = self.viewport_offset
+        normalized_x = source_x / self.capture_width
+        normalized_y = source_y / self.capture_height
+        logical = (
+            min(
+                self.device_logical_width - 1,
+                offset_x + int(round(normalized_x * viewport_width)),
+            ),
+            min(
+                self.device_logical_height - 1,
+                offset_y + int(round(normalized_y * viewport_height)),
+            ),
+        )
+        physical = (
+            min(
+                self.device_physical_width - 1,
+                int(round(logical[0] * self.device_physical_width /
+                          self.device_logical_width)),
+            ),
+            min(
+                self.device_physical_height - 1,
+                int(round(logical[1] * self.device_physical_height /
+                          self.device_logical_height)),
+            ),
+        )
+        round_trip = (
+            (logical[0] - offset_x) * self.capture_width / viewport_width,
+            (logical[1] - offset_y) * self.capture_height / viewport_height,
+        )
+        error = max(abs(round_trip[0] - source_x), abs(round_trip[1] - source_y))
+        return logical, physical, round(float(error), 6)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "capture_width": self.capture_width,
+            "capture_height": self.capture_height,
+            "device_logical_width": self.device_logical_width,
+            "device_logical_height": self.device_logical_height,
+            "device_physical_width": self.device_physical_width,
+            "device_physical_height": self.device_physical_height,
+            "rotation": self.rotation,
+            "viewport_offset": list(self.viewport_offset),
+            "viewport_size": list(self.effective_viewport_size),
+            "coordinate_mapping_status": self.mapping_status,
+            "reason_codes": list(self.reason_codes),
+        }
+
+@dataclass(frozen=True, slots=True)
 class PostNavigationObservation:
     post_observation_index: int
     post_frame_sha256: str
@@ -151,6 +290,9 @@ class PostNavigationObservation:
     negative_cues: tuple[str, ...]
     reason_codes: tuple[str, ...]
     postcondition_result: str
+    source_capture_id: str = ""
+    capture_sequence: int | None = None
+    session_generation: int | None = None
     observed_at: str = field(default_factory=_now)
 
 
@@ -186,6 +328,9 @@ class NavigationAttemptEvidence:
     trusted_postcondition_observed: bool = False
     dispatch_result: str = "not_requested"
     dispatch_timestamp: str = ""
+    detector_nondeterminism: bool = False
+    evidence_invariant_check: str = "PASS"
+    evidence_invariant_reasons: list[str] = field(default_factory=list)
     post_observations: list[PostNavigationObservation] = field(default_factory=list)
 
     def mark_dispatch(self, *, requested: bool, acknowledged: bool, result: str) -> None:
@@ -253,6 +398,9 @@ class NavigationAttemptEvidence:
         normalized_base_page: str | None = None,
         target_control_disappeared: bool = False,
         trusted_postcondition_observed: bool = False,
+        source_capture_id: str = "",
+        capture_sequence: int | None = None,
+        session_generation: int | None = None,
     ) -> PostNavigationObservation:
         post_hash = frame_sha256(frame)
         source_page = _NORMALIZED_BASE_PAGE_ALIASES.get(
@@ -263,18 +411,30 @@ class NavigationAttemptEvidence:
             str(normalized_base_page or state),
             str(normalized_base_page or state),
         )
-        page_changed = bool(
+        frame_changed = bool(post_hash and post_hash != self.pre_frame_sha256)
+        classified_page_changed = bool(
             source_page
             and current_page
             and source_page != "UNKNOWN"
             and current_page != "UNKNOWN"
             and source_page != current_page
         )
+        if not frame_changed and classified_page_changed:
+            self.detector_nondeterminism = True
+            self.evidence_invariant_check = "FAIL"
+            if "same_hash_different_classification" not in self.evidence_invariant_reasons:
+                self.evidence_invariant_reasons.append("same_hash_different_classification")
+        # A visual transition can never be derived from byte-identical frames.
+        # The classification conflict above remains diagnostic but is not
+        # allowed to become positive click-effect evidence.
+        page_changed = bool(frame_changed and classified_page_changed)
+        effective_target_disappeared = bool(frame_changed and target_control_disappeared)
+        effective_trusted_postcondition = bool(frame_changed and trusted_postcondition_observed)
         self.mark_post_effect(
-            frame_changed=bool(post_hash and post_hash != self.pre_frame_sha256),
+            frame_changed=frame_changed,
             target_page_changed=page_changed,
-            target_control_disappeared=target_control_disappeared,
-            trusted_postcondition_observed=trusted_postcondition_observed,
+            target_control_disappeared=effective_target_disappeared,
+            trusted_postcondition_observed=effective_trusted_postcondition,
         )
         if str(postcondition_result).casefold() == "pass" and not any((
             self.post_frame_changed,
@@ -291,6 +451,9 @@ class NavigationAttemptEvidence:
             negative_cues=_codes(negative_cues),
             reason_codes=_codes(reason_codes),
             postcondition_result=str(postcondition_result),
+            source_capture_id=str(source_capture_id),
+            capture_sequence=(int(capture_sequence) if capture_sequence is not None else None),
+            session_generation=(int(session_generation) if session_generation is not None else None),
         )
         self.post_observations.append(observation)
         return observation
@@ -325,9 +488,29 @@ class NavigationAttemptEvidence:
                 "negative_cues": latest.negative_cues if latest else (),
                 "reason_codes": latest.reason_codes if latest else (),
                 "postcondition_result": latest.postcondition_result if latest else "not_observed",
+                "EVIDENCE_INVARIANT_CHECK": self.evidence_invariant_check,
+                "DETECTOR_NONDETERMINISM": self.detector_nondeterminism,
             }
         )
         return document
+
+
+def classify_native_accepted_no_effect(
+    *,
+    native_accepted: bool,
+    nemu_frame_changed: bool,
+    adb_crosscheck_available: bool,
+    adb_frame_changed: bool | None,
+) -> str:
+    """Separate a stale NEMU capture from a real no-effect input result."""
+
+    if not native_accepted or nemu_frame_changed:
+        return "NOT_APPLICABLE"
+    if not adb_crosscheck_available or adb_frame_changed is None:
+        return "CROSSCHECK_UNAVAILABLE"
+    if adb_frame_changed:
+        return "NEMU_CAPTURE_STALE_SUSPECTED"
+    return "TOUCH_NO_EFFECT_OR_TARGET_INVALID"
 
 
 def record_navigation_attempt(

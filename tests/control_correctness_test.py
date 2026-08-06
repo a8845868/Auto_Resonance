@@ -10,6 +10,7 @@ from core.control.adb import ADB
 from core.control.nemu import NEMU
 from core.exception.exceptions import StopExecution
 from core.image.utils import match_template
+from core.services.read_only_policy import ActionIntent
 
 
 class FakeBackend:
@@ -30,6 +31,9 @@ class FakeBackend:
         self.events.append(f"{self.name}.kill")
         if self.kill_error is not None:
             raise self.kill_error
+
+    def input_keyevent(self, keycode):
+        self.events.append(f"{self.name}.keyevent:{keycode}")
 
 
 @pytest.fixture(autouse=True)
@@ -68,6 +72,20 @@ def test_nemu_constructor_exception_falls_back_to_adb(monkeypatch):
     assert control_module.connect(16384) is True
     assert control_module.control is adb
     assert events == ["nemu.init", "adb.init", "adb.connect"]
+
+
+def test_system_back_requires_exact_close_intent_and_dispatches_once():
+    events = []
+    control_module.control = FakeBackend("adb", events)
+
+    assert control_module.input_system_back(intent=ActionIntent(
+        "close_home_sidebar", "android_system_back", "test"
+    )) is True
+    assert events == ["adb.keyevent:4"]
+    assert control_module.input_system_back(intent=ActionIntent(
+        "open_home_sidebar", "android_system_back", "test"
+    )) is False
+    assert events == ["adb.keyevent:4"]
 
 
 def test_nemu_connect_exception_closes_before_adb(monkeypatch):

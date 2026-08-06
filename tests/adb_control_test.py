@@ -21,6 +21,15 @@ class _TimeoutDevice:
         self.closed = True
 
 
+class _ShellDevice:
+    def __init__(self):
+        self.commands = []
+
+    def shell(self, command, **_kwargs):
+        self.commands.append(command)
+        return ""
+
+
 def test_adb_connect_timeout_is_closed_and_reported(monkeypatch):
     _TimeoutDevice.instances.clear()
     monkeypatch.setattr(adb_module, "AdbDeviceTcp", _TimeoutDevice)
@@ -50,3 +59,13 @@ def test_adb_transport_uses_configured_runtime_host(monkeypatch):
         assert _TimeoutDevice.instances[-1].kwargs["port"] == 16544
     finally:
         control_module.clear_runtime_device()
+
+
+def test_adb_system_back_dispatches_exact_keycode_once():
+    control = adb_module.ADB()
+    device = _ShellDevice()
+    control.device = device
+
+    control.input_keyevent(4)
+
+    assert device.commands == ["input keyevent 4"]

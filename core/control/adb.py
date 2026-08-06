@@ -79,6 +79,12 @@ class ADB(IADB):
         ]
         self.device.shell(" ".join(shell))
 
+    def input_keyevent(self, keycode: int):
+        ensure_automation_allowed("dispatch Android key event through ADB")
+        if isinstance(keycode, bool) or int(keycode) <= 0:
+            raise ValueError("android_keycode_invalid")
+        self.device.shell(f"input keyevent {int(keycode)}")
+
     def screenshot(self) -> cv.typing.MatLike:
         ensure_automation_allowed("通过 ADB 读取游戏画面")
         screenshot_data = self.device.shell("screencap -p", decode=False)

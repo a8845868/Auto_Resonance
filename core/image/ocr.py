@@ -6,6 +6,7 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 """
 
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Tuple, Union
@@ -17,6 +18,45 @@ from core.image.utils import crop_image
 _model = None
 _model_provider: str | None = None
 _model_lock = threading.Lock()
+_UID_PREFIX = re.compile(r"(?i)\b(?:uid|u1d)\s*[:：]?\s*\d{6,12}\b")
+_BARE_SENSITIVE_DIGITS = re.compile(r"^\s*\d{6,12}\s*$")
+_REDACTED_UID = "<redacted_home_profile_id>"
+
+
+def _log_bbox(item: dict) -> tuple[int, int, int, int] | None:
+    points = item.get("position")
+    if not isinstance(points, (list, tuple)) or len(points) < 2:
+        return None
+    try:
+        xs = [int(round(float(point[0]))) for point in points]
+        ys = [int(round(float(point[1]))) for point in points]
+    except (TypeError, ValueError, IndexError):
+        return None
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def redact_ocr_result_for_log(
+    result: list[dict], *, frame_size: tuple[int, int]
+) -> list[dict]:
+    """Redact HOME profile identifiers without mutating OCR return values."""
+
+    width, height = map(int, frame_size)
+    redacted: list[dict] = []
+    for original in result:
+        item = dict(original)
+        text = str(item.get("text", ""))
+        bounds = _log_bbox(item)
+        in_home_profile_roi = bool(
+            bounds is not None
+            and bounds[0] <= int(width * 0.28)
+            and bounds[1] >= int(height * 0.68)
+        )
+        if _UID_PREFIX.search(text) or (
+            in_home_profile_roi and _BARE_SENSITIVE_DIGITS.fullmatch(text)
+        ):
+            item["text"] = _REDACTED_UID
+        redacted.append(item)
+    return redacted
 
 
 def _available_providers() -> tuple[str, ...]:
@@ -130,11 +170,16 @@ def predict(
         image = str(image)
     if isinstance(image, str):
         image = cv.imread(image)
+    frame_height, frame_width = image.shape[:2]
     if (cropped_pos1 != (0, 0) or cropped_pos2 != (0, 0)) and not no_crop:
         image = crop_image(image, cropped_pos1, cropped_pos2)
     out = get_ocr_model().ocr(image)
     result = ocrout2result(out, cropped_pos1)
-    logger.debug(result)
+    logger.debug(
+        redact_ocr_result_for_log(
+            result, frame_size=(frame_width, frame_height)
+        )
+    )
     return result
 
 
@@ -155,9 +200,14 @@ def number_predict(
         image = str(image)
     if isinstance(image, str):
         image = cv.imread(image)
+    frame_height, frame_width = image.shape[:2]
     if (cropped_pos1 != (0, 0) or cropped_pos2 != (0, 0)) and not no_crop:
         image = crop_image(image, cropped_pos1, cropped_pos2)
     out = get_ocr_model().ocr(image)
     result = ocrout2result(out, cropped_pos1)
-    logger.debug(result)
+    logger.debug(
+        redact_ocr_result_for_log(
+            result, frame_size=(frame_width, frame_height)
+        )
+    )
     return result

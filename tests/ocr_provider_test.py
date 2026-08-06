@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -75,3 +77,51 @@ def test_initialization_error_is_explicit(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="ocr_model_initialization_failed"):
         ocr.get_ocr_model()
+
+
+def test_home_profile_uid_log_redaction_preserves_non_sensitive_ocr():
+    import core.image.ocr as ocr
+
+    uid = "8821612558"
+    result = [
+        {"text": f"UID:{uid}", "position": [[120, 704], [200, 704], [200, 718], [120, 718]]},
+        {"text": f"U1D: {uid}", "position": [[120, 704], [200, 704], [200, 718], [120, 718]]},
+        {"text": uid, "position": [[148, 704], [200, 704], [200, 718], [148, 718]]},
+        {"text": "访问城市", "position": [[1080, 480], [1180, 480], [1180, 510], [1080, 510]]},
+    ]
+
+    redacted = ocr.redact_ocr_result_for_log(result, frame_size=(1280, 720))
+    serialized = repr(redacted)
+
+    assert uid not in serialized
+    assert hashlib.sha256(uid.encode()).hexdigest() not in serialized
+    assert [value["text"] for value in redacted[:3]] == [
+        "<redacted_home_profile_id>",
+        "<redacted_home_profile_id>",
+        "<redacted_home_profile_id>",
+    ]
+    assert redacted[-1]["text"] == "访问城市"
+    assert result[0]["text"] == f"UID:{uid}"
+
+
+def test_predict_logs_redacted_copy_but_returns_original(monkeypatch):
+    import core.image.ocr as ocr
+
+    uid = "8821612558"
+
+    class Model:
+        def ocr(self, _image):
+            return [[[
+                [[128, 704], [199, 704], [199, 717], [128, 717]],
+                (f"UID:{uid}", 0.99),
+            ]]]
+
+    logged = []
+    monkeypatch.setattr(ocr, "get_ocr_model", lambda: Model())
+    monkeypatch.setattr(ocr, "logger", SimpleNamespace(debug=logged.append))
+
+    result = ocr.predict(np.zeros((720, 1280, 3), dtype=np.uint8), no_crop=True)
+
+    assert result[0]["text"] == f"UID:{uid}"
+    assert uid not in repr(logged)
+    assert logged[0][0]["text"] == "<redacted_home_profile_id>"

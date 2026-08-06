@@ -13,6 +13,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Iterable, Mapping
 
+from core.services.city_entry_postcondition import (
+    CITY_CONTEXT_VISIBLE,
+    CITY_ENTRY_POSTCONDITION_POLICY,
+)
+
 
 UNKNOWN_PAGE = "UNKNOWN"
 
@@ -525,22 +530,68 @@ class TransitionClassifier:
 
 DEFAULT_CAPABILITIES: Mapping[str, frozenset[str]] = {
     "DAILY_CHECKIN": frozenset({"DISMISS_CLAIMED_DAILY_CHECKIN"}),
-    "HOME_READY": frozenset({"OPEN_CITY", "OPEN_ACTION_TERMINAL", "OPEN_INVENTORY"}),
+    "HOME_READY": frozenset({
+        "OPEN_CITY",
+        "OPEN_ACTION_TERMINAL",
+        "OPEN_INVENTORY",
+        "OPEN_HOME_SIDEBAR",
+    }),
+    # CLOSE_HOME_SIDEBAR is granted dynamically only after a fresh, unique,
+    # semantically proven close target excludes account-logout controls.
+    "HOME_SIDEBAR_VISIBLE": frozenset({"READ_CLARITY_BALANCE"}),
     "ACTIVITY_OVERVIEW_VISIBLE": frozenset({"OPEN_GLOBAL_PREP"}),
     "GLOBAL_PREP_PAGE": frozenset({"OPEN_ACTION_SUMMARY"}),
     "ACTION_SUMMARY_VISIBLE": frozenset({"ACTION_SUMMARY_VISIBLE", "SELECT_ACTION_TASK"}),
-    "INVENTORY": frozenset({"READ_INVENTORY", "OPEN_ITEM_DETAIL"}),
-    "CITY_ENTRY_VISIBLE": frozenset({"ENTER_CITY"}),
-    "CITY_DETAIL": frozenset({"OPEN_CITY_FACILITY"}),
+    "INVENTORY_PAGE_VISIBLE": frozenset({"READ_INVENTORY", "OPEN_ITEM_DETAIL"}),
+    "HOME_CITY_ENTRY_CONTROL_VISIBLE": frozenset({"ENTER_CITY"}),
+    "CITY_DETAIL_VISIBLE": frozenset({"OPEN_CITY_FACILITY", CITY_CONTEXT_VISIBLE}),
+    "EXCHANGE_NPC_VISIBLE": frozenset({"OPEN_CITY_FACILITY", CITY_CONTEXT_VISIBLE}),
 }
 
 
 LEGACY_BASE_PAGE_ALIASES: Mapping[str, str] = {
     "ACTION_SUMMARY_ENTRY_VISIBLE": "GLOBAL_PREP_PAGE",
+    "INVENTORY": "INVENTORY_PAGE_VISIBLE",
+    "CITY_ENTRY_VISIBLE": "HOME_CITY_ENTRY_CONTROL_VISIBLE",
+    "CITY_DETAIL": "CITY_DETAIL_VISIBLE",
 }
 
 
 PROVEN_NAVIGATION_CONTRACTS: Mapping[str, ActionContract] = {
+    "OPEN_HOME_SIDEBAR": ActionContract(
+        action_id="open_home_sidebar",
+        primitive=ActionPrimitive.OPEN_MENU,
+        allowed_pre_pages=frozenset({"HOME_READY"}),
+        required_capabilities=frozenset({"OPEN_HOME_SIDEBAR"}),
+        candidate_policy="UNIQUE_BOTTOM_LEFT_PROFILE_ANCHOR",
+        hit_target_policy="SEMANTIC_PARENT_AVATAR_SAFE_REGION",
+        max_dispatches=1,
+        random_offset=False,
+        allowed_post_pages=frozenset({"HOME_SIDEBAR_VISIBLE"}),
+        forbidden_post_pages=frozenset({
+            "ACTION_SUMMARY_VISIBLE", "BATTLE_PAGE", "EXTERNAL_BROWSER",
+            "LOGIN_PAGE", "FOREIGN_PAGE",
+        }),
+        transition_timeout_seconds=6.0,
+        irreversible=False,
+    ),
+    "CLOSE_HOME_SIDEBAR": ActionContract(
+        action_id="close_home_sidebar",
+        primitive=ActionPrimitive.GO_BACK,
+        allowed_pre_pages=frozenset({"HOME_SIDEBAR_VISIBLE"}),
+        required_capabilities=frozenset({"CLOSE_HOME_SIDEBAR"}),
+        candidate_policy="UNIQUE_TRUSTED_SIDEBAR_CLOSE_SOURCE",
+        hit_target_policy="SEMANTIC_CONTAINER_BOUND_CLOSE_REGION",
+        max_dispatches=1,
+        random_offset=False,
+        allowed_post_pages=frozenset({"HOME_READY"}),
+        forbidden_post_pages=frozenset({
+            "ACTION_SUMMARY_VISIBLE", "BATTLE_PAGE", "EXTERNAL_BROWSER",
+            "LOGIN_PAGE", "FOREIGN_PAGE",
+        }),
+        transition_timeout_seconds=6.0,
+        irreversible=False,
+    ),
     "DISMISS_CLAIMED_DAILY_CHECKIN": ActionContract(
         action_id="dismiss_claimed_daily_checkin",
         primitive=ActionPrimitive.DISMISS_CLAIMED_OVERLAY,
@@ -563,8 +614,8 @@ PROVEN_NAVIGATION_CONTRACTS: Mapping[str, ActionContract] = {
         primitive=ActionPrimitive.OPEN_ENTRY,
         allowed_pre_pages=frozenset({"HOME_READY"}),
         required_capabilities=frozenset({"OPEN_INVENTORY"}),
-        candidate_policy="UNIQUE_TOP_RIGHT_ASSETS_GLYPH",
-        hit_target_policy="TEMPLATE_PARENT_SAFE_REGION",
+        candidate_policy="UNIQUE_TOP_RIGHT_BACKPACK_CUBE_CONTROL",
+        hit_target_policy="DYNAMIC_CUBE_INSET_SAFE_REGION",
         max_dispatches=1,
         random_offset=False,
         allowed_post_pages=frozenset({"INVENTORY"}),
@@ -575,13 +626,13 @@ PROVEN_NAVIGATION_CONTRACTS: Mapping[str, ActionContract] = {
     "ENTER_CITY": ActionContract(
         action_id="enter_city",
         primitive=ActionPrimitive.OPEN_ENTRY,
-        allowed_pre_pages=frozenset({"CITY_ENTRY_VISIBLE"}),
+        allowed_pre_pages=frozenset({"HOME_CITY_ENTRY_CONTROL_VISIBLE"}),
         required_capabilities=frozenset({"ENTER_CITY"}),
         candidate_policy="UNIQUE_CITY_SEMANTIC_ANCHOR",
         hit_target_policy="RESOLVER_BOUND_TARGET",
         max_dispatches=1,
         random_offset=False,
-        allowed_post_pages=frozenset({"CITY_DETAIL", "CITY_MAP"}),
+        allowed_post_pages=CITY_ENTRY_POSTCONDITION_POLICY.accepted_leaf_states,
         transitional_post_pages=frozenset({"CITY_TRANSITION"}),
         forbidden_post_pages=frozenset({
             "INVENTORY", "ACTION_SUMMARY_VISIBLE", "EXTERNAL_BROWSER", "LOGIN_PAGE",
