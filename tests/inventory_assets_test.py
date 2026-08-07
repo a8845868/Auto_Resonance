@@ -56,6 +56,8 @@ def test_assets_text_only_guards_station_home_and_is_not_the_click_target():
     ]
 
     assert inventory._find_assets_text_entry(items, 1280, 720) == (230, 687)
+    assert inventory.HOME_ASSETS_BALANCE_SEMANTICS.currency_id == "iron_coin"
+    assert inventory.HOME_ASSETS_BALANCE_SEMANTICS.can_open_inventory is False
 
 
 def test_assets_inventory_screen_requires_category_rail():
@@ -110,9 +112,10 @@ def test_strict_restock_book_detail_rejects_other_book_and_unowned_numbers():
 
 
 class OcrFrame:
-    def __init__(self, items):
+    def __init__(self, items, *, pixel=0, capture_id=""):
         self.items = items
-        self.image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.image = np.full((720, 1280, 3), pixel, dtype=np.uint8)
+        self.source_capture_id = capture_id
 
     def ocr(self):
         return self.items
@@ -142,8 +145,15 @@ class Clock:
         self.now += seconds
 
 
-def _home_frame():
-    return OcrFrame([box(190, 675, "资产"), box(1040, 130, "任务")])
+def _home_frame(*, pixel=1, capture_id="home-1"):
+    frame = OcrFrame(
+        [box(190, 675, "资产"), box(1040, 130, "任务")],
+        pixel=pixel,
+        capture_id=capture_id,
+    )
+    frame.image[18:85, 1055:1148] = 220
+    frame.image[21:82, 1058:1145] = pixel
+    return frame
 
 
 def _inventory_frame():
@@ -166,7 +176,11 @@ def _geometry():
 
 
 def test_assets_entry_dispatch_and_backpack_postcondition_share_evidence():
-    provider = FrameProvider([_home_frame(), _inventory_frame()])
+    provider = FrameProvider([
+        _home_frame(capture_id="home-1"),
+        _home_frame(pixel=2, capture_id="home-2"),
+        _inventory_frame(),
+    ])
     clock = Clock()
     dispatches = []
     evidence = []
@@ -190,13 +204,19 @@ def test_assets_entry_dispatch_and_backpack_postcondition_share_evidence():
     assert len(evidence) == 1
     document = evidence[0].to_dict()
     assert document["dispatch_acknowledged"] is True
-    assert document["post_state"] == "INVENTORY"
+    assert document["post_state"] == "INVENTORY_PAGE_VISIBLE"
     assert document["postcondition_result"] == "PASS"
     assert document["coordinate_chain_complete"] is True
+    assert document["entry_name"] == "home_backpack_cube"
+    assert document["candidate_type"] == "home_backpack_cube_control"
+    assert document["candidate_bbox"] == (1079, 29, 1123, 73)
 
 
 def test_assets_entry_home_unchanged_fails_after_one_dispatch():
-    provider = FrameProvider([_home_frame(), _home_frame()])
+    provider = FrameProvider([
+        _home_frame(capture_id="home-1"),
+        _home_frame(pixel=2, capture_id="home-2"),
+    ])
     clock = Clock()
     dispatches = []
     evidence = []
@@ -220,7 +240,11 @@ def test_assets_entry_home_unchanged_fails_after_one_dispatch():
 
 def test_assets_entry_unexpected_page_fails_without_retry():
     unexpected = OcrFrame([box(500, 300, "活动总览")])
-    provider = FrameProvider([_home_frame(), unexpected])
+    provider = FrameProvider([
+        _home_frame(capture_id="home-1"),
+        _home_frame(pixel=2, capture_id="home-2"),
+        unexpected,
+    ])
     clock = Clock()
     dispatches = []
     evidence = []
@@ -243,7 +267,10 @@ def test_assets_entry_unexpected_page_fails_without_retry():
 
 
 def test_assets_entry_dispatch_rejection_stops_before_post_observation():
-    provider = FrameProvider([_home_frame()])
+    provider = FrameProvider([
+        _home_frame(capture_id="home-1"),
+        _home_frame(pixel=2, capture_id="home-2"),
+    ])
     evidence = []
 
     result = inventory._open_assets_entry(
@@ -255,7 +282,7 @@ def test_assets_entry_dispatch_rejection_stops_before_post_observation():
     )
 
     assert result is False
-    assert provider.calls == 1
+    assert provider.calls == 2
     assert evidence[0].dispatch_result == "dispatch_rejected"
     assert evidence[0].post_observations == []
 
@@ -265,7 +292,11 @@ def test_assets_entry_distinguishes_postcondition_detector_failure():
         def ocr(self):
             raise RuntimeError("offline detector failure")
 
-    provider = FrameProvider([_home_frame(), BrokenOcrFrame([])])
+    provider = FrameProvider([
+        _home_frame(capture_id="home-1"),
+        _home_frame(pixel=2, capture_id="home-2"),
+        BrokenOcrFrame([]),
+    ])
     clock = Clock()
     evidence = []
 
@@ -288,7 +319,7 @@ def test_assets_entry_distinguishes_postcondition_detector_failure():
     )
 
 
-def test_assets_entry_multiple_candidates_blocks_all_dispatch():
+def test_backpack_cube_multiple_candidates_blocks_all_dispatch():
     provider = FrameProvider([_home_frame()])
     dispatches = []
     evidence = []
@@ -305,7 +336,7 @@ def test_assets_entry_multiple_candidates_blocks_all_dispatch():
     assert dispatches == []
     assert evidence[0].candidate_count == 2
     assert evidence[0].dispatch_requested is False
-    assert evidence[0].to_dict()["reason_codes"] == ("candidate_ambiguous",)
+    assert evidence[0].to_dict()["reason_codes"] == ("backpack_cube_ambiguous",)
 
 
 def test_restock_book_scan_scrolls_past_first_page_and_confirms_twice():

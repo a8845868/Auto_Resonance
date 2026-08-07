@@ -350,7 +350,7 @@ def test_city_transition_is_known_but_nonterminal():
     assert not decision.success
 
 
-def test_four_proven_adapters_normalize_to_reusable_capabilities():
+def test_proven_adapters_normalize_to_reusable_capabilities_without_assets_authority():
     home = _Frame([
         _item("资产", 190, 675),
         _item("访问城市", 1172, 486),
@@ -365,7 +365,7 @@ def test_four_proven_adapters_normalize_to_reusable_capabilities():
         _item("收集装备、材料等物资", 940, 330, 260),
     ], "global-prep")).to_ui_state()
 
-    assert assets.has_capability(
+    assert not assets.has_capability(
         "OPEN_INVENTORY", current_capture_id="home", current_frame_hash=assets.frame_hash
     )
     assert city.has_capability(
@@ -382,7 +382,7 @@ def test_four_proven_adapters_normalize_to_reusable_capabilities():
         current_frame_hash=global_prep.frame_hash,
     )
 
-    assert PROVEN_NAVIGATION_CONTRACTS["OPEN_INVENTORY"].authorize(
+    assert not PROVEN_NAVIGATION_CONTRACTS["OPEN_INVENTORY"].authorize(
         assets, current_capture_id="home", current_frame_hash=assets.frame_hash
     ).allowed
     assert PROVEN_NAVIGATION_CONTRACTS["ENTER_CITY"].authorize(
@@ -403,6 +403,14 @@ def test_four_proven_adapters_normalize_to_reusable_capabilities():
         current_frame_hash=global_prep.frame_hash,
     ).allowed
     assert global_prep.base_page == "GLOBAL_PREP_PAGE"
+
+
+def test_open_inventory_contract_names_cube_control_not_assets_or_toolbar_parent():
+    contract = PROVEN_NAVIGATION_CONTRACTS["OPEN_INVENTORY"]
+    assert contract.candidate_policy == "UNIQUE_TOP_RIGHT_BACKPACK_CUBE_CONTROL"
+    assert contract.hit_target_policy == "DYNAMIC_CUBE_INSET_SAFE_REGION"
+    assert "ASSETS" not in contract.candidate_policy
+    assert "PARENT" not in contract.hit_target_policy
 
 
 def test_kernel_import_does_not_load_capture_input_or_ocr_backends():

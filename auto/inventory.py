@@ -4,7 +4,7 @@ import re
 import time
 import json
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import replace
 
 import cv2 as cv
 import numpy as np
@@ -41,7 +41,15 @@ from core.services.navigation_evidence import (
     record_navigation_attempt,
 )
 from core.services.read_only_policy import ActionIntent
+from core.services.home_backpack_cube import (
+    HomeAssetsBalanceDisplay,
+    HomeBackpackCubeCandidate,
+    confirm_fresh_home_backpack_cube,
+    find_home_backpack_cube_candidates,
+    resolve_home_backpack_cube_control,
+)
 from core.services.runtime_navigation_kernel import UiState, normalize_legacy_state
+from core.services.inventory_page_observer import InventoryPageState, observe_inventory_page
 
 
 def _center(item: dict) -> tuple[float, float]:
@@ -52,6 +60,7 @@ def _center(item: dict) -> tuple[float, float]:
 STATION_PRIMARY_CURRENCIES = {
     "武林源": "交子",
 }
+HOME_ASSETS_BALANCE_SEMANTICS = HomeAssetsBalanceDisplay()
 
 
 def _home_primary_currency(items: list[dict]) -> list[Asset]:
@@ -285,80 +294,13 @@ def _parse_primary_currency_grid(image, ocr_items: list[dict]) -> list[Asset]:
     return found
 
 
-def _white_icon_mask(image: cv.typing.MatLike) -> cv.typing.MatLike:
-    """Keep the bright low-saturation glyph and discard its colored background."""
-    hsv = cv.cvtColor(image, cv.COLOR_BGR2HSV)
-    mask = cv.inRange(hsv, np.array([0, 0, 170]), np.array([180, 90, 255]))
-    return cv.morphologyEx(mask, cv.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8))
-
-
-@dataclass(frozen=True, slots=True)
-class AssetsEntryCandidate:
-    point: tuple[int, int]
-    bbox: tuple[int, int, int, int]
-    score: float
+AssetsEntryCandidate = HomeBackpackCubeCandidate
 
 
 def _find_assets_entry_candidates(image) -> list[AssetsEntryCandidate]:
-    """Find distinct Assets glyph candidates in the guarded top-right ROI."""
+    """Backward-compatible name for the HOME backpack cube resolver."""
 
-    template = cv.imread(str(RESOURCES_PATH / "inventory" / "assets_entry.png"))
-    if template is None:
-        return []
-    # The stored screenshot contains old scenery around the icon. Only the
-    # central white six-part glyph is stable across themes and game versions.
-    th, tw = template.shape[:2]
-    template = template[int(th * 0.16) : int(th * 0.87), int(tw * 0.16) : int(tw * 0.87)]
-    template_mask = _white_icon_mask(template)
-    ys, xs = np.where(template_mask > 0)
-    if not len(xs):
-        return []
-    template_mask = template_mask[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
-    # The icon lives in the top-right toolbar. Cropping avoids visually similar
-    # white hexagons elsewhere on the home screen and makes matching faster.
-    height, width = image.shape[:2]
-    x1, y1 = int(width * 0.58), 0
-    roi = image[y1 : int(height * 0.18), x1:width]
-    roi_mask = _white_icon_mask(roi)
-    raw_candidates: list[AssetsEntryCandidate] = []
-    for scale_percent in range(60, 141, 5):
-        scale = scale_percent / 100
-        resized = cv.resize(template_mask, None, fx=scale, fy=scale, interpolation=cv.INTER_NEAREST)
-        glyph_h, glyph_w = resized.shape[:2]
-        if glyph_h >= roi_mask.shape[0] or glyph_w >= roi_mask.shape[1]:
-            continue
-        result = cv.matchTemplate(roi_mask, resized, cv.TM_CCOEFF_NORMED)
-        local_maxima = cv.dilate(result, np.ones((3, 3), dtype=np.uint8))
-        candidate_ys, candidate_xs = np.where(
-            (result >= 0.70) & np.isfinite(result) & (result >= local_maxima - 1e-6)
-        )
-        ranked = sorted(
-            (
-                (float(result[y, x]), int(x), int(y))
-                for x, y in zip(candidate_xs, candidate_ys)
-            ),
-            reverse=True,
-        )[:20]
-        for score, x, y in ranked:
-            left, top = x1 + x, y1 + y
-            raw_candidates.append(
-                AssetsEntryCandidate(
-                    point=(left + glyph_w // 2, top + glyph_h // 2),
-                    bbox=(left, top, left + glyph_w, top + glyph_h),
-                    score=score,
-                )
-            )
-
-    distinct: list[AssetsEntryCandidate] = []
-    for candidate in sorted(raw_candidates, key=lambda item: item.score, reverse=True):
-        if any(
-            abs(candidate.point[0] - kept.point[0]) <= 24
-            and abs(candidate.point[1] - kept.point[1]) <= 24
-            for kept in distinct
-        ):
-            continue
-        distinct.append(candidate)
-    return distinct
+    return find_home_backpack_cube_candidates(image)
 
 
 def _find_assets_entry(image) -> tuple[tuple[int, int] | None, float]:
@@ -417,10 +359,11 @@ def _assets_runtime_state(frame) -> tuple[UiState, tuple[str, ...]]:
             ("ocr_detector_error",),
         )
     height, width = frame.image.shape[:2]
-    if _is_assets_inventory_screen(items):
+    inventory_observation = observe_inventory_page(frame)
+    if inventory_observation.state is InventoryPageState.INVENTORY_PAGE_VISIBLE:
         return (
             normalize_legacy_state(
-                "INVENTORY",
+                "INVENTORY_PAGE_VISIBLE",
                 phase="OPEN_INVENTORY",
                 evidence=("inventory_category_rail",),
                 frame_hash=frame_hash,
@@ -429,14 +372,15 @@ def _assets_runtime_state(frame) -> tuple[UiState, tuple[str, ...]]:
             (),
         )
     if _find_assets_text_entry(items, width, height):
+        home = normalize_legacy_state(
+            "HOME_READY",
+            phase="OPEN_INVENTORY",
+            evidence=("home_iron_coin_balance_display",),
+            frame_hash=frame_hash,
+            capture_id=capture_id,
+        )
         return (
-            normalize_legacy_state(
-                "HOME_READY",
-                phase="OPEN_INVENTORY",
-                evidence=("home_assets_balance",),
-                frame_hash=frame_hash,
-                capture_id=capture_id,
-            ),
+            replace(home, capabilities=frozenset()),
             ("inventory_category_rail_absent",),
         )
     if items:
@@ -498,62 +442,107 @@ def _open_assets_entry(
     if not _find_assets_text_entry(items, width, height):
         logger.warning("当前画面未识别到站点主界面的资产余额，拒绝盲点背包入口")
         return False
-    candidates = [
-        candidate
-        for candidate in candidate_resolver(image.image)
-        if candidate.point[0] >= width * 0.75 and candidate.point[1] <= height * 0.2
-    ]
-    if not candidates:
-        logger.error("未找到唯一资产魔方模板候选；拒绝归一化猜测坐标")
+    candidates = list(candidate_resolver(image.image))
+    initial_control = resolve_home_backpack_cube_control(
+        image,
+        candidate_resolver=lambda _pixels: candidates,
+    )
+    if not initial_control.resolved:
+        if initial_control.candidate_count <= 1:
+            logger.error(
+                "未解析出唯一 HOME 背包魔方控件；资产余额显示不提供点击权限"
+            )
+            return False
+        candidate = candidates[0]
+        geometry = geometry_provider()
+        chain = CoordinateChain.from_capture_point(
+            candidate.point,
+            capture_size=(width, height),
+            render_client_size=(int(geometry.physical_width), int(geometry.physical_height)),
+            device_size=(int(geometry.physical_width), int(geometry.physical_height)),
+            source_coordinate_space="CAPTURE_PIXELS",
+        )
+        blocked = NavigationAttemptEvidence(
+            task_name="inventory_scan",
+            entry_name="home_backpack_cube",
+            pre_state="HOME_READY",
+            pre_frame_sha256=frame_sha256(image),
+            coordinate_chain=chain,
+            candidate_type="home_backpack_cube_control",
+            candidate_bbox=None,
+            candidate_score=candidate.score,
+            candidate_count=initial_control.candidate_count,
+            dispatch_backend="device_control",
+        )
+        blocked.mark_dispatch(requested=False, acknowledged=False, result="blocked_ambiguous_candidates")
+        blocked.add_post_observation(
+            frame=image,
+            state="HOME_READY",
+            negative_cues=("multiple_backpack_cube_candidates",),
+            reason_codes=("backpack_cube_ambiguous",),
+            postcondition_result="FAIL",
+        )
+        evidence_recorder(blocked)
+        logger.error(
+            f"HOME 背包魔方候选不唯一（{initial_control.candidate_count}），拒绝点击"
+        )
         return False
 
-    candidate = candidates[0]
+    if poll_interval > 0:
+        sleep(min(poll_interval, 0.25))
+    fresh_frame = frame_provider()
+    fresh_height, fresh_width = fresh_frame.image.shape[:2]
+    fresh_items = fresh_frame.ocr()
+    if not _find_assets_text_entry(fresh_items, fresh_width, fresh_height):
+        logger.warning("背包魔方 fresh HOME_READY 前置条件不再成立")
+        return False
+    fresh_candidates = list(candidate_resolver(fresh_frame.image))
+    fresh_control = resolve_home_backpack_cube_control(
+        fresh_frame,
+        candidate_resolver=lambda _pixels: fresh_candidates,
+    )
+    confirmed_control = confirm_fresh_home_backpack_cube(
+        initial_control,
+        fresh_control,
+    )
+    if confirmed_control is None or confirmed_control.safe_hit_point is None:
+        logger.error("背包魔方控件在两张 fresh HOME_READY 帧之间不稳定，输入为 0")
+        return False
+    point = confirmed_control.safe_hit_point
+    image = fresh_frame
+    height, width = fresh_height, fresh_width
     geometry = geometry_provider()
     chain = CoordinateChain.from_capture_point(
-        candidate.point,
+        point,
         capture_size=(width, height),
         render_client_size=(int(geometry.physical_width), int(geometry.physical_height)),
         device_size=(int(geometry.physical_width), int(geometry.physical_height)),
-        source_coordinate_space="CAPTURE_LOGICAL_1280x720",
+        source_coordinate_space="CAPTURE_PIXELS",
     )
     evidence = NavigationAttemptEvidence(
         task_name="inventory_scan",
-        entry_name="assets_entry",
+        entry_name="home_backpack_cube",
         pre_state="HOME_READY",
         pre_frame_sha256=frame_sha256(image),
         coordinate_chain=chain,
-        candidate_type="template_white_glyph",
-        candidate_bbox=candidate.bbox,
-        candidate_score=candidate.score,
-        candidate_count=len(candidates),
+        candidate_type="home_backpack_cube_control",
+        candidate_bbox=confirmed_control.cube_bbox,
+        candidate_score=confirmed_control.candidate_score,
+        candidate_count=confirmed_control.candidate_count,
         dispatch_backend="device_control",
     )
-    if len(candidates) != 1:
-        evidence.mark_dispatch(
-            requested=False, acknowledged=False, result="blocked_ambiguous_candidates"
-        )
-        evidence.add_post_observation(
-            frame=image,
-            state="HOME_READY",
-            positive_cues=("home_assets_balance",),
-            negative_cues=("multiple_assets_candidates",),
-            reason_codes=("candidate_ambiguous",),
-            postcondition_result="FAIL",
-        )
-        evidence_recorder(evidence)
-        logger.error(f"资产入口模板候选不唯一（{len(candidates)}），拒绝点击")
-        return False
 
     logger.info(
-        f"资产入口 attempt={evidence.attempt_id} capture_point={candidate.point} "
-        f"device_point={chain.device_point} bbox={candidate.bbox} score={candidate.score:.3f}"
+        f"背包魔方 attempt={evidence.attempt_id} capture_point={point} "
+        f"device_point={chain.device_point} bbox={confirmed_control.cube_bbox} "
+        f"score={confirmed_control.candidate_score:.3f}"
     )
     try:
         dispatch_result = dispatcher(
-            candidate.point,
+            point,
             random_offset=False,
             intent=ActionIntent(
-                "open_assets_entry", "assets_entry", evidence.attempt_id
+                "open_inventory", "home_backpack_cube", evidence.attempt_id
             ),
         )
     except Exception as error:  # noqa: BLE001 - preserve evidence before fail-closed
@@ -563,7 +552,7 @@ def _open_assets_entry(
             result=f"dispatch_exception:{type(error).__name__}",
         )
         evidence_recorder(evidence)
-        logger.exception("资产入口 dispatch 失败")
+        logger.exception("背包魔方 dispatch 失败")
         return False
     acknowledged = bool(dispatch_result)
     evidence.mark_dispatch(
@@ -573,7 +562,7 @@ def _open_assets_entry(
     )
     if not acknowledged:
         evidence_recorder(evidence)
-        logger.error("资产入口 dispatch 未确认，停止且不重试")
+        logger.error("背包魔方 dispatch 未确认，停止且不重试")
         return False
 
     deadline = monotonic() + max(0.0, float(timeout))
@@ -584,7 +573,7 @@ def _open_assets_entry(
         post_frame = frame_provider()
         state, positive, negative = _assets_post_state(post_frame)
         final_state = state
-        passed = state == "INVENTORY"
+        passed = state == "INVENTORY_PAGE_VISIBLE"
         evidence.add_post_observation(
             frame=post_frame,
             state=state,
@@ -601,7 +590,7 @@ def _open_assets_entry(
         )
         if passed:
             evidence_recorder(evidence)
-            logger.info("已确认进入资产背包（识别到右侧道具/材料分类栏）")
+            logger.info("已确认进入背包（识别到右侧道具/材料分类栏）")
             return True
         if state == "UNEXPECTED_PAGE":
             break
@@ -623,7 +612,7 @@ def _open_assets_entry(
         postcondition_result="FAIL",
     )
     evidence_recorder(evidence)
-    logger.error(f"资产入口后置条件失败：{reason}；停止且不重试")
+    logger.error(f"背包魔方后置条件失败：{reason}；停止且不重试")
     return False
 
 
