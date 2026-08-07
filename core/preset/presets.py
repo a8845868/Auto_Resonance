@@ -21,6 +21,7 @@ from core.control.control import (
     screenshot,
     screenshot_image,
     wait_stopped,
+    recover_nemu_capture_session,
 )
 from core.exception.exceptions import StopExecution
 from core.image.utils import match_template
@@ -31,6 +32,7 @@ from core.services.screen_state import is_train_in_transit
 from core.services.city_navigation import (
     CityNavigationAdapter as ReadOnlyCityNavigationAdapter,
     CityNavigationState as ReadOnlyCityNavigationState,
+    KnownNavigationBlock,
 )
 from core.services.city_entry_postcondition import CITY_ENTRY_POSTCONDITION_POLICY
 from core.services.navigation_evidence import record_navigation_attempt
@@ -95,6 +97,19 @@ class CityNavigationResult:
     city_entry_verified: bool = False
     exact_expected_leaf_match: bool = False
     gate_postcondition_policy_id: str = ""
+    dispatch_count: int = 0
+    physical_input_count: int = 0
+    capture_failure: object | None = None
+    capture_failure_stage: str = ""
+    session_recovery_count: int = 0
+    same_action_retry: int = 0
+    retry_exhausted: bool = False
+    postcondition_observation_failed: bool = False
+    stale_frame_reused: bool = False
+    runtime_fault_recorded: bool = False
+    session_lifecycle_conflict: str = "NOT_PROVEN"
+    session_generation_before_recovery: int | None = None
+    session_generation_after_recovery: int | None = None
 
     def __bool__(self) -> bool:
         return self.success
@@ -553,6 +568,8 @@ def get_station(
             or getattr(navigation, "reason", "station_detector_no_match")
         )
         logger.error(f"城市/站点单动作确认失败：{reason}；不执行第二次城市入口动作")
+        if getattr(navigation, "capture_failure", None) is not None:
+            raise KnownNavigationBlock(navigation)
         return None
     if not station:
         logger.error("站点 detector 返回空标识；不使用岚心城或任何默认值")
@@ -648,6 +665,7 @@ def go_city(
     evidence_recorder: Callable[..., object] = record_navigation_attempt,
     station_ids: tuple[str, ...] = (),
     require_station_confirmation: bool = False,
+    session_recoverer: Callable[[], object] | None = recover_nemu_capture_session,
 ):
     """
     说明:
@@ -670,6 +688,7 @@ def go_city(
             evidence_recorder=evidence_recorder,
             station_ids=station_ids,
             require_station_confirmation=require_station_confirmation,
+            session_recoverer=session_recoverer,
         ).enter_city()
         attempted = (
             ("city_entry_navigation",)
@@ -734,6 +753,19 @@ def go_city(
             postcondition.city_entry_verified,
             postcondition.exact_expected_leaf_match,
             postcondition.policy_id,
+            getattr(resolved, "dispatch_count", 0),
+            getattr(resolved, "physical_input_count", 0),
+            getattr(resolved, "capture_failure", None),
+            getattr(resolved, "capture_failure_stage", ""),
+            getattr(resolved, "session_recovery_count", 0),
+            getattr(resolved, "same_action_retry", 0),
+            getattr(resolved, "retry_exhausted", False),
+            getattr(resolved, "postcondition_observation_failed", False),
+            getattr(resolved, "stale_frame_reused", False),
+            getattr(resolved, "runtime_fault_recorded", False),
+            getattr(resolved, "session_lifecycle_conflict", "NOT_PROVEN"),
+            getattr(resolved, "session_generation_before_recovery", None),
+            getattr(resolved, "session_generation_after_recovery", None),
         )
 
     started = monotonic()

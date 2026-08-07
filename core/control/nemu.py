@@ -1,7 +1,9 @@
 
 import ctypes
 import os
+import threading
 import time
+from datetime import datetime
 from typing import Optional
 
 from loguru import logger
@@ -21,6 +23,7 @@ from core.control.nemu_receipt import (
     ReleaseStatus,
     map_capture_to_nemu,
 )
+from core.control.nemu_capture import NemuCaptureError
 from core.model import app
 from core.services.repair_safety import ensure_automation_allowed
 
@@ -106,6 +109,20 @@ class NEMU(IADB):
         self.session_quarantined = False
         self.last_touch_receipt: NemuTouchReceipt | None = None
         self._health_adb = None
+        self.connect_epoch = ""
+        self.native_capture_call_count = 0
+        self.last_successful_capture_call_index = 0
+        self.health_capture_return_code = None
+        self.health_capture_session_generation = None
+        self.business_capture_return_code = None
+        self.business_capture_session_generation = None
+        self.kill_call_count = 0
+        self.disconnect_call_count = 0
+        self.last_kill_timestamp = ""
+        self.last_disconnect_timestamp = ""
+        self._health_capture_instance_handle = None
+        self._health_capture_display_id = None
+        self._health_capture_disconnect_call_count = 0
 
     def connect(self, adb_port: Optional[int] = None) -> bool:
         ensure_automation_allowed("建立 NEMU 连接")
@@ -113,6 +130,9 @@ class NEMU(IADB):
         self._health_adb = getattr(self, "_health_adb", None)
         self.session_quarantined = False
         self.last_touch_receipt = None
+        self.connect_epoch = datetime.now().astimezone().isoformat(
+            timespec="microseconds"
+        )
         try:
             self.connect_id = self.nemu.nemu_connect(self.path, self.device.index)
             self.display_id = self.nemu.nemu_get_display_id(
@@ -167,12 +187,23 @@ class NEMU(IADB):
             self.last_capture_return_code = None
             self.last_capture_native_status = "NOT_CALLED"
             self.native_capture_call_count = 0
+            self.last_successful_capture_call_index = 0
+            self.health_capture_return_code = None
+            self.health_capture_session_generation = None
+            self.business_capture_return_code = None
+            self.business_capture_session_generation = None
             if not self.check_resolution_ratio(self.width, self.height):
                 self.kill()
                 return False
 
             # Match ADB.connect(): do not publish a backend that cannot capture.
-            screenshot = self.screenshot()
+            # Preserve the public zero-argument screenshot contract used by
+            # test doubles and other backends while tagging this native call.
+            self._capture_failure_stage_context = "CONNECT_HEALTH_CAPTURE"
+            try:
+                screenshot = self.screenshot()
+            finally:
+                self._capture_failure_stage_context = ""
             expected_shape = (self.height, self.width, 3)
             if not isinstance(screenshot, np.ndarray) or screenshot.shape != expected_shape:
                 actual_shape = getattr(screenshot, "shape", None)
@@ -327,20 +358,100 @@ class NEMU(IADB):
         time.sleep(0.5)
         return receipt
 
-    def screenshot(self) -> cv.typing.MatLike:
+    def _capture_lifecycle_conflict(self) -> str:
+        if (
+            getattr(self, "health_capture_return_code", None) != 0
+            or getattr(self, "health_capture_session_generation", None)
+            != getattr(self, "session_generation", 0)
+        ):
+            return "NOT_PROVEN"
+        changed = any(
+            (
+                getattr(self, "connect_id", None)
+                != getattr(self, "_health_capture_instance_handle", None),
+                getattr(self, "display_id", None)
+                != getattr(self, "_health_capture_display_id", None),
+                int(getattr(self, "disconnect_call_count", 0))
+                != int(getattr(self, "_health_capture_disconnect_call_count", 0)),
+            )
+        )
+        return "YES" if changed else "NO"
+
+    def screenshot(
+        self,
+        *,
+        failure_stage: str | None = None,
+    ) -> cv.typing.MatLike:
         ensure_automation_allowed("通过 NEMU 读取游戏画面")
+        failure_stage = str(
+            failure_stage
+            or getattr(self, "_capture_failure_stage_context", "")
+            or "RUNTIME_CAPTURE"
+        )
         result = int(self.nemu.nemu_capture_display(self.connect_id, self.display_id, self.length, self.width_ptr, self.height_ptr, self.pixels_pointer))
         self.native_capture_call_count = int(
             getattr(self, "native_capture_call_count", 0)
         ) + 1
+        call_index = self.native_capture_call_count
         self.last_capture_return_code = result
         self.last_capture_native_status = "ACCEPTED" if result == 0 else "REJECTED"
+        if failure_stage == "CONNECT_HEALTH_CAPTURE":
+            self.health_capture_return_code = result
+            self.health_capture_session_generation = int(
+                getattr(self, "session_generation", 0)
+            )
+        else:
+            self.business_capture_return_code = result
+            self.business_capture_session_generation = int(
+                getattr(self, "session_generation", 0)
+            )
         if result != 0:
-            raise RuntimeError(f"nemu_capture_failed:{result}")
+            raise NemuCaptureError(
+                native_return_code=result,
+                instance_index=getattr(getattr(self, "device", None), "index", None),
+                instance_handle=getattr(self, "connect_id", None),
+                display_id=getattr(self, "display_id", None),
+                session_generation=getattr(self, "session_generation", 0),
+                connect_epoch=getattr(self, "connect_epoch", ""),
+                capture_call_index=call_index,
+                last_successful_capture_call_index=getattr(
+                    self, "last_successful_capture_call_index", 0
+                ),
+                capture_width=getattr(self, "width", 0),
+                capture_height=getattr(self, "height", 0),
+                thread_id=threading.get_ident(),
+                failure_stage=failure_stage,
+                session_lifecycle_conflict=self._capture_lifecycle_conflict(),
+                health_capture_return_code=getattr(
+                    self, "health_capture_return_code", None
+                ),
+                health_capture_session_generation=getattr(
+                    self, "health_capture_session_generation", None
+                ),
+                business_capture_return_code=getattr(
+                    self, "business_capture_return_code", None
+                ),
+                business_capture_session_generation=getattr(
+                    self, "business_capture_session_generation", None
+                ),
+                disconnect_call_count=getattr(self, "disconnect_call_count", 0),
+                kill_call_count=getattr(self, "kill_call_count", 0),
+                last_disconnect_timestamp=getattr(
+                    self, "last_disconnect_timestamp", ""
+                ),
+                last_kill_timestamp=getattr(self, "last_kill_timestamp", ""),
+            )
         image = np.frombuffer(self.pixels_array, dtype=np.uint8).reshape((self.height, self.width, 4))
 
         image = cv.cvtColor(image, cv.COLOR_BGRA2BGR)
         image = cv.flip(image, 0)
+        self.last_successful_capture_call_index = call_index
+        if failure_stage == "CONNECT_HEALTH_CAPTURE":
+            self._health_capture_instance_handle = getattr(self, "connect_id", None)
+            self._health_capture_display_id = getattr(self, "display_id", None)
+            self._health_capture_disconnect_call_count = int(
+                getattr(self, "disconnect_call_count", 0)
+            )
         return image
     
     def kill(self):
@@ -348,6 +459,10 @@ class NEMU(IADB):
         connect_id = getattr(self, "connect_id", None)
         if connect_id is None:
             return
+        self.kill_call_count = int(getattr(self, "kill_call_count", 0)) + 1
+        self.last_kill_timestamp = datetime.now().astimezone().isoformat(
+            timespec="microseconds"
+        )
         self.connect_id = None
         health_adb, self._health_adb = getattr(self, "_health_adb", None), None
         if health_adb is not None:
@@ -356,3 +471,9 @@ class NEMU(IADB):
             except Exception:
                 pass
         self.nemu.nemu_disconnect(connect_id)
+        self.disconnect_call_count = int(
+            getattr(self, "disconnect_call_count", 0)
+        ) + 1
+        self.last_disconnect_timestamp = datetime.now().astimezone().isoformat(
+            timespec="microseconds"
+        )

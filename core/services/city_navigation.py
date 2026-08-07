@@ -11,6 +11,14 @@ from datetime import datetime
 from enum import Enum
 from typing import Callable, Iterable
 
+from core.control.nemu_capture import (
+    CaptureSessionRecoveryResult,
+    NemuCaptureError,
+)
+from core.services.capture_recovery import (
+    CaptureRecoveryPolicy,
+    DEFAULT_CAPTURE_RECOVERY_POLICY,
+)
 from core.services.navigation_evidence import (
     CoordinateChain,
     NavigationAttemptEvidence,
@@ -23,6 +31,10 @@ from core.services.navigation_parent_control import (
 )
 from core.services.city_entry_postcondition import CITY_ENTRY_POSTCONDITION_POLICY
 from core.services.runtime_navigation_kernel import UiState, normalize_legacy_state
+from core.services.runtime_fault_telemetry import (
+    RuntimeFaultEvent,
+    record_runtime_fault,
+)
 
 
 CITY_ENTRY_TRANSITION_TIMEOUT_SECONDS = 30.0
@@ -128,6 +140,26 @@ class CityNavigationResult:
     city_entry_verified: bool = False
     exact_expected_leaf_match: bool = False
     gate_postcondition_policy_id: str = ""
+    physical_input_count: int = 0
+    capture_failure: NemuCaptureError | None = None
+    capture_failure_stage: str = ""
+    session_recovery_count: int = 0
+    same_action_retry: int = 0
+    retry_exhausted: bool = False
+    postcondition_observation_failed: bool = False
+    stale_frame_reused: bool = False
+    runtime_fault_recorded: bool = False
+    session_lifecycle_conflict: str = "NOT_PROVEN"
+    session_generation_before_recovery: int | None = None
+    session_generation_after_recovery: int | None = None
+
+
+class KnownNavigationBlock(RuntimeError):
+    """Typed bridge from navigation to a task-level safe block."""
+
+    def __init__(self, result: CityNavigationResult) -> None:
+        self.result = result
+        super().__init__(result.reason)
 
 
 @dataclass(frozen=True)
@@ -433,6 +465,9 @@ class CityNavigationAdapter:
         city_entry_transition_timeout_seconds: float | None = None,
         city_entry_observation_interval_seconds: float = CITY_ENTRY_OBSERVATION_INTERVAL_SECONDS,
         city_entry_minimum_grace_seconds: float = CITY_ENTRY_MINIMUM_GRACE_SECONDS,
+        session_recoverer: Callable[[], CaptureSessionRecoveryResult] | None = None,
+        capture_recovery_policy: CaptureRecoveryPolicy = DEFAULT_CAPTURE_RECOVERY_POLICY,
+        runtime_fault_recorder: Callable[[RuntimeFaultEvent], object] | None = record_runtime_fault,
     ):
         self.frame_provider = frame_provider
         self.tap = tap
@@ -464,6 +499,9 @@ class CityNavigationAdapter:
         self.city_entry_minimum_grace_seconds = max(
             0.0, float(city_entry_minimum_grace_seconds)
         )
+        self.session_recoverer = session_recoverer
+        self.capture_recovery_policy = capture_recovery_policy
+        self.runtime_fault_recorder = runtime_fault_recorder
 
     def enter_city(self) -> CityNavigationResult:
         deadline = self.monotonic() + self.timeout
@@ -483,6 +521,18 @@ class CityNavigationAdapter:
         city_entry_verified = False
         exact_expected_leaf_match = False
         gate_postcondition_policy_id = CITY_ENTRY_POSTCONDITION_POLICY.policy_id
+        physical_input_count = 0
+        capture_failure: NemuCaptureError | None = None
+        capture_failure_stage = ""
+        session_recovery_count = 0
+        same_action_retry = 0
+        retry_exhausted = False
+        postcondition_observation_failed = False
+        stale_frame_reused = False
+        runtime_fault_recorded = False
+        session_lifecycle_conflict = "NOT_PROVEN"
+        session_generation_before_recovery: int | None = None
+        session_generation_after_recovery: int | None = None
 
         def record(
             observation,
@@ -566,80 +616,251 @@ class CityNavigationAdapter:
                 city_entry_verified=city_entry_verified,
                 exact_expected_leaf_match=exact_expected_leaf_match,
                 gate_postcondition_policy_id=gate_postcondition_policy_id,
+                physical_input_count=physical_input_count,
+                capture_failure=capture_failure,
+                capture_failure_stage=capture_failure_stage,
+                session_recovery_count=session_recovery_count,
+                same_action_retry=same_action_retry,
+                retry_exhausted=retry_exhausted,
+                postcondition_observation_failed=postcondition_observation_failed,
+                stale_frame_reused=stale_frame_reused,
+                runtime_fault_recorded=runtime_fault_recorded,
+                session_lifecycle_conflict=session_lifecycle_conflict,
+                session_generation_before_recovery=(
+                    session_generation_before_recovery
+                ),
+                session_generation_after_recovery=(
+                    session_generation_after_recovery
+                ),
             )
 
-        if self.cancellation():
-            return finish(CityNavigationState.FAILED, "BLOCKED", "city_entry_cancelled")
-        if self.monotonic() >= deadline:
-            return finish(CityNavigationState.TIMEOUT, "BLOCKED", "navigation_deadline_or_attempt_limit")
-        planned_frame = self.frame_provider()
-        before = observe_city_frame(planned_frame, now=self.now)
-        attempts += 1
-        if before.city_entry.candidate_count != 1:
-            record(before, "OBSERVE_CITY_ENTRY", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_entry_candidate_not_unique")
-            return finish(before.state, "BLOCKED", "city_entry_candidate_not_unique")
-        if before.state is CityNavigationState.HOME_READY:
-            record(before, "OBSERVE_CITY_ENTRY", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_entry_anchor_missing")
-            return finish(CityNavigationState.HOME_READY, "BLOCKED", "city_entry_anchor_missing")
-        if before.state is not CityNavigationState.CITY_ENTRY_VISIBLE:
-            record(before, "OBSERVE_CITY_ENTRY", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "unknown_page_blocks_action")
-            return finish(CityNavigationState.UNKNOWN, "BLOCKED", "unknown_page_blocks_action")
+        def record_capture_fault(
+            failure: NemuCaptureError,
+            *,
+            recovery_attempted: bool,
+            recovery_result: str,
+        ) -> None:
+            nonlocal runtime_fault_recorded
+            if self.runtime_fault_recorder is None:
+                return
+            try:
+                self.runtime_fault_recorder(RuntimeFaultEvent(
+                    task_id="city_entry_navigation",
+                    attempt_id=self.correlation_id,
+                    backend=failure.backend,
+                    session_generation=failure.session_generation,
+                    native_return_code=failure.native_return_code,
+                    failure_stage=failure.failure_stage,
+                    recovery_attempted=recovery_attempted,
+                    recovery_result=recovery_result,
+                    capture_call_index=failure.capture_call_index,
+                    session_lifecycle_conflict=(
+                        failure.session_lifecycle_conflict
+                    ),
+                ))
+                runtime_fault_recorded = True
+            except OSError:
+                runtime_fault_recorded = False
 
-        bounds = before.city_entry.anchor_bbox
-        if bounds is None:
-            return finish(CityNavigationState.HOME_READY, "BLOCKED", "city_entry_anchor_missing")
-        planned_image = getattr(planned_frame, "image", planned_frame)
-        initial_parent = resolve_navigation_parent_control(
-            planned_image,
-            semantic_id="visit_city",
-            anchor_bbox=bounds,
-            source_capture_id=before.source_capture_id,
-            source_frame_sha256=before.screenshot_hash,
-        )
-        if not initial_parent.resolved:
-            record(before, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_parent_control_unresolved")
-            return finish(before.state, "BLOCKED", "city_parent_control_unresolved")
+        def acquire_pre_dispatch():
+            nonlocal attempts, capture_failure, capture_failure_stage
+            nonlocal session_recovery_count, retry_exhausted
+            nonlocal session_lifecycle_conflict
+            nonlocal session_generation_before_recovery
+            nonlocal session_generation_after_recovery
 
-        if self.cancellation():
-            return finish(CityNavigationState.FAILED, "BLOCKED", "city_entry_cancelled")
-        if self.monotonic() >= deadline:
-            return finish(CityNavigationState.TIMEOUT, "BLOCKED", "city_entry_postcondition_timeout")
+            while True:
+                if self.cancellation():
+                    return finish(
+                        CityNavigationState.FAILED,
+                        "BLOCKED",
+                        "city_entry_cancelled",
+                    )
+                if self.monotonic() >= deadline:
+                    return finish(
+                        CityNavigationState.TIMEOUT,
+                        "BLOCKED",
+                        "navigation_deadline_or_attempt_limit",
+                    )
+                try:
+                    planned_frame = self.frame_provider()
+                except NemuCaptureError as error:
+                    failure = error.with_failure_stage("INITIAL_CAPTURE")
+                    recovery_attempted = False
+                    recovery_result = "NOT_ALLOWED"
+                    if (
+                        self.session_recoverer is not None
+                        and self.capture_recovery_policy.allows(
+                            failure,
+                            dispatch_count=dispatch_count,
+                            recovery_count=session_recovery_count,
+                        )
+                    ):
+                        recovery_attempted = True
+                        recovered = self.session_recoverer()
+                        session_recovery_count += 1
+                        session_generation_before_recovery = (
+                            recovered.previous_session_generation
+                        )
+                        session_generation_after_recovery = (
+                            recovered.current_session_generation
+                        )
+                        recovery_result = recovered.reason
+                        record_capture_fault(
+                            failure,
+                            recovery_attempted=True,
+                            recovery_result=recovery_result,
+                        )
+                        if recovered.success:
+                            continue
+                    capture_failure = failure
+                    capture_failure_stage = failure.failure_stage
+                    session_lifecycle_conflict = (
+                        failure.session_lifecycle_conflict
+                    )
+                    retry_exhausted = bool(
+                        recovery_attempted
+                        or session_recovery_count
+                        >= self.capture_recovery_policy.max_pre_dispatch_session_recovery
+                    )
+                    if not recovery_attempted:
+                        record_capture_fault(
+                            failure,
+                            recovery_attempted=False,
+                            recovery_result=recovery_result,
+                        )
+                    return finish(
+                        CityNavigationState.FAILED,
+                        "BLOCKED_SAFETY",
+                        "initial_capture_failed",
+                    )
 
-        # Fresh confirmation owns the dispatch plan. The earlier observation
-        # is only a prerequisite and is never reused for input.
-        fresh_frame = self.frame_provider()
-        fresh = observe_city_frame(fresh_frame, now=self.now)
-        attempts += 1
-        if (
-            before.source_capture_id
-            and fresh.source_capture_id
-            and before.source_capture_id == fresh.source_capture_id
-        ):
-            record(fresh, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "stale_frame_action")
-            return finish(CityNavigationState.FAILED, "BLOCKED", "stale_frame_action")
-        if fresh.city_entry.candidate_count != 1 or fresh.city_entry.anchor_bbox is None:
-            record(fresh, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_entry_candidate_not_unique")
-            return finish(fresh.state, "BLOCKED", "city_entry_candidate_not_unique")
-        if fresh.state is not CityNavigationState.CITY_ENTRY_VISIBLE:
-            record(fresh, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_entry_candidate_mismatch")
-            return finish(fresh.state, "BLOCKED", "city_entry_candidate_mismatch")
+                before = observe_city_frame(planned_frame, now=self.now)
+                attempts += 1
+                if before.city_entry.candidate_count != 1:
+                    record(before, "OBSERVE_CITY_ENTRY", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_entry_candidate_not_unique")
+                    return finish(before.state, "BLOCKED", "city_entry_candidate_not_unique")
+                if before.state is CityNavigationState.HOME_READY:
+                    record(before, "OBSERVE_CITY_ENTRY", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_entry_anchor_missing")
+                    return finish(CityNavigationState.HOME_READY, "BLOCKED", "city_entry_anchor_missing")
+                if before.state is not CityNavigationState.CITY_ENTRY_VISIBLE:
+                    record(before, "OBSERVE_CITY_ENTRY", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "unknown_page_blocks_action")
+                    return finish(CityNavigationState.UNKNOWN, "BLOCKED", "unknown_page_blocks_action")
 
-        bounds = fresh.city_entry.anchor_bbox
-        image = getattr(fresh_frame, "image", fresh_frame)
+                bounds = before.city_entry.anchor_bbox
+                if bounds is None:
+                    return finish(CityNavigationState.HOME_READY, "BLOCKED", "city_entry_anchor_missing")
+                planned_image = getattr(planned_frame, "image", planned_frame)
+                initial_parent = resolve_navigation_parent_control(
+                    planned_image,
+                    semantic_id="visit_city",
+                    anchor_bbox=bounds,
+                    source_capture_id=before.source_capture_id,
+                    source_frame_sha256=before.screenshot_hash,
+                )
+                if not initial_parent.resolved:
+                    record(before, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_parent_control_unresolved")
+                    return finish(before.state, "BLOCKED", "city_parent_control_unresolved")
+
+                if self.cancellation():
+                    return finish(CityNavigationState.FAILED, "BLOCKED", "city_entry_cancelled")
+                if self.monotonic() >= deadline:
+                    return finish(CityNavigationState.TIMEOUT, "BLOCKED", "city_entry_postcondition_timeout")
+                try:
+                    fresh_frame = self.frame_provider()
+                except NemuCaptureError as error:
+                    failure = error.with_failure_stage(
+                        "FRESH_CONFIRMATION_CAPTURE"
+                    )
+                    recovery_attempted = False
+                    recovery_result = "NOT_ALLOWED"
+                    if (
+                        self.session_recoverer is not None
+                        and self.capture_recovery_policy.allows(
+                            failure,
+                            dispatch_count=dispatch_count,
+                            recovery_count=session_recovery_count,
+                        )
+                    ):
+                        recovery_attempted = True
+                        recovered = self.session_recoverer()
+                        session_recovery_count += 1
+                        session_generation_before_recovery = (
+                            recovered.previous_session_generation
+                        )
+                        session_generation_after_recovery = (
+                            recovered.current_session_generation
+                        )
+                        recovery_result = recovered.reason
+                        record_capture_fault(
+                            failure,
+                            recovery_attempted=True,
+                            recovery_result=recovery_result,
+                        )
+                        if recovered.success:
+                            # Never reuse the first frame across sessions.
+                            continue
+                    capture_failure = failure
+                    capture_failure_stage = failure.failure_stage
+                    session_lifecycle_conflict = (
+                        failure.session_lifecycle_conflict
+                    )
+                    retry_exhausted = bool(
+                        recovery_attempted
+                        or session_recovery_count
+                        >= self.capture_recovery_policy.max_pre_dispatch_session_recovery
+                    )
+                    if not recovery_attempted:
+                        record_capture_fault(
+                            failure,
+                            recovery_attempted=False,
+                            recovery_result=recovery_result,
+                        )
+                    return finish(
+                        CityNavigationState.FAILED,
+                        "BLOCKED_SAFETY",
+                        "fresh_capture_failed",
+                    )
+
+                fresh = observe_city_frame(fresh_frame, now=self.now)
+                attempts += 1
+                if (
+                    before.source_capture_id
+                    and fresh.source_capture_id
+                    and before.source_capture_id == fresh.source_capture_id
+                ):
+                    record(fresh, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "stale_frame_action")
+                    return finish(CityNavigationState.FAILED, "BLOCKED", "stale_frame_action")
+                if fresh.city_entry.candidate_count != 1 or fresh.city_entry.anchor_bbox is None:
+                    record(fresh, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_entry_candidate_not_unique")
+                    return finish(fresh.state, "BLOCKED", "city_entry_candidate_not_unique")
+                if fresh.state is not CityNavigationState.CITY_ENTRY_VISIBLE:
+                    record(fresh, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_entry_candidate_mismatch")
+                    return finish(fresh.state, "BLOCKED", "city_entry_candidate_mismatch")
+
+                image = getattr(fresh_frame, "image", fresh_frame)
+                fresh_parent = resolve_navigation_parent_control(
+                    image,
+                    semantic_id="visit_city",
+                    anchor_bbox=fresh.city_entry.anchor_bbox,
+                    source_capture_id=fresh.source_capture_id,
+                    source_frame_sha256=fresh.screenshot_hash,
+                )
+                confirmed_parent = confirm_fresh_parent_control(
+                    initial_parent, fresh_parent
+                )
+                if confirmed_parent is None or confirmed_parent.safe_hit_point is None:
+                    record(fresh, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_parent_control_unstable")
+                    return finish(fresh.state, "BLOCKED", "city_parent_control_unstable")
+                return fresh, image, confirmed_parent
+
+        acquired = acquire_pre_dispatch()
+        if isinstance(acquired, CityNavigationResult):
+            return acquired
+        fresh, image, confirmed_parent = acquired
         if image is None or not hasattr(image, "shape") or len(image.shape) < 2:
             return finish(CityNavigationState.FAILED, "BLOCKED", "city_entry_coordinate_chain_incomplete")
         capture_height, capture_width = map(int, image.shape[:2])
-        fresh_parent = resolve_navigation_parent_control(
-            image,
-            semantic_id="visit_city",
-            anchor_bbox=bounds,
-            source_capture_id=fresh.source_capture_id,
-            source_frame_sha256=fresh.screenshot_hash,
-        )
-        confirmed_parent = confirm_fresh_parent_control(initial_parent, fresh_parent)
-        if confirmed_parent is None or confirmed_parent.safe_hit_point is None:
-            record(fresh, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_parent_control_unstable")
-            return finish(fresh.state, "BLOCKED", "city_parent_control_unstable")
         point = confirmed_parent.safe_hit_point
         render_size = (capture_width, capture_height)
         device_size = render_size
@@ -696,6 +917,7 @@ class CityNavigationAdapter:
             return finish(CityNavigationState.FAILED, "BLOCKED", "city_entry_dispatch_not_acknowledged")
         evidence.mark_dispatch(requested=True, acknowledged=True, result="call_returned")
         dispatch_count = 1
+        physical_input_count = 1
         dispatch_started = self.monotonic()
         record(
             fresh,
@@ -733,7 +955,30 @@ class CityNavigationAdapter:
                 break
             try:
                 post_frame = self.frame_provider()
-            except Exception:  # noqa: BLE001 - preserve exact transition class
+            except NemuCaptureError as error:
+                capture_failure = error.with_failure_stage(
+                    "POST_DISPATCH_CAPTURE"
+                )
+                capture_failure_stage = capture_failure.failure_stage
+                session_lifecycle_conflict = (
+                    capture_failure.session_lifecycle_conflict
+                )
+                postcondition_observation_failed = True
+                retry_exhausted = True
+                record_capture_fault(
+                    capture_failure,
+                    recovery_attempted=False,
+                    recovery_result="FORBIDDEN_AFTER_DISPATCH",
+                )
+                return finish(
+                    CityNavigationState.FAILED,
+                    "POSTCONDITION_UNOBSERVABLE",
+                    "post_dispatch_capture_failed",
+                    transition_result="UNOBSERVABLE",
+                )
+            except StopIteration:
+                # Deterministic fixture/provider exhaustion remains a precise
+                # transition failure; unexpected RuntimeError still escapes.
                 return finish(
                     CityNavigationState.FAILED,
                     "FAILED",

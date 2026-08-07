@@ -23,6 +23,7 @@ from core.control.adb import ADB
 from core.control.adb_port import EmulatorInfo, EmulatorType
 from core.control.base_control import IADB
 from core.control.nemu import IPCUnavailableError, NEMU
+from core.control.nemu_capture import CaptureSessionRecoveryResult
 from core.exception.exceptions import StopExecution
 from core.image.image import Image
 from core.model import app
@@ -454,6 +455,62 @@ def kill():
     关闭连接
     """
     control.kill()
+
+
+def recover_nemu_capture_session() -> CaptureSessionRecoveryResult:
+    """Replace one failed NEMU session; never fall back to an input backend."""
+
+    ensure_automation_allowed("恢复 NEMU 截图会话")
+    with _BACKEND_LOCK:
+        previous = control
+        if not isinstance(previous, NEMU):
+            return CaptureSessionRecoveryResult(
+                False, "active_backend_is_not_nemu"
+            )
+        previous_generation = int(
+            getattr(previous, "session_generation", 0)
+        )
+        lifecycle_conflict = str(
+            previous._capture_lifecycle_conflict()  # noqa: SLF001
+        )
+        if lifecycle_conflict == "YES":
+            return CaptureSessionRecoveryResult(
+                False,
+                "session_lifecycle_conflict",
+                previous_generation,
+                previous_generation,
+                lifecycle_conflict,
+            )
+        previous.kill()
+
+    try:
+        status = connect(getattr(get_runtime_device(), "port", None))
+    except Exception as error:
+        from core.control.nemu_capture import NemuCaptureError
+
+        if isinstance(error, NemuCaptureError):
+            return CaptureSessionRecoveryResult(
+                False,
+                "replacement_session_capture_failed",
+                previous_generation,
+                int(getattr(control, "session_generation", 0)),
+                lifecycle_conflict,
+                error,
+            )
+        raise
+    current_generation = int(getattr(control, "session_generation", 0))
+    success = bool(
+        status
+        and isinstance(control, NEMU)
+        and current_generation > previous_generation
+    )
+    return CaptureSessionRecoveryResult(
+        success,
+        "replacement_session_ready" if success else "replacement_session_unavailable",
+        previous_generation,
+        current_generation,
+        lifecycle_conflict,
+    )
 
 
 def _legacy_input_swipe(

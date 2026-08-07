@@ -36,10 +36,51 @@ from core.services.fatigue_triggers import (
 from core.services.server_calendar import SERVER_CLOCK
 from core.services.station_facilities import rest_area_availability
 from core.services.weekly_plan_state import load_weekly_plan
+from core.services.city_navigation import KnownNavigationBlock
 from core.utils.utils import RESOURCES_PATH, read_json
 
 
 MINIMUM_TRADING_FATIGUE = 80
+
+
+def _capture_blocked_fatigue_result(error: KnownNavigationBlock) -> dict:
+    navigation = error.result
+    failure = getattr(navigation, "capture_failure", None)
+    return {
+        "success": False,
+        "terminal": True,
+        "task_outcome": "BLOCKED_SAFETY",
+        "reason": "city_navigation_capture_unavailable",
+        "incident_eligible": False,
+        "halt_eligible": False,
+        "queue_automatic_retry": False,
+        "queue_retry_count": 0,
+        "capture_failure_stage": str(
+            getattr(navigation, "capture_failure_stage", "")
+        ),
+        "native_return_code": getattr(failure, "native_return_code", None),
+        "in_task_capture_recovery_count": int(
+            getattr(navigation, "session_recovery_count", 0)
+        ),
+        "retry_exhausted": bool(
+            getattr(navigation, "retry_exhausted", False)
+        ),
+        "runtime_fault_recorded": bool(
+            getattr(navigation, "runtime_fault_recorded", False)
+        ),
+        "physical_input_count": int(
+            getattr(navigation, "physical_input_count", 0)
+        ),
+        "fatigue_ui_actions": int(
+            getattr(navigation, "physical_input_count", 0)
+        ),
+        "fatigue_business_actions": 0,
+        "buy_actions": 0,
+        "sell_actions": 0,
+        "depart_actions": 0,
+        "fatigue_consume_actions": 0,
+        "business_progress_made": False,
+    }
 
 
 def _route_context(current_station: str | None = None) -> TradeRouteContext | None:
@@ -223,7 +264,10 @@ def _run_daily_fatigue_recovery_impl(*, expected_waypoint: str | None = None) ->
     """Observe resources, execute the plan one action at a time, and replan."""
     if not connect():
         raise RuntimeError("疲劳规划无法连接模拟器")
-    station_name = get_station()
+    try:
+        station_name = get_station()
+    except KnownNavigationBlock as error:
+        return _capture_blocked_fatigue_result(error)
     if not station_name:
         raise RuntimeError("疲劳规划未能确认当前站点")
     if expected_waypoint and station_name != expected_waypoint:
@@ -443,6 +487,16 @@ def run_daily_fatigue_recovery(
                 path=path,
             )
         raise
+    if result.get("task_outcome") == "BLOCKED_SAFETY":
+        if checkpoint is not None:
+            fail_fatigue_checkpoint(
+                str(checkpoint["id"]),
+                str(result.get("reason", "blocked_safety")),
+                owner_id=owner_id,
+                lease_token=lease_token,
+                path=path,
+            )
+        return result
     if checkpoint is None and isinstance(result.get("transfer_intent"), dict):
         transfer = dict(result["transfer_intent"])
         initial_action = {
