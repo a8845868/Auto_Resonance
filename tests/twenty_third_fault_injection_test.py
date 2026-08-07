@@ -228,7 +228,7 @@ def test_invalid_direct_city_detail_source_cannot_issue_action():
         tap=lambda *args, **kwargs: taps.append((args, kwargs)),
     ).enter_city()
     assert result.status == "BLOCKED"
-    assert result.reason == "invalid_source_state:CITY_DETAIL"
+    assert result.reason == "invalid_source_state:CITY_DETAIL_VISIBLE"
     assert taps == []
 
 

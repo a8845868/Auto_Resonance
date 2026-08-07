@@ -32,6 +32,7 @@ from core.services.city_navigation import (
     CityNavigationAdapter as ReadOnlyCityNavigationAdapter,
     CityNavigationState as ReadOnlyCityNavigationState,
 )
+from core.services.city_entry_postcondition import CITY_ENTRY_POSTCONDITION_POLICY
 from core.services.navigation_evidence import record_navigation_attempt
 from core.services.read_only_policy import ActionIntent
 from core.services.station_availability import station_unavailable_reason
@@ -49,6 +50,7 @@ class CityNavigationState(str, Enum):
     CITY_ENTRY_AVAILABLE = "CITY_ENTRY_AVAILABLE"
     CITY_MAP = "CITY_MAP"
     CITY_DETAIL = "CITY_DETAIL"
+    EXCHANGE_NPC_VISIBLE = "EXCHANGE_NPC_VISIBLE"
     NPC_DIALOG = "NPC_DIALOG"
     NPC_DIALOGUE = "NPC_DIALOGUE"
     EXCHANGE_MENU = "EXCHANGE_MENU"
@@ -88,6 +90,11 @@ class CityNavigationResult:
     station_id: str | None = None
     terminal: bool = True
     evidence_attempt_id: str = ""
+    post_canonical_leaf_state: str = ""
+    post_context_state: str = ""
+    city_entry_verified: bool = False
+    exact_expected_leaf_match: bool = False
+    gate_postcondition_policy_id: str = ""
 
     def __bool__(self) -> bool:
         return self.success
@@ -682,10 +689,23 @@ def go_city(
         state_map = {
             ReadOnlyCityNavigationState.CITY_MAP: CityNavigationState.CITY_MAP,
             ReadOnlyCityNavigationState.CITY_DETAIL: CityNavigationState.CITY_DETAIL,
-            ReadOnlyCityNavigationState.EXCHANGE_NPC_VISIBLE: CityNavigationState.CITY_DETAIL,
+            ReadOnlyCityNavigationState.EXCHANGE_NPC_VISIBLE: CityNavigationState.EXCHANGE_NPC_VISIBLE,
             ReadOnlyCityNavigationState.TIMEOUT: CityNavigationState.TIMEOUT,
             ReadOnlyCityNavigationState.UNKNOWN: CityNavigationState.UNKNOWN,
         }
+        evidence = getattr(resolved, "evidence", None)
+        postcondition = CITY_ENTRY_POSTCONDITION_POLICY.evaluate(
+            getattr(resolved, "post_canonical_leaf_state", "") or resolved.state,
+            frame_is_fresh=bool(
+                evidence
+                and evidence.post_observations
+                and evidence.post_observations[-1].source_capture_id
+            ),
+            frame_changed=bool(evidence and evidence.post_frame_changed),
+            evidence_invariant_check=(
+                evidence.evidence_invariant_check if evidence else "NOT_RUN"
+            ),
+        )
         if resolved.reason == "NAVIGATION_STALLED":
             state = CityNavigationState.STALLED
         elif resolved.reason == "guard_denied_city_entry":
@@ -694,7 +714,7 @@ def go_city(
             state = state_map.get(resolved.state, CityNavigationState.UNKNOWN)
         last = resolved.trace[-1] if resolved.trace else None
         return CityNavigationResult(
-            resolved.status == "PASS",
+            resolved.status == "PASS" and postcondition.city_entry_verified,
             state,
             resolved.attempt_count,
             max(0.0, monotonic() - started),
@@ -709,6 +729,11 @@ def go_city(
             resolved.station_id,
             resolved.terminal,
             resolved.evidence_attempt_id,
+            postcondition.post_canonical_leaf_state,
+            postcondition.post_context_state,
+            postcondition.city_entry_verified,
+            postcondition.exact_expected_leaf_match,
+            postcondition.policy_id,
         )
 
     started = monotonic()

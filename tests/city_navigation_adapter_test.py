@@ -60,6 +60,14 @@ class _Frame:
             )
             for index, text in enumerate(texts)
         ]
+        if any("访问城市" in text for text in texts):
+            cx, cy = round(width * 1100 / 1280), round(height * 480 / 720)
+            left, right = max(0, cx - round(width * 100 / 1280)), min(width - 1, cx + round(width * 100 / 1280))
+            top, bottom = max(0, cy - round(height * 40 / 720)), min(height - 1, cy + round(height * 40 / 720))
+            self.image[top:top + 3, left:right + 1] = 255
+            self.image[bottom - 2:bottom + 1, left:right + 1] = 255
+            self.image[top:bottom + 1, left:left + 3] = 255
+            self.image[top:bottom + 1, right - 2:right + 1] = 255
 
     def ocr(self):
         return list(self._items)
@@ -137,7 +145,8 @@ def test_home_ready_to_city_detail_uses_observed_anchor_and_waits_through_transi
     assert result.status == "PASS"
     assert result.state is CityNavigationState.CITY_DETAIL
     assert result.reason == "city_postcondition_verified"
-    assert taps[0][0][0] == (1100, 480)
+    assert taps[0][0][0] == (1037, 480)
+    assert taps[0][0][0] != (1100, 480)
     assert taps[0][1]["intent"].action_key == "city_entry_navigation"
     assert CityNavigationState.CITY_TRANSITION in [event.state for event in result.trace]
 
@@ -312,7 +321,7 @@ def test_nonempty_unknown_transition_replays_real_defect_then_reaches_station():
     assert result.dispatch_count == 1
     assert result.post_observation_count == 3
     assert result.transition_result == "PASS"
-    assert result.last_observed_state == "CITY_DETAIL"
+    assert result.last_observed_state == "CITY_DETAIL_VISIBLE"
     assert result.attempt_count != result.dispatch_count
     assert len(taps) == 1
     pending = [event for event in result.trace if event.transition_classification == "PENDING"]
@@ -377,7 +386,7 @@ def test_committed_foreign_pages_fail_early_without_redispatch(foreign_texts):
             ],
             "HOME_READY",
         ),
-        ([_home(pixel=3), _home(pixel=4)], "CITY_ENTRY_VISIBLE"),
+        ([_home(pixel=3), _home(pixel=4)], "HOME_CITY_ENTRY_CONTROL_VISIBLE"),
     ],
 )
 def test_home_states_after_dispatch_remain_pending_until_timeout(
@@ -565,6 +574,57 @@ def test_city_map_and_city_detail_are_distinct_states():
     city_detail = observe_city_frame(_Frame("当前城市", "城市设施", "城市手册"))
     assert city_map.state is CityNavigationState.CITY_MAP
     assert city_detail.state is CityNavigationState.CITY_DETAIL
+
+
+def test_exchange_npc_classifier_requires_city_structure_and_unique_exchange_anchor():
+    observed = observe_city_frame(
+        _Frame("当前城市", "城市设施", "交易所", pixel=22, capture_id="exchange-npc")
+    )
+
+    assert observed.state is CityNavigationState.EXCHANGE_NPC_VISIBLE
+    assert observed.reason == "city_exchange_anchor_confirmed"
+    assert len(observed.evidence) >= 2
+
+
+def test_exchange_npc_and_home_cues_conflict_fail_closed():
+    observed = observe_city_frame(
+        _Frame(
+            "当前城市", "城市设施", "交易所",
+            "访问城市", "作战终端", "启程",
+            pixel=23,
+            capture_id="conflict",
+        )
+    )
+
+    assert observed.state is CityNavigationState.UNKNOWN
+    assert observed.reason == "conflicting_home_city_page_evidence"
+
+
+def test_same_frame_hash_produces_same_exchange_npc_leaf_state():
+    frame = _Frame(
+        "当前城市", "城市设施", "交易所", pixel=24, capture_id="stable-exchange"
+    )
+
+    first = observe_city_frame(frame)
+    second = observe_city_frame(frame)
+
+    assert first.screenshot_hash == second.screenshot_hash
+    assert first.state is second.state is CityNavigationState.EXCHANGE_NPC_VISIBLE
+
+
+def test_product_adapter_preserves_exchange_leaf_and_verifies_city_context():
+    exchange = _Frame(
+        "当前城市", "城市设施", "交易所", pixel=25, capture_id="exchange-post"
+    )
+    result = _adapter([_home(), _home(pixel=2), exchange]).enter_city()
+
+    assert result.status == "PASS"
+    assert result.state is CityNavigationState.EXCHANGE_NPC_VISIBLE
+    assert result.post_canonical_leaf_state == "EXCHANGE_NPC_VISIBLE"
+    assert result.post_context_state == "CITY_CONTEXT_VISIBLE"
+    assert result.city_entry_verified is True
+    assert result.exact_expected_leaf_match is False
+    assert result.gate_postcondition_policy_id == "CITY_ENTRY_TRUSTED_CONTEXT_V1"
 
 
 def test_exchange_menu_is_not_buy_page():

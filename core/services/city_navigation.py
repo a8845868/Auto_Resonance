@@ -17,6 +17,11 @@ from core.services.navigation_evidence import (
     record_navigation_attempt,
 )
 from core.services.read_only_policy import ActionIntent
+from core.services.navigation_parent_control import (
+    confirm_fresh_parent_control,
+    resolve_navigation_parent_control,
+)
+from core.services.city_entry_postcondition import CITY_ENTRY_POSTCONDITION_POLICY
 from core.services.runtime_navigation_kernel import UiState, normalize_legacy_state
 
 
@@ -27,10 +32,12 @@ CITY_ENTRY_MINIMUM_GRACE_SECONDS = 2.0
 
 class CityNavigationState(str, Enum):
     HOME_READY = "HOME_READY"
-    CITY_ENTRY_VISIBLE = "CITY_ENTRY_VISIBLE"
+    HOME_CITY_ENTRY_CONTROL_VISIBLE = "HOME_CITY_ENTRY_CONTROL_VISIBLE"
+    CITY_ENTRY_VISIBLE = "HOME_CITY_ENTRY_CONTROL_VISIBLE"
     CITY_TRANSITION = "CITY_TRANSITION"
     CITY_MAP = "CITY_MAP"
-    CITY_DETAIL = "CITY_DETAIL"
+    CITY_DETAIL_VISIBLE = "CITY_DETAIL_VISIBLE"
+    CITY_DETAIL = "CITY_DETAIL_VISIBLE"
     NPC_DIALOG = "NPC_DIALOG"
     EXCHANGE_NPC_VISIBLE = "EXCHANGE_NPC_VISIBLE"
     EXCHANGE_MENU = "EXCHANGE_MENU"
@@ -116,6 +123,11 @@ class CityNavigationResult:
     transition_elapsed_seconds: float = 0.0
     transition_result: str = "NOT_RUN"
     last_observed_state: str = ""
+    post_canonical_leaf_state: str = ""
+    post_context_state: str = ""
+    city_entry_verified: bool = False
+    exact_expected_leaf_match: bool = False
+    gate_postcondition_policy_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -299,6 +311,10 @@ def observe_city_frame(
         state = CityNavigationState.CITY_MAP
         reason = "city_map_evidence_confirmed"
         evidence.extend(("city_title", "map_element"))
+    elif len(city_categories) >= 2 and len(home_evidence) >= 2:
+        state = CityNavigationState.UNKNOWN
+        reason = "conflicting_home_city_page_evidence"
+        evidence.extend(("home_city_conflict",))
     elif len(city_categories) >= 2 and exchange_bbox is not None:
         state = CityNavigationState.EXCHANGE_NPC_VISIBLE
         reason = "city_exchange_anchor_confirmed"
@@ -462,6 +478,11 @@ class CityNavigationAdapter:
         post_observation_count = 0
         dispatch_started: float | None = None
         last_observed_state = ""
+        post_canonical_leaf_state = ""
+        post_context_state = ""
+        city_entry_verified = False
+        exact_expected_leaf_match = False
+        gate_postcondition_policy_id = CITY_ENTRY_POSTCONDITION_POLICY.policy_id
 
         def record(
             observation,
@@ -540,6 +561,11 @@ class CityNavigationAdapter:
                 transition_elapsed_seconds=round(elapsed, 6),
                 transition_result=resolved_transition_result,
                 last_observed_state=last_observed_state,
+                post_canonical_leaf_state=post_canonical_leaf_state,
+                post_context_state=post_context_state,
+                city_entry_verified=city_entry_verified,
+                exact_expected_leaf_match=exact_expected_leaf_match,
+                gate_postcondition_policy_id=gate_postcondition_policy_id,
             )
 
         if self.cancellation():
@@ -562,6 +588,17 @@ class CityNavigationAdapter:
         bounds = before.city_entry.anchor_bbox
         if bounds is None:
             return finish(CityNavigationState.HOME_READY, "BLOCKED", "city_entry_anchor_missing")
+        planned_image = getattr(planned_frame, "image", planned_frame)
+        initial_parent = resolve_navigation_parent_control(
+            planned_image,
+            semantic_id="visit_city",
+            anchor_bbox=bounds,
+            source_capture_id=before.source_capture_id,
+            source_frame_sha256=before.screenshot_hash,
+        )
+        if not initial_parent.resolved:
+            record(before, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_parent_control_unresolved")
+            return finish(before.state, "BLOCKED", "city_parent_control_unresolved")
 
         if self.cancellation():
             return finish(CityNavigationState.FAILED, "BLOCKED", "city_entry_cancelled")
@@ -588,11 +625,22 @@ class CityNavigationAdapter:
             return finish(fresh.state, "BLOCKED", "city_entry_candidate_mismatch")
 
         bounds = fresh.city_entry.anchor_bbox
-        point = _center(bounds)
-        image = getattr(fresh_frame, "image", None)
+        image = getattr(fresh_frame, "image", fresh_frame)
         if image is None or not hasattr(image, "shape") or len(image.shape) < 2:
             return finish(CityNavigationState.FAILED, "BLOCKED", "city_entry_coordinate_chain_incomplete")
         capture_height, capture_width = map(int, image.shape[:2])
+        fresh_parent = resolve_navigation_parent_control(
+            image,
+            semantic_id="visit_city",
+            anchor_bbox=bounds,
+            source_capture_id=fresh.source_capture_id,
+            source_frame_sha256=fresh.screenshot_hash,
+        )
+        confirmed_parent = confirm_fresh_parent_control(initial_parent, fresh_parent)
+        if confirmed_parent is None or confirmed_parent.safe_hit_point is None:
+            record(fresh, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_parent_control_unstable")
+            return finish(fresh.state, "BLOCKED", "city_parent_control_unstable")
+        point = confirmed_parent.safe_hit_point
         render_size = (capture_width, capture_height)
         device_size = render_size
         if self.geometry_provider is not None:
@@ -620,8 +668,8 @@ class CityNavigationAdapter:
             pre_state="HOME_READY",
             pre_frame_sha256=fresh.screenshot_hash,
             coordinate_chain=chain,
-            candidate_type="ocr_visit_city_anchor",
-            candidate_bbox=bounds,
+            candidate_type="visual_parent_control",
+            candidate_bbox=confirmed_parent.parent_control_bbox,
             candidate_score=fresh.city_entry.candidate_score,
             candidate_count=fresh.city_entry.candidate_count,
             dispatch_backend=self.dispatch_backend,
@@ -704,19 +752,34 @@ class CityNavigationAdapter:
             last_observed_state = observation.state.value
             elapsed_since_dispatch = max(0.0, self.monotonic() - dispatch_started)
 
-            trusted_city_state = observation.state in {
-                CityNavigationState.CITY_MAP,
-                CityNavigationState.CITY_DETAIL,
-                CityNavigationState.EXCHANGE_NPC_VISIBLE,
-            }
-            if trusted_city_state:
+            frame_is_fresh = bool(
+                observation.source_capture_id
+                and observation.source_capture_id != fresh.source_capture_id
+            )
+            frame_changed = bool(
+                observation.screenshot_hash
+                and observation.screenshot_hash != fresh.screenshot_hash
+            )
+            postcondition = CITY_ENTRY_POSTCONDITION_POLICY.evaluate(
+                observation.state,
+                frame_is_fresh=frame_is_fresh,
+                frame_changed=frame_changed,
+                evidence_invariant_check=evidence.evidence_invariant_check,
+            )
+            if postcondition.city_entry_verified:
+                post_canonical_leaf_state = postcondition.post_canonical_leaf_state
+                post_context_state = postcondition.post_context_state
+                city_entry_verified = True
+                exact_expected_leaf_match = postcondition.exact_expected_leaf_match
                 evidence.add_post_observation(
                     frame=post_frame,
                     state=observation.state.value,
                     positive_cues=(observation.reason, *observation.evidence),
                     negative_cues=(),
-                    reason_codes=("trusted_city_page",),
+                    reason_codes=postcondition.reason_codes,
                     postcondition_result="PASS_TO_STATION_DETECTOR",
+                    trusted_postcondition_observed=True,
+                    source_capture_id=observation.source_capture_id,
                 )
                 entry_opened = True
                 if not self.require_station_confirmation:
@@ -824,6 +887,32 @@ class CityNavigationAdapter:
                     "station_detector_no_match",
                     transition_result="PASS",
                 )
+            if observation.state.value in CITY_ENTRY_POSTCONDITION_POLICY.accepted_leaf_states:
+                evidence.add_post_observation(
+                    frame=post_frame,
+                    state=observation.state.value,
+                    positive_cues=(observation.reason, *observation.evidence),
+                    negative_cues=postcondition.reason_codes,
+                    reason_codes=("city_entry_policy_evidence_failed",),
+                    postcondition_result="FAIL",
+                    source_capture_id=observation.source_capture_id,
+                )
+                record(
+                    observation,
+                    "OBSERVE_CITY_POSTCONDITION",
+                    "ALLOWED",
+                    "FAILED",
+                    "FAILED",
+                    "city_entry_postcondition_evidence_failed",
+                    state=CityNavigationState.FAILED,
+                    transition_classification="EXPLICIT_FAILURE",
+                )
+                return finish(
+                    CityNavigationState.FAILED,
+                    "FAILED",
+                    "city_entry_postcondition_evidence_failed",
+                    transition_result="EXPLICIT_FAILURE",
+                )
             pending_reason_codes = ["postcondition_pending"]
             if elapsed_since_dispatch < self.city_entry_minimum_grace_seconds:
                 pending_reason_codes.append("within_minimum_grace")
@@ -910,6 +999,7 @@ class CityNavigationAdapter:
                 negative_cues=(),
                 reason_codes=tuple(pending_reason_codes),
                 postcondition_result="PENDING",
+                source_capture_id=observation.source_capture_id,
             )
             record(
                 observation,
