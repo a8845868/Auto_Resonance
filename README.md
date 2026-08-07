@@ -30,7 +30,8 @@
    - 安装Python
    - 在项目根目录执行 `python -m venv .venv`
    - 执行 `.\.venv\Scripts\python.exe -m pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/`
-   - 双击 `start-gui.cmd`（它会通过 `gui_launcher.pyw` 取得运行锁并记录启动异常）
+   - 双击 `启动黑月无人驾驶.cmd` 或 `start-gui.cmd`（它会通过 `gui_launcher.pyw` 取得运行锁并记录启动异常）
+   - 在 Git worktree 中运行时，启动器会自动复用主仓库的 `.venv`，无需为每个功能分支复制虚拟环境；如虚拟环境位于自定义位置，可通过 `HEIYUE_PYTHONW` 指定完整的 `pythonw.exe` 路径
 
 ### MuMu 多开与任务资源管理
 

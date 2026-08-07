@@ -1,4 +1,6 @@
 import importlib.util
+import os
+import subprocess
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from types import SimpleNamespace
@@ -67,3 +69,97 @@ def test_startup_report_reads_both_self_healing_switches(tmp_path):
     )
 
     assert launcher._self_healing_flags() == (True, False)
+
+
+def test_shared_repository_root_resolves_linked_worktree_gitdir(tmp_path):
+    launcher = _load_launcher()
+    repository = tmp_path / "repository"
+    git_dir = repository / ".git" / "worktrees" / "feature"
+    git_dir.mkdir(parents=True)
+    worktree = tmp_path / "feature-worktree"
+    worktree.mkdir()
+    (worktree / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+
+    assert launcher._shared_repository_root(worktree) == repository
+
+
+def test_project_pythonw_uses_shared_repository_venv(tmp_path):
+    launcher = _load_launcher()
+    repository = tmp_path / "repository"
+    git_dir = repository / ".git" / "worktrees" / "feature"
+    git_dir.mkdir(parents=True)
+    pythonw = repository / ".venv" / "Scripts" / "pythonw.exe"
+    pythonw.parent.mkdir(parents=True)
+    pythonw.touch()
+    worktree = tmp_path / "feature-worktree"
+    worktree.mkdir()
+    (worktree / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+
+    selected = launcher._select_project_pythonw(
+        root=worktree,
+        current_executable=tmp_path / "global" / "pythonw.exe",
+        environ={},
+    )
+
+    assert selected == pythonw
+
+
+def test_project_pythonw_does_not_relaunch_same_environment(tmp_path):
+    launcher = _load_launcher()
+    worktree = tmp_path / "worktree"
+    pythonw = worktree / ".venv" / "Scripts" / "pythonw.exe"
+    pythonw.parent.mkdir(parents=True)
+    pythonw.touch()
+
+    selected = launcher._select_project_pythonw(
+        root=worktree,
+        current_executable=pythonw.with_name("python.exe"),
+        environ={},
+    )
+
+    assert selected is None
+
+
+def test_explicit_pythonw_override_has_priority(tmp_path):
+    launcher = _load_launcher()
+    worktree = tmp_path / "worktree"
+    local_pythonw = worktree / ".venv" / "Scripts" / "pythonw.exe"
+    local_pythonw.parent.mkdir(parents=True)
+    local_pythonw.touch()
+    override = tmp_path / "portable" / "pythonw.exe"
+    override.parent.mkdir(parents=True)
+    override.touch()
+
+    selected = launcher._select_project_pythonw(
+        root=worktree,
+        current_executable=tmp_path / "global" / "pythonw.exe",
+        environ={"HEIYUE_PYTHONW": str(override)},
+    )
+
+    assert selected == override
+
+
+def test_start_gui_cmd_honors_explicit_pythonw_override(tmp_path):
+    pythonw = tmp_path / "portable" / "pythonw.exe"
+    pythonw.parent.mkdir(parents=True)
+    pythonw.touch()
+    environment = os.environ.copy()
+    environment["HEIYUE_PYTHONW"] = str(pythonw)
+
+    result = subprocess.run(
+        [
+            environment.get("COMSPEC", "cmd.exe"),
+            "/d",
+            "/c",
+            str(ROOT / "start-gui.cmd"),
+            "--print-python",
+        ],
+        cwd=ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(pythonw)
