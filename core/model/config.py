@@ -6,17 +6,21 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 """
 
 import json
+import sys
 from pathlib import Path
 from typing import Dict, List
 
 from loguru import logger
 from pydantic import BaseModel, Field
 
-ROOT_PATH = Path().resolve()
+ROOT_PATH = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parents[2]
+)
 """项目根目录路径"""
 CONFIG_PATH = ROOT_PATH / "config" / "config.json"
 """自动程序配置文件路径"""
-CONFIG_PATH.parent.exists() or CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
 class RestAreaModel(BaseModel):
@@ -67,6 +71,7 @@ class Config(BaseModel):
         """保存配置"""
         try:
             str_data = self.model_dump_json(indent=4, by_alias=True)
+            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 f.write(str_data)
         except (AttributeError, TypeError, ValueError, PermissionError):
@@ -78,19 +83,11 @@ class Config(BaseModel):
             logger.info(f"配置文件 {CONFIG_PATH} 已保存。")
 
 
-if CONFIG_PATH.exists() and CONFIG_PATH.is_file():
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    config = Config.model_validate(data)
-else:
-    config = Config()
-    try:
-        str_data = config.model_dump_json(indent=4)
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            f.write(str_data)
-    except (AttributeError, TypeError, ValueError, PermissionError):
-        logger.exception(f"创建配置文件失败，请检查是否有权限读取和写入 {CONFIG_PATH}")
-        raise
-    else:
-        logger.info(f"配置文件 {CONFIG_PATH} 不存在，已创建默认插件配置文件。")
-config.save_config()
+def _load_config() -> Config:
+    if CONFIG_PATH.exists() and CONFIG_PATH.is_file():
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return Config.model_validate(json.load(f))
+    return Config()
+
+
+config = _load_config()
