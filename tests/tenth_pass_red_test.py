@@ -14,6 +14,7 @@ import auto.reward_collection as rewards
 import core.control.control as control_module
 import core.services.fatigue_triggers as triggers
 import tools.sixth_read_only_probe as probe
+from core.services.dispatch_outcome import DispatchOutcome, DispatchStatus
 from core.services.server_calendar import SERVER_CLOCK
 from core.services.read_only_policy import (
     ActionIntent,
@@ -42,7 +43,11 @@ def _observation(*, anchor_bbox=(20, 10, 130, 85)) -> PageObservation:
     )
 
 
-def _guard(observation: PageObservation | None = None):
+def _guard(
+    observation: PageObservation | None = None,
+    *,
+    hardware_tap=None,
+):
     value = observation or _observation()
     state = {"sequence": 0}
     def observe():
@@ -66,7 +71,11 @@ def _guard(observation: PageObservation | None = None):
     issuer = ReadOnlyPermitIssuer(
         PageObserver(observe), AnchorResolver(), now=lambda: NOW
     )
-    return ReadOnlySafetySession(lambda _point: None, permit_issuer=issuer, now=lambda: NOW), issuer
+    return ReadOnlySafetySession(
+        hardware_tap or (lambda _point: None),
+        permit_issuer=issuer,
+        now=lambda: NOW,
+    ), issuer
 
 
 def test_directly_constructed_permit_is_rejected():
@@ -79,7 +88,8 @@ def test_directly_constructed_permit_is_rejected():
 
 
 def test_one_use_permit_is_consumed_atomically_by_concurrent_callers(monkeypatch):
-    guard, issuer = _guard()
+    taps: list[tuple[int, int]] = []
+    guard, issuer = _guard(hardware_tap=lambda point: taps.append(point))
     permit = issuer.issue(
         ActionIntent("reward_back", "top_left_back", "concurrent"), ((50, 40),)
     )
@@ -90,7 +100,7 @@ def test_one_use_permit_is_consumed_atomically_by_concurrent_callers(monkeypatch
         return True
 
     monkeypatch.setattr(issuer, "revalidate", synchronized_revalidate)
-    results: list[bool] = []
+    results: list[DispatchOutcome | bool] = []
     threads = [
         threading.Thread(
             target=lambda: results.append(
@@ -104,7 +114,17 @@ def test_one_use_permit_is_consumed_atomically_by_concurrent_callers(monkeypatch
     for thread in threads:
         thread.join(timeout=10)
 
-    assert sorted(results) == [False, True]
+    denied_results = [result for result in results if result is False]
+    dispatched = [result for result in results if result is not False]
+    assert denied_results == [False]
+    assert len(dispatched) == 1
+    assert dispatched[0]
+    assert dispatched[0].status is DispatchStatus.DISPATCHED_VERIFIED
+    assert dispatched[0].receipt is None
+    assert taps == [(50, 40)]
+    assert [entry.stage for entry in guard.journal].count(
+        "POSTCONDITION_VERIFIED"
+    ) == 1
     denied = [entry.reason for entry in guard.journal if entry.stage == "CONSUME_DENIED"]
     assert denied == ["permit_already_consumed"]
 

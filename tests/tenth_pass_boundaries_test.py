@@ -19,6 +19,7 @@ import core.services.fatigue_triggers as triggers
 import tools.sixth_read_only_probe as probe
 import tools.audit_export as audit
 from app.utils.task_queue import QueuedTask, TaskQueueWorker
+from core.services.dispatch_outcome import DispatchOutcome, DispatchStatus
 from core.services.fatigue_planner import (
     FatigueAction,
     FatiguePlan,
@@ -163,7 +164,7 @@ def test_concurrent_permit_use_causes_exactly_one_hardware_tap(monkeypatch):
     permit = issuer.issue(
         ActionIntent("reward_back", "top_left_back", "hardware-race"), ((50, 40),)
     )
-    results: list[bool] = []
+    results: list[DispatchOutcome | bool] = []
     threads = [
         threading.Thread(
             target=lambda: results.append(
@@ -177,7 +178,13 @@ def test_concurrent_permit_use_causes_exactly_one_hardware_tap(monkeypatch):
     for thread in threads:
         thread.join(timeout=10)
 
-    assert sorted(results) == [False, True]
+    denied = [result for result in results if result is False]
+    dispatched = [result for result in results if result is not False]
+    assert denied == [False]
+    assert len(dispatched) == 1
+    assert dispatched[0]
+    assert dispatched[0].status is DispatchStatus.DISPATCHED_VERIFIED
+    assert dispatched[0].receipt is None
     assert taps == [(50, 40)]
     assert [entry.stage for entry in guard.journal].count("POSTCONDITION_VERIFIED") == 1
     assert [entry.reason for entry in guard.journal].count("permit_already_consumed") == 1
@@ -196,10 +203,13 @@ def test_ratio_greater_than_one_preserves_valid_logical_tap(monkeypatch):
         )
         owner = control_module.activate_action_policy(guard)
         try:
-            assert control_module.input_tap(
+            outcome = control_module.input_tap(
                 (50, 40),
                 intent=ActionIntent("reward_back", "top_left_back", f"ratio-{ratio}"),
-            ) is True
+            )
+            assert outcome
+            assert outcome.status is DispatchStatus.DISPATCHED_VERIFIED
+            assert outcome.receipt is None
         finally:
             control_module.remove_action_policy(owner)
         assert taps == [(round(50 * ratio), round(40 * ratio))]
@@ -231,14 +241,17 @@ def test_swipe_full_trajectory_uses_one_coordinate_space(monkeypatch):
     state["post_value"] = replace(state["value"], content_marker_hash="after")
     owner = control_module.activate_action_policy(guard)
     try:
-        assert control_module.input_swipe(
+        outcome = control_module.input_swipe(
             (900, 350),
             (400, 350),
             swipe_time=650,
             intent=ActionIntent(
                 "daily_horizontal_scroll", "daily_content", "one-space"
             ),
-        ) is True
+        )
+        assert outcome
+        assert outcome.status is DispatchStatus.DISPATCHED_VERIFIED
+        assert outcome.receipt is None
     finally:
         control_module.remove_action_policy(owner)
 

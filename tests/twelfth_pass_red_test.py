@@ -11,6 +11,7 @@ import pytest
 import auto.reward_collection as rewards
 import core.control.control as control_module
 import core.services.read_only_policy as policy
+from core.services.dispatch_outcome import DispatchStatus
 from core.services import fatigue_triggers
 from core.services.task_schedule_state import (
     TaskScheduleStateCorrupt,
@@ -207,7 +208,9 @@ def test_reward_back_rejects_unapproved_account_settings_transition():
     allowed = guard.authorize_coordinate(
         (50, 40), intent=policy.ActionIntent("reward_back", "top_left_back")
     )
-    assert allowed is False
+    assert allowed
+    assert allowed.status is DispatchStatus.DISPATCHED_UNVERIFIED
+    assert allowed.receipt is None
     assert executor.taps == [(50, 40)]
     assert guard.journal[-1].stage == "POSTCONDITION_FAILED"
 

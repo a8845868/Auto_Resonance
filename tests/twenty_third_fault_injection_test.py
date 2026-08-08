@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from core.services import read_only_policy as policy
+from core.services.dispatch_outcome import DispatchStatus
 from core.services.city_entry_resolver import (
     CityEntryResolver,
     CityEntryState,
@@ -307,7 +308,9 @@ def test_guard_journal_records_full_action_lifecycle_in_order():
         ),
     )
 
-    assert allowed is True
+    assert allowed
+    assert allowed.status is DispatchStatus.DISPATCHED_VERIFIED
+    assert allowed.receipt is None
     stages = [
         entry.stage
         for entry in guard.journal

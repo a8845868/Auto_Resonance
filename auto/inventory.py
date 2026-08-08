@@ -41,6 +41,7 @@ from core.services.navigation_evidence import (
     record_navigation_attempt,
 )
 from core.services.read_only_policy import ActionIntent
+from core.services.dispatch_outcome import physical_input_count_from_dispatch_error
 from core.services.runtime_errors import BlockedBySafetyError
 from core.services.home_backpack_cube import (
     HomeAssetsBalanceDisplay,
@@ -547,13 +548,16 @@ def _open_assets_entry(
             ),
         )
     except Exception as error:  # noqa: BLE001 - preserve evidence before fail-closed
+        physical_input_count = physical_input_count_from_dispatch_error(error)
         evidence.mark_dispatch(
             requested=True,
             acknowledged=False,
             result=f"dispatch_exception:{type(error).__name__}",
         )
         evidence_recorder(evidence)
-        logger.exception("背包魔方 dispatch 失败")
+        logger.exception(
+            f"背包魔方 dispatch 失败；physical_input_count={physical_input_count}"
+        )
         return False
     acknowledged = bool(dispatch_result)
     evidence.mark_dispatch(

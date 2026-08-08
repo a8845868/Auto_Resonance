@@ -15,6 +15,12 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Callable, Iterator, Protocol
 
+from core.services.dispatch_outcome import (
+    DispatchOutcome,
+    DispatchStatus,
+    outcome_from_receipt,
+)
+
 
 LOGICAL_WIDTH = 1280
 LOGICAL_HEIGHT = 720
@@ -1336,7 +1342,7 @@ class ReadOnlyActionGuard:
         geometry: DisplayGeometry | None,
         action_kind: ActionKind,
         duration_ms: int,
-    ) -> bool:
+    ) -> DispatchOutcome | bool:
         try:
             components = self._components()
         except PermissionError as error:
@@ -1397,11 +1403,12 @@ class ReadOnlyActionGuard:
                 observation=consume_observation, observation_role="CONSUME",
             )
             self._record(key, trajectory, physical_trajectory=physical, allowed=True, reason="execution_started", stage=JournalStage.EXECUTION_STARTED, action_kind=action_kind, permit=permit, record=record)
+            receipt = None
             try:
                 if action_kind is ActionKind.TAP:
-                    executor.tap(physical[0])
+                    receipt = executor.tap(physical[0])
                 else:
-                    executor.swipe(physical, duration_ms)
+                    receipt = executor.swipe(physical, duration_ms)
             except Exception:
                 self._record(key, trajectory, physical_trajectory=physical, allowed=False, reason="execution_failed", stage=JournalStage.EXECUTION_FAILED, action_kind=action_kind, permit=permit, record=record, side_effect_occurred=True)
                 raise
@@ -1409,9 +1416,17 @@ class ReadOnlyActionGuard:
             verified, post_reason, post_observation = issuer.verify_postcondition(permit, record)
             if not verified:
                 self._record(key, trajectory, physical_trajectory=physical, allowed=False, reason=post_reason, stage=JournalStage.POSTCONDITION_FAILED, action_kind=action_kind, permit=permit, record=record, observation=post_observation, observation_role="POST", side_effect_occurred=True)
-                return False
+                return outcome_from_receipt(
+                    DispatchStatus.DISPATCHED_UNVERIFIED,
+                    reason=post_reason,
+                    receipt=receipt,
+                )
             self._record(key, trajectory, physical_trajectory=physical, allowed=True, reason=post_reason, stage=JournalStage.POSTCONDITION_VERIFIED, action_kind=action_kind, permit=permit, record=record, observation=post_observation, observation_role="POST", side_effect_occurred=True)
-            return True
+            return outcome_from_receipt(
+                DispatchStatus.DISPATCHED_VERIFIED,
+                reason=post_reason,
+                receipt=receipt,
+            )
 
     def authorize_coordinate(
         self,
@@ -1421,7 +1436,7 @@ class ReadOnlyActionGuard:
         intent: ActionIntent | None = None,
         geometry: DisplayGeometry | None = None,
         **caller_claims,
-    ) -> bool:
+    ) -> DispatchOutcome | bool:
         logical = (_point(coordinate),)
         if any(caller_claims.values()) and permit is None and intent is None:
             return self._record("unclassified_tap", logical, allowed=False, reason="caller_page_claims_are_untrusted")
@@ -1441,7 +1456,7 @@ class ReadOnlyActionGuard:
         geometry: DisplayGeometry | None = None,
         duration_ms: int = 100,
         **_caller_claims,
-    ) -> bool:
+    ) -> DispatchOutcome | bool:
         path = tuple(_point(point) for point in (trajectory or (start, end)))
         if not path or path[0] != _point(start) or path[-1] != _point(end):
             return self._record("unclassified_swipe", path, allowed=False, reason="invalid_final_swipe_trajectory")
@@ -1460,13 +1475,13 @@ class ReadOnlyActionGuard:
     def request_tap(
         self, intent: ActionIntent, coordinate: tuple[int, int], *,
         geometry: DisplayGeometry | None = None,
-    ) -> bool:
+    ) -> DispatchOutcome | bool:
         return self.authorize_coordinate(coordinate, intent=intent, geometry=geometry)
 
     def request_swipe(
         self, intent: ActionIntent, trajectory: tuple[tuple[int, int], ...],
         duration_ms: int, *, geometry: DisplayGeometry | None = None,
-    ) -> bool:
+    ) -> DispatchOutcome | bool:
         return self.authorize_swipe(
             trajectory[0], trajectory[-1], trajectory=trajectory,
             intent=intent, geometry=geometry, duration_ms=duration_ms,

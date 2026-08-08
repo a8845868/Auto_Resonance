@@ -11,6 +11,7 @@ import pytest
 import auto.reward_collection as rewards
 import core.control.control as control_module
 from core.services import fatigue_triggers as triggers
+from core.services.dispatch_outcome import DispatchStatus
 from core.services.read_only_policy import (
     ActionIntent,
     ActionKind,
@@ -148,10 +149,13 @@ def test_trusted_executor_cannot_receive_a_different_trajectory(monkeypatch):
     guard, _issuer, _unused = _guard(values=captures, executor=executor)
     owner = control_module.activate_action_policy(guard)
     try:
-        assert control_module.input_swipe(
+        outcome = control_module.input_swipe(
             (900, 350), (400, 350), 650,
             intent=ActionIntent("daily_horizontal_scroll", "daily_content"),
-        ) is True
+        )
+        assert outcome
+        assert outcome.status is DispatchStatus.DISPATCHED_VERIFIED
+        assert outcome.receipt is None
     finally:
         control_module.remove_action_policy(owner)
     assert calls == [(900, 350, 400, 350, 650)]
@@ -166,14 +170,22 @@ def test_permit_handle_mutation_cannot_change_registry_record():
     token = handle.opaque_token
     object.__setattr__(handle, "opaque_token", "mutated")
     assert token in issuer._registry
-    assert guard.authorize_coordinate((50, 40), permit=ReadOnlyPermitHandle(token)) is True
+    outcome = guard.authorize_coordinate(
+        (50, 40), permit=ReadOnlyPermitHandle(token)
+    )
+    assert outcome
+    assert outcome.status is DispatchStatus.DISPATCHED_VERIFIED
+    assert outcome.receipt is None
 
 
 def test_direct_handle_copy_remains_single_use():
     guard, issuer, executor = _guard()
     handle = issuer.issue(_tap_intent("copy"), ((50, 40),))
     copied = copy.copy(handle)
-    assert guard.authorize_coordinate((50, 40), permit=handle) is True
+    outcome = guard.authorize_coordinate((50, 40), permit=handle)
+    assert outcome
+    assert outcome.status is DispatchStatus.DISPATCHED_VERIFIED
+    assert outcome.receipt is None
     assert guard.authorize_coordinate((50, 40), permit=copied) is False
     assert executor.taps == [(50, 40)]
 
@@ -181,7 +193,10 @@ def test_direct_handle_copy_remains_single_use():
 def test_postcondition_failure_stops_followup_actions():
     guard, issuer, executor = _guard([_obs(oid="issue"), _obs(oid="consume"), _obs("unknown", oid="post", anchor=False)])
     handle = issuer.issue(_tap_intent("post-fail"), ((50, 40),))
-    assert guard.authorize_coordinate((50, 40), permit=handle) is False
+    outcome = guard.authorize_coordinate((50, 40), permit=handle)
+    assert outcome
+    assert outcome.status is DispatchStatus.DISPATCHED_UNVERIFIED
+    assert outcome.receipt is None
     assert guard.journal[-1].stage == "POSTCONDITION_FAILED"
     assert guard.authorize_coordinate((50, 40), permit=handle) is False
     assert executor.taps == [(50, 40)]
@@ -192,7 +207,10 @@ def test_issue_and_consume_use_independent_capture_sequences():
     handle = issuer.issue(_tap_intent("captures"), ((50, 40),))
     entry = issuer._registry[handle.opaque_token]
     issue_sequence = entry.record.issue_capture_sequence
-    assert guard.authorize_coordinate((50, 40), permit=handle) is True
+    outcome = guard.authorize_coordinate((50, 40), permit=handle)
+    assert outcome
+    assert outcome.status is DispatchStatus.DISPATCHED_VERIFIED
+    assert outcome.receipt is None
     assert entry.consume_capture_sequence > issue_sequence
 
 
@@ -271,7 +289,10 @@ def test_journal_does_not_mark_execution_success_before_hardware_returns():
     thread.start(); assert entered.wait(5)
     assert "EXECUTED" not in [entry.stage for entry in guard.journal]
     release.set(); thread.join(5)
-    assert result == [True]
+    assert len(result) == 1
+    assert result[0]
+    assert result[0].status is DispatchStatus.DISPATCHED_VERIFIED
+    assert result[0].receipt is None
     assert guard.journal[-1].stage == "POSTCONDITION_VERIFIED"
 
 

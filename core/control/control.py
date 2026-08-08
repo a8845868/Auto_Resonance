@@ -734,11 +734,12 @@ def _input_swipe_locked(
 
     if intent is None:
         return False
-    if not action_policy.request_swipe(
+    outcome = action_policy.request_swipe(
         intent, trajectory, swipe_time, geometry=current_display_geometry()
-    ):
+    )
+    if outcome is False:
         return False
-    return True
+    return outcome
 
 
 def input_swipe(
@@ -794,11 +795,12 @@ def _input_tap_locked(
 
     if intent is None:
         return False
-    if not action_policy.request_tap(
+    outcome = action_policy.request_tap(
         intent, logical, geometry=current_display_geometry()
-    ):
+    )
+    if outcome is False:
         return False
-    return True
+    return outcome
 
 
 def input_tap(

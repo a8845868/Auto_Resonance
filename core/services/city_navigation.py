@@ -19,6 +19,10 @@ from core.services.capture_recovery import (
     CaptureRecoveryPolicy,
     DEFAULT_CAPTURE_RECOVERY_POLICY,
 )
+from core.services.dispatch_outcome import (
+    DispatchStatus,
+    physical_input_count_from_dispatch_error,
+)
 from core.services.navigation_evidence import (
     CoordinateChain,
     DerivedObservationProvenanceContract,
@@ -909,6 +913,8 @@ class CityNavigationAdapter:
                 ),
             )
         except (PermissionError, RuntimeError) as error:
+            physical_input_count = physical_input_count_from_dispatch_error(error)
+            dispatch_count = physical_input_count
             evidence.mark_dispatch(requested=True, acknowledged=False, result=f"dispatch_exception:{type(error).__name__}")
             record(fresh, "enter_city", type(error).__name__, "NOT_CHECKED", "BLOCKED", "city_entry_dispatch_not_acknowledged")
             return finish(CityNavigationState.FAILED, "BLOCKED", "city_entry_dispatch_not_acknowledged")
@@ -920,13 +926,19 @@ class CityNavigationAdapter:
         dispatch_count = 1
         physical_input_count = 1
         dispatch_started = self.monotonic()
+        action_reason = (
+            "city_entry_guard_postcondition_unverified"
+            if getattr(allowed, "status", None)
+            is DispatchStatus.DISPATCHED_UNVERIFIED
+            else "city_entry_action_executed"
+        )
         record(
             fresh,
             "enter_city",
             "ALLOWED",
             "PENDING",
             "PENDING",
-            "city_entry_action_executed",
+            action_reason,
             transition_classification="PENDING",
         )
 

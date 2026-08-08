@@ -15,6 +15,7 @@ from auto import reward_collection as rewards
 from core.control import control as control_module
 from core.preset import presets
 from core.services import read_only_policy as policy
+from core.services.dispatch_outcome import DispatchStatus
 from core.services.daily_rewards import (
     DailyProgressSnapshot,
     RewardRunStatus,
@@ -214,13 +215,16 @@ def test_only_control_factory_session_can_reach_bound_executor(monkeypatch):
         policy.PageObserver(lambda: next(observations)), now=lambda: NOW
     )
     with policy.installed_read_only_guard(session):
-        assert control_module.input_tap(
+        outcome = control_module.input_tap(
             (1170, 492),
             random_offset=False,
             intent=policy.ActionIntent(
                 "city_entry_navigation", "city_entry", "production-action"
             ),
-        ) is True
+        )
+        assert outcome
+        assert outcome.status is DispatchStatus.DISPATCHED_VERIFIED
+        assert outcome.receipt is None
     assert backend.taps == [(1170, 492)]
     action_entries = [
         entry
@@ -462,12 +466,15 @@ def test_outlet_swipe_journal_records_direction_and_axis():
     session, _issuer = policy.create_test_read_only_session(
         policy.PageObserver(lambda: next(captures)), executor, now=lambda: NOW
     )
-    assert session.request_swipe(
+    outcome = session.request_swipe(
         policy.ActionIntent("outlet_list_scroll", "outlet_list", "scroll-action"),
         ((457, 340), (457, 390), (457, 440)),
         500,
         geometry=policy.DisplayGeometry(),
-    ) is True
+    )
+    assert outcome
+    assert outcome.status is DispatchStatus.DISPATCHED_VERIFIED
+    assert outcome.receipt is None
     final = [
         entry
         for entry in session.journal

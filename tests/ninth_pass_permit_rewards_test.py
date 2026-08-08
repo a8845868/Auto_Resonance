@@ -31,6 +31,7 @@ from core.services.read_only_policy import (
     ReadOnlySafetySession,
     ReadOnlyPermitIssuer,
 )
+from core.services.dispatch_outcome import DispatchStatus
 
 
 NOW = datetime(2026, 7, 19, 12, 0, tzinfo=timezone(timedelta(hours=8)))
@@ -149,10 +150,13 @@ def test_random_offset_cannot_escape_permit_bounds(monkeypatch):
     monkeypatch.setattr(control_module.random, "randint", lambda *_args: 999)
     owner = control_module.activate_action_policy(guard)
     try:
-        assert control_module.input_tap(
+        outcome = control_module.input_tap(
             (50, 40), random_offset=True,
             intent=ActionIntent("reward_back", "top_left_back", "offset"),
-        ) is True
+        )
+        assert outcome
+        assert outcome.status is DispatchStatus.DISPATCHED_VERIFIED
+        assert outcome.receipt is None
     finally:
         control_module.remove_action_policy(owner)
     assert calls == [(50, 40)]
@@ -185,7 +189,10 @@ def test_swipe_segment_outside_region_is_rejected():
 def test_permit_is_single_use_and_observation_bound():
     guard, issuer, _state = _guard()
     permit = issuer.issue(ActionIntent("reward_back", "top_left_back", "once"), ((50, 40),))
-    assert guard.authorize_coordinate((50, 40), permit=permit) is True
+    outcome = guard.authorize_coordinate((50, 40), permit=permit)
+    assert outcome
+    assert outcome.status is DispatchStatus.DISPATCHED_VERIFIED
+    assert outcome.receipt is None
     assert guard.authorize_coordinate((50, 40), permit=permit) is False
 
 

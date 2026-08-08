@@ -15,6 +15,7 @@ import core.control.control as control
 import core.preset.control as preset_control
 import core.preset.presets as presets
 import core.services.read_only_policy as policy
+from core.services.dispatch_outcome import DispatchStatus
 import core.services.task_schedule_state as schedule
 import tools.audit_export as audit_export
 import tools.sixth_read_only_probe as probe
@@ -369,10 +370,13 @@ def test_city_entry_policy_rejects_npc_dialogue():
         _city_policy_observation(11, "home"),
         _city_policy_observation(12, "npc_dialogue"),
     ])
-    assert not guard.authorize_coordinate(
+    outcome = guard.authorize_coordinate(
         (1170, 492),
         intent=policy.ActionIntent("city_entry_navigation", "city_entry"),
     )
+    assert outcome
+    assert outcome.status is DispatchStatus.DISPATCHED_UNVERIFIED
+    assert outcome.receipt is None
     assert executor.taps == [(1170, 492)]
     assert guard.journal[-1].stage == "POSTCONDITION_FAILED"
     assert guard.journal[-1].source_capture_sequence == 12
