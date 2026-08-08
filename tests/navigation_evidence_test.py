@@ -8,6 +8,7 @@ import pytest
 
 from core.services.navigation_evidence import (
     CoordinateChain,
+    DerivedObservationProvenanceContract,
     ScreenToDeviceCoordinateTransform,
     NavigationAttemptEvidence,
     frame_sha256,
@@ -166,6 +167,110 @@ def _evidence(chain: CoordinateChain) -> NavigationAttemptEvidence:
         candidate_count=1,
         dispatch_backend="fake",
     )
+
+
+def _parent_observation(source_capture_id: str = "capture-A"):
+    chain = CoordinateChain.from_capture_point(
+        (5, 5), capture_size=(60, 40), render_client_size=(60, 40)
+    )
+    evidence = _evidence(chain)
+    parent = evidence.add_post_observation(
+        frame=SimpleNamespace(raw_frame_hash="post-frame-A"),
+        state="CITY_DETAIL_VISIBLE",
+        postcondition_result="PENDING",
+        source_capture_id=source_capture_id,
+        capture_sequence=7 if source_capture_id else None,
+        session_generation=3 if source_capture_id else None,
+    )
+    return evidence, parent
+
+
+def test_derived_observation_inherits_parent_provenance_without_new_capture():
+    _evidence_record, parent = _parent_observation()
+
+    provenance = DerivedObservationProvenanceContract.resolve(
+        parent_observation=parent,
+        frame=SimpleNamespace(source_capture_id="capture-A"),
+        new_capture_performed=False,
+    )
+
+    assert provenance.valid is True
+    assert provenance.source_capture_id == "capture-A"
+    assert provenance.capture_sequence == 7
+    assert provenance.session_generation == 3
+
+
+def test_derived_observation_does_not_fabricate_missing_parent_provenance():
+    _evidence_record, parent = _parent_observation("")
+
+    provenance = DerivedObservationProvenanceContract.resolve(
+        parent_observation=parent,
+        new_capture_performed=False,
+    )
+
+    assert provenance.valid is False
+    assert provenance.source_capture_id == ""
+    assert provenance.reason == "parent_capture_provenance_missing"
+
+
+def test_derived_observation_binds_an_actual_new_capture_instead_of_parent():
+    _evidence_record, parent = _parent_observation()
+    new_frame = SimpleNamespace(
+        source_capture_id="capture-B",
+        capture_sequence=8,
+        backend_generation=4,
+    )
+
+    provenance = DerivedObservationProvenanceContract.resolve(
+        parent_observation=parent,
+        frame=new_frame,
+        new_capture_performed=True,
+    )
+
+    assert provenance.valid is True
+    assert provenance.source_capture_id == "capture-B"
+    assert provenance.capture_sequence == 8
+    assert provenance.session_generation == 4
+
+
+def test_derived_observation_chain_preserves_capture_provenance():
+    evidence, parent = _parent_observation()
+    first_provenance = DerivedObservationProvenanceContract.resolve(
+        parent_observation=parent,
+        new_capture_performed=False,
+    )
+    derived = evidence.add_post_observation(
+        frame=SimpleNamespace(raw_frame_hash="post-frame-A"),
+        state="CITY_DETAIL_VISIBLE",
+        postcondition_result="PENDING",
+        source_capture_id=first_provenance.source_capture_id,
+        capture_sequence=first_provenance.capture_sequence,
+        session_generation=first_provenance.session_generation,
+    )
+
+    station_provenance = DerivedObservationProvenanceContract.resolve(
+        parent_observation=derived,
+        new_capture_performed=False,
+    )
+
+    assert station_provenance.valid is True
+    assert station_provenance.source_capture_id == "capture-A"
+    assert station_provenance.capture_sequence == 7
+    assert station_provenance.session_generation == 3
+
+
+def test_derived_observation_rejects_conflicting_capture_without_new_capture():
+    _evidence_record, parent = _parent_observation()
+
+    provenance = DerivedObservationProvenanceContract.resolve(
+        parent_observation=parent,
+        frame=SimpleNamespace(source_capture_id="capture-B"),
+        new_capture_performed=False,
+    )
+
+    assert provenance.valid is False
+    assert provenance.source_capture_id == ""
+    assert provenance.reason == "derived_capture_provenance_conflict"
 
 
 def test_coordinate_chain_is_complete_for_device_backend_without_screen_space():

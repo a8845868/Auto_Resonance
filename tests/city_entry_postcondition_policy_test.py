@@ -176,3 +176,45 @@ def test_fatigue_city_entry_wrapper_preserves_leaf_and_revalidates_policy(monkey
     assert result.city_entry_verified is True
     assert result.exact_expected_leaf_match is False
     assert result.gate_postcondition_policy_id == CITY_ENTRY_POSTCONDITION_POLICY.policy_id
+
+
+def test_fatigue_wrapper_reproduces_historical_dropped_station_provenance(
+    monkeypatch,
+):
+    evidence = SimpleNamespace(
+        post_observations=[
+            SimpleNamespace(source_capture_id="fresh-post"),
+            SimpleNamespace(source_capture_id=""),
+        ],
+        post_frame_changed=True,
+        evidence_invariant_check="PASS",
+    )
+    resolved = SimpleNamespace(
+        state=CityNavigationState.EXCHANGE_NPC_VISIBLE,
+        status="PASS",
+        reason="station_confirmed",
+        attempt_count=3,
+        trace=(),
+        entry_opened=True,
+        station_confirmed=True,
+        station_id="岚心城",
+        terminal=True,
+        evidence_attempt_id="historical-attempt",
+        evidence=evidence,
+        post_canonical_leaf_state="EXCHANGE_NPC_VISIBLE",
+    )
+
+    class _Adapter:
+        def __init__(self, **_kwargs):
+            pass
+
+        def enter_city(self):
+            return resolved
+
+    monkeypatch.setattr(presets, "ReadOnlyCityNavigationAdapter", _Adapter)
+    result = presets.go_city(monotonic=lambda: 1.0)
+
+    assert result.station_confirmed is True
+    assert result.city_entry_verified is False
+    assert result.success is False
+    assert result.post_canonical_leaf_state == "EXCHANGE_NPC_VISIBLE"

@@ -296,6 +296,72 @@ class PostNavigationObservation:
     observed_at: str = field(default_factory=_now)
 
 
+@dataclass(frozen=True, slots=True)
+class DerivedObservationProvenance:
+    source_capture_id: str
+    capture_sequence: int | None
+    session_generation: int | None
+    valid: bool
+    reason: str
+
+
+class DerivedObservationProvenanceContract:
+    """Resolve capture provenance without inventing freshness for derived facts."""
+
+    @staticmethod
+    def resolve(
+        *,
+        parent_observation: PostNavigationObservation,
+        frame=None,
+        new_capture_performed: bool,
+    ) -> DerivedObservationProvenance:
+        frame_capture_id = str(getattr(frame, "source_capture_id", "") or "")
+        frame_capture_sequence = getattr(frame, "capture_sequence", None)
+        frame_session_generation = getattr(
+            frame,
+            "session_generation",
+            getattr(frame, "backend_generation", None),
+        )
+
+        if new_capture_performed:
+            if not frame_capture_id:
+                return DerivedObservationProvenance(
+                    "", None, None, False, "new_capture_provenance_missing"
+                )
+            return DerivedObservationProvenance(
+                frame_capture_id,
+                (
+                    int(frame_capture_sequence)
+                    if frame_capture_sequence is not None
+                    else None
+                ),
+                (
+                    int(frame_session_generation)
+                    if frame_session_generation is not None
+                    else None
+                ),
+                True,
+                "bound_to_new_capture",
+            )
+
+        parent_capture_id = str(parent_observation.source_capture_id or "")
+        if not parent_capture_id:
+            return DerivedObservationProvenance(
+                "", None, None, False, "parent_capture_provenance_missing"
+            )
+        if frame_capture_id and frame_capture_id != parent_capture_id:
+            return DerivedObservationProvenance(
+                "", None, None, False, "derived_capture_provenance_conflict"
+            )
+        return DerivedObservationProvenance(
+            parent_capture_id,
+            parent_observation.capture_sequence,
+            parent_observation.session_generation,
+            True,
+            "inherited_from_parent_observation",
+        )
+
+
 @dataclass(slots=True)
 class NavigationAttemptEvidence:
     task_name: str

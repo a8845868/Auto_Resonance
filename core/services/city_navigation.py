@@ -21,6 +21,7 @@ from core.services.capture_recovery import (
 )
 from core.services.navigation_evidence import (
     CoordinateChain,
+    DerivedObservationProvenanceContract,
     NavigationAttemptEvidence,
     record_navigation_attempt,
 )
@@ -1016,7 +1017,7 @@ class CityNavigationAdapter:
                 post_context_state = postcondition.post_context_state
                 city_entry_verified = True
                 exact_expected_leaf_match = postcondition.exact_expected_leaf_match
-                evidence.add_post_observation(
+                trusted_city_observation = evidence.add_post_observation(
                     frame=post_frame,
                     state=observation.state.value,
                     positive_cues=(observation.reason, *observation.evidence),
@@ -1025,6 +1026,12 @@ class CityNavigationAdapter:
                     postcondition_result="PASS_TO_STATION_DETECTOR",
                     trusted_postcondition_observed=True,
                     source_capture_id=observation.source_capture_id,
+                    capture_sequence=getattr(post_frame, "capture_sequence", None),
+                    session_generation=getattr(
+                        post_frame,
+                        "session_generation",
+                        getattr(post_frame, "backend_generation", None),
+                    ),
                 )
                 entry_opened = True
                 if not self.require_station_confirmation:
@@ -1054,12 +1061,20 @@ class CityNavigationAdapter:
                 if station.result == "PASS" and station.station_id:
                     station_confirmed = True
                     station_id = station.station_id
+                    station_provenance = DerivedObservationProvenanceContract.resolve(
+                        parent_observation=trusted_city_observation,
+                        frame=post_frame,
+                        new_capture_performed=False,
+                    )
                     evidence.add_post_observation(
                         frame=post_frame,
                         state=observation.state.value,
                         positive_cues=("station_confirmed", *station.evidence_ids),
                         reason_codes=("city_and_station_verified",),
                         postcondition_result="PASS",
+                        source_capture_id=station_provenance.source_capture_id,
+                        capture_sequence=station_provenance.capture_sequence,
+                        session_generation=station_provenance.session_generation,
                     )
                     record(
                         observation,

@@ -296,6 +296,9 @@ def test_unknown_transition_then_station_confirmation_passes_with_one_dispatch()
     assert result.station_confirmed is True
     assert result.station_id == "七号自由港"
     assert len(taps) == 1
+    trusted_city, station_confirmation = result.evidence.post_observations[-2:]
+    assert trusted_city.source_capture_id == "city-4"
+    assert station_confirmation.source_capture_id == trusted_city.source_capture_id
 
 
 def test_nonempty_unknown_transition_replays_real_defect_then_reaches_station():
@@ -473,6 +476,10 @@ def test_trusted_city_page_without_station_cue_fails_as_station_no_match():
     assert result.station_confirmed is False
     assert result.reason == "station_detector_no_match"
     assert result.transition_result == "PASS"
+    assert all(
+        observation.postcondition_result != "PASS"
+        for observation in result.evidence.post_observations
+    )
 
 
 def test_explicit_inventory_page_after_dispatch_fails_without_second_action():
@@ -625,6 +632,60 @@ def test_product_adapter_preserves_exchange_leaf_and_verifies_city_context():
     assert result.city_entry_verified is True
     assert result.exact_expected_leaf_match is False
     assert result.gate_postcondition_policy_id == "CITY_ENTRY_TRUSTED_CONTEXT_V1"
+
+
+def test_post_city_leaf_reusing_fresh_home_capture_id_is_not_verified():
+    stale_exchange = _Frame(
+        "当前城市",
+        "城市设施",
+        "交易所",
+        pixel=26,
+        capture_id="home-2",
+    )
+
+    result = _adapter([_home(), _home(pixel=2), stale_exchange]).enter_city()
+
+    assert result.status != "PASS"
+    assert result.city_entry_verified is False
+    assert result.post_canonical_leaf_state == ""
+
+
+def test_fatigue_wrapper_accepts_station_confirmed_exchange_with_preserved_provenance(
+    monkeypatch,
+):
+    exchange = _Frame(
+        "当前城市",
+        "城市设施",
+        "交易所",
+        "岚心城",
+        pixel=26,
+        capture_id="exchange-station-post",
+    )
+    adapter = _adapter([_home(), _home(pixel=2), exchange])
+    adapter.require_station_confirmation = True
+    adapter.station_ids = ("岚心城",)
+    resolved = adapter.enter_city()
+
+    assert resolved.status == "PASS"
+    assert resolved.station_confirmed is True
+    assert resolved.evidence.post_observations[-1].source_capture_id == (
+        "exchange-station-post"
+    )
+
+    class _Adapter:
+        def __init__(self, **_kwargs):
+            pass
+
+        def enter_city(self):
+            return resolved
+
+    monkeypatch.setattr(presets, "ReadOnlyCityNavigationAdapter", _Adapter)
+    result = presets.go_city(monotonic=lambda: 1.0)
+
+    assert result.success is True
+    assert result.station_confirmed is True
+    assert result.post_canonical_leaf_state == "EXCHANGE_NPC_VISIBLE"
+    assert result.city_entry_verified is True
 
 
 def test_exchange_menu_is_not_buy_page():
