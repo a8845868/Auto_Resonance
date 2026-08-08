@@ -57,6 +57,7 @@ class _ProductionSessionProvenance:
     instance_id: str
     adb_serial: str
     policy_revision: str
+    session_kind: str
 
 
 _PRODUCTION_SESSION_REGISTRY: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
@@ -105,7 +106,9 @@ def _create_bound_input_executor(backend: IADB):
     return _BoundControlInputExecutor(backend)
 
 
-def _register_production_session(policy, identity, policy_revision: str) -> None:
+def _register_production_session(
+    policy, identity, policy_revision: str, *, session_kind: str = "READ_ONLY"
+) -> None:
     with _PRODUCTION_SESSION_REGISTRY_LOCK:
         _PRODUCTION_SESSION_REGISTRY[policy] = _ProductionSessionProvenance(
             session_id=secrets.token_urlsafe(24),
@@ -114,6 +117,7 @@ def _register_production_session(policy, identity, policy_revision: str) -> None
             instance_id=str(identity.instance_id),
             adb_serial=str(identity.adb_serial),
             policy_revision=str(policy_revision),
+            session_kind=str(session_kind),
         )
 
 
@@ -125,22 +129,31 @@ def _revoke_production_session(policy) -> None:
 def _validate_production_session(policy) -> _ProductionSessionProvenance:
     from core.services.read_only_policy import (
         PRODUCTION_POLICY_REVISION,
-        ProductionReadOnlySafetySession,
+        ReadOnlyActionGuard,
     )
 
-    if not isinstance(policy, ProductionReadOnlySafetySession):
+    if not isinstance(policy, ReadOnlyActionGuard):
         raise TypeError("production session provenance required")
     with _PRODUCTION_SESSION_REGISTRY_LOCK:
         provenance = _PRODUCTION_SESSION_REGISTRY.get(policy)
     if provenance is None or policy.closed:
         raise PermissionError("production session provenance is not registered")
+    if provenance.session_kind == "READ_ONLY":
+        expected_revision = PRODUCTION_POLICY_REVISION
+    elif provenance.session_kind == "BUSINESS":
+        from core.services.business_action_policy import BUSINESS_POLICY_REVISION
+
+        expected_revision = BUSINESS_POLICY_REVISION
+    else:
+        _revoke_production_session(policy)
+        raise PermissionError("production session kind is not registered")
     identity = current_bound_device_identity()
     if (
         provenance.backend_object_identity != identity.backend_object_identity
         or provenance.backend_generation != identity.backend_generation
         or provenance.instance_id != identity.instance_id
         or provenance.adb_serial != identity.adb_serial
-        or provenance.policy_revision != PRODUCTION_POLICY_REVISION
+        or provenance.policy_revision != expected_revision
     ):
         _revoke_production_session(policy)
         raise PermissionError("production session provenance changed")
@@ -293,7 +306,46 @@ def _create_production_read_only_safety_session(observer, *, resolver=None, now=
             now=now or (lambda: datetime.now().astimezone()),
             device_action_lock=_BACKEND_LOCK,
         )
-        _register_production_session(session, identity, PRODUCTION_POLICY_REVISION)
+        _register_production_session(
+            session, identity, PRODUCTION_POLICY_REVISION, session_kind="READ_ONLY"
+        )
+        return session
+
+
+def _create_production_business_action_session(
+    observer, *, snapshot, context_validator, resolver=None, now=None
+):
+    """Seal one business session to the current backend and device identity."""
+
+    from core.services.business_action_policy import (
+        BUSINESS_POLICY_REVISION,
+        BusinessPermitIssuer,
+        ProductionBusinessActionSession,
+    )
+    from core.services.read_only_policy import AnchorResolver
+
+    with _BACKEND_LOCK:
+        backend = control
+        identity = current_bound_device_identity()
+        clock = now or (lambda: datetime.now().astimezone())
+        issuer = BusinessPermitIssuer(
+            observer,
+            resolver or AnchorResolver(),
+            snapshot=snapshot,
+            context_validator=context_validator,
+            now=clock,
+            bound_device_identity=identity,
+            identity_provider=current_bound_device_identity,
+        )
+        session = ProductionBusinessActionSession(
+            _create_bound_input_executor(backend),
+            permit_issuer=issuer,
+            now=clock,
+            device_action_lock=_BACKEND_LOCK,
+        )
+        _register_production_session(
+            session, identity, BUSINESS_POLICY_REVISION, session_kind="BUSINESS"
+        )
         return session
 
 
@@ -863,6 +915,7 @@ def screenshot() -> Image:
     frame.captured_at = envelope.captured_at
     frame.backend_generation = envelope.backend_generation
     frame.instance_id = envelope.instance_id
+    frame.adb_serial = getattr(envelope, "adb_serial", "")
     frame.capture_sequence = getattr(envelope, "backend_monotonic_sequence", None)
     frame.capture_id_provenance = getattr(
         envelope, "capture_id_provenance", "LEGACY_UNSPECIFIED"

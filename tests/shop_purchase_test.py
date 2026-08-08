@@ -255,11 +255,15 @@ def test_purchase_writes_ledger_before_confirmation_tap(monkeypatch):
         "record_shop_attempt",
         lambda *args, **kwargs: events.append("ledger") or {},
     )
-    monkeypatch.setattr(
-        shop_purchase,
-        "input_tap",
-        lambda pos: events.append("confirm" if pos == DIALOG_CONFIRM_POS else "tap"),
-    )
+    def dispatch(snapshot, confirmed_item):
+        events.append("confirm")
+        assert confirmed_item is item
+        assert snapshot.item_id == item.id
+        assert snapshot.quantity == 1
+        assert snapshot.total_cost == item.price
+        return object()
+
+    monkeypatch.setattr(shop_purchase, "_dispatch_shop_confirm", dispatch)
     monkeypatch.setattr(shop_purchase, "screenshot", lambda: _FakeImage())
     monkeypatch.setattr(shop_purchase, "locate_product", lambda *_: refreshed)
     monkeypatch.setattr(

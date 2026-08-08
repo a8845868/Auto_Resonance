@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -107,6 +108,43 @@ class ConfiguredPurchase:
     shop: ShopDefinition
     item: ShopItem
     quantity: str
+
+
+def _stable_digest(value: object) -> str:
+    payload = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def shop_catalog_digest(catalog: ShopCatalog) -> str:
+    """Stable digest of catalog facts relevant to an irreversible confirmation."""
+
+    return _stable_digest({
+        "version": catalog.version,
+        "currencies": {
+            key: {"name": value.name, "icon": value.icon}
+            for key, value in sorted(catalog.currencies.items())
+        },
+        "items": [
+            {"id": item.id, "shop_id": item.shop_id, "period": item.period,
+             "max_limit": item.max_limit, "price": item.price,
+             "currency": item.currency, "icon": item.icon}
+            for item in sorted(catalog.items, key=lambda value: value.id)
+        ],
+    })
+
+
+def shop_plan_digest(plan: object, catalog: ShopCatalog) -> str:
+    """Digest normalized plan facts rather than caller-provided JSON shape."""
+
+    return _stable_digest(normalize_shop_plan(plan, catalog))
+
+
+def shop_attempt_digest(entry: object) -> str:
+    """Digest the exact write-ahead entry that authorizes one confirmation."""
+
+    return _stable_digest(entry if isinstance(entry, dict) else {})
 
 
 def load_shop_catalog(path: Path = CATALOG_PATH) -> ShopCatalog:

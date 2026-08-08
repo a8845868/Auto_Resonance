@@ -7,6 +7,7 @@ quantity dialog and OCR validation before the final confirmation.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -20,8 +21,11 @@ import numpy as np
 from loguru import logger
 
 from core.control.control import (
+    _create_production_business_action_session,
     connect,
     connect_adb,
+    current_bound_device_identity,
+    current_display_geometry,
     input_swipe,
     input_tap,
     kill,
@@ -40,7 +44,18 @@ from core.services.shop_catalog import (
     load_shop_catalog,
     load_shop_plan,
     record_shop_attempt,
+    shop_attempt_digest,
+    shop_catalog_digest,
+    shop_plan_digest,
     update_shop_attempt,
+)
+from core.services.business_action_policy import BusinessActionSnapshot
+from core.services.read_only_policy import (
+    ActionIntent,
+    CalibratedStaticRegion,
+    PageObservation,
+    PageObserver,
+    installed_read_only_guard,
 )
 
 
@@ -56,6 +71,131 @@ DIALOG_CONFIRM_POS = (960, 535)
 DIALOG_MAX_POS = (892, 380)
 BATCH_TOGGLE_POS = (1230, 117)
 MAX_SCAN_PAGES = 30
+
+
+def _shop_confirm_observation(item: ShopItem) -> PageObservation:
+    """Classify a new capture for the final shop confirmation policy only."""
+
+    frame = screenshot()
+    ocr_items = frame.ocr()
+    identity = current_bound_device_identity()
+    geometry = current_display_geometry()
+    source_id = str(getattr(frame, "source_capture_id", ""))
+    source_sequence = int(getattr(frame, "capture_sequence", 0) or 0)
+    captured_at = getattr(frame, "captured_at", None)
+    raw_hash = str(getattr(frame, "raw_frame_hash", ""))
+    if not source_id or source_sequence <= 0 or captured_at is None or not raw_hash:
+        raise PermissionError("shop confirmation requires trusted capture provenance")
+    quantity = _dialog_quantity(ocr_items)
+    price = _dialog_price(ocr_items)
+    is_source = bool(
+        _has_complete_quantity_dialog(frame.image, ocr_items)
+        and _dialog_has_item(ocr_items, item)
+        and quantity is not None
+        and price is not None
+    )
+    markers = ["shop_quantity_dialog"] if is_source else ["shop_confirmation_resolved"]
+    if is_source:
+        currency = load_shop_catalog().currencies.get(item.currency)
+        visible_currency = bool(currency) and any(
+            _normalize_text(value.get("text")) == _normalize_text(currency.name)
+            for value in ocr_items
+        )
+        markers.extend((
+            f"shop_item={item.id}", f"shop_quantity={quantity[0]}",
+            f"shop_max_quantity={quantity[1]}", f"shop_total_cost={price}",
+        ))
+        # Never infer a dialog currency from the caller/catalog.  The marker is
+        # emitted only when the current OCR independently names it; otherwise
+        # the context gate rejects before physical input.
+        if visible_currency:
+            markers.append(f"shop_currency={item.currency}")
+    regions = ()
+    if is_source:
+        regions = (CalibratedStaticRegion(
+            anchor_id="shop_confirm_button", bbox=(800, 480, 1120, 590),
+            page_classifier="shop_quantity_dialog", allowed_action="shop_confirm",
+            postcondition="shop_confirmation_resolved",
+            geometry_revision=geometry.geometry_revision,
+        ),)
+    return PageObservation(
+        observation_id=f"shop-confirm:{source_id}", screenshot_hash=raw_hash,
+        page_type="shop_quantity_dialog" if is_source else "shop_purchase_result",
+        markers=tuple(markers), anchors=(), captured_at=captured_at,
+        display_geometry=geometry, static_regions=regions,
+        capture_sequence=source_sequence, source_capture_id=source_id,
+        source_monotonic_sequence=source_sequence,
+        backend_generation=identity.backend_generation,
+        instance_id=identity.instance_id, adb_serial=identity.adb_serial,
+        content_marker_hash=hashlib.sha256("|".join(markers).encode("utf-8")).hexdigest()[:16],
+    )
+
+
+def _shop_confirm_snapshot(
+    item: ShopItem, quantity_mode: str, quantity: int, total_cost: int, ledger_entry: dict,
+) -> BusinessActionSnapshot:
+    catalog = load_shop_catalog()
+    plan = load_shop_plan(catalog=catalog)
+    return BusinessActionSnapshot(
+        item_id=item.id, shop_id=item.shop_id, currency=item.currency,
+        quantity_mode=quantity_mode, quantity=int(quantity), total_cost=int(total_cost),
+        catalog_digest=shop_catalog_digest(catalog), plan_digest=shop_plan_digest(plan, catalog),
+        ledger_digest=shop_attempt_digest(ledger_entry),
+    )
+
+
+def _validate_shop_confirm_context(
+    observation: PageObservation, snapshot: BusinessActionSnapshot,
+) -> None:
+    """Re-read all authorization facts; no caller-provided value is trusted."""
+
+    catalog = load_shop_catalog()
+    plan = load_shop_plan(catalog=catalog)
+    item = catalog.item(snapshot.item_id)
+    if (
+        item.shop_id != snapshot.shop_id or item.currency != snapshot.currency
+        or shop_catalog_digest(catalog) != snapshot.catalog_digest
+        or shop_plan_digest(plan, catalog) != snapshot.plan_digest
+    ):
+        raise PermissionError("shop confirmation catalog or plan changed")
+    shop_rule = plan["shops"].get(item.shop_id, {})
+    item_rule = shop_rule.get("items", {}).get(item.id, {})
+    if not (
+        plan.get("enabled") and shop_rule.get("enabled") and item_rule.get("enabled")
+        and item_rule.get("quantity") == snapshot.quantity_mode
+    ):
+        raise PermissionError("shop confirmation plan is no longer enabled")
+    entry = active_shop_attempt(item)
+    if (
+        not entry or entry.get("status") != "prepared"
+        or shop_attempt_digest(entry) != snapshot.ledger_digest
+        or int(entry.get("quantity", -1)) != snapshot.quantity
+        or int(entry.get("cost", -1)) != snapshot.total_cost
+    ):
+        raise PermissionError("shop confirmation write-ahead entry changed")
+    expected_markers = {
+        "shop_quantity_dialog", f"shop_item={item.id}",
+        f"shop_quantity={snapshot.quantity}", f"shop_total_cost={snapshot.total_cost}",
+        f"shop_currency={item.currency}",
+    }
+    if not expected_markers.issubset(set(observation.markers)):
+        raise PermissionError("shop confirmation dialog facts changed")
+
+
+def _dispatch_shop_confirm(snapshot: BusinessActionSnapshot, item: ShopItem):
+    """Use the one-action business session for the only irreversible tap."""
+
+    session = _create_production_business_action_session(
+        PageObserver(lambda: _shop_confirm_observation(item)),
+        snapshot=snapshot,
+        context_validator=_validate_shop_confirm_context,
+    )
+    with installed_read_only_guard(session):
+        return input_tap(
+            DIALOG_CONFIRM_POS,
+            random_offset=False,
+            intent=ActionIntent("shop_confirm", "shop_confirm_button", item.id),
+        )
 
 
 def _normalize_text(value: object) -> str:
@@ -456,7 +596,7 @@ class HeadquartersBlackMoonAdapter:
         # At-most-once boundary: persist the item-period lock before the ADB
         # confirmation tap.  A crash may skip one cycle, but can never repeat it.
         try:
-            record_shop_attempt(
+            ledger_entry = record_shop_attempt(
                 located.item,
                 quantity_mode,
                 quantity=quantity,
@@ -477,7 +617,15 @@ class HeadquartersBlackMoonAdapter:
             self._cancel_dialog(f"cancel-ledger-error-{located.item.id}")
             raise
         try:
-            input_tap(DIALOG_CONFIRM_POS)
+            dispatch_result = _dispatch_shop_confirm(
+                _shop_confirm_snapshot(
+                    located.item, quantity_mode, quantity, observed_total, ledger_entry
+                ),
+                located.item,
+            )
+            if dispatch_result is False:
+                self._cancel_dialog(f"cancel-policy-denied-{located.item.id}")
+                raise BlockedBySafetyError("商店确认前置条件不再成立，未发送购买确认")
         except StopExecution:
             _finalize_attempt(
                 {
@@ -491,6 +639,10 @@ class HeadquartersBlackMoonAdapter:
                     "verification_error": "确认点击阶段收到停止请求",
                 }
             )
+            raise
+        except BlockedBySafetyError:
+            # This is a pre-dispatch denial.  The dialog has been safely
+            # cancelled and no write-ahead record may be re-used for a tap.
             raise
         except Exception as error:
             # The ADB command may have reached the emulator even if its caller
