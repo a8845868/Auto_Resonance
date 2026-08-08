@@ -6,6 +6,7 @@ from loguru import logger
 
 from core.control.control import input_tap, screenshot
 from core.preset.control import blurry_ocr_click, go_home
+from core.services.runtime_errors import BlockedBySafetyError
 
 
 def collect_dispatch_rewards() -> bool:
@@ -19,7 +20,7 @@ def collect_dispatch_rewards() -> bool:
     # reminder exists only on the home HUD, so always normalize navigation
     # before looking for it.
     if not go_home():
-        raise RuntimeError("无法返回主界面，取消检查委派奖励")
+        raise BlockedBySafetyError("无法返回主界面，取消检查委派奖励")
     visible_text = [item["text"] for item in screenshot().ocr()]
     if not any("委派奖励可收取" in text for text in visible_text):
         logger.info("当前没有可领取的委派奖励")
@@ -39,7 +40,7 @@ def collect_dispatch_rewards() -> bool:
         log=False,
     ):
         go_home()
-        raise RuntimeError("已进入派遣页面，但没有识别到领取奖励按钮")
+        raise BlockedBySafetyError("已进入派遣页面，但没有识别到领取奖励按钮")
 
     time.sleep(1.5)
     logger.info("委派奖励领取成功")

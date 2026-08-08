@@ -24,6 +24,7 @@ from loguru import logger
 
 from core.control.control import connect, input_swipe, input_tap, screenshot
 from core.services.read_only_policy import ActionIntent
+from core.services.runtime_errors import BlockedBySafetyError
 from core.services.screen_state import (
     RESOURCE_DOWNLOAD_CONFIRM_TAP,
     RESOURCE_DOWNLOAD_WAIT_ATTEMPTS,
@@ -1618,7 +1619,7 @@ class RewardCollector:
 
     def _open_from_home(self, page_marker: str) -> bool:
         if not self.driver.go_home():
-            raise RuntimeError("无法返回主界面，取消领取奖励")
+            raise BlockedBySafetyError("无法返回主界面，取消领取奖励")
         candidates = self.driver.red_badge_shortcuts()
         learned = self.state.get("shortcut_positions", {}).get(page_marker)
         if learned:
@@ -2132,7 +2133,7 @@ class RewardCollector:
 
     def run(self, daily_activity: bool = True, travel_manual: bool = True) -> dict[str, int]:
         if not connect():
-            raise RuntimeError("ADB连接失败")
+            raise BlockedBySafetyError("ADB连接失败")
         result = {"每日活跃": 0, "环游手册": 0}
         if daily_activity:
             result["每日活跃"] = self.collect_daily_activity()

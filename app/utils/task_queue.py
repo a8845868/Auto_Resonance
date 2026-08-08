@@ -15,11 +15,13 @@ from core.control.control import reset_stop, stop
 from core.exception.exceptions import StopExecution
 from core.services.emulator_lifecycle import LifecycleCancelled, QueueLifecycle
 from core.services.runtime_errors import (
+    BlockedBySafetyError,
     FatalAutomationError,
     RecoverableAutomationError,
     classify_runtime_error,
 )
 from core.services.task_schedule_state import (
+    TaskOutcome,
     next_daily_reset,
     task_result_halt_eligible,
     task_result_incident_eligible,
@@ -233,6 +235,32 @@ class TaskQueueWorker(QThread):
                     except Exception as error:
                         classified = classify_runtime_error(error)
                         traceback_text = traceback.format_exc()
+                        if isinstance(classified, BlockedBySafetyError):
+                            # Known safety block: terminal for this task, never
+                            # queue-fatal, never an incident, never retried
+                            # inside this run.  Emit the same structured result
+                            # dict-producing tasks already use so the existing
+                            # outcome helpers and GUI rendering apply unchanged.
+                            result = {
+                                "success": False,
+                                "terminal": True,
+                                "task_outcome": TaskOutcome.BLOCKED_SAFETY.value,
+                                "reason": str(classified),
+                                "incident_eligible": False,
+                                "halt_eligible": False,
+                                "queue_automatic_retry": False,
+                                "queue_retry_count": 0,
+                            }
+                            succeeded = False
+                            incident_eligible = False
+                            halt_eligible = False
+                            logger.warning(
+                                f"任务被安全阻断（非致命）：{task.name}; {classified}"
+                            )
+                            self.error.emit(
+                                f"{task.name}被安全阻断，本任务等待调度重试"
+                            )
+                            break
                         if isinstance(classified, RecoverableAutomationError):
                             if attempt < max(0, int(task.recoverable_retries)):
                                 delay = max(0.0, float(task.retry_backoff_seconds)) * (

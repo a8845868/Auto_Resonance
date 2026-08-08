@@ -20,6 +20,16 @@ class RecoverableAutomationError(AutomationRuntimeError):
     """A transient observation or transport failure eligible for bounded retry."""
 
 
+class BlockedBySafetyError(AutomationRuntimeError):
+    """A known environment or page precondition failed and the task must stop.
+
+    Queue semantics (frozen by AUTO_RESONANCE_BLOCKED_SAFETY_OUTCOME_TAXONOMY_V1):
+    the task terminates as ``TaskOutcome.BLOCKED_SAFETY`` — never queue-fatal,
+    never self-healing eligible, never retried inside the queue run.  Only the
+    ordinary scheduler-level next-run policy applies.
+    """
+
+
 class FatalAutomationError(AutomationRuntimeError):
     """A programming/schema failure that must stop the remaining task queue."""
 
@@ -79,6 +89,7 @@ def classify_runtime_error(error: BaseException) -> AutomationRuntimeError:
 __all__ = [
     "AutomationRuntimeError",
     "RecoverableAutomationError",
+    "BlockedBySafetyError",
     "FatalAutomationError",
     "AdbTimeoutError",
     "OcrUnknownError",

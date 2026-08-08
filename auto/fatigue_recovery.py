@@ -37,6 +37,7 @@ from core.services.server_calendar import SERVER_CLOCK
 from core.services.station_facilities import rest_area_availability
 from core.services.weekly_plan_state import load_weekly_plan
 from core.services.city_navigation import KnownNavigationBlock
+from core.services.runtime_errors import BlockedBySafetyError
 from core.utils.utils import RESOURCES_PATH, read_json
 
 
@@ -263,22 +264,22 @@ def _snapshot_from_observation(
 def _run_daily_fatigue_recovery_impl(*, expected_waypoint: str | None = None) -> dict:
     """Observe resources, execute the plan one action at a time, and replan."""
     if not connect():
-        raise RuntimeError("疲劳规划无法连接模拟器")
+        raise BlockedBySafetyError("疲劳规划无法连接模拟器")
     try:
         station_name = get_station()
     except KnownNavigationBlock as error:
         return _capture_blocked_fatigue_result(error)
     if not station_name:
-        raise RuntimeError("疲劳规划未能确认当前站点")
+        raise BlockedBySafetyError("疲劳规划未能确认当前站点")
     if expected_waypoint and station_name != expected_waypoint:
-        raise RuntimeError(
+        raise BlockedBySafetyError(
             f"fatigue checkpoint waypoint mismatch: expected={expected_waypoint} actual={station_name}"
         )
     if not _open_exchange_buy_page():
-        raise RuntimeError("疲劳规划未能进入交易所买入页")
+        raise BlockedBySafetyError("疲劳规划未能进入交易所买入页")
     before = _wait_strength()
     if not before:
-        raise RuntimeError("疲劳规划无法读取恢复前疲劳")
+        raise BlockedBySafetyError("疲劳规划无法读取恢复前疲劳")
     logger.info(
         f"开始每日疲劳规划: {before[0]}/{before[1]}；"
         "先用气泡水，再判断全部便当是否会浪费"
@@ -340,7 +341,7 @@ def _run_daily_fatigue_recovery_impl(*, expected_waypoint: str | None = None) ->
         )
         observed_strength = _wait_strength()
         if not observed_strength:
-            raise RuntimeError("疲劳动作后无法重新读取疲劳")
+            raise BlockedBySafetyError("疲劳动作后无法重新读取疲劳")
         observation = observe_recovery_resources(station_name)
         snapshot = _snapshot_from_observation(
             station_name, observed_strength, observation, daily_usage

@@ -20,6 +20,7 @@ from core.control.control import (
 )
 from core.control.adb_port import EmulatorInfo, get_adb_port
 from core.services.read_only_policy import ActionIntent
+from core.services.runtime_errors import BlockedBySafetyError
 from core.services.action_summary_navigation import ActionSummaryNavigator
 from core.services.action_summary_product_model import (
     ActionSummaryDecision,
@@ -726,21 +727,21 @@ class ResidentActivityAutomation:
     ) -> dict[str, int]:
         self._require_legacy_execution()
         if not connect_resonance():
-            raise RuntimeError("ADB连接失败")
+            raise BlockedBySafetyError("ADB连接失败")
         if not self.open_action_summary():
-            raise RuntimeError("无法打开活动总览，未执行扫荡与全域整备")
+            raise BlockedBySafetyError("无法打开活动总览，未执行扫荡与全域整备")
 
         results = {"私贩追缴": self.run_limited_activity("私贩追缴")}
         # Limited activity detail screens have a back button. Re-open the summary
         # instead of relying on a particular post-reward screen.
         if not self.open_action_summary():
-            raise RuntimeError("无法重新打开活动总览，未完成全境特供")
+            raise BlockedBySafetyError("无法重新打开活动总览，未完成全境特供")
         stage = FULL_REALM_REWARDS.get(full_realm_reward)
         results["全境特供"] = self.run_limited_activity(
             "全境特供", stage=stage, reward=full_realm_reward
         )
         if not self.open_action_summary():
-            raise RuntimeError(f"无法重新打开活动总览，未完成{task}")
+            raise BlockedBySafetyError(f"无法重新打开活动总览，未完成{task}")
         results[task] = self.run_siege(task)
         return results
 
@@ -752,7 +753,7 @@ class ResidentActivityAutomation:
         fresh_model: ActionSummaryPageModel | None = None,
     ) -> ActionSummaryExecutionResult:
         if not connect_resonance():
-            raise RuntimeError("ADB连接失败")
+            raise BlockedBySafetyError("ADB连接失败")
         model, decision = self.read_action_summary_product_model()
         return evaluate_execution_interlock(
             model,
@@ -809,7 +810,7 @@ class ResidentActivityAutomation:
     def _run_once_legacy(self, task: str) -> dict[str, int]:
         self._require_legacy_execution()
         if not connect_resonance():
-            raise RuntimeError("ADB连接失败")
+            raise BlockedBySafetyError("ADB连接失败")
         if not self.open_action_summary():
             return {task: 0}
         if not self.select_siege_task(task):
