@@ -496,20 +496,23 @@ def observe_recovery_resources(station_name: str | None = None) -> dict[str, obj
     input_tap((1117, 607))
     if _wait_text("便当柜", "BENTO CABINET", timeout=8):
         cabinet = screenshot()
-        observation["lunches_remaining"] = _lunchbox_inventory(cabinet)
-        observation["lunch_recovery_values"] = _lunchbox_recovery_values(
-            cabinet.ocr()
+        remaining = _lunchbox_inventory(cabinet)
+        values = _lunchbox_recovery_values(cabinet.ocr())
+        observation["lunches_remaining"] = remaining
+        observation["lunch_recovery_values"] = values
+        # F-01 containment: observation must never open the irreversible
+        # use-all confirmation dialog.  The total is trusted only when every
+        # remaining bento's card value is visible on the cabinet page itself;
+        # otherwise it stays None and the planner defers as UNKNOWN.
+        total = (
+            sum(max(0, int(value)) for value in values)
+            if remaining is not None and remaining > 0 and len(values) == remaining
+            else None
         )
-        input_tap((1070, 427))
-        time.sleep(1.0)
-        total = _lunchbox_total_recovery(screenshot().ocr())
         observation["lunch_total_recovery"] = total
-        # Observation is read-only; always cancel the irreversible batch use.
-        input_tap((320, 503))
         observation["source_confidence"] = (
             "HIGH"
-            if observation["lunches_remaining"] is not None
-            and (total is not None or observation["lunches_remaining"] == 0)
+            if remaining is not None and (remaining == 0 or total is not None)
             else "PARTIAL"
         )
     go_home()
