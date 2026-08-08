@@ -13,11 +13,12 @@ from core.services.action_summary_navigation import ActionSummaryNavigator
 from core.services.dispatch_outcome import (
     DispatchOutcome,
     DispatchStatus,
+    outcome_from_receipt,
     physical_input_count_from_dispatch_error,
 )
 from core.services.personal_action_budget import EpisodeActionBudget
-from tests.action_summary_navigation_test import Clock, Frames, home
-from tests.city_navigation_adapter_test import _adapter, _home
+from tests.action_summary_navigation_test import Clock, Frames, home, overview
+from tests.city_navigation_adapter_test import _adapter, _city_detail, _home
 from tests.eleventh_pass_boundaries_test import _guard, _obs, _tap_intent
 from tests.inventory_assets_test import (
     Clock as InventoryClock,
@@ -25,6 +26,7 @@ from tests.inventory_assets_test import (
     _candidate,
     _geometry,
     _home_frame,
+    _inventory_frame,
 )
 
 
@@ -32,6 +34,7 @@ def _receipt(
     delivery: DeliveryStatus,
     *,
     touch_down_called: bool = False,
+    release: ReleaseStatus = ReleaseStatus.UNKNOWN,
 ) -> NemuTouchReceipt:
     return NemuTouchReceipt(
         schema_version="1.0",
@@ -55,7 +58,7 @@ def _receipt(
         touch_up_status="NOT_CALLED",
         python_call_returned=False,
         delivery_status=delivery.value,
-        release_status=ReleaseStatus.UNKNOWN.value,
+        release_status=release.value,
         started_at="2026-08-09T00:00:00+08:00",
         finished_at="2026-08-09T00:00:01+08:00",
     )
@@ -129,6 +132,7 @@ def test_receiptless_exception_preserves_zero_physical_input_accounting():
 
 def test_city_partial_dispatch_exception_counts_once_and_never_redispatches():
     calls = []
+    evidence = []
 
     def tap(*_args, **_kwargs):
         calls.append(1)
@@ -139,13 +143,16 @@ def test_city_partial_dispatch_exception_counts_once_and_never_redispatches():
             )
         )
 
-    result = _adapter([_home(), _home(pixel=2)], tap=tap).enter_city()
+    adapter = _adapter([_home(), _home(pixel=2)], tap=tap)
+    adapter.evidence_recorder = evidence.append
+    result = adapter.enter_city()
 
     assert result.status == "BLOCKED"
     assert result.dispatch_count == 1
     assert result.physical_input_count == 1
     assert result.same_action_retry == 0
     assert len(calls) == 1
+    assert evidence[0].dispatch_result == "UNKNOWN_AFTER_PARTIAL_DISPATCH"
 
 
 def test_action_summary_partial_dispatch_exception_counts_budget_once():
@@ -178,6 +185,7 @@ def test_action_summary_partial_dispatch_exception_counts_budget_once():
     assert result.dispatch_count == 1
     assert navigator.budget.total_actions == 1
     assert len(calls) == len(evidence) == 1
+    assert evidence[0].dispatch_result == "UNKNOWN_AFTER_PARTIAL_DISPATCH"
 
 
 def test_inventory_partial_dispatch_exception_is_accounted_and_not_retried(
@@ -227,3 +235,191 @@ def test_inventory_partial_dispatch_exception_is_accounted_and_not_retried(
     assert result is False
     assert accounted == [1]
     assert len(calls) == len(evidence) == 1
+    assert evidence[0].dispatch_result == "UNKNOWN_AFTER_PARTIAL_DISPATCH"
+
+
+class _ReceiptExecutor:
+    def __init__(self, *, receipt=None, error=None):
+        self.receipt = receipt
+        self.error = error
+
+    def tap(self, _point):
+        if self.error is not None:
+            raise self.error
+        return self.receipt
+
+    def swipe(self, _trajectory, _duration_ms):
+        if self.error is not None:
+            raise self.error
+        return self.receipt
+
+
+def test_policy_journal_carries_native_receipt_through_verified_lifecycle():
+    receipt = _receipt(
+        DeliveryStatus.NATIVE_ACCEPTED,
+        touch_down_called=True,
+        release=ReleaseStatus.CONFIRMED,
+    )
+    guard, issuer, _executor = _guard(executor=_ReceiptExecutor(receipt=receipt))
+    permit = issuer.issue(_tap_intent("journal-native"), ((50, 40),))
+
+    outcome = guard.authorize_coordinate((50, 40), permit=permit)
+
+    assert outcome.status is DispatchStatus.DISPATCHED_VERIFIED
+    assert outcome.receipt is receipt
+    for stage in ("EXECUTED", "POSTCONDITION_VERIFIED"):
+        entry = next(item for item in guard.journal if item.stage == stage)
+        assert entry.delivery_status == DeliveryStatus.NATIVE_ACCEPTED.value
+        assert entry.release_status == ReleaseStatus.CONFIRMED.value
+
+
+def test_policy_postcondition_failed_journal_preserves_native_receipt():
+    receipt = _receipt(
+        DeliveryStatus.NATIVE_ACCEPTED,
+        touch_down_called=True,
+        release=ReleaseStatus.CONFIRMED,
+    )
+    guard, issuer, _executor = _guard(
+        [
+            _obs(oid="issue"),
+            _obs(oid="consume"),
+            _obs("unknown", oid="post", anchor=False),
+        ],
+        executor=_ReceiptExecutor(receipt=receipt),
+    )
+    permit = issuer.issue(_tap_intent("journal-unverified"), ((50, 40),))
+
+    outcome = guard.authorize_coordinate((50, 40), permit=permit)
+
+    assert outcome.status is DispatchStatus.DISPATCHED_UNVERIFIED
+    failed = guard.journal[-1]
+    assert failed.stage == "POSTCONDITION_FAILED"
+    assert failed.delivery_status == DeliveryStatus.NATIVE_ACCEPTED.value
+    assert failed.release_status == ReleaseStatus.CONFIRMED.value
+
+
+@pytest.mark.parametrize(
+    "delivery",
+    [
+        DeliveryStatus.REJECTED_BEFORE_DELIVERY,
+        DeliveryStatus.UNKNOWN_AFTER_PARTIAL_DISPATCH,
+    ],
+)
+def test_policy_execution_failed_journal_carries_exception_receipt_and_reraises(
+    delivery,
+):
+    receipt = _receipt(
+        delivery,
+        touch_down_called=(
+            delivery is DeliveryStatus.UNKNOWN_AFTER_PARTIAL_DISPATCH
+        ),
+    )
+    error = NemuInputDispatchError(receipt)
+    guard, issuer, _executor = _guard(executor=_ReceiptExecutor(error=error))
+    permit = issuer.issue(_tap_intent(f"journal-{delivery.value}"), ((50, 40),))
+
+    with pytest.raises(NemuInputDispatchError) as caught:
+        guard.authorize_coordinate((50, 40), permit=permit)
+
+    assert caught.value is error
+    failed = guard.journal[-1]
+    assert failed.stage == "EXECUTION_FAILED"
+    assert failed.delivery_status == delivery.value
+    assert failed.release_status == ReleaseStatus.UNKNOWN.value
+
+
+def test_receiptless_backend_keeps_empty_journal_fields_and_evidence_fallback():
+    guard, issuer, _executor = _guard()
+    permit = issuer.issue(_tap_intent("journal-adb"), ((50, 40),))
+    outcome = guard.authorize_coordinate((50, 40), permit=permit)
+    assert outcome.delivery_status == outcome.release_status == ""
+    assert guard.journal[-1].delivery_status == ""
+    assert guard.journal[-1].release_status == ""
+
+    evidence = []
+    adapter = _adapter(
+        [
+            _home(),
+            _home(pixel=2),
+            _city_detail(pixel=3),
+        ],
+        tap=lambda *_args, **_kwargs: DispatchOutcome(
+            DispatchStatus.DISPATCHED_VERIFIED
+        ),
+    )
+    adapter.evidence_recorder = evidence.append
+    result = adapter.enter_city()
+    assert result.status == "PASS"
+    assert evidence[0].dispatch_result == "call_returned"
+
+
+def test_city_and_action_summary_success_evidence_use_native_delivery_status():
+    receipt = _receipt(
+        DeliveryStatus.NATIVE_ACCEPTED,
+        touch_down_called=True,
+        release=ReleaseStatus.CONFIRMED,
+    )
+    dispatched = outcome_from_receipt(
+        DispatchStatus.DISPATCHED_VERIFIED,
+        receipt=receipt,
+    )
+
+    city_evidence = []
+    adapter = _adapter(
+        [_home(), _home(pixel=2), _city_detail(pixel=3)],
+        tap=lambda *_args, **_kwargs: dispatched,
+    )
+    adapter.evidence_recorder = city_evidence.append
+    assert adapter.enter_city().status == "PASS"
+    assert city_evidence[0].dispatch_result == "NATIVE_ACCEPTED"
+
+    summary_evidence = []
+    clock = Clock()
+    navigator = ActionSummaryNavigator(
+        frame_provider=Frames([home("one"), home("two"), overview("three")]),
+        tap=lambda *_args, **_kwargs: dispatched,
+        evidence_recorder=summary_evidence.append,
+        monotonic=clock,
+        sleep=clock.sleep,
+        postcondition_timeout=1.0,
+        poll_interval=0.2,
+        stop_after_first_stage=True,
+    )
+    assert navigator.navigate().success
+    assert summary_evidence[0].dispatch_result == "NATIVE_ACCEPTED"
+
+
+def test_inventory_success_evidence_uses_native_delivery_status():
+    receipt = _receipt(
+        DeliveryStatus.NATIVE_ACCEPTED,
+        touch_down_called=True,
+        release=ReleaseStatus.CONFIRMED,
+    )
+    dispatched = outcome_from_receipt(
+        DispatchStatus.DISPATCHED_VERIFIED,
+        receipt=receipt,
+    )
+    provider = FrameProvider(
+        [
+            _home_frame(capture_id="home-1"),
+            _home_frame(pixel=2, capture_id="home-2"),
+            _inventory_frame(),
+        ]
+    )
+    clock = InventoryClock()
+    evidence = []
+
+    result = inventory._open_assets_entry(
+        frame_provider=provider,
+        dispatcher=lambda *_args, **_kwargs: dispatched,
+        candidate_resolver=lambda _image: [_candidate()],
+        geometry_provider=_geometry,
+        evidence_recorder=evidence.append,
+        timeout=2.0,
+        poll_interval=0.4,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert result is True
+    assert evidence[0].dispatch_result == "NATIVE_ACCEPTED"

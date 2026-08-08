@@ -22,6 +22,7 @@ from core.services.capture_recovery import (
 from core.services.dispatch_outcome import (
     DispatchStatus,
     physical_input_count_from_dispatch_error,
+    receipt_from_dispatch_error,
 )
 from core.services.navigation_evidence import (
     CoordinateChain,
@@ -915,14 +916,25 @@ class CityNavigationAdapter:
         except (PermissionError, RuntimeError) as error:
             physical_input_count = physical_input_count_from_dispatch_error(error)
             dispatch_count = physical_input_count
-            evidence.mark_dispatch(requested=True, acknowledged=False, result=f"dispatch_exception:{type(error).__name__}")
+            error_receipt = receipt_from_dispatch_error(error)
+            dispatch_result = str(
+                getattr(error_receipt, "delivery_status", "")
+                or f"dispatch_exception:{type(error).__name__}"
+            )
+            evidence.mark_dispatch(
+                requested=True, acknowledged=False, result=dispatch_result
+            )
             record(fresh, "enter_city", type(error).__name__, "NOT_CHECKED", "BLOCKED", "city_entry_dispatch_not_acknowledged")
             return finish(CityNavigationState.FAILED, "BLOCKED", "city_entry_dispatch_not_acknowledged")
         if allowed is False:
             evidence.mark_dispatch(requested=True, acknowledged=False, result="dispatch_rejected")
             record(fresh, "enter_city", "DENIED", "NOT_CHECKED", "BLOCKED", "city_entry_dispatch_not_acknowledged")
             return finish(CityNavigationState.FAILED, "BLOCKED", "city_entry_dispatch_not_acknowledged")
-        evidence.mark_dispatch(requested=True, acknowledged=True, result="call_returned")
+        evidence.mark_dispatch(
+            requested=True,
+            acknowledged=True,
+            result=str(getattr(allowed, "delivery_status", "") or "call_returned"),
+        )
         dispatch_count = 1
         physical_input_count = 1
         dispatch_started = self.monotonic()

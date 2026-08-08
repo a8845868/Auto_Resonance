@@ -19,6 +19,7 @@ from core.services.dispatch_outcome import (
     DispatchOutcome,
     DispatchStatus,
     outcome_from_receipt,
+    receipt_from_dispatch_error,
 )
 
 
@@ -1108,6 +1109,8 @@ class ActionJournalEntry:
     observation_captured_at: str = ""
     content_marker_hash: str = ""
     side_effect_occurred: bool = False
+    delivery_status: str = ""
+    release_status: str = ""
     dominant_axis: str = ""
     swipe_direction: str = ""
 
@@ -1235,6 +1238,8 @@ class ReadOnlyActionGuard:
         observation: PageObservation | None = None,
         observation_role: str = "",
         side_effect_occurred: bool = False,
+        delivery_status: str = "",
+        release_status: str = "",
     ) -> bool:
         authoritative = record
         try:
@@ -1318,6 +1323,8 @@ class ReadOnlyActionGuard:
             ),
             content_marker_hash=(observation.content_marker_hash if observation else ""),
             side_effect_occurred=bool(side_effect_occurred),
+            delivery_status=str(delivery_status or ""),
+            release_status=str(release_status or ""),
             dominant_axis=(authoritative.dominant_axis if authoritative else ""),
             swipe_direction=(authoritative.swipe_direction if authoritative else ""),
         )
@@ -1409,19 +1416,49 @@ class ReadOnlyActionGuard:
                     receipt = executor.tap(physical[0])
                 else:
                     receipt = executor.swipe(physical, duration_ms)
-            except Exception:
-                self._record(key, trajectory, physical_trajectory=physical, allowed=False, reason="execution_failed", stage=JournalStage.EXECUTION_FAILED, action_kind=action_kind, permit=permit, record=record, side_effect_occurred=True)
+            except Exception as error:
+                error_receipt = receipt_from_dispatch_error(error)
+                self._record(
+                    key, trajectory, physical_trajectory=physical, allowed=False,
+                    reason="execution_failed", stage=JournalStage.EXECUTION_FAILED,
+                    action_kind=action_kind, permit=permit, record=record,
+                    side_effect_occurred=True,
+                    delivery_status=getattr(error_receipt, "delivery_status", ""),
+                    release_status=getattr(error_receipt, "release_status", ""),
+                )
                 raise
-            self._record(key, trajectory, physical_trajectory=physical, allowed=True, reason="hardware_execution_completed", stage=JournalStage.EXECUTED, action_kind=action_kind, permit=permit, record=record, side_effect_occurred=True)
+            delivery_status = str(getattr(receipt, "delivery_status", "") or "")
+            release_status = str(getattr(receipt, "release_status", "") or "")
+            self._record(
+                key, trajectory, physical_trajectory=physical, allowed=True,
+                reason="hardware_execution_completed", stage=JournalStage.EXECUTED,
+                action_kind=action_kind, permit=permit, record=record,
+                side_effect_occurred=True, delivery_status=delivery_status,
+                release_status=release_status,
+            )
             verified, post_reason, post_observation = issuer.verify_postcondition(permit, record)
             if not verified:
-                self._record(key, trajectory, physical_trajectory=physical, allowed=False, reason=post_reason, stage=JournalStage.POSTCONDITION_FAILED, action_kind=action_kind, permit=permit, record=record, observation=post_observation, observation_role="POST", side_effect_occurred=True)
+                self._record(
+                    key, trajectory, physical_trajectory=physical, allowed=False,
+                    reason=post_reason, stage=JournalStage.POSTCONDITION_FAILED,
+                    action_kind=action_kind, permit=permit, record=record,
+                    observation=post_observation, observation_role="POST",
+                    side_effect_occurred=True, delivery_status=delivery_status,
+                    release_status=release_status,
+                )
                 return outcome_from_receipt(
                     DispatchStatus.DISPATCHED_UNVERIFIED,
                     reason=post_reason,
                     receipt=receipt,
                 )
-            self._record(key, trajectory, physical_trajectory=physical, allowed=True, reason=post_reason, stage=JournalStage.POSTCONDITION_VERIFIED, action_kind=action_kind, permit=permit, record=record, observation=post_observation, observation_role="POST", side_effect_occurred=True)
+            self._record(
+                key, trajectory, physical_trajectory=physical, allowed=True,
+                reason=post_reason, stage=JournalStage.POSTCONDITION_VERIFIED,
+                action_kind=action_kind, permit=permit, record=record,
+                observation=post_observation, observation_role="POST",
+                side_effect_occurred=True, delivery_status=delivery_status,
+                release_status=release_status,
+            )
             return outcome_from_receipt(
                 DispatchStatus.DISPATCHED_VERIFIED,
                 reason=post_reason,

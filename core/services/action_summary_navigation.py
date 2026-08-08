@@ -16,7 +16,10 @@ from enum import Enum
 from typing import Callable, Mapping, Sequence
 
 from core.services.announcement_overlay_handler import AnnouncementSafeRegionSelector
-from core.services.dispatch_outcome import physical_input_count_from_dispatch_error
+from core.services.dispatch_outcome import (
+    physical_input_count_from_dispatch_error,
+    receipt_from_dispatch_error,
+)
 from core.services.navigation_evidence import (
     CoordinateChain,
     NavigationAttemptEvidence,
@@ -2282,7 +2285,14 @@ class ActionSummaryNavigator:
                 )
             except Exception as error:  # noqa: BLE001 - record exact dispatch boundary
                 physical_input_count = physical_input_count_from_dispatch_error(error)
-                evidence.mark_dispatch(requested=True, acknowledged=False, result=f"dispatch_exception:{type(error).__name__}")
+                error_receipt = receipt_from_dispatch_error(error)
+                dispatch_result = str(
+                    getattr(error_receipt, "delivery_status", "")
+                    or f"dispatch_exception:{type(error).__name__}"
+                )
+                evidence.mark_dispatch(
+                    requested=True, acknowledged=False, result=dispatch_result
+                )
                 self.evidence_recorder(evidence)
                 if physical_input_count:
                     self.budget.record_dispatch(decision)
@@ -2296,7 +2306,13 @@ class ActionSummaryNavigator:
                 evidence.mark_dispatch(requested=True, acknowledged=False, result="dispatch_rejected")
                 self.evidence_recorder(evidence)
                 return ActionSummaryResult(False, planned.state, "dispatch_failure", dispatches, dispatches, evidences, timeline, candidate_resolutions)
-            evidence.mark_dispatch(requested=True, acknowledged=True, result="call_returned")
+            evidence.mark_dispatch(
+                requested=True,
+                acknowledged=True,
+                result=str(
+                    getattr(result, "delivery_status", "") or "call_returned"
+                ),
+            )
             self.budget.record_dispatch(decision)
             if contract_key is not None:
                 contract_dispatches[contract_key] = (

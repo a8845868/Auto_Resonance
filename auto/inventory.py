@@ -41,7 +41,10 @@ from core.services.navigation_evidence import (
     record_navigation_attempt,
 )
 from core.services.read_only_policy import ActionIntent
-from core.services.dispatch_outcome import physical_input_count_from_dispatch_error
+from core.services.dispatch_outcome import (
+    physical_input_count_from_dispatch_error,
+    receipt_from_dispatch_error,
+)
 from core.services.runtime_errors import BlockedBySafetyError
 from core.services.home_backpack_cube import (
     HomeAssetsBalanceDisplay,
@@ -549,10 +552,15 @@ def _open_assets_entry(
         )
     except Exception as error:  # noqa: BLE001 - preserve evidence before fail-closed
         physical_input_count = physical_input_count_from_dispatch_error(error)
+        error_receipt = receipt_from_dispatch_error(error)
+        dispatch_evidence_result = str(
+            getattr(error_receipt, "delivery_status", "")
+            or f"dispatch_exception:{type(error).__name__}"
+        )
         evidence.mark_dispatch(
             requested=True,
             acknowledged=False,
-            result=f"dispatch_exception:{type(error).__name__}",
+            result=dispatch_evidence_result,
         )
         evidence_recorder(evidence)
         logger.exception(
@@ -563,7 +571,11 @@ def _open_assets_entry(
     evidence.mark_dispatch(
         requested=True,
         acknowledged=acknowledged,
-        result="call_returned" if acknowledged else "dispatch_rejected",
+        result=(
+            str(getattr(dispatch_result, "delivery_status", "") or "call_returned")
+            if acknowledged
+            else "dispatch_rejected"
+        ),
     )
     if not acknowledged:
         evidence_recorder(evidence)
