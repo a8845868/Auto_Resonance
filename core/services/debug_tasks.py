@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from typing import Callable
 
 from app.common.config import cfg
+from core.services.runtime_errors import BlockedBySafetyError
 from core.services.task_schedule_state import next_daily_reset
 
 
@@ -31,7 +32,7 @@ def _screen_state() -> dict:
     from core.services.screen_state import is_train_in_transit
 
     if not connect():
-        raise RuntimeError("无法连接模拟器")
+        raise BlockedBySafetyError("无法连接模拟器")
     try:
         items = screenshot().ocr()
         texts = [item["text"] for item in items]
@@ -48,11 +49,11 @@ def _station_state() -> dict:
     from core.preset import get_station
 
     if not connect():
-        raise RuntimeError("无法连接模拟器")
+        raise BlockedBySafetyError("无法连接模拟器")
     try:
         station = get_station()
         if not station:
-            raise RuntimeError("未能确认当前站点")
+            raise BlockedBySafetyError("未能确认当前站点")
         return {"station": station}
     finally:
         kill()

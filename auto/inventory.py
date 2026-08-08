@@ -41,6 +41,7 @@ from core.services.navigation_evidence import (
     record_navigation_attempt,
 )
 from core.services.read_only_policy import ActionIntent
+from core.services.runtime_errors import BlockedBySafetyError
 from core.services.home_backpack_cube import (
     HomeAssetsBalanceDisplay,
     HomeBackpackCubeCandidate,
@@ -774,21 +775,23 @@ def _deduplicate_inventory_probes(probes: list[dict]) -> list[dict]:
 def scan_inventory_assets(max_pages: int = 10) -> list[Asset]:
     """Build a full-page icon index, probing only ambiguous or unknown cells."""
     if not connect():
-        raise RuntimeError("ADB 连接失败，请先在“ADB信息”中确认模拟器连接")
+        raise BlockedBySafetyError("ADB 连接失败，请先在“ADB信息”中确认模拟器连接")
     initial_items = screenshot().ocr()
     if _is_train_in_transit(initial_items):
-        raise RuntimeError("列车正在行驶，当前无法打开资产页面；请到站后重新扫描")
+        raise BlockedBySafetyError("列车正在行驶，当前无法打开资产页面；请到站后重新扫描")
     should_restore_home = False
     try:
         if not go_home():
-            raise RuntimeError("无法返回站点主画面；请确认列车已到站后重试")
+            raise BlockedBySafetyError("无法返回站点主画面；请确认列车已到站后重试")
         # The home screen contains many unrelated numbers; only retain known currency-like rows.
         home_items = screenshot().ocr()
         currencies = _home_primary_currency(home_items)
         currencies.extend(asset for asset in parse_ocr_assets(home_items) if asset.category == "货币")
         snapshots = [currencies]
         if not _open_assets_entry():
-            raise RuntimeError("未找到游戏主界面的资产入口图标；请停留在主界面后重试")
+            raise BlockedBySafetyError(
+                "未找到游戏主界面的资产入口图标；请停留在主界面后重试"
+            )
         should_restore_home = True
         time.sleep(1.2)
         first_frame = screenshot()

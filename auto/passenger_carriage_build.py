@@ -10,6 +10,7 @@ from loguru import logger
 from core.control.control import connect, input_tap, is_stopped, screenshot
 from core.preset.control import blurry_ocr_click, go_home
 from core.services.game_recovery import is_game_running, start_game
+from core.services.runtime_errors import BlockedBySafetyError
 from core.services.passenger_build_planner import (
     build_monitor_summary,
     load_build_monitor_plan,
@@ -216,17 +217,17 @@ def persist_passenger_build_inventory(result: PassengerBuildInventory) -> None:
 def scan_passenger_build_inventory() -> dict:
     """Navigate safely, OCR actual build counts, persist them, and return a mapping."""
     if not _wait_for_game():
-        raise RuntimeError("游戏启动超时，无法同步客厢数量")
+        raise BlockedBySafetyError("游戏启动超时，无法同步客厢数量")
     try:
         if not go_home():
-            raise RuntimeError("无法返回主界面")
+            raise BlockedBySafetyError("无法返回主界面")
         if not _click_until_ready("整备列车", _is_train_management_screen, score=0.6):
-            raise RuntimeError("未能进入整备列车页面")
+            raise BlockedBySafetyError("未能进入整备列车页面")
         if not _click_until_ready("编组", _is_workshop_screen, score=0.6):
-            raise RuntimeError("未能进入编组工坊页面")
+            raise BlockedBySafetyError("未能进入编组工坊页面")
         result = read_passenger_build_inventory_on_workshop()
         if not result:
-            raise RuntimeError("客厢/座椅数量未通过多帧 OCR 核对")
+            raise BlockedBySafetyError("客厢/座椅数量未通过多帧 OCR 核对")
         persist_passenger_build_inventory(result)
         return result.__dict__.copy()
     finally:

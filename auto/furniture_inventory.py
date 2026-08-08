@@ -13,6 +13,7 @@ from core.preset import go_home
 from core.preset.control import blurry_ocr_click
 from core.services.inventory_assets import parse_amount
 from core.services.passenger_layout import load_furniture_catalog
+from core.services.runtime_errors import BlockedBySafetyError
 
 
 def _normal(value: str) -> str:
@@ -79,7 +80,7 @@ def scan_furniture_inventory(max_pages: int = 6, max_items: int = 120) -> dict:
     prior/manual warehouse values and must not clear keys omitted by this scan.
     """
     if not connect():
-        raise RuntimeError("ADB连接失败，请先在“ADB信息”确认模拟器连接")
+        raise BlockedBySafetyError("ADB连接失败，请先在“ADB信息”确认模拟器连接")
     catalog = load_furniture_catalog()
     found: dict[str, dict] = {}
     unknown = []
@@ -87,10 +88,12 @@ def scan_furniture_inventory(max_pages: int = 6, max_items: int = 120) -> dict:
     try:
         go_home()
         if not _open_assets_entry():
-            raise RuntimeError("未找到资产/背包入口")
+            raise BlockedBySafetyError("未找到资产/背包入口")
         time.sleep(1.0)
         if not blurry_ocr_click("私人仓库", score=0.62, trynum=3, log=False):
-            raise RuntimeError("未找到“私人仓库”分页；请停留在游戏主界面后重试")
+            raise BlockedBySafetyError(
+                "未找到“私人仓库”分页；请停留在游戏主界面后重试"
+            )
         time.sleep(1.0)
         seen_pages = set()
         scanned = 0
@@ -132,7 +135,9 @@ def scan_furniture_inventory(max_pages: int = 6, max_items: int = 120) -> dict:
             complete = False
         logger.info(f"私人仓库家具扫描：确认 {len(found)} 类，未确认 {len(unknown)} 个卡片")
         if not found:
-            raise RuntimeError("已进入私人仓库，但未能从详情面板确认家具名称；请手动填写仓库数量")
+            raise BlockedBySafetyError(
+                "已进入私人仓库，但未能从详情面板确认家具名称；请手动填写仓库数量"
+            )
         return {"items": found, "unknown": unknown, "complete": complete, "scanned_cards": scanned}
     finally:
         try:

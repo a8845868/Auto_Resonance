@@ -29,6 +29,7 @@ from core.control.control import (
 )
 from core.exception.exceptions import StopExecution
 from core.preset.control import go_home
+from core.services.runtime_errors import BlockedBySafetyError
 from core.services.shop_catalog import (
     ConfiguredPurchase,
     ShopAttemptAlreadyActive,
@@ -273,7 +274,7 @@ def _wait_for_text(
         if expected_normalized.issubset(visible):
             return latest, latest_ocr
         time.sleep(0.6)
-    raise RuntimeError(f"等待商店文本超时: {', '.join(expected)}")
+    raise BlockedBySafetyError(f"等待商店文本超时: {', '.join(expected)}")
 
 
 def _dialog_quantity(ocr_items: Iterable[dict]) -> tuple[int, int] | None:
@@ -334,7 +335,7 @@ class HeadquartersBlackMoonAdapter:
             self.recorder.capture("existing-shop", initial, initial_ocr)
         else:
             if not go_home():
-                raise RuntimeError("无法返回主界面，未进入商店")
+                raise BlockedBySafetyError("无法返回主界面，未进入商店")
             self.recorder.capture("home")
             input_tap(SHOP_ENTRY_POS)
             image, ocr_items = _wait_for_text(
@@ -352,7 +353,7 @@ class HeadquartersBlackMoonAdapter:
             ocr_items = image.ocr()
             self.recorder.capture("batch-disabled", image, ocr_items)
             if _batch_purchase_enabled(image):
-                raise RuntimeError("无法关闭批量购买，已停止自动购买")
+                raise BlockedBySafetyError("无法关闭批量购买，已停止自动购买")
         self._rewind_to_top()
 
     def _rewind_to_top(self) -> None:
@@ -371,14 +372,14 @@ class HeadquartersBlackMoonAdapter:
             previous = current
             if stable >= 2:
                 return
-        raise RuntimeError("商店回顶超过安全滑动次数，已停止继续")
+        raise BlockedBySafetyError("商店回顶超过安全滑动次数，已停止继续")
 
     def _cancel_dialog(self, label: str) -> None:
         input_tap(DIALOG_CANCEL_POS)
         time.sleep(0.8)
         remaining_ocr = self.recorder.capture(label)
         if _has_quantity_dialog(remaining_ocr):
-            raise RuntimeError("数量弹窗取消后仍未关闭，已停止继续操作")
+            raise BlockedBySafetyError("数量弹窗取消后仍未关闭，已停止继续操作")
 
     def inspect_dialog(
         self,
@@ -392,16 +393,16 @@ class HeadquartersBlackMoonAdapter:
         self.recorder.capture(f"dialog-{located.item.id}", dialog, dialog_ocr)
         if not _has_complete_quantity_dialog(dialog, dialog_ocr):
             self._cancel_dialog(f"cancel-missing-controls-{located.item.id}")
-            raise RuntimeError(
+            raise BlockedBySafetyError(
                 f"未识别到完整数量弹窗，拒绝确认购买: {located.item.name}"
             )
         if not _dialog_has_item(dialog_ocr, located.item):
             self._cancel_dialog(f"cancel-unexpected-{located.item.id}")
-            raise RuntimeError(f"商品弹窗名称校验失败: {located.item.name}")
+            raise BlockedBySafetyError(f"商品弹窗名称校验失败: {located.item.name}")
         observed_price = _dialog_price(dialog_ocr)
         if observed_price != located.item.price:
             self._cancel_dialog(f"cancel-price-{located.item.id}")
-            raise RuntimeError(
+            raise BlockedBySafetyError(
                 f"商品价格校验失败: {located.item.name}，"
                 f"目录 {located.item.price}，实机 {observed_price}"
             )
@@ -410,7 +411,7 @@ class HeadquartersBlackMoonAdapter:
         if quantity is None:
             if located.remaining != 1:
                 self._cancel_dialog(f"cancel-quantity-{located.item.id}")
-                raise RuntimeError(f"未识别数量控件: {located.item.name}")
+                raise BlockedBySafetyError(f"未识别数量控件: {located.item.name}")
             quantity = (1, 1)
         if quantity_mode == "max" and quantity[0] != quantity[1]:
             input_tap(DIALOG_MAX_POS)
@@ -422,13 +423,13 @@ class HeadquartersBlackMoonAdapter:
             observed_total = _dialog_price(dialog_ocr)
             if observed_total is None or observed_total < observed_price:
                 self._cancel_dialog(f"cancel-total-{located.item.id}")
-                raise RuntimeError(
+                raise BlockedBySafetyError(
                     f"未能安全识别上限模式实时总价: {located.item.name}"
                 )
         expected = 1 if quantity_mode == "one" else located.remaining
         if quantity[0] != expected:
             self._cancel_dialog(f"cancel-quantity-mismatch-{located.item.id}")
-            raise RuntimeError(
+            raise BlockedBySafetyError(
                 f"商品数量校验失败: {located.item.name}，"
                 f"期望 {expected}，实机 {quantity[0]}/{quantity[1]}"
             )
@@ -668,7 +669,7 @@ class HeadquartersBlackMoonAdapter:
             input_swipe(PRODUCT_SCROLL_START, PRODUCT_SCROLL_END, swipe_time=650)
             time.sleep(1.0)
         if catalog_probe and not reached_bottom:
-            raise RuntimeError(
+            raise BlockedBySafetyError(
                 f"商店扫描达到 {max_pages} 页安全上限，仍未确认触底"
             )
         page_limit_reached = (
@@ -724,7 +725,7 @@ def _connected_run(callback: Callable[[], object]) -> object:
             )
         if not adb_connected:
             if not connect():
-                raise RuntimeError("无法通过 ADB 或模拟器 IPC 连接模拟器")
+                raise BlockedBySafetyError("无法通过 ADB 或模拟器 IPC 连接模拟器")
             transport = "nemu_ipc"
             logger.warning("本次商店任务使用 NEMUIPC 回退传输")
         result = callback()

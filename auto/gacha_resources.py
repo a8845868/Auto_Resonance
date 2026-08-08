@@ -8,6 +8,7 @@ from loguru import logger
 
 from core.control.control import connect, input_tap, screenshot
 from core.preset import go_home
+from core.services.runtime_errors import BlockedBySafetyError
 from core.utils.utils import RESOURCES_PATH
 
 
@@ -64,14 +65,16 @@ def parse_recruit_resource_counts(items: list[dict], screen_width: int = 1280) -
 def scan_gacha_resources() -> dict[str, int]:
     """Open recruitment from the home toolbar and read protocol/stone balances."""
     if not connect():
-        raise RuntimeError("ADB 连接失败，请先在“ADB信息”中确认模拟器连接")
+        raise BlockedBySafetyError("ADB 连接失败，请先在“ADB信息”中确认模拟器连接")
     try:
         if not go_home():
-            raise RuntimeError("无法返回游戏主界面")
+            raise BlockedBySafetyError("无法返回游戏主界面")
         home = screenshot()
         location, score = _find_recruit_entry(home.image)
         if not location:
-            raise RuntimeError(f"未找到主界面的招募入口图标（最高匹配度 {score:.3f}）")
+            raise BlockedBySafetyError(
+                f"未找到主界面的招募入口图标（最高匹配度 {score:.3f}）"
+            )
         logger.info(f"识别到招募入口：{location}（匹配度 {score:.3f}）")
         input_tap(location)
         time.sleep(2.0)
@@ -79,7 +82,7 @@ def scan_gacha_resources() -> dict[str, int]:
         values = parse_recruit_resource_counts(recruit.ocr(), recruit.image.shape[1])
         if "tickets" not in values or "stones" not in values:
             missing = "、".join(name for key, name in (("tickets", "拉普拉斯协议"), ("stones", "桦石")) if key not in values)
-            raise RuntimeError(f"已进入招募页面，但未识别到{missing}数量")
+            raise BlockedBySafetyError(f"已进入招募页面，但未识别到{missing}数量")
         logger.info(f"抽卡资源读取完成：协议 {values['tickets']}，桦石 {values['stones']}")
         return values
     finally:

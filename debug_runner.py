@@ -88,6 +88,7 @@ def _run_debug_task(
         EmulatorQueueLifecycle,
         LifecycleOptions,
     )
+    from core.services.runtime_errors import BlockedBySafetyError
     from core.services.task_schedule_state import (
         TaskOutcome,
         record_task_execution,
@@ -177,6 +178,19 @@ def _run_debug_task(
     except StopExecution:
         error_text = "任务收到停止请求"
         logger.warning(f"后台调试已停止: {task.name}")
+    except BlockedBySafetyError as error:
+        result = {
+            "success": False,
+            "terminal": True,
+            "task_outcome": TaskOutcome.BLOCKED_SAFETY.value,
+            "reason": str(error),
+            "incident_eligible": False,
+            "halt_eligible": False,
+            "queue_automatic_retry": False,
+            "queue_retry_count": 0,
+        }
+        error_text = "任务按页面安全门禁停止"
+        logger.warning(f"后台调试被安全阻断（非事故）: {task.name}; {error}")
     except Exception as error:  # noqa: BLE001 - debug boundary must report all failures
         error_text = f"{type(error).__name__}: {error}"
         incident = {

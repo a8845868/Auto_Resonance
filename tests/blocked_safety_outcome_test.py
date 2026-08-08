@@ -11,7 +11,12 @@ from unittest.mock import patch
 import pytest
 
 import auto.fatigue_recovery as fatigue_recovery
+import auto.furniture_inventory as furniture_inventory
+import auto.gacha_resources as gacha_resources
+import auto.inventory as inventory
 import auto.module.dispatch as dispatch
+import auto.passenger_carriage_build as passenger_carriage_build
+import auto.shop_purchase as shop_purchase
 from app.utils.task_queue import QueuedTask, TaskQueueWorker
 from core.services.runtime_errors import (
     BlockedBySafetyError,
@@ -171,3 +176,93 @@ def test_reward_and_resident_connect_sites_raise_blocked_safety_error():
     with patch.object(resident_activity, "connect_resonance", return_value=False):
         with pytest.raises(BlockedBySafetyError):
             resident_activity.ResidentActivityAutomation._run_interlocked(automation)
+
+
+def test_shop_timeout_site_raises_blocked_safety_error():
+    with pytest.raises(BlockedBySafetyError):
+        shop_purchase._wait_for_text(("商店",), timeout=0)
+
+
+def test_passenger_game_timeout_site_raises_blocked_safety_error():
+    with patch.object(passenger_carriage_build, "_wait_for_game", return_value=False):
+        with pytest.raises(BlockedBySafetyError):
+            passenger_carriage_build.scan_passenger_build_inventory()
+
+
+def test_gacha_connect_site_raises_blocked_safety_error():
+    with patch.object(gacha_resources, "connect", return_value=False):
+        with pytest.raises(BlockedBySafetyError):
+            gacha_resources.scan_gacha_resources()
+
+
+def test_furniture_connect_site_raises_blocked_safety_error():
+    with patch.object(furniture_inventory, "connect", return_value=False):
+        with pytest.raises(BlockedBySafetyError):
+            furniture_inventory.scan_furniture_inventory()
+
+
+def test_inventory_connect_site_raises_blocked_safety_error():
+    with patch.object(inventory, "connect", return_value=False):
+        with pytest.raises(BlockedBySafetyError):
+            inventory.scan_inventory_assets()
+
+
+def test_debug_task_connect_site_raises_blocked_safety_error():
+    with patch("core.control.control.connect", return_value=False):
+        from core.services import debug_tasks
+
+        with pytest.raises(BlockedBySafetyError):
+            debug_tasks._screen_state()
+
+
+def test_debug_runner_translates_blocked_safety_error_without_incident(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.common.config import cfg
+    import debug_runner
+    from core.services import debug_tasks
+
+    task = SimpleNamespace(
+        key="screen",
+        name="只读画面识别",
+        run=lambda: (_ for _ in ()).throw(BlockedBySafetyError("无法连接模拟器")),
+    )
+    lease = SimpleNamespace(pid=1234, stop_requested=lambda: False)
+    incidents = []
+    monkeypatch.setattr(cfg.enableAutoGameLifecycle, "value", False)
+    with (
+        patch.object(debug_tasks, "resolve_task", return_value=task),
+        patch.object(debug_runner, "write_debug_status", return_value=None),
+        patch.object(debug_runner, "read_debug_status", return_value={}),
+    ):
+        response = debug_runner._run_debug_task(
+            lease,
+            {"id": "blocked-screen", "task": "screen"},
+            incident_reporter=incidents.append,
+        )
+
+    assert response["success"] is False
+    assert response["result"]["task_outcome"] == "BLOCKED_SAFETY"
+    assert response["result"]["queue_automatic_retry"] is False
+    assert response["result"]["queue_retry_count"] == 0
+    assert response["error"] == "任务按页面安全门禁停止"
+    assert incidents == []
+
+
+def test_slice_2_keep_fatal_sites_remain_plain_runtime_errors():
+    from core.services import debug_tasks
+
+    with (
+        patch.dict(shop_purchase.ADAPTERS, {}, clear=True),
+        patch.object(shop_purchase, "_connected_run", side_effect=lambda run: run()),
+    ):
+        with pytest.raises(RuntimeError) as shop_error:
+            shop_purchase.probe_shop_quantity_dialog(capture_evidence=False)
+    assert type(shop_error.value) is RuntimeError
+
+    with patch(
+        "core.services.weekly_plan_state.load_weekly_plan", return_value=None
+    ):
+        with pytest.raises(RuntimeError) as debug_error:
+            debug_tasks._run_business()
+    assert type(debug_error.value) is RuntimeError
