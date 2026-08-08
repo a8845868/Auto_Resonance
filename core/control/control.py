@@ -27,6 +27,7 @@ from core.control.nemu_capture import CaptureSessionRecoveryResult
 from core.exception.exceptions import StopExecution
 from core.image.image import Image
 from core.model import app
+from core.services.action_policy_shadow import record_shadow_dispatch
 from core.services.repair_safety import ensure_automation_allowed
 
 EXCURSIONX = [-10, 10]
@@ -709,6 +710,13 @@ def _input_swipe_locked(
     if action_policy is None:
         if _READ_ONLY_FAIL_CLOSED:
             raise PermissionError("read_only_session_policy_unavailable")
+        # F-02 stage 0: metadata-only shadow row for a legacy dispatch attempt.
+        record_shadow_dispatch(
+            api="swipe",
+            intent=intent,
+            logical_points=(pos1, pos2),
+            duration_ms=int(swipe_time),
+        )
         return _legacy_input_swipe(
             pos1, pos2, swipe_time, intent=intent, permit=permit,
             page_id=page_id, page_fingerprint=page_fingerprint,
@@ -766,6 +774,13 @@ def _input_tap_locked(
     if action_policy is None:
         if _READ_ONLY_FAIL_CLOSED:
             raise PermissionError("read_only_session_policy_unavailable")
+        # F-02 stage 0: metadata-only shadow row for a legacy dispatch attempt.
+        record_shadow_dispatch(
+            api="tap",
+            intent=intent,
+            logical_points=(pos,),
+            random_offset=bool(random_offset),
+        )
         return _legacy_input_tap(
             pos, random_offset=random_offset, intent=intent, permit=permit,
             page_id=page_id, page_fingerprint=page_fingerprint,
@@ -824,6 +839,8 @@ def input_system_back(*, intent=None):
             raise StopExecution()
         if intent is None or getattr(intent, "action_key", None) != "close_home_sidebar":
             return False
+        # F-02 stage 0: metadata-only shadow row for a legacy dispatch attempt.
+        record_shadow_dispatch(api="keyevent", intent=intent, logical_points=())
         control.input_keyevent(4)
         return True
 
