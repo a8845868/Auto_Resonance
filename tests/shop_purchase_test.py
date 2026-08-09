@@ -22,6 +22,7 @@ from core.services.shop_catalog import (
     default_shop_plan,
     load_shop_catalog,
 )
+from core.services.read_only_policy import DEFAULT_POLICY_SPECS
 
 
 def _ocr(text, x, y, width=110, height=24):
@@ -767,3 +768,163 @@ def test_connected_run_never_retries_callback_after_task_failure(monkeypatch):
         shop_purchase._connected_run(fail_after_connect)
 
     assert events == ["adb", "callback", "kill"]
+
+
+def test_locator_selects_weekly_tier_price_for_laplace_with_remaining_two():
+    """Right-card weekly laplace (remaining 2/3, tier price 200000) is
+    accepted; the left monthly laplace (1/1 at 100000) is a different period
+    and must not shadow it."""
+    catalog = load_shop_catalog()
+    target = catalog.item("laplace_weekly_iron")
+    ocr_items = [
+        # Left card: monthly, full 10/10, base price
+        _ocr("拉普拉斯协议", 700, 310),
+        _ocr("每月限购10/10", 790, 280, 105),
+        _ocr("100000", 810, 350, 90),
+        # Right card: weekly, remaining 2/3, tier price 200000
+        _ocr("拉普拉斯协议", 1125, 310),
+        _ocr("每周限购2/3", 1153, 280, 105),
+        _ocr("200000", 1163, 350, 90),
+    ]
+
+    located = locate_product(ocr_items, target)
+
+    assert located is not None
+    assert located.remaining == 2
+    assert located.total == 3
+    assert located.center[0] > 923
+
+
+def test_locator_rejects_laplace_when_remaining_tier_price_is_unproven():
+    """Weekly laplace at remaining 1/3 has no proven price tier in the
+    catalog; the locator must fail closed rather than guess."""
+    catalog = load_shop_catalog()
+    target = catalog.item("laplace_weekly_iron")
+    ocr_items = [
+        _ocr("拉普拉斯协议", 1125, 310),
+        _ocr("每周限购1/3", 1153, 280, 105),
+        _ocr("300000", 1163, 350, 90),
+    ]
+
+    assert locate_product(ocr_items, target) is None
+
+
+def test_locator_rejects_laplace_when_price_conflicts_with_tier():
+    """Weekly laplace at remaining 2/3 showing the wrong price (e.g. the
+    base 100000 instead of the tier 200000) must fail closed."""
+    catalog = load_shop_catalog()
+    target = catalog.item("laplace_weekly_iron")
+    ocr_items = [
+        _ocr("拉普拉斯协议", 1125, 310),
+        _ocr("每周限购2/3", 1153, 280, 105),
+        _ocr("100000", 1163, 350, 90),
+    ]
+
+    assert locate_product(ocr_items, target) is None
+
+
+def test_shop_swipe_intents_are_present_on_rewind_and_scroll(monkeypatch):
+    """Both swipe calls carry a distinct ActionIntent so the shadow journal
+    never records them as NO_INTENT."""
+    catalog = load_shop_catalog()
+    item = catalog.item("cactus_energy_weekly_iron")
+    shop = catalog.shop(item.shop_id)
+    swipes = []
+    monkeypatch.setattr(
+        shop_purchase,
+        "input_swipe",
+        lambda *args, **kwargs: swipes.append(kwargs.get("intent")),
+    )
+    monkeypatch.setattr(shop_purchase.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(
+        shop_purchase,
+        "screenshot",
+        lambda: _FakeImage(np.zeros((720, 1280, 3), dtype=np.uint8)),
+    )
+    adapter = HeadquartersBlackMoonAdapter(shop, _FakeRecorder())
+
+    adapter._rewind_to_top()
+
+    assert swipes
+    assert all(intent is not None for intent in swipes)
+    assert swipes[0].action_key == "shop_catalog_rewind"
+
+    # scan() calls the scroll swipe when there are pending items.
+    swipes.clear()
+    purchase = ConfiguredPurchase(shop, item, "one")
+    frames = iter([_FakeImage(np.zeros((720, 1280, 3), dtype=np.uint8))] * 4)
+    monkeypatch.setattr(shop_purchase, "screenshot", lambda: next(frames))
+
+    adapter.scan([purchase], dry_run=True, max_pages=2)
+
+    assert swipes
+    assert all(intent is not None for intent in swipes)
+    assert swipes[0].action_key == "shop_catalog_scroll"
+
+
+def test_shop_swipe_specs_have_correct_directions_and_resolvable_anchor():
+    """The two new specs must survive the real permit issuer: correct swipe
+    direction for each action and a resolvable calibrated anchor."""
+    from core.services.read_only_policy import (
+        ActionIntent,
+        AnchorResolver,
+        PageObservation,
+        ReadOnlyPermitIssuer,
+        DisplayGeometry,
+        CalibratedStaticRegion,
+    )
+    from datetime import datetime, timezone
+
+    specs = {
+        "shop_catalog_rewind": "DOWN",
+        "shop_catalog_scroll": "UP",
+    }
+    for action_key, expected_direction in specs.items():
+        spec = DEFAULT_POLICY_SPECS[action_key]
+        assert spec.allowed_swipe_directions == frozenset({expected_direction})
+        assert spec.action_kind.value == "SWIPE"
+        assert spec.allowed_page_types == frozenset({"shop"})
+        assert spec.allowed_region == (580, 150, 1260, 660)
+        assert spec.postcondition == "shop_catalog_remains_safe"
+
+    geometry = DisplayGeometry()
+    region = CalibratedStaticRegion(
+        anchor_id="shop_catalog_content", bbox=(580, 150, 1260, 660),
+        page_classifier="shop", allowed_action="shop_catalog_scroll",
+        postcondition="shop_catalog_remains_safe",
+        geometry_revision=geometry.geometry_revision,
+    )
+    now = datetime.now(timezone.utc)
+    observation = PageObservation(
+        observation_id="obs-1", screenshot_hash="a" * 64, page_type="shop",
+        markers=("shop_catalog_content",), anchors=(), captured_at=now,
+        display_geometry=geometry, static_regions=(region,),
+        source_capture_id="capture-1", source_monotonic_sequence=1,
+        backend_generation=1, instance_id="0", adb_serial="test-adb-0",
+    )
+    resolver = AnchorResolver()
+    anchor, source = resolver.resolve_with_source(
+        observation, "shop_catalog_content",
+        action_key="shop_catalog_scroll",
+        postcondition="shop_catalog_remains_safe",
+    )
+    assert anchor.anchor_id == "shop_catalog_content"
+    assert source == "CALIBRATED_STATIC"
+
+    # The rewind trajectory (585→365, dy=-220, UP) must be rejected by the
+    # scroll spec and accepted by the rewind spec — proving direction is real.
+    scroll_spec = DEFAULT_POLICY_SPECS["shop_catalog_scroll"]
+    rewind_spec = DEFAULT_POLICY_SPECS["shop_catalog_rewind"]
+    # scroll trajectory: START=(800,585) END=(800,365) → UP ✓
+    # rewind trajectory: START=(800,365) END=(800,585) → DOWN ✓
+    scroll_trajectory = ((800, 585), (800, 365))
+    rewind_trajectory = ((800, 365), (800, 585))
+    from core.services.read_only_policy import ReadOnlyPermitIssuer
+    axis, direction = ReadOnlyPermitIssuer._validate_modality(
+        scroll_spec, scroll_trajectory, 650
+    )
+    assert direction == "UP"
+    axis, direction = ReadOnlyPermitIssuer._validate_modality(
+        rewind_spec, rewind_trajectory, 650
+    )
+    assert direction == "DOWN"

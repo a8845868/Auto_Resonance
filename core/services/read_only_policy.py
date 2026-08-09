@@ -427,6 +427,22 @@ DEFAULT_POLICY_SPECS = {
         postcondition_attempts=3, postcondition_interval_seconds=0.35,
         anchor_bbox_tolerance=8,
     ),
+    "shop_catalog_rewind": ReadOnlyPolicySpec(
+        "shop_catalog_rewind", frozenset({"shop"}), "shop_catalog_content",
+        action_kind=ActionKind.SWIPE,
+        allowed_region=(580, 150, 1260, 660),
+        allowed_swipe_directions=frozenset({"DOWN"}),
+        postcondition="shop_catalog_remains_safe",
+        allowed_post_page_types=frozenset({"shop"}),
+    ),
+    "shop_catalog_scroll": ReadOnlyPolicySpec(
+        "shop_catalog_scroll", frozenset({"shop"}), "shop_catalog_content",
+        action_kind=ActionKind.SWIPE,
+        allowed_region=(580, 150, 1260, 660),
+        allowed_swipe_directions=frozenset({"UP"}),
+        postcondition="shop_catalog_remains_safe",
+        allowed_post_page_types=frozenset({"shop"}),
+    ),
 }
 
 # Production sessions always use this immutable, versioned snapshot. Test

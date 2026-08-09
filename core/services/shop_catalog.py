@@ -62,10 +62,28 @@ class ShopItem:
     price: int
     currency: str
     icon: str
+    price_tiers: tuple[tuple[int, int], ...] = ()
 
     @property
     def period_label(self) -> str:
         return PERIOD_LABELS.get(self.period, self.period)
+
+    def price_for_remaining(self, remaining: int) -> int | None:
+        """Return the catalog price for a card showing ``remaining`` left.
+
+        Items without a ``price_tiers`` declaration have a single fixed price
+        regardless of the remaining count; the card may legitimately show a
+        partial stock while keeping the same price.  Only items with an
+        explicit stepped price list fail closed on an unproven tier.
+        """
+        if not self.price_tiers:
+            return self.price
+        if remaining == self.max_limit:
+            return self.price
+        for count, price in self.price_tiers:
+            if count == remaining:
+                return price
+        return None
 
 
 @dataclass(frozen=True)
@@ -169,6 +187,18 @@ def load_shop_catalog(path: Path = CATALOG_PATH) -> ShopCatalog:
             currency = str(item_value["currency"])
             if currency not in currencies:
                 raise ValueError(f"未知商店货币: {currency}")
+            price_tiers = tuple(
+                sorted(
+                    (
+                        (max(1, int(count)), max(0, int(tier_price)))
+                        for count, tier_price in dict(
+                            item_value.get("price_tiers") or {}
+                        ).items()
+                    ),
+                    key=lambda entry: entry[0],
+                    reverse=True,
+                )
+            )
             items.append(
                 ShopItem(
                     id=item_id,
@@ -179,6 +209,7 @@ def load_shop_catalog(path: Path = CATALOG_PATH) -> ShopCatalog:
                     price=max(0, int(item_value["price"])),
                     currency=currency,
                     icon=str(item_value.get("icon", "")),
+                    price_tiers=price_tiers,
                 )
             )
         shops.append(

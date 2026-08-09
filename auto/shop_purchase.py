@@ -74,6 +74,51 @@ BATCH_TOGGLE_POS = (1230, 117)
 MAX_SCAN_PAGES = 30
 
 
+def _shop_swipe_observation(action_key: str) -> PageObservation:
+    """Classify a shop-catalog frame for a swipe intent (rewind or scroll)."""
+
+    frame = screenshot()
+    ocr_items = frame.ocr()
+    identity = current_bound_device_identity()
+    geometry = current_display_geometry()
+    source_id = str(getattr(frame, "source_capture_id", ""))
+    source_sequence = int(getattr(frame, "capture_sequence", 0) or 0)
+    captured_at = getattr(frame, "captured_at", None)
+    raw_hash = str(getattr(frame, "raw_frame_hash", ""))
+    if not source_id or source_sequence <= 0 or captured_at is None or not raw_hash:
+        raise PermissionError("shop catalog swipe requires trusted capture provenance")
+    in_shop = any(
+        _normalize_text(item.get("text")) in ("总部商店", "黑月商店", "NIGHTCHAINSSTORE")
+        for item in ocr_items
+    )
+    page_type = "shop" if in_shop else "unknown"
+    markers = ("shop_catalog_content",) if in_shop else ()
+    regions = ()
+    if in_shop:
+        regions = (CalibratedStaticRegion(
+            anchor_id="shop_catalog_content", bbox=PRODUCT_REGION,
+            page_classifier="shop", allowed_action=action_key,
+            postcondition="shop_catalog_remains_safe",
+            geometry_revision=geometry.geometry_revision,
+        ),)
+    return PageObservation(
+        observation_id=f"shop-swipe:{source_id}", screenshot_hash=raw_hash,
+        page_type=page_type, markers=markers, anchors=(), captured_at=captured_at,
+        display_geometry=geometry, static_regions=regions,
+        capture_sequence=source_sequence, source_capture_id=source_id,
+        source_monotonic_sequence=source_sequence,
+        backend_generation=identity.backend_generation,
+        instance_id=identity.instance_id, adb_serial=identity.adb_serial,
+        content_marker_hash=hashlib.sha256("|".join(markers).encode("utf-8")).hexdigest()[:16],
+    )
+
+
+def _shop_swipe_observer(action_key: str) -> PageObserver:
+    """A page observer bound to the shop-catalog swipe classifier."""
+
+    return PageObserver(lambda: _shop_swipe_observation(action_key))
+
+
 def _shop_confirm_observation(item: ShopItem) -> PageObservation:
     """Classify a new capture for the final shop confirmation policy only."""
 
@@ -379,6 +424,12 @@ def locate_product(ocr_items: Iterable[dict], target: ShopItem) -> LocatedProduc
         )
         if not expected_limit:
             continue
+        remaining = expected_limit[1]
+        expected_price = target.price_for_remaining(remaining)
+        if expected_price is None:
+            # This remaining tier has no proven price in the catalog.
+            # Fail closed — never buy at an unverified price.
+            continue
         numeric_values = {
             value
             for value in (_numeric_value(item.get("text")) for item in context_items)
@@ -388,7 +439,7 @@ def locate_product(ocr_items: Iterable[dict], target: ShopItem) -> LocatedProduc
         # period/limit remain readable (observed on 星云物质（8钛）).  Reject a
         # conflicting observed price, but allow a missing one: the quantity
         # dialog performs the authoritative price check before confirmation.
-        if numeric_values and target.price not in numeric_values:
+        if numeric_values and expected_price not in numeric_values:
             continue
         located.append(
             LocatedProduct(
@@ -609,7 +660,10 @@ class HeadquartersBlackMoonAdapter:
         previous = screenshot()
         stable = 0
         for index in range(14):
-            input_swipe(PRODUCT_REWIND_START, PRODUCT_REWIND_END, swipe_time=650)
+            input_swipe(
+                PRODUCT_REWIND_START, PRODUCT_REWIND_END, swipe_time=650,
+                intent=ActionIntent("shop_catalog_rewind", "shop_catalog_content", f"rewind-{index:02d}"),
+            )
             time.sleep(0.9)
             current = screenshot()
             difference = _content_difference(previous.image, current.image)
@@ -1025,7 +1079,10 @@ class HeadquartersBlackMoonAdapter:
             previous_matrix = page_matrix
             if page_count >= max_pages:
                 break
-            input_swipe(PRODUCT_SCROLL_START, PRODUCT_SCROLL_END, swipe_time=650)
+            input_swipe(
+                PRODUCT_SCROLL_START, PRODUCT_SCROLL_END, swipe_time=650,
+                intent=ActionIntent("shop_catalog_scroll", "shop_catalog_content", f"scan-page-{page_count:02d}"),
+            )
             time.sleep(1.0)
         if catalog_probe and not reached_bottom:
             raise BlockedBySafetyError(

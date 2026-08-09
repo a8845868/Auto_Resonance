@@ -30,6 +30,10 @@
           "period": "weekly",
           "max_limit": 3,
           "price": 100000,
+          "price_tiers": {
+            "3": 100000,
+            "2": 200000
+          },
           "currency": "iron_coin",
           "icon": "resources/shop/headquarters_black_moon/laplace_weekly.png"
         },
