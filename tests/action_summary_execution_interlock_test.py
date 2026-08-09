@@ -18,6 +18,8 @@ from core.services.action_summary_execution_interlock import (
     evaluate_execution_interlock,
     validate_execution_authorization,
 )
+from core.services.proven_capability_navigation import CapabilityNavigationResult
+from core.services.runtime_errors import BlockedBySafetyError
 from core.services.action_summary_product_model import (
     decide_action_summary,
     observe_action_summary_page,
@@ -402,3 +404,79 @@ def test_interlock_import_does_not_initialize_control_backend():
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_navigation_failure_raises_blocked_safety_without_second_capture():
+    """When open_action_summary() returns False, read_action_summary_product_model
+    raises BlockedBySafetyError immediately — no second screenshot, no input,
+    no legacy fallback."""
+    capture_calls = []
+
+    class _Driver:
+        def capture_frame(self):
+            capture_calls.append(1)
+            raise RuntimeError("NEMU code 2 — should never be called")
+
+    automation = ResidentActivityAutomation(
+        _Driver(),
+        execution_mode=ActionSummaryExecutionMode.READ_ONLY,
+    )
+    automation.open_action_summary = lambda: False
+    automation.last_capability_navigation_result = CapabilityNavigationResult(
+        success=False, terminal=False, target_capability="ACTION_SUMMARY_VISIBLE",
+        initial_state="HOME_READY", final_state="UNKNOWN",
+        planned_edge_ids=(), completed_edge_ids=(), failed_edge_id=None,
+        physical_dispatches=0, unknown_state_actions=0, irreversible_actions=0,
+        reason="unknown_start_state",
+    )
+
+    with pytest.raises(BlockedBySafetyError, match="unknown_start_state"):
+        automation.read_action_summary_product_model()
+
+    assert capture_calls == []
+
+
+def test_navigation_failure_without_stored_reason_uses_fallback():
+    """When last_capability_navigation_result has no reason, a fallback is used."""
+    automation = ResidentActivityAutomation(
+        Mock(), execution_mode=ActionSummaryExecutionMode.READ_ONLY,
+    )
+    automation.open_action_summary = lambda: False
+    automation.last_capability_navigation_result = None
+
+    with pytest.raises(BlockedBySafetyError, match="action_summary_navigation_failed"):
+        automation.read_action_summary_product_model()
+
+
+def test_read_only_model_succeeds_after_proven_navigation(monkeypatch):
+    """Normal case: navigation succeeds, one screenshot runs, BlockedBySafetyError
+    is NOT raised."""
+    capture_calls = []
+
+    class _Frame:
+        def ocr(self):
+            return []
+
+    def _capture():
+        capture_calls.append(1)
+        return _Frame()
+
+    automation = ResidentActivityAutomation(
+        Mock(), execution_mode=ActionSummaryExecutionMode.READ_ONLY,
+    )
+    automation.open_action_summary = lambda: True
+    automation.driver.capture_frame = _capture
+
+    monkeypatch.setattr(
+        "auto.resident_activity.observe_action_summary_page",
+        lambda _frame: Mock(),
+    )
+    monkeypatch.setattr(
+        "auto.resident_activity.decide_action_summary",
+        lambda _model: Mock(),
+    )
+
+    result = automation.read_action_summary_product_model()
+
+    assert result is not None
+    assert len(capture_calls) == 1

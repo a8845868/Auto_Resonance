@@ -432,11 +432,21 @@ class ResidentActivityAutomation:
         No task card, challenge, sweep, reward, or other page element is
         clicked here.  The returned decision is advisory and carries no input
         authority.
+
+        Raises :class:`BlockedBySafetyError` when navigation fails — the
+        failure reason is already in ``last_capability_navigation_result``
+        and a second unconditional screenshot would escalate a transient
+        capture error into a queue FATAL.
         """
 
         if not self.open_action_summary():
-            model = observe_action_summary_page(self.driver.capture_frame())
-            return model, decide_action_summary(model)
+            reason = str(
+                getattr(
+                    getattr(self, "last_capability_navigation_result", None),
+                    "reason", "",
+                ) or "action_summary_navigation_failed"
+            )
+            raise BlockedBySafetyError(f"进入行动汇总失败: {reason}")
         model = observe_action_summary_page(self.driver.capture_frame())
         return model, decide_action_summary(model)
 
