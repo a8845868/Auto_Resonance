@@ -19,6 +19,22 @@ from core.services.shop_catalog import (
 )
 
 
+def test_stepped_price_breakdown_reports_marginal_and_cumulative_costs():
+    catalog = load_shop_catalog()
+    laplace = catalog.item("laplace_weekly_iron")
+    fixed = catalog.item("self_observation_daily_iron")
+
+    assert laplace.price_breakdown() == (
+        (1, 3, 100000, 100000),
+        (2, 2, 200000, 300000),
+        (3, 1, None, None),
+    )
+    assert laplace.cumulative_cost_for_target(1) == 100000
+    assert laplace.cumulative_cost_for_target(2) == 300000
+    assert laplace.cumulative_cost_for_target(3) is None
+    assert fixed.price_breakdown() == ()
+
+
 def test_catalog_keeps_resume_intelligence_and_black_moon_ticket_distinct():
     catalog = load_shop_catalog()
 

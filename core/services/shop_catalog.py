@@ -85,6 +85,40 @@ class ShopItem:
                 return price
         return None
 
+    def price_breakdown(self) -> tuple[tuple[int, int, int | None, int | None], ...]:
+        """Return purchase number, remaining-before, marginal and cumulative cost.
+
+        The catalog keys stepped prices by the card's *remaining-before* value.
+        Cumulative cost is known only while every preceding marginal is known;
+        an unobserved tier therefore cannot accidentally become a selectable
+        automation target.
+        """
+
+        if not self.price_tiers:
+            return ()
+        cumulative = 0
+        complete = True
+        rows: list[tuple[int, int, int | None, int | None]] = []
+        for purchase_number in range(1, self.max_limit + 1):
+            remaining_before = self.max_limit - purchase_number + 1
+            marginal = self.price_for_remaining(remaining_before)
+            if marginal is None:
+                complete = False
+            elif complete:
+                cumulative += marginal
+            rows.append((
+                purchase_number,
+                remaining_before,
+                marginal,
+                cumulative if complete else None,
+            ))
+        return tuple(rows)
+
+    def cumulative_cost_for_target(self, purchase_number: int) -> int | None:
+        for number, _remaining, _marginal, cumulative in self.price_breakdown():
+            if number == purchase_number:
+                return cumulative
+        return None
 
 @dataclass(frozen=True)
 class ShopDefinition:
@@ -147,6 +181,7 @@ def shop_catalog_digest(catalog: ShopCatalog) -> str:
         "items": [
             {"id": item.id, "shop_id": item.shop_id, "period": item.period,
              "max_limit": item.max_limit, "price": item.price,
+             "price_tiers": item.price_tiers,
              "currency": item.currency, "icon": item.icon}
             for item in sorted(catalog.items, key=lambda value: value.id)
         ],
@@ -199,14 +234,30 @@ def load_shop_catalog(path: Path = CATALOG_PATH) -> ShopCatalog:
                     reverse=True,
                 )
             )
+            max_limit = max(1, int(item_value["max_limit"]))
+            if any(count > max_limit for count, _price in price_tiers):
+                raise ValueError(f"商品价格档位超过限购上限: {item_id}")
+            tier_map = dict(price_tiers)
+            base_price = max(0, int(item_value["price"]))
+            if max_limit in tier_map and tier_map[max_limit] != base_price:
+                raise ValueError(f"商品首档价格与基础价冲突: {item_id}")
+            previous_price: int | None = None
+            for remaining in range(max_limit, 0, -1):
+                tier_price = base_price if remaining == max_limit else tier_map.get(remaining)
+                if tier_price is None:
+                    previous_price = None
+                    continue
+                if previous_price is not None and tier_price < previous_price:
+                    raise ValueError(f"商品阶梯价格不是单调递增: {item_id}")
+                previous_price = tier_price
             items.append(
                 ShopItem(
                     id=item_id,
                     shop_id=shop_id,
                     name=str(item_value["name"]),
                     period=period,
-                    max_limit=max(1, int(item_value["max_limit"])),
-                    price=max(0, int(item_value["price"])),
+                    max_limit=max_limit,
+                    price=base_price,
                     currency=currency,
                     icon=str(item_value.get("icon", "")),
                     price_tiers=price_tiers,

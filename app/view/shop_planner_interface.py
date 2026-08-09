@@ -49,6 +49,30 @@ QUANTITY_OPTIONS = (
 )
 
 
+def _quantity_options(
+    item: ShopItem,
+    currency: CurrencyDefinition,
+) -> tuple[tuple[str, str], ...]:
+    if not item.price_tiers:
+        return QUANTITY_OPTIONS
+    return (
+        ("one", "从当前状态仅买 1 件（按当前档位）"),
+        ("max", "买完当前剩余（弹窗实时总价）"),
+    )
+
+
+def _price_breakdown_text(item: ShopItem, currency: CurrencyDefinition) -> str:
+    rows = []
+    for number, _remaining, marginal, cumulative in item.price_breakdown():
+        if marginal is None or cumulative is None:
+            rows.append(f"第 {number} 件：价格未采集（不可选为累计目标）")
+        else:
+            rows.append(
+                f"第 {number} 件：边际 {marginal:,}，累计 {cumulative:,} {currency.name}"
+            )
+    return "  ·  ".join(rows)
+
+
 def _run_shop_dry_run() -> dict:
     """Run the existing shop scanner without enabling purchase confirmation."""
 
@@ -126,8 +150,9 @@ class ShopItemCard(QFrame):
         super().__init__(parent)
         self.item = item
         self.currency = currency
+        self.quantityOptions = _quantity_options(item, currency)
         self.setObjectName("shopItemCard")
-        self.setMinimumHeight(142)
+        self.setMinimumHeight(186 if item.price_tiers else 142)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         root = QHBoxLayout(self)
@@ -154,7 +179,8 @@ class ShopItemCard(QFrame):
         currency_icon.setFixedSize(24, 24)
         currency_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         currency_icon.setPixmap(_pixmap(currency.icon, 22, 22))
-        price = QLabel(f"单件起价 {item.price:,}  {currency.name}", self)
+        price_label = "固定单价" if not item.price_tiers else "首档边际"
+        price = QLabel(f"{price_label} {item.price:,}  {currency.name}", self)
         price.setStyleSheet("color: #e6bd61; font-size: 13px; font-weight: 600;")
         price_row.addWidget(currency_icon)
         price_row.addWidget(price)
@@ -162,6 +188,11 @@ class ShopItemCard(QFrame):
         details.addWidget(name)
         details.addWidget(limit)
         details.addLayout(price_row)
+        if item.price_tiers:
+            breakdown = QLabel(_price_breakdown_text(item, currency), self)
+            breakdown.setWordWrap(True)
+            breakdown.setStyleSheet("color: #c7c7c7; font-size: 12px;")
+            details.addWidget(breakdown)
         details.addStretch(1)
         root.addLayout(details, 1)
 
@@ -171,12 +202,12 @@ class ShopItemCard(QFrame):
         self.enabledCheck.setChecked(bool(rule.get("enabled", False)))
         self.quantityCombo = ComboBox(self)
         self.quantityCombo.setMinimumWidth(158)
-        for _, label in QUANTITY_OPTIONS:
+        for _, label in self.quantityOptions:
             self.quantityCombo.addItem(label)
         selected_mode = str(rule.get("quantity", "max"))
         selected_index = next(
-            (index for index, (key, _) in enumerate(QUANTITY_OPTIONS) if key == selected_mode),
-            1,
+            (index for index, (key, _) in enumerate(self.quantityOptions) if key == selected_mode),
+            0,
         )
         self.quantityCombo.setCurrentIndex(selected_index)
         controls.addWidget(self.enabledCheck)
@@ -211,7 +242,7 @@ class ShopItemCard(QFrame):
         index = max(0, self.quantityCombo.currentIndex())
         return {
             "enabled": self.enabledCheck.isChecked(),
-            "quantity": QUANTITY_OPTIONS[index][0],
+            "quantity": self.quantityOptions[index][0],
         }
 
 
@@ -435,7 +466,10 @@ class ShopPlannerInterface(ScrollArea):
                 if not rule["enabled"]:
                     continue
                 selected.append(item)
-                if rule["quantity"] == "max":
+                quantity_mode = str(rule["quantity"])
+                if quantity_mode == "max" or (
+                    quantity_mode == "one" and bool(item.price_tiers)
+                ):
                     dynamic_total_count += 1
                 else:
                     fixed_costs[item.currency] += item.price
@@ -446,9 +480,9 @@ class ShopPlannerInterface(ScrollArea):
         state = "自动执行已开启" if self.plan["enabled"] else "自动执行已关闭"
         estimates = []
         if costs:
-            estimates.append(f"单件模式起价合计 {costs}")
+            estimates.append(f"当前可确定金额合计 {costs}")
         if dynamic_total_count:
-            estimates.append(f"{dynamic_total_count} 项上限模式执行时读取实时总价")
+            estimates.append(f"{dynamic_total_count} 项执行时按当前档位读取实时总价")
         estimate = f"；{'；'.join(estimates)}" if estimates else ""
         self.summaryLabel.setText(f"{state} · 已选 {len(selected)} 项{estimate}")
 

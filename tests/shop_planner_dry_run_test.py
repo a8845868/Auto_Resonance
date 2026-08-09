@@ -158,3 +158,31 @@ def test_shop_dry_run_summary_surfaces_attention_without_claiming_purchase():
 
     assert summary == "干跑完成：扫描 4 页，处理 2 项，未定位 1 项，需要人工复核"
     assert "购买成功" not in summary
+
+
+def test_stepped_item_card_shows_marginal_and_cumulative_price_details():
+    application = QApplication.instance() or QApplication([])
+    catalog = load_shop_catalog()
+    item = catalog.item("laplace_weekly_iron")
+    currency = catalog.currencies[item.currency]
+
+    text = shop_interface._price_breakdown_text(item, currency)
+    options = shop_interface._quantity_options(item, currency)
+
+    assert "第 1 件：边际 100,000，累计 100,000 铁盟币" in text
+    assert "第 2 件：边际 200,000，累计 300,000 铁盟币" in text
+    assert "第 3 件：价格未采集（不可选为累计目标）" in text
+    assert options == (
+        ("one", "从当前状态仅买 1 件（按当前档位）"),
+        ("max", "买完当前剩余（弹窗实时总价）"),
+    )
+    assert application is not None
+
+
+def test_fixed_price_item_keeps_simple_quantity_options():
+    catalog = load_shop_catalog()
+    item = catalog.item("self_observation_daily_iron")
+    currency = catalog.currencies[item.currency]
+
+    assert shop_interface._price_breakdown_text(item, currency) == ""
+    assert shop_interface._quantity_options(item, currency) == shop_interface.QUANTITY_OPTIONS
