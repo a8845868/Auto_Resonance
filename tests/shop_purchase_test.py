@@ -280,6 +280,360 @@ def test_purchase_writes_ledger_before_confirmation_tap(monkeypatch):
     assert events.count("confirm") == 1
 
 
+def test_purchase_dismisses_reward_overlay_before_verifying_remaining(
+    monkeypatch,
+):
+    """After confirmation, the reward overlay ('获得物品') covers the shop
+    card.  One safe blank-area tap dismisses it; the revealed card is then
+    used for the remaining-count check."""
+    catalog = load_shop_catalog()
+    item = catalog.item("cactus_energy_weekly_iron")
+    shop = catalog.shop(item.shop_id)
+    located = LocatedProduct(item, (760, 480), 8, 8, ())
+    refreshed = LocatedProduct(item, (760, 480), 7, 8, ())
+    adapter = HeadquartersBlackMoonAdapter(shop, _FakeRecorder())
+    monkeypatch.setattr(adapter, "inspect_dialog", lambda *_: (1, item.price))
+    monkeypatch.setattr(
+        shop_purchase,
+        "record_shop_attempt",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(shop_purchase, "_dispatch_shop_confirm", lambda *args: object())
+
+    # First screenshot: the reward overlay.
+    overlay_ocr = [
+        {"text": "获得物品", "position": [
+            [591, 185], [759, 185], [759, 236], [591, 236]
+        ]},
+        {"text": "触碰空白区域退出", "position": [
+            [603, 674], [712, 674], [712, 692], [603, 692]
+        ]},
+    ]
+    # Second screenshot: the revealed shop card with the new 2/8 limit.
+    card_ocr = [
+        {"text": item.name, "position": [
+            [700, 310], [825, 310], [825, 335], [700, 335]
+        ]},
+        {"text": "每周限购2/8", "position": [
+            [790, 280], [925, 280], [925, 300], [790, 300]
+        ]},
+        {"text": str(item.price), "position": [
+            [810, 350], [875, 350], [875, 370], [810, 370]
+        ]},
+    ]
+    frames = iter([
+        _FakeImage(ocr_items=overlay_ocr),
+        _FakeImage(ocr_items=card_ocr),
+    ])
+    taps = []
+
+    class _FakeSafetyMap:
+        def __init__(self, candidates):
+            self.candidates = candidates
+
+    class _FakeSelector:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def select(self, *_args, **_kwargs):
+            from core.services.announcement_overlay_handler import SafeBlankRegion
+            return _FakeSafetyMap([
+                SafeBlankRegion(
+                    bbox=(0, 200, 500, 700), point=(180, 420),
+                    area=5000, edge_density=0.0,
+                ),
+            ])
+
+    monkeypatch.setattr(shop_purchase, "AnnouncementSafeRegionSelector", _FakeSelector)
+    monkeypatch.setattr(shop_purchase, "screenshot", lambda: next(frames))
+    monkeypatch.setattr(shop_purchase.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(shop_purchase, "locate_product", lambda *_: refreshed)
+    monkeypatch.setattr(
+        shop_purchase,
+        "update_shop_attempt",
+        lambda *args, **kwargs: {},
+    )
+
+    def _tap(pos, random_offset=True, **kwargs):
+        taps.append((pos, random_offset, kwargs.get("intent")))
+
+    monkeypatch.setattr(shop_purchase, "input_tap", _tap)
+
+    result = adapter.purchase(located, "one", dry_run=False)
+
+    assert result["status"] == "purchased"
+    assert result["remaining_after"] == 7
+    # One safe dismiss tap from selector candidate, random_offset=False.
+    assert len(taps) == 1
+    assert taps[0][0] == (180, 420)
+    assert taps[0][1] is False  # random_offset
+    dismiss_intent = taps[0][2]
+    assert dismiss_intent is not None
+    assert dismiss_intent.action_key == "dialog_cancel"
+    assert dismiss_intent.requested_target == "shop_result_overlay_dismiss"
+    assert DIALOG_CONFIRM_POS not in [t[0] for t in taps]
+
+
+def test_purchase_overlay_no_safe_point_produces_submitted_unverified(
+    monkeypatch,
+):
+    """When the safe-region selector finds no blank region, the result is
+    ``submitted_unverified`` and no dismissal tap is sent."""
+    catalog = load_shop_catalog()
+    item = catalog.item("cactus_energy_weekly_iron")
+    shop = catalog.shop(item.shop_id)
+    located = LocatedProduct(item, (760, 480), 8, 8, ())
+    adapter = HeadquartersBlackMoonAdapter(shop, _FakeRecorder())
+    monkeypatch.setattr(adapter, "inspect_dialog", lambda *_: (1, item.price))
+    monkeypatch.setattr(shop_purchase, "record_shop_attempt", lambda *a, **kw: {})
+    monkeypatch.setattr(shop_purchase, "_dispatch_shop_confirm", lambda *a: object())
+
+    overlay_ocr = [
+        {"text": "获得物品", "position": [
+            [591, 185], [759, 185], [759, 236], [591, 236]
+        ]},
+        {"text": "触碰空白区域退出", "position": [
+            [603, 674], [712, 674], [712, 692], [603, 692]
+        ]},
+    ]
+    taps = []
+
+    class _EmptySafetyMap:
+        candidates = ()
+
+    class _EmptySelector:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def select(self, *_args, **_kwargs):
+            return _EmptySafetyMap()
+
+    monkeypatch.setattr(shop_purchase, "AnnouncementSafeRegionSelector", _EmptySelector)
+    monkeypatch.setattr(shop_purchase, "screenshot", lambda: _FakeImage(ocr_items=overlay_ocr))
+    monkeypatch.setattr(shop_purchase.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(shop_purchase, "input_tap", lambda *a, **kw: taps.append(a))
+    monkeypatch.setattr(shop_purchase, "locate_product", lambda *a: None)
+    monkeypatch.setattr(shop_purchase, "update_shop_attempt", lambda *a, **kw: {})
+
+    result = adapter.purchase(located, "one", dry_run=False)
+
+    assert result["status"] == "submitted_unverified"
+    assert result["remaining_after"] is None
+    assert taps == []
+
+
+def test_purchase_overlay_stop_execution_after_dismiss_tap_is_propagated(
+    monkeypatch,
+):
+    """StopExecution raised during the post-dismiss snapshot must propagate
+    uncaught."""
+    catalog = load_shop_catalog()
+    item = catalog.item("cactus_energy_weekly_iron")
+    shop = catalog.shop(item.shop_id)
+    located = LocatedProduct(item, (760, 480), 8, 8, ())
+    adapter = HeadquartersBlackMoonAdapter(shop, _FakeRecorder())
+    monkeypatch.setattr(adapter, "inspect_dialog", lambda *_: (1, item.price))
+    monkeypatch.setattr(shop_purchase, "record_shop_attempt", lambda *a, **kw: {})
+    monkeypatch.setattr(shop_purchase, "_dispatch_shop_confirm", lambda *a: object())
+
+    overlay_ocr = [
+        {"text": "获得物品", "position": [
+            [591, 185], [759, 185], [759, 236], [591, 236]
+        ]},
+        {"text": "触碰空白区域退出", "position": [
+            [603, 674], [712, 674], [712, 692], [603, 692]
+        ]},
+    ]
+
+    class _FakeSafetyMap:
+        def __init__(self, candidates):
+            self.candidates = candidates
+
+    class _FakeSelector:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def select(self, *_args, **_kwargs):
+            from core.services.announcement_overlay_handler import SafeBlankRegion
+            return _FakeSafetyMap([
+                SafeBlankRegion(
+                    bbox=(0, 200, 500, 700), point=(180, 420),
+                    area=5000, edge_density=0.0,
+                ),
+            ])
+
+    from core.exception.exceptions import StopExecution
+
+    screenshots = 0
+    finalize_calls = []
+
+    def _fail_second():
+        nonlocal screenshots
+        screenshots += 1
+        if screenshots == 1:
+            return _FakeImage(ocr_items=overlay_ocr)
+        raise StopExecution()
+
+    monkeypatch.setattr(shop_purchase, "screenshot", _fail_second)
+    monkeypatch.setattr(shop_purchase.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(shop_purchase, "input_tap", lambda *a, **kw: object())
+    monkeypatch.setattr(shop_purchase, "AnnouncementSafeRegionSelector", _FakeSelector)
+    monkeypatch.setattr(shop_purchase, "locate_product", lambda *a: None)
+    monkeypatch.setattr(
+        shop_purchase, "update_shop_attempt", lambda *a: finalize_calls.append(a)
+    )
+
+    # Once the overlay is captured, raise StopExecution on the next screenshot.
+    with pytest.raises(StopExecution):
+        adapter.purchase(located, "one", dry_run=False)
+
+    # The write-ahead ledger must be closed before re-raising.
+    assert len(finalize_calls) == 1
+    assert finalize_calls[0][0] == item.id
+    assert finalize_calls[0][1] == "submitted_unverified"
+
+
+def test_purchase_overlay_dismiss_denied_returns_submitted_unverified_without_screenshot(
+    monkeypatch,
+):
+    """When the dismiss tap returns literal False (hardware unreachable or
+    policy blocked), the result is ``submitted_unverified`` immediately —
+    no sleep, no second screenshot."""
+    catalog = load_shop_catalog()
+    item = catalog.item("cactus_energy_weekly_iron")
+    shop = catalog.shop(item.shop_id)
+    located = LocatedProduct(item, (760, 480), 8, 8, ())
+    adapter = HeadquartersBlackMoonAdapter(shop, _FakeRecorder())
+    monkeypatch.setattr(adapter, "inspect_dialog", lambda *_: (1, item.price))
+    monkeypatch.setattr(shop_purchase, "record_shop_attempt", lambda *a, **kw: {})
+    monkeypatch.setattr(shop_purchase, "_dispatch_shop_confirm", lambda *a: object())
+
+    overlay_ocr = [
+        {"text": "获得物品", "position": [
+            [591, 185], [759, 185], [759, 236], [591, 236]
+        ]},
+        {"text": "触碰空白区域退出", "position": [
+            [603, 674], [712, 674], [712, 692], [603, 692]
+        ]},
+    ]
+    taps = []
+    screenshot_calls = []
+
+    class _FakeSafetyMap:
+        def __init__(self, candidates):
+            self.candidates = candidates
+
+    class _FakeSelector:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def select(self, *_args, **_kwargs):
+            from core.services.announcement_overlay_handler import SafeBlankRegion
+            return _FakeSafetyMap([
+                SafeBlankRegion(
+                    bbox=(0, 200, 500, 700), point=(180, 420),
+                    area=5000, edge_density=0.0,
+                ),
+            ])
+
+    monkeypatch.setattr(shop_purchase, "AnnouncementSafeRegionSelector", _FakeSelector)
+    # First call: overlay.  Must NOT be called again after dismiss denial.
+    monkeypatch.setattr(shop_purchase, "screenshot",
+                        lambda: (screenshot_calls.append(1), _FakeImage(ocr_items=overlay_ocr))[1])
+    monkeypatch.setattr(shop_purchase.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(shop_purchase, "locate_product", lambda *a: None)
+    monkeypatch.setattr(shop_purchase, "update_shop_attempt", lambda *a, **kw: {})
+
+    def _tap(pos, random_offset=True, **kwargs):
+        taps.append((pos, random_offset, kwargs.get("intent")))
+        return False  # hardware unreachable
+
+    monkeypatch.setattr(shop_purchase, "input_tap", _tap)
+
+    result = adapter.purchase(located, "one", dry_run=False)
+
+    assert result["status"] == "submitted_unverified"
+    assert result["remaining_after"] is None
+    assert "覆盖层退出点击被拒绝" in result["verification_error"]
+    # Exactly one tap (dismiss), no extra screenshot.
+    assert len(taps) == 1
+    assert len(screenshot_calls) == 1
+
+
+def test_purchase_overlay_re_screenshot_failure_produces_submitted_unverified(
+    monkeypatch,
+):
+    """When the post-dismiss re-screenshot raises an exception (not
+    StopExecution), the result is ``submitted_unverified``."""
+    catalog = load_shop_catalog()
+    item = catalog.item("cactus_energy_weekly_iron")
+    shop = catalog.shop(item.shop_id)
+    located = LocatedProduct(item, (760, 480), 8, 8, ())
+    adapter = HeadquartersBlackMoonAdapter(shop, _FakeRecorder())
+    monkeypatch.setattr(adapter, "inspect_dialog", lambda *_: (1, item.price))
+    monkeypatch.setattr(shop_purchase, "record_shop_attempt", lambda *a, **kw: {})
+    monkeypatch.setattr(shop_purchase, "_dispatch_shop_confirm", lambda *a: object())
+
+    overlay_ocr = [
+        {"text": "获得物品", "position": [
+            [591, 185], [759, 185], [759, 236], [591, 236]
+        ]},
+        {"text": "触碰空白区域退出", "position": [
+            [603, 674], [712, 674], [712, 692], [603, 692]
+        ]},
+    ]
+
+    class _FakeSafetyMap:
+        def __init__(self, candidates):
+            self.candidates = candidates
+
+    class _FakeSelector:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def select(self, *_args, **_kwargs):
+            from core.services.announcement_overlay_handler import SafeBlankRegion
+            return _FakeSafetyMap([
+                SafeBlankRegion(
+                    bbox=(0, 200, 500, 700), point=(180, 420),
+                    area=5000, edge_density=0.0,
+                ),
+            ])
+
+    calls = {"screenshot": 0}
+    recorder_labels = []
+
+    class _LabelTrackingRecorder:
+        def capture(self, label, _image=None, ocr_items=None):
+            recorder_labels.append(label)
+            return list(ocr_items or [])
+
+    adapter = HeadquartersBlackMoonAdapter(shop, _LabelTrackingRecorder())
+    monkeypatch.setattr(adapter, "inspect_dialog", lambda *_: (1, item.price))
+
+    def _fail_second_screenshot():
+        calls["screenshot"] += 1
+        if calls["screenshot"] == 1:
+            return _FakeImage(ocr_items=overlay_ocr)
+        raise OSError("NEMU disconnected")
+
+    monkeypatch.setattr(shop_purchase, "screenshot", _fail_second_screenshot)
+    monkeypatch.setattr(shop_purchase.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(shop_purchase, "input_tap", lambda *a, **kw: None)
+    monkeypatch.setattr(shop_purchase, "AnnouncementSafeRegionSelector", _FakeSelector)
+    monkeypatch.setattr(shop_purchase, "locate_product", lambda *a: None)
+    monkeypatch.setattr(shop_purchase, "update_shop_attempt", lambda *a, **kw: {})
+
+    result = adapter.purchase(located, "one", dry_run=False)
+
+    assert result["status"] == "submitted_unverified"
+    assert result["remaining_after"] is None
+    assert "OSError" in result["verification_error"]
+    assert "NEMU disconnected" in result["verification_error"]
+    # Must not record a "dismissed" label when re-screenshot failed.
+    assert "purchase-result-dismissed-" not in " ".join(recorder_labels)
+
+
 def test_purchase_never_confirms_when_write_ahead_ledger_fails(monkeypatch):
     catalog = load_shop_catalog()
     item = catalog.item("cactus_energy_weekly_iron")

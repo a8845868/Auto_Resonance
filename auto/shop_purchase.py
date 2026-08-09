@@ -49,6 +49,7 @@ from core.services.shop_catalog import (
     shop_plan_digest,
     update_shop_attempt,
 )
+from core.services.announcement_overlay_handler import AnnouncementSafeRegionSelector
 from core.services.business_action_policy import BusinessActionSnapshot
 from core.services.read_only_policy import (
     ActionIntent,
@@ -534,6 +535,21 @@ def _dialog_has_item(ocr_items: Iterable[dict], item: ShopItem) -> bool:
     return any(_normalize_text(value.get("text")) == expected for value in ocr_items)
 
 
+def _ocr_bbox(ocr_items: list[dict], text: str) -> tuple[int, int, int, int] | None:
+    """Return the bounding box (x1, y1, x2, y2) of the first OCR item matching
+    ``text``, or None."""
+    for item in ocr_items:
+        if str(item.get("text", "")) == text:
+            pos = item.get("position", [])
+            if len(pos) >= 4:
+                x1 = min(int(pt[0]) for pt in pos)
+                y1 = min(int(pt[1]) for pt in pos)
+                x2 = max(int(pt[0]) for pt in pos)
+                y2 = max(int(pt[1]) for pt in pos)
+                return x1, y1, x2, y2
+    return None
+
+
 def _finalize_attempt(result: dict) -> dict:
     """Best-effort status update; the pre-confirm block must survive failures."""
     try:
@@ -808,6 +824,105 @@ class HeadquartersBlackMoonAdapter:
                 "remaining_after": None,
                 "verification_error": "确认后数量弹窗仍可见",
             })
+        # If the purchase-result overlay ("获得物品" / "触碰空白区域退出")
+        # is covering the shop card, dismiss it with one safe blank-area tap
+        # to reveal the refreshed card underneath.  This is the button-free
+        # game instruction, not a second confirmation.
+        result_texts = {str(item.get("text", "")) for item in result_ocr}
+        if "获得物品" in result_texts and "触碰空白区域退出" in result_texts:
+            # Compute a safe blank-area point from the actual frame and OCR
+            # bboxes.  The overlay is uniform dark, so the selector's Canny
+            # edge pass finds zero edges; its result reduces to "any region
+            # outside the excluded OCR bboxes that is large enough to tap".
+            selector = AnnouncementSafeRegionSelector(
+                minimum_region_area=1200,
+                exclusion_margin=12,
+            )
+            frame_img = getattr(result_image, "image", result_image)
+            height, width = frame_img.shape[:2]
+            dialog_bbox = _ocr_bbox(result_ocr, "获得物品")
+            if dialog_bbox is None:
+                dialog_bbox = (0, 0, 1, 1)  # fallback: zero-area
+            ocr_bboxes = tuple(
+                _ocr_bbox(result_ocr, text)
+                for text in result_texts
+                if text != "获得物品"
+            )
+            ocr_bboxes = tuple(b for b in ocr_bboxes if b is not None)
+            safety_map = selector.select(
+                result_image,
+                overlay_bbox=(0, 0, width, height),
+                dialog_bbox=dialog_bbox,
+                ocr_bboxes=ocr_bboxes,
+            )
+            safe_point = safety_map.candidates[0].point if safety_map.candidates else None
+            if safe_point is not None:
+                dismiss_intent = ActionIntent(
+                    "dialog_cancel", "shop_result_overlay_dismiss", located.item.id
+                )
+                dismissed = input_tap(
+                    safe_point, random_offset=False, intent=dismiss_intent
+                )
+                if dismissed is False:
+                    # The dismiss tap was denied — hardware is unreachable
+                    # or a policy blocked it.  Do not wait or screenshot.
+                    return _finalize_attempt({
+                        "id": located.item.id,
+                        "name": located.item.name,
+                        "status": "submitted_unverified",
+                        "quantity": quantity,
+                        "cost": observed_total,
+                        "remaining_before": located.remaining,
+                        "remaining_after": None,
+                        "verification_error": "覆盖层退出点击被拒绝，无法读取购买后限购余量",
+                    })
+                time.sleep(0.8)
+                try:
+                    dismissed_image = screenshot()
+                    dismissed_ocr = dismissed_image.ocr()
+                except StopExecution:
+                    _finalize_attempt({
+                        "id": located.item.id,
+                        "name": located.item.name,
+                        "status": "submitted_unverified",
+                        "quantity": quantity,
+                        "cost": observed_total,
+                        "remaining_before": located.remaining,
+                        "remaining_after": None,
+                        "verification_error": "覆盖层退出后截图阶段收到停止请求",
+                    })
+                    raise
+                except Exception as error:
+                    # Re-screenshot failed.  Do NOT record a "dismissed"
+                    # evidence frame — the overlay may still be present.
+                    # Return submitted_unverified with a precise reason.
+                    logger.exception(
+                        f"覆盖层退出后截图失败: {located.item.name}"
+                    )
+                    return _finalize_attempt({
+                        "id": located.item.id,
+                        "name": located.item.name,
+                        "status": "submitted_unverified",
+                        "quantity": quantity,
+                        "cost": observed_total,
+                        "remaining_before": located.remaining,
+                        "remaining_after": None,
+                        "verification_error": (
+                            f"覆盖层退出后截图失败: "
+                            f"{type(error).__name__}: {error}"
+                        ),
+                    })
+                self.recorder.capture(
+                    f"purchase-result-dismissed-{located.item.id}",
+                    dismissed_image, dismissed_ocr,
+                )
+                result_image = dismissed_image
+                result_ocr = dismissed_ocr
+            else:
+                # No safe blank region found on the overlay; conservative.
+                logger.warning(
+                    f"购买结果覆盖层无可安全点击区域: {located.item.name}"
+                )
         refreshed = locate_product(result_ocr, located.item)
         expected_remaining = max(0, located.remaining - quantity)
         verified = refreshed is not None and refreshed.remaining == expected_remaining
