@@ -20,6 +20,7 @@ from core.services.action_summary_execution_interlock import (
 )
 from core.services.proven_capability_navigation import CapabilityNavigationResult
 from core.services.runtime_errors import BlockedBySafetyError
+from core.control.nemu_capture import NemuCaptureError
 from core.services.action_summary_product_model import (
     decide_action_summary,
     observe_action_summary_page,
@@ -480,3 +481,22 @@ def test_read_only_model_succeeds_after_proven_navigation(monkeypatch):
 
     assert result is not None
     assert len(capture_calls) == 1
+
+
+def test_final_model_nemu_capture_failure_is_blocked_safety_not_fatal():
+    capture_calls = []
+
+    class _Driver:
+        def capture_frame(self):
+            capture_calls.append(1)
+            raise NemuCaptureError(native_return_code=2)
+
+    automation = ResidentActivityAutomation(
+        _Driver(), execution_mode=ActionSummaryExecutionMode.READ_ONLY,
+    )
+    automation.open_action_summary = lambda: True
+
+    with pytest.raises(BlockedBySafetyError, match="nemu_capture_failed:2"):
+        automation.read_action_summary_product_model()
+
+    assert capture_calls == [1]

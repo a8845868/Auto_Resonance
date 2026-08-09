@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from core.control.nemu_capture import CaptureSessionRecoveryResult, NemuCaptureError
 from core.services.claimed_daily_checkin_navigation import (
     dismiss_claimed_daily_checkin,
 )
@@ -43,6 +44,27 @@ def _resolver(frame: _Frame):
 def _provider(*frames: _Frame):
     values = iter(frames)
     return lambda: next(values)
+
+
+def _capture_failure(*, conflict: str = "NOT_PROVEN") -> NemuCaptureError:
+    return NemuCaptureError(
+        native_return_code=2,
+        session_generation=7,
+        capture_call_index=4,
+        session_lifecycle_conflict=conflict,
+    )
+
+
+def _provider_with_errors(*values):
+    iterator = iter(values)
+
+    def provide():
+        value = next(iterator)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    return provide
 
 
 def _registry(budget: EpisodeActionBudget, calls: list[str], *, fail_on=None):
@@ -158,6 +180,159 @@ def test_target_already_present_is_zero_input_success():
     assert result.reason == "target_capability_already_present"
     assert result.physical_dispatches == 0
     assert calls == []
+
+
+def test_initial_nemu_capture_failure_recovers_once_before_any_input():
+    budget = EpisodeActionBudget()
+    calls: list[str] = []
+    recoveries = []
+    frames = _provider_with_errors(
+        _capture_failure(),
+        _Frame("GLOBAL_PREP_PAGE", "1"),
+        _Frame("GLOBAL_PREP_PAGE", "2"),
+        _Frame("ACTION_SUMMARY_VISIBLE", "3"),
+    )
+
+    result = ensure_capability(
+        "ACTION_SUMMARY_VISIBLE",
+        frame_provider=frames,
+        state_resolver=_resolver,
+        adapter_registry=_registry(budget, calls),
+        action_budget=budget,
+        session_recoverer=lambda: recoveries.append(True) or (
+            CaptureSessionRecoveryResult(
+                True, "replacement_session_ready", 7, 8, "NO"
+            )
+        ),
+    )
+
+    assert result.success
+    assert recoveries == [True]
+    assert calls == ["global_prep_to_action_summary"]
+    assert result.physical_dispatches == 1
+    assert result.session_recovery_count == 1
+    assert result.capture_failure_stage == "INITIAL_CAPTURE"
+    assert result.capture_recovery_result == "replacement_session_ready"
+    assert result.capture_native_return_code == 2
+
+
+def test_fresh_capture_recovery_restarts_complete_two_frame_precondition():
+    budget = EpisodeActionBudget()
+    calls: list[str] = []
+    recoveries = []
+    frames = _provider_with_errors(
+        _Frame("GLOBAL_PREP_PAGE", "old-initial"),
+        _capture_failure(),
+        _Frame("GLOBAL_PREP_PAGE", "new-initial"),
+        _Frame("GLOBAL_PREP_PAGE", "new-fresh"),
+        _Frame("ACTION_SUMMARY_VISIBLE", "new-post"),
+    )
+
+    result = ensure_capability(
+        "ACTION_SUMMARY_VISIBLE",
+        frame_provider=frames,
+        state_resolver=_resolver,
+        adapter_registry=_registry(budget, calls),
+        action_budget=budget,
+        session_recoverer=lambda: recoveries.append(True) or (
+            CaptureSessionRecoveryResult(
+                True, "replacement_session_ready", 7, 8, "NO"
+            )
+        ),
+    )
+
+    assert result.success
+    assert recoveries == [True]
+    assert calls == ["global_prep_to_action_summary"]
+    assert result.physical_dispatches == 1
+    assert result.session_recovery_count == 1
+    assert result.capture_failure_stage == "FRESH_CONFIRMATION_CAPTURE"
+    assert result.capture_recovery_result == "replacement_session_ready"
+    assert result.capture_native_return_code == 2
+
+
+def test_failed_replacement_session_blocks_without_dispatch():
+    budget = EpisodeActionBudget()
+    calls: list[str] = []
+    recoveries = []
+
+    result = ensure_capability(
+        "ACTION_SUMMARY_VISIBLE",
+        frame_provider=_provider_with_errors(_capture_failure()),
+        state_resolver=_resolver,
+        adapter_registry=_registry(budget, calls),
+        action_budget=budget,
+        session_recoverer=lambda: recoveries.append(True) or (
+            CaptureSessionRecoveryResult(
+                False, "replacement_session_unavailable", 7, 7, "NO"
+            )
+        ),
+    )
+
+    assert not result.success
+    assert result.reason == "initial_capture_failed"
+    assert result.physical_dispatches == 0
+    assert recoveries == [True]
+    assert calls == []
+    assert result.session_recovery_count == 1
+    assert result.capture_failure_stage == "INITIAL_CAPTURE"
+    assert result.capture_recovery_result == "replacement_session_unavailable"
+    assert result.capture_native_return_code == 2
+
+
+def test_lifecycle_conflict_forbids_capability_session_recovery():
+    budget = EpisodeActionBudget()
+    calls: list[str] = []
+    recoveries = []
+
+    result = ensure_capability(
+        "ACTION_SUMMARY_VISIBLE",
+        frame_provider=_provider_with_errors(_capture_failure(conflict="YES")),
+        state_resolver=_resolver,
+        adapter_registry=_registry(budget, calls),
+        action_budget=budget,
+        session_recoverer=lambda: recoveries.append(True) or (
+            CaptureSessionRecoveryResult(True, "unexpected")
+        ),
+    )
+
+    assert not result.success
+    assert result.reason == "initial_capture_failed"
+    assert result.physical_dispatches == 0
+    assert recoveries == []
+    assert calls == []
+    assert result.session_recovery_count == 0
+    assert result.capture_failure_stage == "INITIAL_CAPTURE"
+    assert result.capture_recovery_result == "NOT_APPLICABLE"
+    assert result.capture_native_return_code == 2
+
+
+def test_post_dispatch_capture_failure_never_recovers_or_repeats_edge():
+    budget = EpisodeActionBudget()
+    calls: list[str] = []
+    recoveries = []
+
+    result = ensure_capability(
+        "ACTION_SUMMARY_VISIBLE",
+        frame_provider=_provider_with_errors(
+            _Frame("GLOBAL_PREP_PAGE", "initial"),
+            _Frame("GLOBAL_PREP_PAGE", "fresh"),
+            _capture_failure(),
+        ),
+        state_resolver=_resolver,
+        adapter_registry=_registry(budget, calls),
+        action_budget=budget,
+        session_recoverer=lambda: recoveries.append(True) or (
+            CaptureSessionRecoveryResult(True, "unexpected")
+        ),
+    )
+
+    assert not result.success
+    assert result.physical_dispatches == 1
+    assert result.failed_edge_id == "global_prep_to_action_summary"
+    assert calls == ["global_prep_to_action_summary"]
+    assert recoveries == []
+    assert result.session_recovery_count == 0
 
 
 @pytest.mark.parametrize(

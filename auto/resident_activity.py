@@ -16,8 +16,10 @@ from core.control.control import (
     current_display_geometry,
     input_swipe,
     input_tap,
+    recover_nemu_capture_session,
     screenshot,
 )
+from core.control.nemu_capture import NemuCaptureError
 from core.control.adb_port import EmulatorInfo, get_adb_port
 from core.services.read_only_policy import ActionIntent
 from core.services.runtime_errors import BlockedBySafetyError
@@ -406,6 +408,7 @@ class ResidentActivityAutomation:
                 adapter_registry=adapters.registry(),
                 action_budget=budget,
                 max_steps=4,
+                session_recoverer=recover_nemu_capture_session,
             )
             self.last_capability_navigation_result = capability_result
             if not capability_result.success:
@@ -447,7 +450,13 @@ class ResidentActivityAutomation:
                 ) or "action_summary_navigation_failed"
             )
             raise BlockedBySafetyError(f"进入行动汇总失败: {reason}")
-        model = observe_action_summary_page(self.driver.capture_frame())
+        try:
+            frame = self.driver.capture_frame()
+        except NemuCaptureError as error:
+            raise BlockedBySafetyError(
+                f"行动汇总页面截图失败: {error}"
+            ) from error
+        model = observe_action_summary_page(frame)
         return model, decide_action_summary(model)
 
     def _reward_attempts(self, fallback: int = 3) -> int:

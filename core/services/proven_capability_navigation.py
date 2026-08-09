@@ -8,10 +8,15 @@ injected adapters; this module only replans and revalidates one edge at a time.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from types import MappingProxyType
 from typing import Callable, Iterable, Mapping
 
+from core.control.nemu_capture import CaptureSessionRecoveryResult, NemuCaptureError
+from core.services.capture_recovery import (
+    CaptureRecoveryPolicy,
+    DEFAULT_CAPTURE_RECOVERY_POLICY,
+)
 from core.services.personal_action_budget import EpisodeActionBudget
 from core.services.runtime_navigation_kernel import (
     ActionContract,
@@ -73,6 +78,10 @@ class CapabilityNavigationResult:
     reason: str
     step_results: tuple[CapabilityNavigationStepResult, ...] = ()
     evidence_ids: tuple[str, ...] = ()
+    session_recovery_count: int = 0
+    capture_failure_stage: str = ""
+    capture_recovery_result: str = "NOT_APPLICABLE"
+    capture_native_return_code: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         document = asdict(self)
@@ -234,6 +243,10 @@ def _result(
     reason: str,
     steps: list[CapabilityNavigationStepResult],
     evidence_ids: list[str],
+    session_recovery_count: int = 0,
+    capture_failure_stage: str = "",
+    capture_recovery_result: str = "NOT_APPLICABLE",
+    capture_native_return_code: int | None = None,
 ) -> CapabilityNavigationResult:
     return CapabilityNavigationResult(
         success=success,
@@ -250,6 +263,10 @@ def _result(
         reason=reason,
         step_results=tuple(steps),
         evidence_ids=tuple(evidence_ids),
+        session_recovery_count=session_recovery_count,
+        capture_failure_stage=capture_failure_stage,
+        capture_recovery_result=capture_recovery_result,
+        capture_native_return_code=capture_native_return_code,
     )
 
 
@@ -263,6 +280,8 @@ def ensure_capability(
     cancellation: Callable[[], bool] = lambda: False,
     max_steps: int = 4,
     graph: ProvenNavigationGraph | None = None,
+    session_recoverer: Callable[[], CaptureSessionRecoveryResult] | None = None,
+    capture_recovery_policy: CaptureRecoveryPolicy = DEFAULT_CAPTURE_RECOVERY_POLICY,
 ) -> CapabilityNavigationResult:
     """Reach one target capability by revalidating one proven edge at a time."""
 
@@ -274,8 +293,78 @@ def ensure_capability(
     evidence_ids: list[str] = []
     physical_dispatches = 0
     irreversible_actions = 0
+    session_recovery_count = 0
+    capture_failure_stage = ""
+    capture_recovery_result = "NOT_APPLICABLE"
+    capture_native_return_code: int | None = None
+
+    def recover_and_restart(
+        failure: NemuCaptureError,
+    ) -> CapabilityNavigationResult | None:
+        nonlocal session_recovery_count, capture_failure_stage
+        nonlocal capture_recovery_result, capture_native_return_code
+        capture_failure_stage = failure.failure_stage
+        capture_native_return_code = failure.native_return_code
+        if (
+            session_recoverer is None
+            or not capture_recovery_policy.allows(
+                failure,
+                dispatch_count=physical_dispatches,
+                recovery_count=0,
+            )
+        ):
+            return None
+        recovered = session_recoverer()
+        session_recovery_count += 1
+        capture_recovery_result = recovered.reason
+        if not recovered.success:
+            return None
+        # A replacement NEMU session invalidates every frame captured by the
+        # previous session.  Restart the complete planner precondition and
+        # disable further session recovery for this navigation occurrence.
+        restarted = ensure_capability(
+            target_capability,
+            frame_provider=frame_provider,
+            state_resolver=state_resolver,
+            adapter_registry=adapter_registry,
+            action_budget=action_budget,
+            cancellation=cancellation,
+            max_steps=max_steps,
+            graph=graph,
+            session_recoverer=None,
+            capture_recovery_policy=CaptureRecoveryPolicy(
+                max_pre_dispatch_session_recovery=0
+            ),
+        )
+        return replace(
+            restarted,
+            session_recovery_count=(
+                restarted.session_recovery_count + session_recovery_count
+            ),
+            capture_failure_stage=capture_failure_stage,
+            capture_recovery_result=capture_recovery_result,
+            capture_native_return_code=capture_native_return_code,
+        )
+
     try:
         current = state_resolver(frame_provider())
+    except NemuCaptureError as failure:
+        restarted = recover_and_restart(
+            failure.with_failure_stage("INITIAL_CAPTURE")
+        )
+        if restarted is not None:
+            return restarted
+        return _result(
+            success=False, target_capability=target_capability,
+            initial_state="UNKNOWN", final_state="UNKNOWN", planned=(),
+            completed=completed, failed=None, physical_dispatches=0,
+            irreversible_actions=0, reason="initial_capture_failed",
+            steps=steps, evidence_ids=evidence_ids,
+            session_recovery_count=session_recovery_count,
+            capture_failure_stage=capture_failure_stage,
+            capture_recovery_result=capture_recovery_result,
+            capture_native_return_code=capture_native_return_code,
+        )
     except Exception:
         return _result(
             success=False, target_capability=target_capability,
@@ -369,6 +458,25 @@ def ensure_capability(
         contract = graph.contract_for(edge)
         try:
             fresh = state_resolver(frame_provider())
+        except NemuCaptureError as failure:
+            restarted = recover_and_restart(
+                failure.with_failure_stage("FRESH_CONFIRMATION_CAPTURE")
+            )
+            if restarted is not None:
+                return restarted
+            return _result(
+                success=False, target_capability=target_capability,
+                initial_state=initial_state, final_state=current.base_page,
+                planned=planned, completed=completed, failed=edge.edge_id,
+                physical_dispatches=physical_dispatches,
+                irreversible_actions=irreversible_actions,
+                reason="fresh_capture_failed", steps=steps,
+                evidence_ids=evidence_ids,
+                session_recovery_count=session_recovery_count,
+                capture_failure_stage=capture_failure_stage,
+                capture_recovery_result=capture_recovery_result,
+                capture_native_return_code=capture_native_return_code,
+            )
         except Exception:
             return _result(
                 success=False, target_capability=target_capability,
