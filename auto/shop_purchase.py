@@ -97,9 +97,12 @@ def _shop_confirm_observation(item: ShopItem) -> PageObservation:
     markers = ["shop_quantity_dialog"] if is_source else ["shop_confirmation_resolved"]
     if is_source:
         currency = load_shop_catalog().currencies.get(item.currency)
-        visible_currency = bool(currency) and any(
-            _normalize_text(value.get("text")) == _normalize_text(currency.name)
-            for value in ocr_items
+        visible_currency = bool(currency) and (
+            any(
+                _normalize_text(value.get("text")) == _normalize_text(currency.name)
+                for value in ocr_items
+            )
+            or _price_icon_slot_present(frame.image, ocr_items)
         )
         markers.extend((
             f"shop_item={item.id}", f"shop_quantity={quantity[0]}",
@@ -142,6 +145,95 @@ def _shop_confirm_snapshot(
         catalog_digest=shop_catalog_digest(catalog), plan_digest=shop_plan_digest(plan, catalog),
         ledger_digest=shop_attempt_digest(ledger_entry),
     )
+
+
+def _price_icon_slot_present(frame_image, ocr_items):
+    """Return True when a non-background icon region sits between the price
+    label and the price number in the dialog.
+
+    The currency **type** is already cryptographically bound by the
+    product card → catalog → currency mapping; this function only proves
+    that the gap between the price label (e.g. "售价") and the price
+    number (e.g. "100000") contains an icon — any icon — rather than
+    empty background.  Template matching on a 22-px NEMU frame cannot
+    distinguish coin art from one another; trying to do so causes false
+    negatives on every icon-only dialog.
+
+    Structural evidence required:
+    * Exactly one price-label OCR item ("售价").
+    * Exactly one price-number OCR item immediately to the right.
+    * The pixel strip between them has local variance significantly above
+      the uniform dark dialog background.
+    """
+    # 1. Locate the price label ("售价") in the dialog.
+    price_labels: list[tuple] = []
+    for raw in ocr_items:
+        text = _normalize_text(raw.get("text"))
+        if text == _normalize_text("售价"):
+            pos = raw.get("position", [])
+            if len(pos) >= 4:
+                cx, cy = _center(raw)
+                if cy >= 420:
+                    price_labels.append((int(cx), int(cy), pos))
+    if len(price_labels) != 1:
+        return False
+
+    # 2. Locate the price number — the only numeric OCR item in the same
+    #    vertical band as the label.
+    label_cx, label_cy, _ = price_labels[0]
+    price_numbers: list[tuple[int, int, float]] = []
+    for raw in ocr_items:
+        value = _numeric_value(raw.get("text"))
+        if value is None:
+            continue
+        pos = raw.get("position", [])
+        if len(pos) < 4:
+            continue
+        cx, cy = _center(raw)
+        # Must be to the right of the label, in the same vertical band.
+        if cx > label_cx and abs(cy - label_cy) <= 12:
+            # Center coordinates of the box for gap calculation.
+            price_numbers.append((int(cx), int(cy), float(value)))
+    if len(price_numbers) != 1:
+        return False
+
+    # 3. Compute the gap between the label's right edge and the number's
+    #    left edge.
+    label_right = max(int(pt[0]) for pt in price_labels[0][2])
+    num_pts: list[tuple[int, int]] = []
+    for raw in ocr_items:
+        if _numeric_value(raw.get("text")) is not None:
+            for pt in raw.get("position", [[0, 0], [0, 0], [0, 0], [0, 0]]):
+                num_pts.append((int(pt[0]), int(pt[1])))
+    if not num_pts:
+        return False
+    num_left = min(pt[0] for pt in num_pts)
+
+    # The gap must be wide enough for an icon (>12 px) but not absurdly wide.
+    gap = num_left - label_right
+    if not (12 <= gap <= 120):
+        return False
+
+    # 4. The gap region must have local variance significantly above the
+    #    uniform dark dialog background, proving an icon is present.
+    min_y = min(int(pt[1]) for pt in num_pts)
+    max_y = max(int(pt[1]) for pt in num_pts)
+    strip_top = max(0, min_y - 4)
+    strip_bottom = min(frame_image.shape[0], max_y + 4)
+    strip_left = max(0, label_right)
+    strip_right = min(frame_image.shape[1], num_left)
+
+    gap_strip = frame_image[strip_top:strip_bottom, strip_left:strip_right]
+    if gap_strip.size == 0:
+        return False
+    gap_gray = cv.cvtColor(gap_strip, cv.COLOR_BGR2GRAY)
+
+    # The dialog background is uniform dark (< 2 px std after
+    # median-filter); an icon boosts local variance well above 10.
+    # Absolute threshold avoids fragile reference-region selection.
+    from scipy import ndimage
+    gap_std = float(ndimage.median_filter(gap_gray, size=3).std())
+    return gap_std >= 15.0
 
 
 def _validate_shop_confirm_context(

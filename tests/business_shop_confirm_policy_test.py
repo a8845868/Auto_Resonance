@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+import numpy as np
 import pytest
 
 import auto.shop_purchase as shop_purchase
@@ -220,3 +222,55 @@ def test_shop_dispatch_helper_installs_business_guard_and_disables_random_offset
     assert seen["point"] == shop_purchase.DIALOG_CONFIRM_POS
     assert seen["random_offset"] is False
     assert seen["intent"].action_key == "shop_confirm"
+
+
+def test_price_icon_slot_present_with_complete_layout(monkeypatch):
+    """Icon slot detected when '售价', price number, and visible gap content
+    are all present — matching the real dialog layout."""
+    # Dark dialog background with a brighter circular icon in the gap.
+    frame = np.full((720, 1280, 3), 28, dtype=np.uint8)
+    gap_y, gap_x = 440, 590
+    rr, cc = np.ogrid[:34, :48]
+    mask = (rr - 16) ** 2 + (cc - 17) ** 2 <= 144
+    icon_overlay = np.minimum(frame[gap_y:gap_y + 34, gap_x:gap_x + 48] + 35, 255)
+    icon_overlay[mask] = np.clip(icon_overlay[mask] + 20, 0, 255)
+    frame[gap_y:gap_y + 34, gap_x:gap_x + 48] = icon_overlay
+
+    ocr_items = [
+        {"text": "售价", "position": [
+            [535, 441], [579, 441], [579, 466], [535, 466]
+        ]},
+        {"text": "100000", "position": [
+            [648, 442], [721, 442], [721, 465], [648, 465]
+        ]},
+    ]
+    assert shop_purchase._price_icon_slot_present(frame, ocr_items) is True
+
+
+def test_price_icon_slot_absent_without_price_label(monkeypatch):
+    """Returns False when no '售价' OCR item exists."""
+    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    ocr_items = [
+        {"text": "100000", "position": [
+            [648, 442], [721, 442], [721, 465], [648, 465]
+        ]},
+        {"text": "确定", "position": [
+            [900, 515], [980, 515], [980, 535], [900, 535]
+        ]},
+    ]
+    assert shop_purchase._price_icon_slot_present(frame, ocr_items) is False
+
+
+def test_price_icon_slot_absent_when_gap_is_uniform_background(monkeypatch):
+    """Returns False when the gap between label and price is uniform dark bg."""
+    frame = np.full((720, 1280, 3), 28, dtype=np.uint8)
+    # Deliberately blank gap — no icon content.
+    ocr_items = [
+        {"text": "售价", "position": [
+            [535, 441], [579, 441], [579, 466], [535, 466]
+        ]},
+        {"text": "100000", "position": [
+            [648, 442], [721, 442], [721, 465], [648, 465]
+        ]},
+    ]
+    assert shop_purchase._price_icon_slot_present(frame, ocr_items) is False
