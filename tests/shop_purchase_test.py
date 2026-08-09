@@ -1133,3 +1133,147 @@ def test_shop_swipe_specs_have_correct_directions_and_resolvable_anchor():
         rewind_spec, rewind_trajectory, 650
     )
     assert direction == "DOWN"
+
+
+def test_price_roi_ocr_recovers_small_digit_when_general_ocr_misses(monkeypatch):
+    """The ROI fallback crops the price area, upscales and enhances contrast."""
+    from auto.shop_purchase import _price_roi_ocr
+
+    dialog_ocr = [
+        _ocr("独石碎片", 580, 306, 150),
+        _ocr("最少", 365, 363),
+        _ocr("-1", 430, 355),
+        _ocr("+1", 760, 355),
+        _ocr("最多", 873, 367),
+        _ocr("售价", 536, 442, 45, 22),
+        _ocr("取消", 324, 521),
+        _ocr("确定", 959, 523),
+        _ocr("1/42", 619, 353),
+    ]
+    matrix = np.zeros((720, 1280, 3), dtype=np.uint8)
+    # Simulate a small "2" to the right of the price label.
+    cv2 = __import__("cv2")
+    label_x2 = 536 + 45
+    digit_x = label_x2 + 15
+    cv2.putText(
+        matrix, "2", (digit_x, 452),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1,
+    )
+    frame = _FakeImage(matrix, dialog_ocr)
+
+    result = _price_roi_ocr(frame, dialog_ocr)
+
+    assert result == 2
+
+
+def test_price_roi_ocr_returns_none_when_label_is_missing(monkeypatch):
+    from auto.shop_purchase import _price_roi_ocr
+
+    dialog_ocr = [
+        _ocr("独石碎片", 580, 306, 150),
+        _ocr("取消", 324, 521),
+        _ocr("确定", 959, 523),
+    ]
+    frame = _FakeImage()
+
+    assert _price_roi_ocr(frame, dialog_ocr) is None
+
+
+def test_scan_continues_after_per_item_blocked_by_safety_error(monkeypatch):
+    """When purchase() raises BlockedBySafetyError, scan records failure
+    and continues to the next item — exercising the real try/except path."""
+    catalog = load_shop_catalog()
+    shop = catalog.shop("headquarters_black_moon")
+    item_a = catalog.item("cactus_energy_weekly_iron")
+    item_b = catalog.item("bait_balloon_weekly_iron")
+    purchase_a = ConfiguredPurchase(shop, item_a, "one")
+    purchase_b = ConfiguredPurchase(shop, item_b, "one")
+    adapter = HeadquartersBlackMoonAdapter(shop, _FakeRecorder())
+    monkeypatch.setattr(adapter, "open", lambda: None)
+    monkeypatch.setattr(adapter, "_verify_shop_page", lambda: True)
+    monkeypatch.setattr(adapter, "_rewind_to_top", lambda: None)
+    call_count = [0]
+
+    def fake_purchase(located, quantity_mode, dry_run):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            raise shop_purchase.BlockedBySafetyError(
+                "商品价格校验失败: 仙人掌能量棒棒糖，目录档位 10000，实机 None"
+            )
+        return {
+            "id": located.item.id,
+            "name": located.item.name,
+            "status": "validated",
+            "quantity": 1,
+            "cost": located.item.price,
+        }
+
+    monkeypatch.setattr(adapter, "purchase", fake_purchase)
+    page_ocr = [
+        _ocr(item_a.name, 782, 392, 150),
+        _ocr("每周限购 8/8", 786, 430, 150),
+        _ocr("10000", 786, 460, 120),
+        _ocr(item_b.name, 930, 250, 150),
+        _ocr("每周限购 30/30", 934, 288, 150),
+        _ocr("5000", 934, 318, 120),
+    ]
+    monkeypatch.setattr(
+        shop_purchase, "screenshot",
+        lambda: _FakeImage(
+            np.zeros((720, 1280, 3), dtype=np.uint8), page_ocr,
+        ),
+    )
+    monkeypatch.setattr(shop_purchase.time, "sleep", lambda *_: None)
+
+    result = adapter.scan(
+        purchases=[purchase_a, purchase_b], dry_run=True, max_pages=2,
+    )
+
+    results = result["results"]
+    assert len(results) == 2
+    assert results[0]["status"] == "failed"
+    assert results[0]["error"].startswith("商品价格校验失败")
+    assert results[1]["status"] == "validated"
+    assert result["requires_attention"] is True
+    assert call_count == [2]  # first call raised after increment to 1, second = 2
+
+
+def test_ambiguous_monthly_laplace_skips_when_price_not_visible(monkeypatch):
+    """When the card price is missing and two items share name+period+max_limit,
+    locate_product must return None instead of guessing."""
+    from auto.shop_purchase import _ambiguous_sibling_ids
+
+    catalog = load_shop_catalog()
+    ambiguous = _ambiguous_sibling_ids()
+    assert "laplace_monthly_iron" in ambiguous
+    assert "laplace_monthly_resume" in ambiguous
+
+    target = catalog.item("laplace_monthly_iron")
+    # OCR data: name matches, limit matches, but NO price visible.
+    ocr_items = [
+        _ocr("拉普拉斯协议", 782, 392, 150),
+        _ocr("每月限购 10/10", 1016, 402, 150),
+    ]
+
+    located = locate_product(ocr_items, target)
+
+    assert located is None
+
+
+def test_ambiguous_monthly_laplace_matches_when_price_is_visible(monkeypatch):
+    """When the card price IS visible, locate_product can disambiguate."""
+    catalog = load_shop_catalog()
+    target = catalog.item("laplace_monthly_iron")
+    target_price = target.price  # 500000
+    # All items must be in the same column (left: centre_x < 923) and within
+    # ±62 px vertically of the name match centre (centre_y=404).
+    ocr_items = [
+        _ocr("拉普拉斯协议", 782, 392, 150),
+        _ocr("每月限购 10/10", 785, 424, 150),
+        _ocr(str(target_price), 785, 448, 120),
+    ]
+
+    located = locate_product(ocr_items, target)
+
+    assert located is not None
+    assert located.item.id == "laplace_monthly_iron"

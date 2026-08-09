@@ -130,11 +130,21 @@ def _shop_dry_run_summary(result: dict) -> str:
         for shop in shops
         if isinstance(shop, dict) and isinstance(shop.get("missing"), list)
     )
-    suffix = "，需要人工复核" if bool(result.get("requires_attention")) else ""
-    return (
-        f"干跑完成：扫描 {page_count} 页，处理 {found_count} 项"
-        f"，未定位 {missing_count} 项{suffix}"
+    failed_count = sum(
+        1
+        for shop in shops
+        if isinstance(shop, dict)
+        for result in (shop.get("results") or [])
+        if isinstance(result, dict) and result.get("status") == "failed"
     )
+    parts = [f"干跑完成：扫描 {page_count} 页，处理 {found_count} 项"]
+    if failed_count:
+        parts.append(f"{failed_count} 项失败")
+    if missing_count:
+        parts.append(f"未定位 {missing_count} 项")
+    if bool(result.get("requires_attention")):
+        parts.append("需要人工复核")
+    return "，".join(parts)
 
 
 class ShopDryRunWorker(QThread):
@@ -226,6 +236,13 @@ class ShopItemCard(QFrame):
             details.addWidget(self.observedPriceLabel)
         else:
             self.observedPriceLabel = None
+        self.failureLabel = QLabel(self)
+        self.failureLabel.setWordWrap(True)
+        self.failureLabel.setStyleSheet(
+            "color: #e05555; font-size: 12px; font-weight: 600;"
+        )
+        self.failureLabel.hide()
+        details.addWidget(self.failureLabel)
         details.addStretch(1)
         root.addLayout(details, 1)
 
@@ -284,6 +301,14 @@ class ShopItemCard(QFrame):
         text = _observed_price_breakdown_text(observations, self.currency)
         self.observedPriceLabel.setText(text)
         self.observedPriceLabel.setVisible(bool(text))
+        if text:
+            self.failureLabel.hide()
+
+    def setFailureReason(self, reason: str) -> None:
+        self.failureLabel.setText(f"干跑失败：{reason}")
+        self.failureLabel.show()
+        if self.observedPriceLabel is not None:
+            self.observedPriceLabel.hide()
 
 
 class ShopPlannerInterface(ScrollArea):
@@ -536,6 +561,7 @@ class ShopPlannerInterface(ScrollArea):
         self.observedPriceSchedules.clear()
         for card in self.itemCards.values():
             card.setObservedPriceSchedule([])
+            card.failureLabel.hide()
         self.dryRunButton.setEnabled(False)
         self.dryRunButton.setText("正在扫描商店…")
         self.dryRunStatus.setText(
@@ -556,11 +582,17 @@ class ShopPlannerInterface(ScrollArea):
                     continue
                 card = self.itemCards.get(str(item_result.get("id") or ""))
                 item_id = str(item_result.get("id") or "")
+                status = str(item_result.get("status") or "")
                 observations = item_result.get("price_observations")
                 if isinstance(observations, list) and observations:
                     self.observedPriceSchedules[item_id] = observations
                 if card is not None:
-                    card.setObservedPriceSchedule(observations)
+                    if status == "failed":
+                        card.setFailureReason(
+                            str(item_result.get("error", "未知错误"))
+                        )
+                    else:
+                        card.setObservedPriceSchedule(observations)
         summary = _shop_dry_run_summary(result)
         self.dryRunStatus.setText(summary)
         info = InfoBar.warning if bool(result.get("requires_attention")) else InfoBar.success

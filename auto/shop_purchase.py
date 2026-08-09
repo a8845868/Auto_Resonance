@@ -389,6 +389,23 @@ class LocatedProduct:
     context: tuple[str, ...]
 
 
+def _ambiguous_sibling_ids() -> frozenset[str]:
+    """Return IDs of catalog items that share name+period+max_limit with another."""
+    from core.services.shop_catalog import load_shop_catalog
+
+    catalog = load_shop_catalog()
+    by_key: dict[tuple[str, str, int], list[str]] = {}
+    for item in catalog.items:
+        key = (item.name, item.period, item.max_limit)
+        by_key.setdefault(key, []).append(item.id)
+    return frozenset(
+        item_id
+        for ids in by_key.values()
+        if len(set(ids)) > 1
+        for item_id in ids
+    )
+
+
 def locate_product(ocr_items: Iterable[dict], target: ShopItem) -> LocatedProduct | None:
     """Locate one catalog product and disambiguate duplicate names by its card."""
     data = list(ocr_items)
@@ -443,6 +460,13 @@ def locate_product(ocr_items: Iterable[dict], target: ShopItem) -> LocatedProduc
         # dialog performs the authoritative price check before confirmation.
         if numeric_values and expected_price not in numeric_values:
             continue
+        # When another catalog item shares the same name, period and
+        # max_limit but differs in price or currency, a missing card price
+        # makes disambiguation impossible.  Refuse to match — let the
+        # scanner scroll to a position where the price label is visible.
+        if target.id in _ambiguous_sibling_ids():
+            if not numeric_values or expected_price not in numeric_values:
+                continue
         located.append(
             LocatedProduct(
                 item=target,
@@ -583,6 +607,79 @@ def _dialog_price(ocr_items: Iterable[dict]) -> int | None:
     return values[-1] if values else None
 
 
+def _price_label_bbox(
+    ocr_items: Iterable[dict],
+) -> tuple[int, int, int, int] | None:
+    """Return the bounding box of the "售价" label using normalized matching."""
+    for raw in ocr_items:
+        text = _normalize_text(raw.get("text"))
+        if text == _normalize_text("售价"):
+            pos = raw.get("position", [])
+            if len(pos) >= 4:
+                center_y = _center(raw)[1]
+                if center_y >= 420:
+                    x1 = min(int(pt[0]) for pt in pos)
+                    y1 = min(int(pt[1]) for pt in pos)
+                    x2 = max(int(pt[0]) for pt in pos)
+                    y2 = max(int(pt[1]) for pt in pos)
+                    return x1, y1, x2, y2
+    return None
+
+
+def _price_roi_ocr(
+    frame_image,
+    dialog_ocr: list[dict],
+) -> int | None:
+    """Crop, upscale and contrast-enhance the price digit region.
+
+    When the general OCR model misses a small single digit next to a
+    currency icon, a focused ROI crop with 4× upscaling and CLAHE contrast
+    enhancement can recover it.  This is a pure analysis pass — it never
+    guesses; if the enhanced crop still yields no number, it returns None.
+    """
+    label_bbox = _price_label_bbox(dialog_ocr)
+    if label_bbox is None:
+        return None
+    label_x1, label_y1, label_x2, label_y2 = label_bbox
+    matrix = frame_image.image if hasattr(frame_image, "image") else frame_image
+    height, width = matrix.shape[:2]
+    # Crop the region to the right of the price label, with modest padding.
+    roi_x1 = max(0, label_x2)
+    roi_y1 = max(0, label_y1 - 10)
+    roi_x2 = min(width, label_x2 + 120)
+    roi_y2 = min(height, label_y2 + 10)
+    if roi_x2 <= roi_x1 or roi_y2 <= roi_y1:
+        return None
+    roi = matrix[roi_y1:roi_y2, roi_x1:roi_x2]
+    if roi.size == 0:
+        return None
+    try:
+        # 4× upscale to help the detection model find single small digits.
+        upscaled = cv.resize(roi, None, fx=4, fy=4, interpolation=cv.INTER_CUBIC)
+        # CLAHE contrast enhancement on the luminance channel.
+        lab = cv.cvtColor(upscaled, cv.COLOR_BGR2LAB)
+        l_channel, a_channel, b_channel = cv.split(lab)
+        clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l_eq = clahe.apply(l_channel)
+        enhanced = cv.cvtColor(
+            cv.merge((l_eq, a_channel, b_channel)), cv.COLOR_LAB2BGR,
+        )
+    except cv.error:
+        return None
+    from core.image.ocr import predict
+
+    try:
+        ocr_result = predict(enhanced, cropped_pos1=(0, 0))
+    except Exception:
+        return None
+    values = []
+    for item in ocr_result:
+        value = _numeric_value(item.get("text"))
+        if value is not None:
+            values.append(value)
+    return values[-1] if values else None
+
+
 def _dialog_has_item(ocr_items: Iterable[dict], item: ShopItem) -> bool:
     expected = _normalize_text(item.name)
     return any(_normalize_text(value.get("text")) == expected for value in ocr_items)
@@ -685,6 +782,28 @@ class HeadquartersBlackMoonAdapter:
         if _has_quantity_dialog(remaining_ocr):
             raise BlockedBySafetyError("数量弹窗取消后仍未关闭，已停止继续操作")
 
+    def _verify_shop_page(self) -> bool:
+        """Return True when the current screen shows the headquarters shop."""
+        frame = screenshot()
+        ocr_items = frame.ocr()
+        texts = {_normalize_text(item.get("text")) for item in ocr_items}
+        return {"总部商店", "黑月商店"}.issubset(texts)
+
+    def _recover_to_shop_page(self) -> None:
+        """Verify we are still on the shop page after a per-item cancellation.
+
+        The dialog was already dismissed by :meth:`_cancel_dialog` inside
+        :meth:`inspect_dialog` before the exception that triggers this call.
+        This method only verifies the shop page is present; it never emits
+        input on an unverified page.  If the shop is not visible the entire
+        batch halts safely.
+        """
+        if self._verify_shop_page():
+            return
+        raise BlockedBySafetyError(
+            "单项失败后未返回商店页，已停止继续扫描"
+        )
+
     def inspect_dialog(
         self,
         located: LocatedProduct,
@@ -705,6 +824,8 @@ class HeadquartersBlackMoonAdapter:
             self._cancel_dialog(f"cancel-unexpected-{located.item.id}")
             raise BlockedBySafetyError(f"商品弹窗名称校验失败: {located.item.name}")
         observed_price = _dialog_price(dialog_ocr)
+        if observed_price is None:
+            observed_price = _price_roi_ocr(dialog, dialog_ocr)
         expected_price = located.item.price_for_remaining(located.remaining)
         if expected_price is None or observed_price != expected_price:
             self._cancel_dialog(f"cancel-price-{located.item.id}")
@@ -1149,7 +1270,22 @@ class HeadquartersBlackMoonAdapter:
                         }
                     )
                 else:
-                    result = self.purchase(located, purchase.quantity, dry_run)
+                    try:
+                        result = self.purchase(
+                            located, purchase.quantity, dry_run,
+                        )
+                    except BlockedBySafetyError as error:
+                        self._recover_to_shop_page()
+                        results.append({
+                            "id": item_id,
+                            "name": purchase.item.name,
+                            "status": "failed",
+                            "remaining": located.remaining,
+                            "error": str(error),
+                        })
+                        pending.pop(item_id, None)
+                        page_matrix = screenshot().image.copy()
+                        continue
                     results.append(result)
                     if result["status"] == "submitted_unverified":
                         stop_for_review = True
@@ -1186,7 +1322,7 @@ class HeadquartersBlackMoonAdapter:
             {"id": purchase.item.id, "name": purchase.item.name}
             for purchase in pending.values()
         ]
-        attention_statuses = {"insufficient_currency", "submitted_unverified"}
+        attention_statuses = {"failed", "insufficient_currency", "submitted_unverified"}
         requires_attention = bool(
             missing
             or stop_for_review

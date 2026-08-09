@@ -248,3 +248,69 @@ def test_observed_schedule_survives_shop_card_rebuild_in_same_gui_session():
     )
     assert application is not None
     page.deleteLater()
+
+
+def test_shop_dry_run_summary_counts_failed_items():
+    result = {
+        "success": False,
+        "dry_run": True,
+        "requires_attention": True,
+        "shops": [
+            {
+                "pages": 5,
+                "results": [
+                    {"id": "ok-1", "status": "validated"},
+                    {"id": "fail-1", "status": "failed", "error": "价格校验失败"},
+                    {"id": "ok-2", "status": "validated"},
+                    {"id": "fail-2", "status": "failed", "error": "数量校验失败"},
+                ],
+                "missing": [{"id": "unlocated"}],
+            }
+        ],
+    }
+
+    summary = shop_interface._shop_dry_run_summary(result)
+
+    assert "扫描 5 页" in summary
+    assert "处理 4 项" in summary
+    assert "2 项失败" in summary
+    assert "未定位 1 项" in summary
+    assert "需要人工复核" in summary
+
+
+def test_failed_item_shows_error_in_card_without_claiming_observed_price():
+    application = QApplication.instance() or QApplication([])
+    catalog = load_shop_catalog()
+    item = catalog.item("solitary_shard_monthly_resume")
+    currency = catalog.currencies[item.currency]
+    card = shop_interface.ShopItemCard(
+        item, currency, {"enabled": False, "quantity": "one"},
+    )
+
+    card.setFailureReason("商品价格校验失败: 独石碎片，目录 2，实机 None")
+
+    assert "干跑失败" in card.failureLabel.text()
+    assert "独石碎片" in card.failureLabel.text()
+    assert card.failureLabel.isVisible() is False  # parent not shown
+    assert application is not None
+    card.deleteLater()
+
+
+def test_failure_reason_is_cleared_by_new_observed_price(monkeypatch):
+    application = QApplication.instance() or QApplication([])
+    catalog = load_shop_catalog()
+    item = catalog.item("laplace_weekly_iron")
+    currency = catalog.currencies[item.currency]
+    card = shop_interface.ShopItemCard(
+        item, currency, {"enabled": False, "quantity": "one"},
+    )
+
+    card.setFailureReason("上一次错误")
+    card.setObservedPriceSchedule([
+        {"quantity": 1, "marginal_cost": 100000, "cumulative_cost": 100000},
+    ])
+
+    assert not card.failureLabel.isVisible()
+    assert card.observedPriceLabel.isVisible() is False
+    assert application is not None
+    card.deleteLater()
