@@ -8,7 +8,12 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QLabel, QWidget
-from qfluentwidgets import ExpandLayout, PrimaryPushSettingCard, SwitchSettingCard
+from qfluentwidgets import (
+    ComboBoxSettingCard,
+    ExpandLayout,
+    PrimaryPushSettingCard,
+    SwitchSettingCard,
+)
 from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import ScrollArea, SettingCardGroup
 
@@ -36,6 +41,7 @@ class SettingInterface(ScrollArea):
         # music folders
         self.musicInThisPCGroup = SettingCardGroup("配置", self.scrollWidget)
         self.lifecycleGroup = SettingCardGroup("任务资源管理", self.scrollWidget)
+        self.ocrGroup = SettingCardGroup("OCR 识别", self.scrollWidget)
         self.selfHealingGroup = SettingCardGroup("Codex 自愈", self.scrollWidget)
         self.mirrorCdkCard = LineEditSettingCard(
             cfg.mirrorCdk,
@@ -132,6 +138,22 @@ class SettingInterface(ScrollArea):
             spin_box_max=102400,
             parent=self.lifecycleGroup,
         )
+        self.ocrBackendCard = ComboBoxSettingCard(
+            cfg.ocrBackend,
+            FIF.SETTING,
+            "OCR 引擎（重启后生效）",
+            "PP-OCRv4 为内置兼容后端；PP-OCRv6 Medium 需先安装可选 OCR 资源",
+            texts=["PP-OCRv4（内置）", "PP-OCRv6 Medium（可选）"],
+            parent=self.ocrGroup,
+        )
+        self.ocrProviderCard = ComboBoxSettingCard(
+            cfg.ocrProvider,
+            FIF.SPEED_HIGH,
+            "OCR 运行设备（重启后生效）",
+            "自动选择、强制 CPU，或优先 CUDA；CUDA 不可用时会明确回退 CPU",
+            texts=["自动", "CPU", "CUDA"],
+            parent=self.ocrGroup,
+        )
         self.codexSelfHealingCard = SwitchSettingCard(
             FIF.SYNC,
             "启用 Codex 自愈智能体",
@@ -191,6 +213,8 @@ class SettingInterface(ScrollArea):
         self.lifecycleGroup.addSettingCard(self.personalStartupEpisodeCard)
         self.lifecycleGroup.addSettingCard(self.autoConfirmResourceUpdateCard)
         self.lifecycleGroup.addSettingCard(self.maximumResourceUpdateMbCard)
+        self.ocrGroup.addSettingCard(self.ocrBackendCard)
+        self.ocrGroup.addSettingCard(self.ocrProviderCard)
         self.selfHealingGroup.addSettingCard(self.codexSelfHealingCard)
         self.selfHealingGroup.addSettingCard(self.codexIsolatedRepairCard)
 
@@ -199,6 +223,7 @@ class SettingInterface(ScrollArea):
         self.expandLayout.setContentsMargins(36, 10, 36, 0)
         self.expandLayout.addWidget(self.musicInThisPCGroup)
         self.expandLayout.addWidget(self.lifecycleGroup)
+        self.expandLayout.addWidget(self.ocrGroup)
         self.expandLayout.addWidget(self.selfHealingGroup)
 
     def showEvent(self, event):

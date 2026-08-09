@@ -172,3 +172,129 @@ def test_invalid_provider_raises_runtime_error_and_does_not_cache_backend(
     backend = ocr._get_backend()
     assert backend.name == "ppocr-v4"
     assert backend.provider == "cpu"
+
+
+def test_ppocr_v6_medium_uses_explicit_game_screenshot_pipeline(monkeypatch):
+    from core.image.ocr_backend import PaddlePpocrV6Backend
+
+    created = []
+    model = object()
+    backend = PaddlePpocrV6Backend(provider="cpu")
+    monkeypatch.setattr(backend, "_cuda_available", lambda: False)
+    monkeypatch.setattr(
+        backend,
+        "_create_ocr_model",
+        lambda **kwargs: created.append(kwargs) or model,
+    )
+
+    assert backend._get_model() is model
+    assert backend._get_model() is model
+    assert backend.name == "ppocr-v6-medium"
+    assert backend.provider == "cpu"
+    assert created == [{"provider": "cpu"}]
+
+
+def test_ppocr_v6_result_is_normalized_with_crop_offset(monkeypatch):
+    from core.image.ocr_backend import PaddlePpocrV6Backend
+
+    class FakeResult:
+        json = {
+            "res": {
+                "rec_texts": ["售价", "200000"],
+                "rec_scores": [0.98, 0.97],
+                "rec_polys": [
+                    [[1, 2], [21, 2], [21, 12], [1, 12]],
+                    [[30, 2], [80, 2], [80, 12], [30, 12]],
+                ],
+            }
+        }
+
+    model = SimpleNamespace(predict=lambda _image: [FakeResult()])
+    backend = PaddlePpocrV6Backend(provider="cpu")
+    monkeypatch.setattr(backend, "_get_model", lambda: model)
+
+    result = backend.predict(
+        np.zeros((40, 100, 3), dtype=np.uint8),
+        cropped_pos1=(100, 200),
+        cropped_pos2=(200, 240),
+        no_crop=True,
+    )
+
+    assert [item["text"] for item in result] == ["售价", "200000"]
+    assert result[0]["position"] == [
+        [101.0, 202.0],
+        [121.0, 202.0],
+        [121.0, 212.0],
+        [101.0, 212.0],
+    ]
+
+
+def test_ppocr_v6_accepts_generator_and_numpy_result_fields(monkeypatch):
+    from core.image.ocr_backend import PaddlePpocrV6Backend
+
+    class FakeResult:
+        json = {
+            "res": {
+                "rec_texts": np.asarray(["每周限购2/3"]),
+                "rec_scores": np.asarray([0.96]),
+                "rec_polys": np.asarray(
+                    [[[1, 1], [71, 1], [71, 16], [1, 16]]]
+                ),
+            }
+        }
+
+    model = SimpleNamespace(predict=lambda _image: (item for item in [FakeResult()]))
+    backend = PaddlePpocrV6Backend(provider="cpu")
+    monkeypatch.setattr(backend, "_get_model", lambda: model)
+
+    result = backend.predict(
+        np.zeros((20, 80, 3), dtype=np.uint8),
+        no_crop=True,
+    )
+
+    assert result == [{
+        "text": "每周限购2/3",
+        "score": 0.96,
+        "position": [
+            [1.0, 1.0], [71.0, 1.0], [71.0, 16.0], [1.0, 16.0]
+        ],
+    }]
+
+
+def test_backend_selector_supports_v6_and_rejects_unknown_backend(monkeypatch):
+    import core.image.ocr as ocr
+    from core.image.ocr_backend import PaddlePpocrV6Backend
+
+    ocr._reset_ocr_backend_for_tests()
+    monkeypatch.setenv("AUTO_RESONANCE_OCR_BACKEND", "ppocr-v6-medium")
+    monkeypatch.setenv("AUTO_RESONANCE_OCR_PROVIDER", "cpu")
+    monkeypatch.setattr(
+        PaddlePpocrV6Backend, "_cuda_available", lambda _self: False
+    )
+    backend = ocr._get_backend()
+    assert isinstance(backend, PaddlePpocrV6Backend)
+    assert backend.provider == "cpu"
+
+    ocr._reset_ocr_backend_for_tests()
+    monkeypatch.setenv("AUTO_RESONANCE_OCR_BACKEND", "not-an-engine")
+    with pytest.raises(RuntimeError, match="ocr_backend_invalid"):
+        ocr._get_backend()
+    assert ocr._backend is None
+
+
+def test_persisted_ocr_choice_applies_without_overriding_explicit_environment():
+    from app.common.config import apply_ocr_runtime_environment
+
+    config = SimpleNamespace(
+        ocrBackend=SimpleNamespace(value="ppocr-v6-medium"),
+        ocrProvider=SimpleNamespace(value="cpu"),
+    )
+    environment = {"AUTO_RESONANCE_OCR_PROVIDER": "cuda"}
+
+    applied = apply_ocr_runtime_environment(config, environment)
+
+    assert environment == {
+        "AUTO_RESONANCE_OCR_BACKEND": "ppocr-v6-medium",
+        "AUTO_RESONANCE_OCR_PROVIDER": "cuda",
+    }
+    assert applied == environment

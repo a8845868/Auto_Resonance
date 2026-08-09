@@ -13,7 +13,15 @@ import uuid
 
 from loguru import logger
 
-from qfluentwidgets import ConfigItem, QConfig, Theme, qconfig, ConfigSerializer, OptionsValidator
+from qfluentwidgets import (
+    ConfigItem,
+    ConfigSerializer,
+    OptionsConfigItem,
+    OptionsValidator,
+    QConfig,
+    Theme,
+    qconfig,
+)
 
 from app.utils.config import CITYS
 from core.control.adb_port import EmulatorInfo, EmulatorType
@@ -21,6 +29,23 @@ from version import __version__
 
 
 PERSONAL_STARTUP_CONFIG_PATH = Path("config/app.json")
+
+
+def apply_ocr_runtime_environment(config, environ=None) -> dict[str, str]:
+    """Expose persisted OCR choices before any OCR consumer is imported.
+
+    Explicit process environment variables remain authoritative, which keeps
+    diagnostic and test launches reproducible without rewriting GUI config.
+    """
+
+    target = os.environ if environ is None else environ
+    values = {
+        "AUTO_RESONANCE_OCR_BACKEND": str(config.ocrBackend.value),
+        "AUTO_RESONANCE_OCR_PROVIDER": str(config.ocrProvider.value),
+    }
+    for key, value in values.items():
+        target.setdefault(key, value)
+    return {key: str(target[key]) for key in values}
 
 
 def migrate_personal_startup_config(path: Path = PERSONAL_STARTUP_CONFIG_PATH) -> bool:
@@ -145,6 +170,21 @@ class Config(RunningBusinessConfig):
 
     # Mirror酱
     mirrorCdk = ConfigItem("Global", "mirrorCdk", "", None)
+
+    ocrBackend = OptionsConfigItem(
+        "OCR",
+        "Backend",
+        "ppocr-v4",
+        OptionsValidator(["ppocr-v4", "ppocr-v6-medium"]),
+        restart=True,
+    )
+    ocrProvider = OptionsConfigItem(
+        "OCR",
+        "Provider",
+        "auto",
+        OptionsValidator(["auto", "cpu", "cuda"]),
+        restart=True,
+    )
 
     enableRewardCollection = ConfigItem("TaskQueue", "RewardCollection", True, None)
     enableResidentActivity = ConfigItem("TaskQueue", "ResidentActivity", True, None)

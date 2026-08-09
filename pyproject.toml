@@ -24,6 +24,12 @@ requires-python = "<3.13,>=3.11"
 readme = "README.md"
 license = {text = "MIT"}
 
+[project.optional-dependencies]
+ocr-v6-cpu = [
+    "paddleocr>=3.5,<4",
+    "paddlepaddle>=3.2,<4",
+]
+
 [build-system]
 requires = ["pdm-backend"]
 build-backend = "pdm.backend"

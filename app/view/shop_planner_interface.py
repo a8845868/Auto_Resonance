@@ -32,10 +32,12 @@ from app.common.style_sheet import StyleSheet
 from app.components.task_schedule_card import TaskScheduleCard
 from core.services.shop_catalog import (
     CurrencyDefinition,
+    ReadOnlyShopItem,
     ShopDefinition,
     ShopItem,
     load_shop_catalog,
     load_shop_plan,
+    load_read_only_shop_catalog,
     next_shop_reset,
     save_shop_plan,
     shop_plan_enabled,
@@ -311,6 +313,53 @@ class ShopItemCard(QFrame):
             self.observedPriceLabel.hide()
 
 
+class ReadOnlyShopItemCard(QFrame):
+    """Evidence-backed display card with deliberately no purchase controls."""
+
+    def __init__(
+        self,
+        item: ReadOnlyShopItem,
+        currencies: dict[str, CurrencyDefinition],
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setObjectName("readOnlyShopItemCard")
+        self.setMinimumHeight(138)
+        self.setStyleSheet(
+            "QFrame#readOnlyShopItemCard { background: rgba(255,255,255,0.035); "
+            "border: 1px solid rgba(100,155,255,0.38); border-radius: 10px; }"
+        )
+        root = QHBoxLayout(self)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(13)
+
+        icon = QLabel(self)
+        icon.setFixedSize(72, 72)
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if item.icon:
+            icon.setPixmap(_pixmap(item.icon, 68, 68))
+        root.addWidget(icon)
+
+        details = QVBoxLayout()
+        name = QLabel(item.name, self)
+        name.setStyleSheet("font-size: 15px; font-weight: 650;")
+        limit = QLabel(item.observed_limit, self)
+        limit.setStyleSheet("color: #a3a3a3; font-size: 12px;")
+        cost_text = " + ".join(
+            f"{cost.amount:,} {currencies[cost.currency].name}"
+            for cost in item.costs
+        )
+        costs = QLabel(cost_text, self)
+        costs.setWordWrap(True)
+        costs.setStyleSheet("color: #79b7ff; font-size: 13px; font-weight: 600;")
+        evidence = QLabel("历史实机只读证据 · 自动兑换未启用", self)
+        evidence.setStyleSheet("color: #76c893; font-size: 12px;")
+        details.addWidget(name)
+        details.addWidget(limit)
+        details.addWidget(costs)
+        details.addWidget(evidence)
+        root.addLayout(details, 1)
+
 class ShopPlannerInterface(ScrollArea):
     """Configure recurring shop purchases without hard-coding future shops."""
 
@@ -483,6 +532,25 @@ class ShopPlannerInterface(ScrollArea):
             )
 
         if not shop.automation_supported:
+            if shop.read_only_catalog:
+                read_only = load_read_only_shop_catalog(
+                    shop.read_only_catalog,
+                    self.catalog.currencies,
+                )
+                self.shopDescription.setText(
+                    f"{shop.description} 只读目录 {len(read_only.items)} 项，"
+                    f"证据日期 {read_only.observed_at}。"
+                )
+                for index, item in enumerate(read_only.items):
+                    card = ReadOnlyShopItemCard(
+                        item,
+                        self.catalog.currencies,
+                        self.productWidget,
+                    )
+                    self.productGrid.addWidget(card, index // 2, index % 2)
+                self.productGrid.setColumnStretch(0, 1)
+                self.productGrid.setColumnStretch(1, 1)
+                return
             placeholder = QLabel(
                 "该店铺已经进入统一目录与 GUI 框架。完成实机完整滚动采集、OCR 字段校验和"
                 "专用购买适配器后，商品会直接出现在这里。",

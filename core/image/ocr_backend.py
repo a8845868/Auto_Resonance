@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import os
 import threading
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Tuple, Union
+from typing import Any, Tuple, Union
 
 import cv2 as cv
 from loguru import logger
@@ -187,4 +188,183 @@ class OnnxPpocrV4Backend(OcrBackend):
                     f"ocr_model_initialization_failed: "
                     f"{type(exc).__name__}: {exc}"
                 ) from exc
+        return self._model
+
+
+# ---------------------------------------------------------------------------
+# PP-OCRv6 Medium (optional PaddleOCR backend)
+# ---------------------------------------------------------------------------
+
+
+def _paddle_result_payload(result: object) -> dict[str, Any]:
+    """Return the documented PaddleOCR result payload as a plain mapping."""
+
+    value = getattr(result, "json", result)
+    if callable(value):
+        value = value()
+    if not isinstance(value, dict):
+        return {}
+    nested = value.get("res")
+    return nested if isinstance(nested, dict) else value
+
+
+def _paddle_ocr_result_to_dict(
+    results: object,
+    cropped_pos1: Tuple[int, int],
+) -> list[dict]:
+    """Convert PaddleOCR 3.x Result objects to the repository OCR contract."""
+
+    if results is None:
+        return []
+    if isinstance(results, Iterable) and not isinstance(
+        results, (dict, str, bytes)
+    ) and not hasattr(results, "json"):
+        results = list(results)
+    if not isinstance(results, (list, tuple)):
+        results = [results]
+    converted: list[dict] = []
+    offset_x, offset_y = cropped_pos1
+    for result in results:
+        payload = _paddle_result_payload(result)
+        texts = payload.get("rec_texts")
+        scores = payload.get("rec_scores")
+        polygons = payload.get("rec_polys")
+        if polygons is None:
+            polygons = payload.get("dt_polys")
+        texts = [] if texts is None else texts
+        scores = [] if scores is None else scores
+        polygons = [] if polygons is None else polygons
+        for text, score, polygon in zip(texts, scores, polygons):
+            try:
+                points = [
+                    [float(point[0]) + offset_x, float(point[1]) + offset_y]
+                    for point in polygon
+                ]
+            except (TypeError, ValueError, IndexError):
+                continue
+            if len(points) < 4:
+                continue
+            converted.append({
+                "text": str(text),
+                "score": float(score),
+                "position": points[:4],
+            })
+    return converted
+
+
+class PaddlePpocrV6Backend(OcrBackend):
+    """PP-OCRv6 Medium through the optional PaddleOCR 3.x runtime."""
+
+    def __init__(self, *, provider: str = "auto") -> None:
+        self._requested_provider = provider
+        self._model = None
+        self._model_provider: str | None = None
+        self._model_lock = threading.Lock()
+
+    @property
+    def name(self) -> str:
+        return "ppocr-v6-medium"
+
+    @property
+    def provider(self) -> str:
+        if self._model_provider is not None:
+            return self._model_provider
+        return self._select_provider(
+            self._requested_provider,
+            self._cuda_available(),
+        )
+
+    def predict(
+        self,
+        image: Union[str, Path, cv.typing.MatLike],
+        cropped_pos1: Tuple[int, int] = (0, 0),
+        cropped_pos2: Tuple[int, int] = (0, 0),
+        no_crop: bool = False,
+    ) -> list[dict]:
+        if isinstance(image, Path):
+            image = str(image)
+        if isinstance(image, str):
+            image = cv.imread(image)
+        if image is None:
+            raise ValueError("ocr_image_unreadable")
+        if (cropped_pos1 != (0, 0) or cropped_pos2 != (0, 0)) and not no_crop:
+            image = crop_image(image, cropped_pos1, cropped_pos2)
+        raw = self._get_model().predict(image)
+        return _paddle_ocr_result_to_dict(raw, cropped_pos1)
+
+    @staticmethod
+    def _select_provider(requested: str, cuda_available: bool) -> str:
+        normalized = requested.strip().lower()
+        if normalized not in {"auto", "cpu", "cuda"}:
+            raise ValueError("ocr_provider_invalid")
+        if normalized == "cpu":
+            return "cpu"
+        if normalized == "cuda" and not cuda_available:
+            logger.warning(
+                "AUTO_RESONANCE_OCR_PROVIDER=cuda requested but the "
+                "Paddle runtime has no CUDA support; falling back to CPU"
+            )
+            return "cpu"
+        return "cuda" if cuda_available else "cpu"
+
+    @staticmethod
+    def _cuda_available() -> bool:
+        try:
+            import paddle
+
+            detector = getattr(paddle, "is_compiled_with_cuda", None)
+            if callable(detector):
+                return bool(detector())
+            device = getattr(paddle, "device", None)
+            detector = getattr(device, "is_compiled_with_cuda", None)
+            return bool(detector()) if callable(detector) else False
+        except ImportError as exc:
+            raise RuntimeError(
+                "ppocr_v6_runtime_missing: install the project optional "
+                "dependency with `pip install -e .[ocr-v6-cpu]`, or install "
+                "the official Paddle GPU inference engine before selecting "
+                "PP-OCRv6"
+            ) from exc
+
+    @staticmethod
+    def _create_ocr_model(*, provider: str):
+        try:
+            from paddleocr import PaddleOCR
+        except ImportError as exc:
+            raise RuntimeError(
+                "ppocr_v6_runtime_missing: install the project optional "
+                "dependency with `pip install -e .[ocr-v6-cpu]`"
+            ) from exc
+        return PaddleOCR(
+            ocr_version="PP-OCRv6",
+            text_detection_model_name="PP-OCRv6_medium_det",
+            text_recognition_model_name="PP-OCRv6_medium_rec",
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            device="gpu:0" if provider == "cuda" else "cpu",
+        )
+
+    def _get_model(self):
+        if self._model is not None:
+            return self._model
+        with self._model_lock:
+            if self._model is not None:
+                return self._model
+            try:
+                provider = self._select_provider(
+                    self._requested_provider,
+                    self._cuda_available(),
+                )
+                model = self._create_ocr_model(provider=provider)
+            except Exception as exc:
+                raise RuntimeError(
+                    "ocr_model_initialization_failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            self._model = model
+            self._model_provider = provider
+            logger.info(
+                f"OCR model initialized: {self.name} provider={provider}"
+            )
         return self._model

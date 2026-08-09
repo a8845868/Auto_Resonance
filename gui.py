@@ -13,8 +13,9 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 from qfluentwidgets import FluentTranslator
 
-from app.common.config import cfg
+from app.common.config import apply_ocr_runtime_environment, cfg
 
+apply_ocr_runtime_environment(cfg)
 cfg.save()  # 生成配置文件
 from app.view.main_window import MainWindow
 from core.control.control import kill

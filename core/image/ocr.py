@@ -41,11 +41,24 @@ def _get_backend():
     with _backend_lock:
         if _backend is not None:
             return _backend
-        from core.image.ocr_backend import OnnxPpocrV4Backend
+        from core.image.ocr_backend import (
+            OnnxPpocrV4Backend,
+            PaddlePpocrV6Backend,
+        )
 
         try:
             provider = os.getenv("AUTO_RESONANCE_OCR_PROVIDER", "auto")
-            _backend = OnnxPpocrV4Backend(provider=provider)
+            backend_name = os.getenv(
+                "AUTO_RESONANCE_OCR_BACKEND", "ppocr-v4"
+            ).strip().lower()
+            factories = {
+                "ppocr-v4": OnnxPpocrV4Backend,
+                "ppocr-v6-medium": PaddlePpocrV6Backend,
+            }
+            factory = factories.get(backend_name)
+            if factory is None:
+                raise ValueError(f"ocr_backend_invalid:{backend_name}")
+            _backend = factory(provider=provider)
             logger.info(
                 f"OCR backend initialised: {_backend.name} "
                 f"provider={_backend.provider}"

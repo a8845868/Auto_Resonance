@@ -12,6 +12,14 @@
     "birch_stone": {
       "name": "桦石",
       "icon": "resources/currency/桦石.png"
+    },
+    "fu_ming": {
+      "name": "赴命奖章",
+      "icon": "resources/currency/赴命奖章.png"
+    },
+    "jue_ming": {
+      "name": "绝命奖章",
+      "icon": "resources/currency/绝命奖章.png"
     }
   },
   "shops": [
@@ -243,7 +251,8 @@
       "short_name": "赴命商店",
       "adapter": "bureau_exchange",
       "automation_supported": false,
-      "description": "已完成 6 个有效滚动位置的实机与 OCR 采集。兑换配方为多材料结构，待独立适配器接入。",
+      "read_only_catalog": "resources/shop/bureau_exchange_observed.json",
+      "description": "已完成 6 个有效滚动位置及稳定底部帧的实机/OCR 采集。当前仅展示多材料兑换事实，不开放自动兑换。",
       "accent": "#3989ff",
       "items": []
     },

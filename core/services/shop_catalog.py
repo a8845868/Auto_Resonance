@@ -120,6 +120,120 @@ class ShopItem:
                 return cumulative
         return None
 
+
+@dataclass(frozen=True)
+class ReadOnlyShopCost:
+    currency: str
+    amount: int
+
+
+@dataclass(frozen=True)
+class ReadOnlyShopItem:
+    id: str
+    name: str
+    observed_limit: str
+    costs: tuple[ReadOnlyShopCost, ...]
+    icon: str
+    source_frames: tuple[str, ...]
+    ocr_aliases: tuple[str, ...]
+    evidence_cost_texts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ReadOnlyShopCatalog:
+    shop_id: str
+    observed_at: str
+    evidence_status: str
+    items: tuple[ReadOnlyShopItem, ...]
+
+
+def load_read_only_shop_catalog(
+    relative_path: str,
+    currencies: dict[str, CurrencyDefinition],
+) -> ReadOnlyShopCatalog:
+    """Load a non-executable catalog backed by historical OCR evidence."""
+
+    path = ROOT / relative_path
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    items: list[ReadOnlyShopItem] = []
+    seen: set[str] = set()
+    for value in raw.get("items", []):
+        item_id = str(value["id"])
+        if item_id in seen:
+            raise ValueError(f"重复的只读商店商品 ID: {item_id}")
+        seen.add(item_id)
+        costs = tuple(
+            ReadOnlyShopCost(
+                currency=str(cost["currency"]),
+                amount=max(1, int(cost["amount"])),
+            )
+            for cost in value.get("costs", [])
+        )
+        if not costs:
+            raise ValueError(f"只读商店商品缺少成本证据: {item_id}")
+        unknown = [cost.currency for cost in costs if cost.currency not in currencies]
+        if unknown:
+            raise ValueError(f"只读商店商品使用未知货币: {item_id}:{unknown[0]}")
+        source_frames = tuple(str(entry) for entry in value.get("source_frames", []))
+        aliases = tuple(str(entry) for entry in value.get("ocr_aliases", []))
+        if not source_frames or not aliases:
+            raise ValueError(f"只读商店商品缺少来源绑定: {item_id}")
+        items.append(ReadOnlyShopItem(
+            id=item_id,
+            name=str(value["name"]),
+            observed_limit=str(value.get("observed_limit", "未稳定识别")),
+            costs=costs,
+            icon=str(value.get("icon", "")),
+            source_frames=source_frames,
+            ocr_aliases=aliases,
+            evidence_cost_texts=tuple(
+                str(entry) for entry in value.get("evidence_cost_texts", [])
+            ),
+        ))
+    return ReadOnlyShopCatalog(
+        shop_id=str(raw["shop_id"]),
+        observed_at=str(raw["observed_at"]),
+        evidence_status=str(raw.get("evidence_status", "historical_observation")),
+        items=tuple(items),
+    )
+
+
+def audit_read_only_shop_catalog_evidence(
+    catalog: ReadOnlyShopCatalog,
+) -> dict[str, Any]:
+    """Replay source OCR JSON without performing capture or input."""
+
+    failures: list[dict[str, str]] = []
+    for item in catalog.items:
+        matched = False
+        for relative_frame in item.source_frames:
+            ocr_path = ROOT / relative_frame
+            try:
+                data = json.loads(ocr_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            texts = tuple(str(entry.get("text", "")) for entry in data)
+            alias_ok = any(
+                alias and any(alias in text for text in texts)
+                for alias in item.ocr_aliases
+            )
+            costs_ok = all(
+                any(expected in text for text in texts)
+                for expected in item.evidence_cost_texts
+            )
+            if alias_ok and costs_ok:
+                matched = True
+                break
+        if not matched:
+            failures.append({"id": item.id, "reason": "source_ocr_mismatch"})
+    return {
+        "shop_id": catalog.shop_id,
+        "expected_items": len(catalog.items),
+        "matched_items": len(catalog.items) - len(failures),
+        "failures": failures,
+        "result": "PASS" if not failures else "FAIL",
+    }
+
 @dataclass(frozen=True)
 class ShopDefinition:
     id: str
@@ -130,6 +244,7 @@ class ShopDefinition:
     description: str
     accent: str
     items: tuple[ShopItem, ...]
+    read_only_catalog: str = ""
 
 
 @dataclass(frozen=True)
@@ -275,6 +390,7 @@ def load_shop_catalog(path: Path = CATALOG_PATH) -> ShopCatalog:
                 description=str(value.get("description", "")),
                 accent=str(value.get("accent", "#d5a04d")),
                 items=tuple(items),
+                read_only_catalog=str(value.get("read_only_catalog", "")),
             )
         )
     return ShopCatalog(
