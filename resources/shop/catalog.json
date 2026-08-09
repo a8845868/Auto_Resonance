@@ -221,7 +221,10 @@
           "name": "拉普拉斯协议",
           "period": "monthly",
           "max_limit": 10,
-          "price": 500000,
+          "price": 100000,
+          "price_tiers": {
+            "10": 100000
+          },
           "currency": "iron_coin",
           "icon": "resources/shop/headquarters_black_moon/laplace_weekly.png"
         },

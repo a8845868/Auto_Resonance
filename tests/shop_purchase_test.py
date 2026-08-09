@@ -1277,3 +1277,114 @@ def test_ambiguous_monthly_laplace_matches_when_price_is_visible(monkeypatch):
 
     assert located is not None
     assert located.item.id == "laplace_monthly_iron"
+
+
+def _stub_roi_predict(monkeypatch, return_texts):
+    """Replace core.image.ocr.predict with a deterministic stub.
+
+    The stub also records the image that was passed so callers can assert
+    it is non-empty and distinct from the original full-frame page image.
+    """
+    recorded = []
+
+    def stub(image, cropped_pos1=(0, 0)):
+        recorded.append((image.shape if hasattr(image, "shape") else None))
+        return [
+            {"text": t, "score": 0.99, "position": [[0, 0], [10, 0], [10, 10], [0, 10]]}
+            for t in return_texts
+        ]
+
+    monkeypatch.setattr("core.image.ocr.predict", stub)
+    return recorded
+
+
+def test_card_price_roi_verify_overrides_general_ocr_misread(monkeypatch):
+    """When v4 general OCR reads 5,000,000 as 15,000,000, ROI re-read fixes it."""
+    from auto.shop_purchase import _card_price_roi_verify
+
+    catalog = load_shop_catalog()
+    target = catalog.item("source_string_monthly_iron")
+    target_price = target.price  # 5,000,000
+    match_center_y = 340
+    x1, x2 = 580, 915
+    # General OCR sees the wrong price: 15000000
+    general_ocr = [
+        _ocr("本源之弦", 782, 328, 150),
+        _ocr("每月限购 4/4", 785, 352, 150),
+        _ocr("15000000", 785, 376, 120),
+    ]
+    result_no_image = locate_product(general_ocr, target)
+    assert result_no_image is None  # rejected by general OCR
+
+    # Build page image with the correct price "5000000" rendered in the
+    # card's price region so the ROI fallback can recover it.
+    import cv2 as cv
+    matrix = np.zeros((720, 1280, 3), dtype=np.uint8)
+    cv.putText(
+        matrix, "5000000", (x1 + 50, int(match_center_y) + 55),
+        cv.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1,
+    )
+    class _FakePage:
+        image = matrix
+
+    recorded = _stub_roi_predict(monkeypatch, ["5000000"])
+    assert _card_price_roi_verify(
+        _FakePage(), x1, x2, match_center_y, target_price,
+    ) is True
+    # Image passed to predict must be the 4×-scaled, CLAHE-enhanced crop,
+    # not the original full-frame page image.
+    assert len(recorded) == 1
+    assert recorded[0][0] != matrix.shape
+    assert recorded[0][0] is not None
+
+    # Now locate_product with page_image should succeed.
+    recorded2 = _stub_roi_predict(monkeypatch, ["5000000"])
+    result_with_image = locate_product(
+        general_ocr, target, page_image=_FakePage(),
+    )
+    assert result_with_image is not None
+    assert result_with_image.item.id == "source_string_monthly_iron"
+    assert len(recorded2) == 1
+
+
+def test_card_price_roi_verify_rejects_when_price_is_genuinely_wrong(monkeypatch):
+    from auto.shop_purchase import _card_price_roi_verify
+
+    catalog = load_shop_catalog()
+    target = catalog.item("source_string_monthly_iron")
+    x1, x2 = 580, 915
+    match_center_y = 340
+
+    import cv2 as cv
+    matrix = np.zeros((720, 1280, 3), dtype=np.uint8)
+    # Render the wrong price: 15000000
+    cv.putText(
+        matrix, "15000000", (x1 + 50, int(match_center_y) + 55),
+        cv.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1,
+    )
+    class _FakePage:
+        image = matrix
+
+    recorded = _stub_roi_predict(monkeypatch, ["15000000"])
+    assert _card_price_roi_verify(
+        _FakePage(), x1, x2, match_center_y, target.price,
+    ) is False
+    assert len(recorded) == 1
+    assert recorded[0][0] is not None
+
+
+def test_laplace_monthly_iron_has_corrected_price_and_tier_probe_enabled():
+    catalog = load_shop_catalog()
+    item = catalog.item("laplace_monthly_iron")
+
+    assert item.price == 100000
+    assert item.price_tiers
+    assert item.price_for_remaining(10) == 100000
+    assert item.price_for_remaining(9) is None  # unproven tier → fail-closed
+    breakdown = item.price_breakdown()
+    assert len(breakdown) == 10
+    assert breakdown[0] == (1, 10, 100000, 100000)  # sole proven tier
+    assert breakdown[1] == (2, 9, None, None)        # everything after is unknown
+    assert item.cumulative_cost_for_target(1) == 100000
+    assert item.cumulative_cost_for_target(2) is None
+    assert bool(item.price_tiers) is True

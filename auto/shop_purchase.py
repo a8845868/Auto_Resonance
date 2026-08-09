@@ -406,7 +406,64 @@ def _ambiguous_sibling_ids() -> frozenset[str]:
     )
 
 
-def locate_product(ocr_items: Iterable[dict], target: ShopItem) -> LocatedProduct | None:
+def _card_price_roi_verify(
+    page_image,
+    x1: int,
+    x2: int,
+    match_center_y: float,
+    expected_price: int,
+) -> bool:
+    """Crop, upscale and OCR the card's price region for a second opinion.
+
+    General OCR can misread large prices (e.g. 5,000,000 → 15,000,000) when
+    the digit string is long or adjacent to visual noise.  This function
+    isolates the price band of a single card column, upscales 4×, applies
+    CLAHE contrast enhancement, and returns True when *expected_price* is
+    found in the enhanced crop.
+    """
+    matrix = page_image.image if hasattr(page_image, "image") else page_image
+    height, width = matrix.shape[:2]
+    # The list-card price sits below the name/limit row, roughly 30-70 px
+    # below the matched name centre, within the column bounds.
+    roi_x1 = max(0, x1 + 30)
+    roi_y1 = max(0, int(match_center_y) + 30)
+    roi_x2 = min(width, x2 - 10)
+    roi_y2 = min(height, int(match_center_y) + 70)
+    if roi_x2 <= roi_x1 or roi_y2 <= roi_y1:
+        return False
+    roi = matrix[roi_y1:roi_y2, roi_x1:roi_x2]
+    if roi.size == 0:
+        return False
+    try:
+        upscaled = cv.resize(roi, None, fx=4, fy=4, interpolation=cv.INTER_CUBIC)
+        lab = cv.cvtColor(upscaled, cv.COLOR_BGR2LAB)
+        l_channel, a_channel, b_channel = cv.split(lab)
+        clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l_eq = clahe.apply(l_channel)
+        enhanced = cv.cvtColor(
+            cv.merge((l_eq, a_channel, b_channel)), cv.COLOR_LAB2BGR,
+        )
+    except cv.error:
+        return False
+    from core.image.ocr import predict
+
+    try:
+        result = predict(enhanced, cropped_pos1=(0, 0))
+    except Exception:
+        return False
+    for item in result:
+        value = _numeric_value(item.get("text"))
+        if value is not None and value == expected_price:
+            return True
+    return False
+
+
+def locate_product(
+    ocr_items: Iterable[dict],
+    target: ShopItem,
+    *,
+    page_image=None,
+) -> LocatedProduct | None:
     """Locate one catalog product and disambiguate duplicate names by its card."""
     data = list(ocr_items)
     expected_name = _normalize_text(target.name)
@@ -459,7 +516,17 @@ def locate_product(ocr_items: Iterable[dict], target: ShopItem) -> LocatedProduc
         # conflicting observed price, but allow a missing one: the quantity
         # dialog performs the authoritative price check before confirmation.
         if numeric_values and expected_price not in numeric_values:
-            continue
+            # General OCR may misread a large price (e.g. 5,000,000 →
+            # 15,000,000).  When a page image is available, try targeted
+            # ROI OCR on the card's price band before rejecting.
+            verified = (
+                page_image is not None
+                and _card_price_roi_verify(
+                    page_image, x1, x2, center_y, expected_price,
+                )
+            )
+            if not verified:
+                continue
         # When another catalog item shares the same name, period and
         # max_limit but differs in price or currency, a missing card price
         # makes disambiguation impossible.  Refuse to match — let the
@@ -1242,7 +1309,9 @@ class HeadquartersBlackMoonAdapter:
                 stable = stable + 1 if difference <= 4.0 else 0
                 logger.debug(f"商店第 {page_index} 页差异: {difference:.3f}")
             for item_id, purchase in list(pending.items()):
-                located = locate_product(page_ocr, purchase.item)
+                located = locate_product(
+                    page_ocr, purchase.item, page_image=page_image,
+                )
                 if not located:
                     continue
                 if located.remaining <= 0:
