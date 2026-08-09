@@ -1,4 +1,5 @@
 import ctypes
+from pathlib import Path
 from types import SimpleNamespace
 
 import cv2 as cv
@@ -7,6 +8,7 @@ import pytest
 
 import core.control.control as control_module
 from core.control.adb import ADB
+from core.control.adb_port import EmulatorInfo, EmulatorType
 from core.control.nemu import NEMU
 from core.exception.exceptions import StopExecution
 from core.image.utils import match_template
@@ -131,6 +133,143 @@ def test_nemu_success_does_not_create_adb(monkeypatch):
     assert control_module.connect(16384) is True
     assert control_module.control is nemu
     assert events == ["nemu.init", "nemu.connect"]
+
+
+def _reusable_nemu_backend(device):
+    backend = object.__new__(NEMU)
+    backend.device = device
+    backend.path = r"C:\Program Files\NetEase\MuMu"
+    backend.connect_id = 42
+    # Zero is a valid display id and must not be treated as a missing value.
+    backend.display_id = 0
+    backend.session_generation = 9
+    backend.session_quarantined = False
+    backend.health_capture_return_code = 0
+    backend.health_capture_session_generation = 9
+    return backend
+
+
+@pytest.mark.parametrize(
+    "configured_path",
+    (
+        r"C:\Program Files\NetEase\MuMu",
+        r"C:\Program Files\NetEase\MuMu\nx_main",
+        r"C:\Program Files\NetEase\MuMu\nx_main\MuMuManager.exe",
+    ),
+)
+def test_connect_reuses_same_healthy_nemu_session_without_reconnecting(
+    monkeypatch, configured_path
+):
+    device = EmulatorInfo(
+        name="instance-0",
+        port=16384,
+        path=configured_path,
+        type=EmulatorType.MUMUV5,
+        index=0,
+    )
+    backend = _reusable_nemu_backend(device)
+    constructor_calls = []
+    monkeypatch.setattr(control_module, "control", backend)
+    monkeypatch.setattr(control_module, "get_runtime_device", lambda: device)
+    monkeypatch.setattr(
+        control_module,
+        "resolve_mumu_launcher",
+        lambda _device: SimpleNamespace(
+            install_root=Path(r"C:\Program Files\NetEase\MuMu")
+        ),
+    )
+    monkeypatch.setattr(
+        control_module,
+        "NEMU",
+        lambda _device: constructor_calls.append(_device) or pytest.fail(
+            "healthy same-target NEMU session must not be reconstructed"
+        ),
+    )
+
+    assert control_module.connect(16384) is True
+    assert control_module.control is backend
+    assert constructor_calls == []
+    assert backend.session_generation == 9
+
+
+@pytest.mark.parametrize(
+    "mutated_field,mutated_value",
+    (
+        ("session_quarantined", True),
+        ("health_capture_return_code", 2),
+        ("health_capture_session_generation", 8),
+        ("connect_id", None),
+    ),
+)
+def test_connect_does_not_reuse_unhealthy_nemu_session(
+    monkeypatch, mutated_field, mutated_value
+):
+    device = EmulatorInfo(
+        name="instance-0",
+        port=16384,
+        path=r"C:\Program Files\NetEase\MuMu",
+        type=EmulatorType.MUMUV5,
+        index=0,
+    )
+    backend = _reusable_nemu_backend(device)
+    setattr(backend, mutated_field, mutated_value)
+    events = []
+    replacement = FakeBackend("replacement", events)
+    monkeypatch.setattr(control_module, "control", backend)
+    monkeypatch.setattr(control_module, "get_runtime_device", lambda: device)
+    monkeypatch.setattr(
+        control_module,
+        "resolve_mumu_launcher",
+        lambda _device: SimpleNamespace(
+            install_root=Path(r"C:\Program Files\NetEase\MuMu")
+        ),
+    )
+    monkeypatch.setattr(
+        control_module,
+        "NEMU",
+        lambda _device: events.append("nemu.init") or replacement,
+    )
+    monkeypatch.setattr(control_module, "ADB", lambda: pytest.fail("ADB fallback"))
+    monkeypatch.setattr(backend, "kill", lambda: events.append("previous.kill"))
+
+    assert control_module.connect(16384) is True
+    assert control_module.control is replacement
+    assert events == ["nemu.init", "replacement.connect", "previous.kill"]
+
+
+def test_connect_never_reuses_nemu_session_for_another_instance(monkeypatch):
+    active_device = EmulatorInfo(
+        name="instance-0",
+        port=16384,
+        path=r"C:\Program Files\NetEase\MuMu",
+        type=EmulatorType.MUMUV5,
+        index=0,
+    )
+    requested_device = EmulatorInfo(
+        name="instance-6",
+        port=16576,
+        path=r"C:\Program Files\NetEase\MuMu",
+        type=EmulatorType.MUMUV5,
+        index=6,
+    )
+    backend = _reusable_nemu_backend(active_device)
+    events = []
+    replacement = FakeBackend("replacement", events)
+    monkeypatch.setattr(control_module, "control", backend)
+    monkeypatch.setattr(
+        control_module, "get_runtime_device", lambda: requested_device
+    )
+    monkeypatch.setattr(
+        control_module,
+        "NEMU",
+        lambda _device: events.append("nemu.init") or replacement,
+    )
+    monkeypatch.setattr(control_module, "ADB", lambda: pytest.fail("ADB fallback"))
+    monkeypatch.setattr(backend, "kill", lambda: events.append("previous.kill"))
+
+    assert control_module.connect(16576) is True
+    assert control_module.control is replacement
+    assert events == ["nemu.init", "replacement.connect", "previous.kill"]
 
 
 def test_failed_adb_candidate_does_not_replace_current_backend(monkeypatch):

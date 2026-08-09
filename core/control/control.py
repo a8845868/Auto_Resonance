@@ -6,6 +6,7 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 """
 
 import hashlib
+import os
 import random
 import secrets
 import threading
@@ -20,7 +21,7 @@ import numpy as np
 from loguru import logger
 
 from core.control.adb import ADB
-from core.control.adb_port import EmulatorInfo, EmulatorType
+from core.control.adb_port import EmulatorInfo, EmulatorType, resolve_mumu_launcher
 from core.control.base_control import IADB
 from core.control.nemu import IPCUnavailableError, NEMU
 from core.control.nemu_capture import CaptureSessionRecoveryResult
@@ -36,6 +37,7 @@ STOP = False
 MAX_SWIPE_SEGMENTS = 100
 
 control: IADB = ADB()
+_NEMU_BACKEND_TYPE = NEMU
 _runtime_device: EmulatorInfo | None = None
 _runtime_auto_start_emulator: bool | None = None
 _BACKEND_LOCK = threading.RLock()
@@ -429,6 +431,60 @@ def _known_nemu_unavailable(error: BaseException) -> bool:
     )
 
 
+def _active_nemu_session_reusable(device: EmulatorInfo) -> bool:
+    """Return whether the current NEMU session already owns this exact target.
+
+    The vendor IPC DLL is loaded once per process. Reopening the same target and
+    then disconnecting the previous backend creates avoidable cross-session
+    teardown after the new session's health capture. Reuse removes that churn
+    without assigning an undocumented meaning to native capture return codes.
+    It is limited to a structurally live session whose original health capture
+    belongs to the current generation and whose target identity still matches.
+    """
+
+    backend = control
+    if not isinstance(backend, _NEMU_BACKEND_TYPE):
+        return False
+    if bool(getattr(backend, "session_quarantined", False)):
+        return False
+    generation = int(getattr(backend, "session_generation", 0) or 0)
+    if generation <= 0 or int(getattr(backend, "connect_id", 0) or 0) <= 0:
+        return False
+    display_id = getattr(backend, "display_id", None)
+    if display_id is None or int(display_id) < 0:
+        return False
+    if getattr(backend, "health_capture_return_code", None) != 0:
+        return False
+    if (
+        int(getattr(backend, "health_capture_session_generation", 0) or 0)
+        != generation
+    ):
+        return False
+    backend_device = getattr(backend, "device", None)
+    if backend_device is None:
+        return False
+    try:
+        same_instance = int(getattr(backend_device, "index", -1)) == int(
+            getattr(device, "index", -2)
+        )
+    except (TypeError, ValueError):
+        return False
+    if not same_instance:
+        return False
+    if getattr(backend_device, "type", None) != getattr(device, "type", None):
+        return False
+    try:
+        requested_root = resolve_mumu_launcher(device).install_root
+    except Exception:
+        return False
+    active_root = str(getattr(backend, "path", "") or "")
+    if not active_root:
+        return False
+    return os.path.normcase(os.path.abspath(active_root)) == os.path.normcase(
+        os.path.abspath(os.fspath(requested_root))
+    )
+
+
 def connect(adb_port: Optional[int] = None):
     """
     连接ADB
@@ -439,6 +495,13 @@ def connect(adb_port: Optional[int] = None):
     global control
     device = get_runtime_device()
     if device.is_mumu:
+        with _BACKEND_LOCK:
+            if _active_nemu_session_reusable(device):
+                logger.info(
+                    "Reuse existing NEMU IPC session: "
+                    f"instance={device.index} generation={control.session_generation}"
+                )
+                return True
         nemu_candidate = None
         try:
             nemu_candidate = NEMU(device)
