@@ -333,17 +333,24 @@ class PaddlePpocrV6Backend(OcrBackend):
         except ImportError as exc:
             raise RuntimeError(
                 "ppocr_v6_runtime_missing: install the project optional "
-                "dependency with `pip install -e .[ocr-v6-cpu]`"
+                "dependency with `pip install -e .[ocr-v6-cpu]` (or "
+                "`pip install -e .[ocr-v6-gpu]` for CUDA)"
             ) from exc
-        return PaddleOCR(
-            ocr_version="PP-OCRv6",
-            text_detection_model_name="PP-OCRv6_medium_det",
-            text_recognition_model_name="PP-OCRv6_medium_rec",
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            device="gpu:0" if provider == "cuda" else "cpu",
-        )
+        kwargs = {
+            "ocr_version": "PP-OCRv6",
+            "text_detection_model_name": "PP-OCRv6_medium_det",
+            "text_recognition_model_name": "PP-OCRv6_medium_rec",
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+            "use_textline_orientation": False,
+            "device": "gpu:0" if provider == "cuda" else "cpu",
+        }
+        if provider != "cuda":
+            # The oneDNN backend in paddlepaddle 3.x CPU cannot convert the
+            # PIR ArrayAttribute<Double> used by PP-OCRv6 detection models.
+            # paddlepaddle-gpu already skips oneDNN in GPU mode.
+            kwargs["enable_mkldnn"] = False
+        return PaddleOCR(**kwargs)
 
     def _get_model(self):
         if self._model is not None:

@@ -25,9 +25,17 @@ readme = "README.md"
 license = {text = "MIT"}
 
 [project.optional-dependencies]
+# PP-OCRv6 CPU-only.  ~10 s/frame on typical office hardware; acceptable
+# for offline analysis but impractical for interactive dry-run scans.
 ocr-v6-cpu = [
     "paddleocr>=3.5,<4",
     "paddlepaddle>=3.2,<4",
+]
+# PP-OCRv6 GPU.  paddlepaddle-gpu already supports CPU fallback via
+# ``device="cpu"``, so this single package works for both providers.
+ocr-v6-gpu = [
+    "paddleocr>=3.5,<4",
+    "paddlepaddle-gpu>=3.2,<4",
 ]
 
 [build-system]
