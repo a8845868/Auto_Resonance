@@ -443,6 +443,14 @@ DEFAULT_POLICY_SPECS = {
         postcondition="shop_catalog_remains_safe",
         allowed_post_page_types=frozenset({"shop"}),
     ),
+    "shop_quantity_increment": ReadOnlyPolicySpec(
+        "shop_quantity_increment",
+        frozenset({"shop_quantity_dialog"}),
+        "shop_quantity_increment_button",
+        allowed_region=(790, 350, 850, 410),
+        postcondition="shop_quantity_dialog_remains_safe",
+        allowed_post_page_types=frozenset({"shop_quantity_dialog"}),
+    ),
 }
 
 # Production sessions always use this immutable, versioned snapshot. Test

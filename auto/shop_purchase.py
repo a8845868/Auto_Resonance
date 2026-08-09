@@ -69,9 +69,11 @@ PRODUCT_REWIND_START = PRODUCT_SCROLL_END
 PRODUCT_REWIND_END = PRODUCT_SCROLL_START
 DIALOG_CANCEL_POS = (320, 535)
 DIALOG_CONFIRM_POS = (960, 535)
+DIALOG_PLUS_POS = (818, 380)
 DIALOG_MAX_POS = (892, 380)
 BATCH_TOGGLE_POS = (1230, 117)
 MAX_SCAN_PAGES = 30
+MAX_QUANTITY_PROBE_INCREMENTS = 10
 
 
 def _shop_swipe_observation(action_key: str) -> PageObservation:
@@ -687,6 +689,7 @@ class HeadquartersBlackMoonAdapter:
         self,
         located: LocatedProduct,
         quantity_mode: str,
+        price_observations: list[dict] | None = None,
     ) -> tuple[int, int]:
         input_tap(located.center)
         time.sleep(0.9)
@@ -716,7 +719,79 @@ class HeadquartersBlackMoonAdapter:
                 self._cancel_dialog(f"cancel-quantity-{located.item.id}")
                 raise BlockedBySafetyError(f"未识别数量控件: {located.item.name}")
             quantity = (1, 1)
-        if quantity_mode == "max" and quantity[0] != quantity[1]:
+        if price_observations is not None:
+            if quantity[1] - quantity[0] > MAX_QUANTITY_PROBE_INCREMENTS:
+                self._cancel_dialog(f"cancel-probe-limit-{located.item.id}")
+                raise BlockedBySafetyError(
+                    f"商品数量只读探测超过 {MAX_QUANTITY_PROBE_INCREMENTS} 次上限: "
+                    f"{located.item.name}"
+                )
+            price_observations.clear()
+            price_observations.append({
+                "quantity": quantity[0],
+                "marginal_cost": observed_total,
+                "cumulative_cost": observed_total,
+            })
+            previous_total = observed_total
+            previous_marginal = observed_total
+            while quantity[0] < quantity[1]:
+                requested_quantity = quantity[0] + 1
+                dispatched = input_tap(
+                    DIALOG_PLUS_POS,
+                    random_offset=False,
+                    intent=ActionIntent(
+                        "shop_quantity_increment",
+                        "shop_quantity_increment_button",
+                        f"{located.item.id}:{requested_quantity}",
+                    ),
+                )
+                if dispatched is False:
+                    self._cancel_dialog(f"cancel-probe-denied-{located.item.id}")
+                    raise BlockedBySafetyError(
+                        f"商品数量只读探测点击被拒绝: {located.item.name}"
+                    )
+                time.sleep(0.45)
+                dialog = screenshot()
+                dialog_ocr = dialog.ocr()
+                self.recorder.capture(
+                    f"dialog-probe-{located.item.id}-{requested_quantity}",
+                    dialog,
+                    dialog_ocr,
+                )
+                next_quantity = _dialog_quantity(dialog_ocr)
+                next_total = _dialog_price(dialog_ocr)
+                marginal = (
+                    next_total - previous_total
+                    if next_total is not None
+                    else None
+                )
+                if (
+                    not _has_complete_quantity_dialog(dialog.image, dialog_ocr)
+                    or not _dialog_has_item(dialog_ocr, located.item)
+                    or next_quantity != (requested_quantity, quantity[1])
+                    or next_total is None
+                    or marginal is None
+                    or marginal <= 0
+                    or marginal < previous_marginal
+                ):
+                    self._cancel_dialog(
+                        f"cancel-probe-mismatch-{located.item.id}-{requested_quantity}"
+                    )
+                    raise BlockedBySafetyError(
+                        f"商品数量只读探测结果不可信: {located.item.name}，"
+                        f"期望 {requested_quantity}/{quantity[1]} 且边际单调不减，"
+                        f"实机 {next_quantity}、累计 {next_total}、边际 {marginal}"
+                    )
+                price_observations.append({
+                    "quantity": requested_quantity,
+                    "marginal_cost": marginal,
+                    "cumulative_cost": next_total,
+                })
+                quantity = next_quantity
+                observed_total = next_total
+                previous_total = next_total
+                previous_marginal = marginal
+        elif quantity_mode == "max" and quantity[0] != quantity[1]:
             input_tap(DIALOG_MAX_POS)
             time.sleep(0.6)
             dialog = screenshot()
@@ -729,7 +804,11 @@ class HeadquartersBlackMoonAdapter:
                 raise BlockedBySafetyError(
                     f"未能安全识别上限模式实时总价: {located.item.name}"
                 )
-        expected = 1 if quantity_mode == "one" else located.remaining
+        expected = (
+            located.remaining
+            if price_observations is not None
+            else (1 if quantity_mode == "one" else located.remaining)
+        )
         if quantity[0] != expected:
             self._cancel_dialog(f"cancel-quantity-mismatch-{located.item.id}")
             raise BlockedBySafetyError(
@@ -744,7 +823,17 @@ class HeadquartersBlackMoonAdapter:
         quantity_mode: str,
         dry_run: bool,
     ) -> dict:
-        quantity, observed_total = self.inspect_dialog(located, quantity_mode)
+        price_observations: list[dict] | None = (
+            [] if dry_run and bool(located.item.price_tiers) else None
+        )
+        if price_observations is None:
+            quantity, observed_total = self.inspect_dialog(located, quantity_mode)
+        else:
+            quantity, observed_total = self.inspect_dialog(
+                located,
+                quantity_mode,
+                price_observations=price_observations,
+            )
         if dry_run:
             self._cancel_dialog(f"dry-run-cancel-{located.item.id}")
             return {
@@ -753,6 +842,7 @@ class HeadquartersBlackMoonAdapter:
                 "status": "validated",
                 "quantity": quantity,
                 "cost": observed_total,
+                "price_observations": price_observations or [],
                 "dry_run": True,
                 "final_action": "cancel",
             }

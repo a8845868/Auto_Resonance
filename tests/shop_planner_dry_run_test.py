@@ -186,3 +186,65 @@ def test_fixed_price_item_keeps_simple_quantity_options():
 
     assert shop_interface._price_breakdown_text(item, currency) == ""
     assert shop_interface._quantity_options(item, currency) == shop_interface.QUANTITY_OPTIONS
+
+
+def test_observed_price_breakdown_formats_live_marginal_and_cumulative_costs():
+    catalog = load_shop_catalog()
+    item = catalog.item("laplace_weekly_iron")
+    currency = catalog.currencies[item.currency]
+
+    text = shop_interface._observed_price_breakdown_text(
+        [
+            {"quantity": 1, "marginal_cost": 200000, "cumulative_cost": 200000},
+            {"quantity": 2, "marginal_cost": 200000, "cumulative_cost": 400000},
+        ],
+        currency,
+    )
+
+    assert text == (
+        "实机只读观察 · 1 件：边际 200,000，累计 200,000 铁盟币"
+        "  ·  2 件：边际 200,000，累计 400,000 铁盟币"
+    )
+
+
+def test_stepped_card_can_show_read_only_observed_price_schedule():
+    application = QApplication.instance() or QApplication([])
+    catalog = load_shop_catalog()
+    item = catalog.item("laplace_weekly_iron")
+    currency = catalog.currencies[item.currency]
+    card = shop_interface.ShopItemCard(
+        item,
+        currency,
+        {"enabled": False, "quantity": "one"},
+    )
+
+    card.setObservedPriceSchedule([
+        {"quantity": 1, "marginal_cost": 200000, "cumulative_cost": 200000},
+        {"quantity": 2, "marginal_cost": 200000, "cumulative_cost": 400000},
+    ])
+
+    assert card.observedPriceLabel.isVisible() is False  # parent is not shown
+    assert "2 件：边际 200,000，累计 400,000 铁盟币" in (
+        card.observedPriceLabel.text()
+    )
+    assert application is not None
+    card.deleteLater()
+
+
+def test_observed_schedule_survives_shop_card_rebuild_in_same_gui_session():
+    application = QApplication.instance() or QApplication([])
+    page = shop_interface.ShopPlannerInterface()
+    item_id = "laplace_weekly_iron"
+    observations = [
+        {"quantity": 1, "marginal_cost": 200000, "cumulative_cost": 200000},
+        {"quantity": 2, "marginal_cost": 200000, "cumulative_cost": 400000},
+    ]
+    page.observedPriceSchedules[item_id] = observations
+
+    page.showShop("headquarters_black_moon")
+
+    assert "2 件：边际 200,000，累计 400,000 铁盟币" in (
+        page.itemCards[item_id].observedPriceLabel.text()
+    )
+    assert application is not None
+    page.deleteLater()

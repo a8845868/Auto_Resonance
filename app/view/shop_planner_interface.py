@@ -73,6 +73,30 @@ def _price_breakdown_text(item: ShopItem, currency: CurrencyDefinition) -> str:
     return "  ·  ".join(rows)
 
 
+def _observed_price_breakdown_text(
+    observations: object,
+    currency: CurrencyDefinition,
+) -> str:
+    if not isinstance(observations, list) or not observations:
+        return ""
+    rows = []
+    for observation in observations:
+        if not isinstance(observation, dict):
+            return ""
+        try:
+            quantity = int(observation["quantity"])
+            marginal = int(observation["marginal_cost"])
+            cumulative = int(observation["cumulative_cost"])
+        except (KeyError, TypeError, ValueError):
+            return ""
+        if quantity < 1 or marginal <= 0 or cumulative <= 0:
+            return ""
+        rows.append(
+            f"{quantity} 件：边际 {marginal:,}，累计 {cumulative:,} {currency.name}"
+        )
+    return "实机只读观察 · " + "  ·  ".join(rows)
+
+
 def _run_shop_dry_run() -> dict:
     """Run the existing shop scanner without enabling purchase confirmation."""
 
@@ -152,7 +176,7 @@ class ShopItemCard(QFrame):
         self.currency = currency
         self.quantityOptions = _quantity_options(item, currency)
         self.setObjectName("shopItemCard")
-        self.setMinimumHeight(186 if item.price_tiers else 142)
+        self.setMinimumHeight(218 if item.price_tiers else 142)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         root = QHBoxLayout(self)
@@ -193,6 +217,15 @@ class ShopItemCard(QFrame):
             breakdown.setWordWrap(True)
             breakdown.setStyleSheet("color: #c7c7c7; font-size: 12px;")
             details.addWidget(breakdown)
+            self.observedPriceLabel = QLabel(self)
+            self.observedPriceLabel.setWordWrap(True)
+            self.observedPriceLabel.setStyleSheet(
+                "color: #7fd8a8; font-size: 12px; font-weight: 600;"
+            )
+            self.observedPriceLabel.hide()
+            details.addWidget(self.observedPriceLabel)
+        else:
+            self.observedPriceLabel = None
         details.addStretch(1)
         root.addLayout(details, 1)
 
@@ -245,6 +278,13 @@ class ShopItemCard(QFrame):
             "quantity": self.quantityOptions[index][0],
         }
 
+    def setObservedPriceSchedule(self, observations: object) -> None:
+        if self.observedPriceLabel is None:
+            return
+        text = _observed_price_breakdown_text(observations, self.currency)
+        self.observedPriceLabel.setText(text)
+        self.observedPriceLabel.setVisible(bool(text))
+
 
 class ShopPlannerInterface(ScrollArea):
     """Configure recurring shop purchases without hard-coding future shops."""
@@ -255,6 +295,7 @@ class ShopPlannerInterface(ScrollArea):
         self.plan = load_shop_plan(catalog=self.catalog)
         self.currentShopId = self.catalog.shops[0].id
         self.itemCards: dict[str, ShopItemCard] = {}
+        self.observedPriceSchedules: dict[str, list[dict]] = {}
         self.shopButtons: dict[str, QPushButton] = {}
         self.dryRunWorker: ShopDryRunWorker | None = None
 
@@ -441,6 +482,9 @@ class ShopPlannerInterface(ScrollArea):
                 self.productWidget,
             )
             card.changed.connect(self._plan_changed)
+            card.setObservedPriceSchedule(
+                self.observedPriceSchedules.get(item.id, [])
+            )
             self.itemCards[item.id] = card
             self.productGrid.addWidget(card, index // 2, index % 2)
         self.productGrid.setColumnStretch(0, 1)
@@ -489,6 +533,9 @@ class ShopPlannerInterface(ScrollArea):
     def startDryRun(self):
         if self.dryRunWorker and self.dryRunWorker.isRunning():
             return
+        self.observedPriceSchedules.clear()
+        for card in self.itemCards.values():
+            card.setObservedPriceSchedule([])
         self.dryRunButton.setEnabled(False)
         self.dryRunButton.setText("正在扫描商店…")
         self.dryRunStatus.setText(
@@ -501,6 +548,19 @@ class ShopPlannerInterface(ScrollArea):
         self.dryRunWorker.start()
 
     def _dryRunSucceeded(self, result: dict):
+        for shop_result in result.get("shops") or []:
+            if not isinstance(shop_result, dict):
+                continue
+            for item_result in shop_result.get("results") or []:
+                if not isinstance(item_result, dict):
+                    continue
+                card = self.itemCards.get(str(item_result.get("id") or ""))
+                item_id = str(item_result.get("id") or "")
+                observations = item_result.get("price_observations")
+                if isinstance(observations, list) and observations:
+                    self.observedPriceSchedules[item_id] = observations
+                if card is not None:
+                    card.setObservedPriceSchedule(observations)
         summary = _shop_dry_run_summary(result)
         self.dryRunStatus.setText(summary)
         info = InfoBar.warning if bool(result.get("requires_attention")) else InfoBar.success

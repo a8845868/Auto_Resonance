@@ -5,6 +5,7 @@ import auto.shop_purchase as shop_purchase
 from auto.shop_purchase import (
     DIALOG_CANCEL_POS,
     DIALOG_CONFIRM_POS,
+    DIALOG_PLUS_POS,
     HeadquartersBlackMoonAdapter,
     LocatedProduct,
     ShopEvidenceRecorder,
@@ -277,6 +278,173 @@ def test_dialog_price_uses_located_remaining_tier_for_weekly_laplace(monkeypatch
     assert quantity == 1
     assert observed_total == 200000
     assert taps == [located.center]
+
+
+def test_dry_run_quantity_probe_reads_each_increment_and_never_confirms(monkeypatch):
+    catalog = load_shop_catalog()
+    item = catalog.item("laplace_weekly_iron")
+    shop = catalog.shop(item.shop_id)
+    located = LocatedProduct(item, (1182, 203), 2, 3, ())
+
+    def dialog_ocr(quantity, total):
+        return [
+            _ocr(item.name, 580, 306, 121),
+            _ocr("最少", 365, 363),
+            _ocr("-1", 430, 355),
+            _ocr("+1", 760, 355),
+            _ocr("最多", 873, 367),
+            _ocr("售价", 536, 442),
+            _ocr(str(total), 647, 442, 74),
+            _ocr("取消", 324, 521),
+            _ocr("确定", 959, 523),
+            _ocr(f"{quantity}/2", 619, 353),
+        ]
+
+    matrix = np.zeros((720, 1280, 3), dtype=np.uint8)
+    matrix[372:382, 445:465] = 255
+    matrix[372:382, 817:837] = 255
+    frames = iter([
+        _FakeImage(matrix, dialog_ocr(1, 200000)),
+        _FakeImage(matrix, dialog_ocr(2, 400000)),
+    ])
+    taps = []
+    monkeypatch.setattr(shop_purchase, "screenshot", lambda: next(frames))
+    monkeypatch.setattr(
+        shop_purchase,
+        "input_tap",
+        lambda pos, **kwargs: taps.append((pos, kwargs)) or object(),
+    )
+    monkeypatch.setattr(shop_purchase.time, "sleep", lambda *_: None)
+    adapter = HeadquartersBlackMoonAdapter(shop, _FakeRecorder())
+    observations = []
+
+    quantity, observed_total = adapter.inspect_dialog(
+        located,
+        "one",
+        price_observations=observations,
+    )
+
+    assert quantity == 2
+    assert observed_total == 400000
+    assert observations == [
+        {"quantity": 1, "marginal_cost": 200000, "cumulative_cost": 200000},
+        {"quantity": 2, "marginal_cost": 200000, "cumulative_cost": 400000},
+    ]
+    assert taps[0] == (located.center, {})
+    assert taps[1][0] == DIALOG_PLUS_POS
+    assert taps[1][1]["random_offset"] is False
+    assert taps[1][1]["intent"].action_key == "shop_quantity_increment"
+    assert DIALOG_CONFIRM_POS not in [position for position, _kwargs in taps]
+
+
+def test_dry_run_quantity_probe_rejects_decreasing_marginal_cost(monkeypatch):
+    catalog = load_shop_catalog()
+    item = catalog.item("laplace_weekly_iron")
+    shop = catalog.shop(item.shop_id)
+    located = LocatedProduct(item, (1182, 203), 2, 3, ())
+
+    def dialog_ocr(quantity, total):
+        return [
+            _ocr(item.name, 580, 306, 121), _ocr("最少", 365, 363),
+            _ocr("-1", 430, 355), _ocr("+1", 760, 355),
+            _ocr("最多", 873, 367), _ocr("售价", 536, 442),
+            _ocr(str(total), 647, 442, 74), _ocr("取消", 324, 521),
+            _ocr("确定", 959, 523), _ocr(f"{quantity}/2", 619, 353),
+        ]
+
+    matrix = np.zeros((720, 1280, 3), dtype=np.uint8)
+    matrix[372:382, 445:465] = 255
+    matrix[372:382, 817:837] = 255
+    frames = iter([
+        _FakeImage(matrix, dialog_ocr(1, 200000)),
+        _FakeImage(matrix, dialog_ocr(2, 350000)),
+    ])
+    taps = []
+    monkeypatch.setattr(shop_purchase, "screenshot", lambda: next(frames))
+    monkeypatch.setattr(
+        shop_purchase,
+        "input_tap",
+        lambda pos, **kwargs: taps.append((pos, kwargs)) or object(),
+    )
+    monkeypatch.setattr(shop_purchase.time, "sleep", lambda *_: None)
+    adapter = HeadquartersBlackMoonAdapter(shop, _FakeRecorder())
+
+    with pytest.raises(RuntimeError, match="边际单调不减"):
+        adapter.inspect_dialog(located, "one", price_observations=[])
+
+    assert DIALOG_CANCEL_POS in [position for position, _kwargs in taps]
+    assert DIALOG_CONFIRM_POS not in [position for position, _kwargs in taps]
+
+
+def test_shop_quantity_increment_spec_is_narrow_and_read_only():
+    spec = DEFAULT_POLICY_SPECS["shop_quantity_increment"]
+
+    assert spec.allowed_page_types == frozenset({"shop_quantity_dialog"})
+    assert spec.anchor_id == "shop_quantity_increment_button"
+    assert spec.allowed_region == (790, 350, 850, 410)
+    assert spec.allowed_post_page_types == frozenset({"shop_quantity_dialog"})
+
+
+def test_tiered_dry_run_returns_observed_schedule_and_cancels(monkeypatch):
+    catalog = load_shop_catalog()
+    item = catalog.item("laplace_weekly_iron")
+    shop = catalog.shop(item.shop_id)
+    located = LocatedProduct(item, (1182, 203), 2, 3, ())
+    adapter = HeadquartersBlackMoonAdapter(shop, _FakeRecorder())
+    calls = []
+
+    def inspect(_located, _mode, *, price_observations):
+        calls.append("inspect")
+        price_observations.extend([
+            {"quantity": 1, "marginal_cost": 200000, "cumulative_cost": 200000},
+            {"quantity": 2, "marginal_cost": 200000, "cumulative_cost": 400000},
+        ])
+        return 2, 400000
+
+    monkeypatch.setattr(adapter, "inspect_dialog", inspect)
+    monkeypatch.setattr(
+        adapter,
+        "_cancel_dialog",
+        lambda label: calls.append(("cancel", label)),
+    )
+
+    result = adapter.purchase(located, "one", dry_run=True)
+
+    assert result["status"] == "validated"
+    assert result["quantity"] == 2
+    assert result["cost"] == 400000
+    assert result["price_observations"][-1] == {
+        "quantity": 2,
+        "marginal_cost": 200000,
+        "cumulative_cost": 400000,
+    }
+    assert calls == ["inspect", ("cancel", f"dry-run-cancel-{item.id}")]
+
+
+def test_tiered_real_purchase_does_not_enable_quantity_probe(monkeypatch):
+    catalog = load_shop_catalog()
+    item = catalog.item("laplace_weekly_iron")
+    shop = catalog.shop(item.shop_id)
+    located = LocatedProduct(item, (1182, 203), 2, 3, ())
+    adapter = HeadquartersBlackMoonAdapter(shop, _FakeRecorder())
+    inspect_kwargs = []
+
+    def inspect(*_args, **kwargs):
+        inspect_kwargs.append(kwargs)
+        return 1, 200000
+
+    monkeypatch.setattr(adapter, "inspect_dialog", inspect)
+    monkeypatch.setattr(
+        shop_purchase,
+        "record_shop_attempt",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("stop after inspect")),
+    )
+    monkeypatch.setattr(adapter, "_cancel_dialog", lambda *_args: None)
+
+    with pytest.raises(OSError, match="stop after inspect"):
+        adapter.purchase(located, "one", dry_run=False)
+
+    assert inspect_kwargs == [{}]
 
 
 def test_purchase_writes_ledger_before_confirmation_tap(monkeypatch):
