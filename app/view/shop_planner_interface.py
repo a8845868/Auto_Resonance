@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QFrame,
@@ -18,7 +18,15 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from qfluentwidgets import CheckBox, ComboBox, ScrollArea
+from qfluentwidgets import (
+    CheckBox,
+    ComboBox,
+    FluentIcon,
+    InfoBar,
+    InfoBarPosition,
+    PrimaryPushButton,
+    ScrollArea,
+)
 
 from app.common.style_sheet import StyleSheet
 from app.components.task_schedule_card import TaskScheduleCard
@@ -39,6 +47,57 @@ QUANTITY_OPTIONS = (
     ("one", "买 1 件"),
     ("max", "买到剩余上限（实时总价）"),
 )
+
+
+def _run_shop_dry_run() -> dict:
+    """Run the existing shop scanner without enabling purchase confirmation."""
+
+    from auto.shop_purchase import run_shop_purchase
+
+    result = run_shop_purchase(dry_run=True)
+    if not isinstance(result, dict):
+        raise TypeError("商店干跑返回了无效结果")
+    return result
+
+
+def _shop_dry_run_summary(result: dict) -> str:
+    skipped = str(result.get("skipped") or "").strip()
+    if skipped:
+        return f"扫描完成：{skipped}"
+    shops = result.get("shops")
+    if not isinstance(shops, list):
+        shops = []
+    page_count = sum(
+        int(shop.get("pages", 0) or 0)
+        for shop in shops
+        if isinstance(shop, dict)
+    )
+    found_count = sum(
+        len(shop.get("results") or [])
+        for shop in shops
+        if isinstance(shop, dict) and isinstance(shop.get("results"), list)
+    )
+    missing_count = sum(
+        len(shop.get("missing") or [])
+        for shop in shops
+        if isinstance(shop, dict) and isinstance(shop.get("missing"), list)
+    )
+    suffix = "，需要人工复核" if bool(result.get("requires_attention")) else ""
+    return (
+        f"干跑完成：扫描 {page_count} 页，处理 {found_count} 项"
+        f"，未定位 {missing_count} 项{suffix}"
+    )
+
+
+class ShopDryRunWorker(QThread):
+    succeeded = Signal(dict)
+    failed = Signal(str)
+
+    def run(self):
+        try:
+            self.succeeded.emit(_run_shop_dry_run())
+        except Exception as error:  # noqa: BLE001 - report worker failure to GUI
+            self.failed.emit(f"{type(error).__name__}: {error}")
 
 
 def _pixmap(relative_path: str, width: int, height: int) -> QPixmap:
@@ -166,6 +225,7 @@ class ShopPlannerInterface(ScrollArea):
         self.currentShopId = self.catalog.shops[0].id
         self.itemCards: dict[str, ShopItemCard] = {}
         self.shopButtons: dict[str, QPushButton] = {}
+        self.dryRunWorker: ShopDryRunWorker | None = None
 
         self.setObjectName("ShopPlannerInterface")
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -227,6 +287,25 @@ class ShopPlannerInterface(ScrollArea):
         options_layout.addStretch(1)
         options_layout.addWidget(self.summaryLabel, 2)
         self.rootLayout.addWidget(options)
+
+        dry_run_row = QHBoxLayout()
+        self.dryRunButton = PrimaryPushButton(
+            FluentIcon.SEARCH,
+            "仅扫描商店（不购买）",
+            self.scrollWidget,
+        )
+        self.dryRunButton.setToolTip(
+            "独立执行商店干跑：允许翻页并打开商品弹窗核验，但只点取消，不确认购买"
+        )
+        self.dryRunStatus = QLabel(
+            "不会进入主任务队列，也不会绕过购买确认门禁",
+            self.scrollWidget,
+        )
+        self.dryRunStatus.setWordWrap(True)
+        self.dryRunButton.clicked.connect(self.startDryRun)
+        dry_run_row.addWidget(self.dryRunButton)
+        dry_run_row.addWidget(self.dryRunStatus, 1)
+        self.rootLayout.addLayout(dry_run_row)
 
         self.scheduleCard = TaskScheduleCard("shop_purchase", self.scrollWidget)
         self.rootLayout.addWidget(self.scheduleCard)
@@ -372,6 +451,49 @@ class ShopPlannerInterface(ScrollArea):
             estimates.append(f"{dynamic_total_count} 项上限模式执行时读取实时总价")
         estimate = f"；{'；'.join(estimates)}" if estimates else ""
         self.summaryLabel.setText(f"{state} · 已选 {len(selected)} 项{estimate}")
+
+    def startDryRun(self):
+        if self.dryRunWorker and self.dryRunWorker.isRunning():
+            return
+        self.dryRunButton.setEnabled(False)
+        self.dryRunButton.setText("正在扫描商店…")
+        self.dryRunStatus.setText(
+            "正在独立执行干跑；只允许翻页、打开商品弹窗并取消"
+        )
+        self.dryRunWorker = ShopDryRunWorker(self)
+        self.dryRunWorker.succeeded.connect(self._dryRunSucceeded)
+        self.dryRunWorker.failed.connect(self._dryRunFailed)
+        self.dryRunWorker.finished.connect(self._dryRunFinished)
+        self.dryRunWorker.start()
+
+    def _dryRunSucceeded(self, result: dict):
+        summary = _shop_dry_run_summary(result)
+        self.dryRunStatus.setText(summary)
+        info = InfoBar.warning if bool(result.get("requires_attention")) else InfoBar.success
+        info(
+            "商店干跑完成",
+            summary,
+            position=InfoBarPosition.TOP,
+            duration=5000,
+            parent=self,
+        )
+
+    def _dryRunFailed(self, message: str):
+        self.dryRunStatus.setText("商店干跑失败；未进入购买确认")
+        InfoBar.error(
+            "商店干跑失败",
+            message,
+            position=InfoBarPosition.TOP,
+            duration=5000,
+            parent=self,
+        )
+
+    def _dryRunFinished(self):
+        self.dryRunButton.setEnabled(True)
+        self.dryRunButton.setText("仅扫描商店（不购买）")
+        if self.dryRunWorker is not None:
+            self.dryRunWorker.deleteLater()
+        self.dryRunWorker = None
 
     def buildQueuedTask(self):
         if not shop_plan_enabled(self.plan, self.catalog):
