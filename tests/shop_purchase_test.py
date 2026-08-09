@@ -242,6 +242,43 @@ def test_dialog_price_is_authoritative_when_list_price_was_missing(monkeypatch):
     assert DIALOG_CONFIRM_POS not in taps
 
 
+def test_dialog_price_uses_located_remaining_tier_for_weekly_laplace(monkeypatch):
+    catalog = load_shop_catalog()
+    item = catalog.item("laplace_weekly_iron")
+    shop = catalog.shop(item.shop_id)
+    located = LocatedProduct(item, (1182, 203), 2, 3, ())
+    dialog_ocr = [
+        _ocr(item.name, 580, 306, 121),
+        _ocr("最少", 365, 363),
+        _ocr("-1", 430, 355),
+        _ocr("+1", 760, 355),
+        _ocr("最多", 873, 367),
+        _ocr("售价", 536, 442),
+        _ocr("200000", 647, 442, 74),
+        _ocr("取消", 324, 521),
+        _ocr("确定", 959, 523),
+        _ocr("1/2", 619, 353),
+    ]
+    taps = []
+    dialog_matrix = np.zeros((720, 1280, 3), dtype=np.uint8)
+    dialog_matrix[372:382, 445:465] = 255
+    dialog_matrix[372:382, 817:837] = 255
+    monkeypatch.setattr(
+        shop_purchase,
+        "screenshot",
+        lambda: _FakeImage(dialog_matrix, dialog_ocr),
+    )
+    monkeypatch.setattr(shop_purchase, "input_tap", lambda pos: taps.append(pos))
+    monkeypatch.setattr(shop_purchase.time, "sleep", lambda *_: None)
+    adapter = HeadquartersBlackMoonAdapter(shop, _FakeRecorder())
+
+    quantity, observed_total = adapter.inspect_dialog(located, "one")
+
+    assert quantity == 1
+    assert observed_total == 200000
+    assert taps == [located.center]
+
+
 def test_purchase_writes_ledger_before_confirmation_tap(monkeypatch):
     catalog = load_shop_catalog()
     item = catalog.item("cactus_energy_weekly_iron")

@@ -702,11 +702,12 @@ class HeadquartersBlackMoonAdapter:
             self._cancel_dialog(f"cancel-unexpected-{located.item.id}")
             raise BlockedBySafetyError(f"商品弹窗名称校验失败: {located.item.name}")
         observed_price = _dialog_price(dialog_ocr)
-        if observed_price != located.item.price:
+        expected_price = located.item.price_for_remaining(located.remaining)
+        if expected_price is None or observed_price != expected_price:
             self._cancel_dialog(f"cancel-price-{located.item.id}")
             raise BlockedBySafetyError(
                 f"商品价格校验失败: {located.item.name}，"
-                f"目录 {located.item.price}，实机 {observed_price}"
+                f"目录档位 {expected_price}，实机 {observed_price}"
             )
         observed_total = observed_price
         quantity = _dialog_quantity(dialog_ocr)
