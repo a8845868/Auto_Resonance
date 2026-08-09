@@ -1,4 +1,5 @@
 import ctypes
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -270,6 +271,86 @@ def test_connect_never_reuses_nemu_session_for_another_instance(monkeypatch):
     assert control_module.connect(16576) is True
     assert control_module.control is replacement
     assert events == ["nemu.init", "replacement.connect", "previous.kill"]
+
+
+def test_concurrent_connects_create_only_one_same_target_nemu_session(monkeypatch):
+    device = EmulatorInfo(
+        name="instance-0",
+        port=16384,
+        path=r"C:\Program Files\NetEase\MuMu",
+        type=EmulatorType.MUMUV5,
+        index=0,
+    )
+    first_connect_entered = threading.Event()
+    second_call_started = threading.Event()
+    release_first_connect = threading.Event()
+    created = []
+
+    class ConcurrentNemuBackend:
+        def __init__(self, target):
+            self.device = target
+            self.path = r"C:\Program Files\NetEase\MuMu"
+            self.connect_id = 42
+            self.display_id = 0
+            self.session_generation = 11
+            self.session_quarantined = False
+            self.health_capture_return_code = 0
+            self.health_capture_session_generation = 11
+            self.kill_calls = 0
+
+        def connect(self, _port=None):
+            if self is created[0]:
+                first_connect_entered.set()
+                assert second_call_started.wait(timeout=2)
+                assert release_first_connect.wait(timeout=2)
+            return True
+
+        def kill(self):
+            self.kill_calls += 1
+
+    def create_nemu(target):
+        candidate = ConcurrentNemuBackend(target)
+        created.append(candidate)
+        return candidate
+
+    previous = FakeBackend("previous", [])
+    monkeypatch.setattr(control_module, "control", previous)
+    monkeypatch.setattr(control_module, "get_runtime_device", lambda: device)
+    monkeypatch.setattr(control_module, "NEMU", create_nemu)
+    monkeypatch.setattr(control_module, "_NEMU_BACKEND_TYPE", ConcurrentNemuBackend)
+    monkeypatch.setattr(
+        control_module,
+        "resolve_mumu_launcher",
+        lambda _device: SimpleNamespace(
+            install_root=Path(r"C:\Program Files\NetEase\MuMu")
+        ),
+    )
+    monkeypatch.setattr(control_module, "ADB", lambda: pytest.fail("ADB fallback"))
+    results = []
+
+    def first_call():
+        results.append(control_module.connect(16384))
+
+    def second_call():
+        second_call_started.set()
+        results.append(control_module.connect(16384))
+
+    first = threading.Thread(target=first_call)
+    second = threading.Thread(target=second_call)
+    first.start()
+    assert first_connect_entered.wait(timeout=2)
+    second.start()
+    assert second_call_started.wait(timeout=2)
+    release_first_connect.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert results == [True, True]
+    assert len(created) == 1
+    assert control_module.control is created[0]
+    assert created[0].kill_calls == 0
 
 
 def test_failed_adb_candidate_does_not_replace_current_backend(monkeypatch):

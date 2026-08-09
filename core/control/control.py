@@ -494,48 +494,54 @@ def connect(adb_port: Optional[int] = None):
     ensure_automation_allowed("连接 ADB/NEMU")
     global control
     device = get_runtime_device()
-    if device.is_mumu:
-        with _BACKEND_LOCK:
+    # Connection establishment and backend publication form one transaction.
+    # Without holding this lock across both steps, two callers can each pass
+    # the reuse check, open separate vendor IPC sessions, and then disconnect
+    # one another while publishing their candidates.
+    with _BACKEND_LOCK:
+        if device.is_mumu:
             if _active_nemu_session_reusable(device):
                 logger.info(
                     "Reuse existing NEMU IPC session: "
                     f"instance={device.index} generation={control.session_generation}"
                 )
                 return True
-        nemu_candidate = None
-        try:
-            nemu_candidate = NEMU(device)
-            status = nemu_candidate.connect(adb_port)
-        except Exception as error:
-            if _known_nemu_unavailable(error):
-                logger.warning(
-                    "MUMUIPC当前不可用，按预期降级到ADB："
-                    f"{type(error).__name__}: {error}"
-                )
-                status = False
-            else:
-                if nemu_candidate is not None:
-                    _close_backend(nemu_candidate, "NEMUIPC")
-                logger.exception("MUMUIPC发生非预期编程错误，禁止静默降级")
-                raise
-        if status:
-            _activate_backend(nemu_candidate)
-            return True
-        if nemu_candidate is not None:
-            _close_backend(nemu_candidate, "NEMUIPC")
-        logger.warning("MUMUIPC连接失败，尝试使用ADB连接")
+            nemu_candidate = None
+            try:
+                nemu_candidate = NEMU(device)
+                status = nemu_candidate.connect(adb_port)
+            except Exception as error:
+                if _known_nemu_unavailable(error):
+                    logger.warning(
+                        "MUMUIPC当前不可用，按预期降级到ADB："
+                        f"{type(error).__name__}: {error}"
+                    )
+                    status = False
+                else:
+                    if nemu_candidate is not None:
+                        _close_backend(nemu_candidate, "NEMUIPC")
+                    logger.exception("MUMUIPC发生非预期编程错误，禁止静默降级")
+                    raise
+            if status:
+                _activate_backend(nemu_candidate)
+                return True
+            if nemu_candidate is not None:
+                _close_backend(nemu_candidate, "NEMUIPC")
+            logger.warning("MUMUIPC连接失败，尝试使用ADB连接")
 
-    adb_candidate = ADB()
-    try:
-        status = adb_candidate.connect(adb_port if adb_port is not None else device.port)
-    except Exception:
-        _close_backend(adb_candidate, "ADB")
-        raise
-    if status:
-        _activate_backend(adb_candidate)
-    else:
-        _close_backend(adb_candidate, "ADB")
-    return status
+        adb_candidate = ADB()
+        try:
+            status = adb_candidate.connect(
+                adb_port if adb_port is not None else device.port
+            )
+        except Exception:
+            _close_backend(adb_candidate, "ADB")
+            raise
+        if status:
+            _activate_backend(adb_candidate)
+        else:
+            _close_backend(adb_candidate, "ADB")
+        return status
 
 
 def connect_adb(adb_port: Optional[int] = None):
