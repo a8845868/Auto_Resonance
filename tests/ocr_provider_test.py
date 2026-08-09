@@ -9,11 +9,11 @@ import numpy as np
 import pytest
 
 
-def test_import_does_not_initialize_ocr_model(monkeypatch):
+def test_import_does_not_initialize_ocr_backend(monkeypatch):
     sys.modules.pop("core.image.ocr", None)
+    sys.modules.pop("core.image.ocr_backend", None)
     module = importlib.import_module("core.image.ocr")
-    assert module._model is None
-    assert module._model_provider is None
+    assert module._backend is None
 
 
 @pytest.mark.parametrize(
@@ -28,37 +28,51 @@ def test_import_does_not_initialize_ocr_model(monkeypatch):
 def test_provider_selection_and_single_initialization(
     monkeypatch, requested, available, expected, use_gpu
 ):
-    import core.image.ocr as ocr
+    from core.image.ocr_backend import OnnxPpocrV4Backend
 
     created = []
     model = object()
-    ocr._reset_ocr_model_for_tests()
-    monkeypatch.setenv("AUTO_RESONANCE_OCR_PROVIDER", requested)
-    monkeypatch.setattr(ocr, "_available_providers", lambda: available)
+    backend = OnnxPpocrV4Backend(provider=requested)
     monkeypatch.setattr(
-        ocr,
+        backend, "_available_providers", lambda: available,
+    )
+    monkeypatch.setattr(
+        backend,
         "_create_ocr_model",
         lambda **kwargs: created.append(kwargs) or model,
     )
 
-    assert ocr.get_ocr_model() is model
-    assert ocr.get_ocr_model() is model
-    assert ocr._model_provider == expected
+    assert backend._get_model() is model
+    assert backend._get_model() is model
+    assert backend.provider == expected
     assert created == [{"use_gpu": use_gpu}]
 
 
-def test_predict_uses_lazy_model_and_preserves_result_shape(monkeypatch):
+def test_predict_uses_lazy_backend_and_preserves_result_shape(monkeypatch):
     import core.image.ocr as ocr
 
-    class Model:
-        def ocr(self, _image):
-            return [[[[[1, 2], [3, 2], [3, 4], [1, 4]], ("岚心城", 0.99)]]]
+    ocr._reset_ocr_backend_for_tests()
 
-    monkeypatch.setattr(ocr, "get_ocr_model", lambda: Model())
-    result = ocr.predict(np.zeros((10, 10, 3), dtype=np.uint8), no_crop=True)
+    class FakeBackend:
+        name = "fake"
+        provider = "cpu"
+
+        def predict(self, image, cropped_pos1, cropped_pos2, no_crop):
+            return [
+                {
+                    "text": "嵐心城",
+                    "score": 0.99,
+                    "position": [[1, 2], [3, 2], [3, 4], [1, 4]],
+                }
+            ]
+
+    monkeypatch.setattr(ocr, "_get_backend", lambda: FakeBackend())
+    result = ocr.predict(
+        np.zeros((10, 10, 3), dtype=np.uint8), no_crop=True,
+    )
     assert result == [
         {
-            "text": "岚心城",
+            "text": "嵐心城",
             "score": 0.99,
             "position": [[1, 2], [3, 2], [3, 4], [1, 4]],
         }
@@ -66,17 +80,19 @@ def test_predict_uses_lazy_model_and_preserves_result_shape(monkeypatch):
 
 
 def test_initialization_error_is_explicit(monkeypatch):
-    import core.image.ocr as ocr
+    from core.image.ocr_backend import OnnxPpocrV4Backend
 
-    ocr._reset_ocr_model_for_tests()
-    monkeypatch.setattr(ocr, "_available_providers", lambda: ("CPUExecutionProvider",))
+    backend = OnnxPpocrV4Backend(provider="auto")
     monkeypatch.setattr(
-        ocr,
+        backend, "_available_providers", lambda: ("CPUExecutionProvider",),
+    )
+    monkeypatch.setattr(
+        backend,
         "_create_ocr_model",
         lambda **_kwargs: (_ for _ in ()).throw(OSError("model missing")),
     )
     with pytest.raises(RuntimeError, match="ocr_model_initialization_failed"):
-        ocr.get_ocr_model()
+        backend._get_model()
 
 
 def test_home_profile_uid_log_redaction_preserves_non_sensitive_ocr():
@@ -107,21 +123,52 @@ def test_home_profile_uid_log_redaction_preserves_non_sensitive_ocr():
 def test_predict_logs_redacted_copy_but_returns_original(monkeypatch):
     import core.image.ocr as ocr
 
+    ocr._reset_ocr_backend_for_tests()
     uid = "8821612558"
 
-    class Model:
-        def ocr(self, _image):
-            return [[[
-                [[128, 704], [199, 704], [199, 717], [128, 717]],
-                (f"UID:{uid}", 0.99),
-            ]]]
+    class FakeBackend:
+        name = "fake"
+        provider = "cpu"
+
+        def predict(self, image, cropped_pos1, cropped_pos2, no_crop):
+            return [
+                {
+                    "text": f"UID:{uid}",
+                    "score": 0.99,
+                    "position": [[128, 704], [199, 704], [199, 717], [128, 717]],
+                }
+            ]
 
     logged = []
-    monkeypatch.setattr(ocr, "get_ocr_model", lambda: Model())
+    monkeypatch.setattr(ocr, "_get_backend", lambda: FakeBackend())
     monkeypatch.setattr(ocr, "logger", SimpleNamespace(debug=logged.append))
 
-    result = ocr.predict(np.zeros((720, 1280, 3), dtype=np.uint8), no_crop=True)
+    result = ocr.predict(
+        np.zeros((720, 1280, 3), dtype=np.uint8), no_crop=True,
+    )
 
     assert result[0]["text"] == f"UID:{uid}"
     assert uid not in repr(logged)
     assert logged[0][0]["text"] == "<redacted_home_profile_id>"
+
+
+def test_invalid_provider_raises_runtime_error_and_does_not_cache_backend(
+    monkeypatch,
+):
+    import core.image.ocr as ocr
+
+    ocr._reset_ocr_backend_for_tests()
+    monkeypatch.setenv("AUTO_RESONANCE_OCR_PROVIDER", "invalid")
+
+    with pytest.raises(RuntimeError, match="ocr_model_initialization_failed"):
+        ocr._get_backend()
+
+    # The stale backend must not be cached — a subsequent valid
+    # configuration must be able to recover.
+    assert ocr._backend is None
+
+    # Reset and prove a valid provider still works afterwards.
+    monkeypatch.setenv("AUTO_RESONANCE_OCR_PROVIDER", "cpu")
+    backend = ocr._get_backend()
+    assert backend.name == "ppocr-v4"
+    assert backend.provider == "cpu"
