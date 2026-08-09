@@ -18,6 +18,9 @@ from core.services.city_navigation import (
     detect_current_station,
     observe_city_frame,
 )
+from core.services.navigation_parent_control import (
+    NavigationParentControlObservation,
+)
 from core.services.personal_runtime_episode import RuntimeState, StateDetector
 from core.services.read_only_policy import DEFAULT_POLICY_SPECS
 from tools import sixth_read_only_probe as live_probe
@@ -134,6 +137,28 @@ def _city_detail(*, pixel=3, station: str | None = None):
     if station:
         texts.append(station)
     return _Frame(*texts, pixel=pixel, capture_id=f"city-{pixel}")
+
+
+def _parent_observation(
+    capture_id: str,
+    *,
+    safe_hit_point: tuple[int, int],
+) -> NavigationParentControlObservation:
+    x, y = safe_hit_point
+    return NavigationParentControlObservation(
+        semantic_id="visit_city",
+        anchor_bbox=(1070, 468, 1130, 492),
+        parent_control_bbox=(1000, 440, 1280, 520),
+        safe_hit_bbox=(x - 12, y - 12, x + 12, y + 12),
+        safe_hit_point=safe_hit_point,
+        parent_detection_method="SEMANTIC_CONTROL_SLOT",
+        candidate_count=1,
+        confidence="HIGH",
+        source_capture_id=capture_id,
+        source_frame_sha256=capture_id.encode("utf-8").hex().ljust(64, "0")[:64],
+        reason_codes=(),
+        evidence_ids=("parent_control_unique",),
+    )
 
 
 def test_home_ready_to_city_detail_uses_observed_anchor_and_waits_through_transition():
@@ -280,6 +305,71 @@ def test_stale_fresh_confirmation_blocks_without_dispatch():
     ).enter_city()
     assert result.reason == "stale_frame_action"
     assert taps == []
+
+
+def test_parent_control_transient_drift_uses_bounded_third_frame_consensus(
+    monkeypatch,
+):
+    taps = []
+    parent_observations = iter((
+        _parent_observation("home-1", safe_hit_point=(1037, 480)),
+        _parent_observation("home-2", safe_hit_point=(1057, 480)),
+        _parent_observation("home-3", safe_hit_point=(1057, 480)),
+    ))
+    monkeypatch.setattr(
+        city_navigation_module,
+        "resolve_navigation_parent_control",
+        lambda *_args, **_kwargs: next(parent_observations),
+    )
+
+    result = _adapter(
+        [_home(), _home(pixel=2), _home(pixel=3), _city_detail(pixel=4)],
+        tap=lambda *args, **kwargs: taps.append((args, kwargs)) or True,
+    ).enter_city()
+
+    assert result.status == "PASS"
+    assert result.dispatch_count == 1
+    assert result.physical_input_count == 1
+    assert len(taps) == 1
+    assert taps[0][0][0] == (1057, 480)
+    assert taps[0][1]["random_offset"] is False
+    assert any(
+        event.reason == "city_parent_control_confirmation_pending"
+        and event.action == "OBSERVE_CITY_PARENT_CONTROL"
+        and event.status == "PENDING"
+        for event in result.trace
+    )
+
+
+def test_parent_control_without_two_frame_consensus_blocks_without_dispatch(
+    monkeypatch,
+):
+    taps = []
+    parent_observations = iter((
+        _parent_observation("home-1", safe_hit_point=(1017, 480)),
+        _parent_observation("home-2", safe_hit_point=(1037, 480)),
+        _parent_observation("home-3", safe_hit_point=(1057, 480)),
+    ))
+    monkeypatch.setattr(
+        city_navigation_module,
+        "resolve_navigation_parent_control",
+        lambda *_args, **_kwargs: next(parent_observations),
+    )
+
+    result = _adapter(
+        [_home(), _home(pixel=2), _home(pixel=3)],
+        tap=lambda *args, **kwargs: taps.append((args, kwargs)) or True,
+    ).enter_city()
+
+    assert result.status == "BLOCKED"
+    assert result.reason == "city_parent_control_unstable"
+    assert result.dispatch_count == 0
+    assert result.physical_input_count == 0
+    assert taps == []
+    assert sum(
+        event.reason == "city_parent_control_confirmation_pending"
+        for event in result.trace
+    ) == 1
 
 
 def test_unknown_transition_then_station_confirmation_passes_with_one_dispatch():

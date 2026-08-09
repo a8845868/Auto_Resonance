@@ -46,6 +46,7 @@ from core.services.runtime_fault_telemetry import (
 CITY_ENTRY_TRANSITION_TIMEOUT_SECONDS = 30.0
 CITY_ENTRY_OBSERVATION_INTERVAL_SECONDS = 0.5
 CITY_ENTRY_MINIMUM_GRACE_SECONDS = 2.0
+CITY_PARENT_CONTROL_FRESH_OBSERVATION_LIMIT = 2
 
 
 class CityNavigationState(str, Enum):
@@ -471,6 +472,7 @@ class CityNavigationAdapter:
         city_entry_transition_timeout_seconds: float | None = None,
         city_entry_observation_interval_seconds: float = CITY_ENTRY_OBSERVATION_INTERVAL_SECONDS,
         city_entry_minimum_grace_seconds: float = CITY_ENTRY_MINIMUM_GRACE_SECONDS,
+        city_parent_control_fresh_observation_limit: int = CITY_PARENT_CONTROL_FRESH_OBSERVATION_LIMIT,
         session_recoverer: Callable[[], CaptureSessionRecoveryResult] | None = None,
         capture_recovery_policy: CaptureRecoveryPolicy = DEFAULT_CAPTURE_RECOVERY_POLICY,
         runtime_fault_recorder: Callable[[RuntimeFaultEvent], object] | None = record_runtime_fault,
@@ -504,6 +506,9 @@ class CityNavigationAdapter:
         )
         self.city_entry_minimum_grace_seconds = max(
             0.0, float(city_entry_minimum_grace_seconds)
+        )
+        self.city_parent_control_fresh_observation_limit = max(
+            1, int(city_parent_control_fresh_observation_limit)
         )
         self.session_recoverer = session_recoverer
         self.capture_recovery_policy = capture_recovery_policy
@@ -768,97 +773,133 @@ class CityNavigationAdapter:
                     record(before, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_parent_control_unresolved")
                     return finish(before.state, "BLOCKED", "city_parent_control_unresolved")
 
-                if self.cancellation():
-                    return finish(CityNavigationState.FAILED, "BLOCKED", "city_entry_cancelled")
-                if self.monotonic() >= deadline:
-                    return finish(CityNavigationState.TIMEOUT, "BLOCKED", "city_entry_postcondition_timeout")
-                try:
-                    fresh_frame = self.frame_provider()
-                except NemuCaptureError as error:
-                    failure = error.with_failure_stage(
-                        "FRESH_CONFIRMATION_CAPTURE"
-                    )
-                    recovery_attempted = False
-                    recovery_result = "NOT_ALLOWED"
-                    if (
-                        self.session_recoverer is not None
-                        and self.capture_recovery_policy.allows(
-                            failure,
-                            dispatch_count=dispatch_count,
-                            recovery_count=session_recovery_count,
-                        )
-                    ):
-                        recovery_attempted = True
-                        recovered = self.session_recoverer()
-                        session_recovery_count += 1
-                        session_generation_before_recovery = (
-                            recovered.previous_session_generation
-                        )
-                        session_generation_after_recovery = (
-                            recovered.current_session_generation
-                        )
-                        recovery_result = recovered.reason
-                        record_capture_fault(
-                            failure,
-                            recovery_attempted=True,
-                            recovery_result=recovery_result,
-                        )
-                        if recovered.success:
-                            # Never reuse the first frame across sessions.
-                            continue
-                    capture_failure = failure
-                    capture_failure_stage = failure.failure_stage
-                    session_lifecycle_conflict = (
-                        failure.session_lifecycle_conflict
-                    )
-                    retry_exhausted = bool(
-                        recovery_attempted
-                        or session_recovery_count
-                        >= self.capture_recovery_policy.max_pre_dispatch_session_recovery
-                    )
-                    if not recovery_attempted:
-                        record_capture_fault(
-                            failure,
-                            recovery_attempted=False,
-                            recovery_result=recovery_result,
-                        )
-                    return finish(
-                        CityNavigationState.FAILED,
-                        "BLOCKED_SAFETY",
-                        "fresh_capture_failed",
-                    )
-
-                fresh = observe_city_frame(fresh_frame, now=self.now)
-                attempts += 1
-                if (
-                    before.source_capture_id
-                    and fresh.source_capture_id
-                    and before.source_capture_id == fresh.source_capture_id
+                parent_observations = [initial_parent]
+                restart_pre_dispatch = False
+                for fresh_index in range(
+                    self.city_parent_control_fresh_observation_limit
                 ):
-                    record(fresh, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "stale_frame_action")
-                    return finish(CityNavigationState.FAILED, "BLOCKED", "stale_frame_action")
-                if fresh.city_entry.candidate_count != 1 or fresh.city_entry.anchor_bbox is None:
-                    record(fresh, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_entry_candidate_not_unique")
-                    return finish(fresh.state, "BLOCKED", "city_entry_candidate_not_unique")
-                if fresh.state is not CityNavigationState.CITY_ENTRY_VISIBLE:
-                    record(fresh, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_entry_candidate_mismatch")
-                    return finish(fresh.state, "BLOCKED", "city_entry_candidate_mismatch")
+                    if self.cancellation():
+                        return finish(CityNavigationState.FAILED, "BLOCKED", "city_entry_cancelled")
+                    if self.monotonic() >= deadline:
+                        return finish(CityNavigationState.TIMEOUT, "BLOCKED", "city_entry_postcondition_timeout")
+                    try:
+                        fresh_frame = self.frame_provider()
+                    except NemuCaptureError as error:
+                        failure = error.with_failure_stage(
+                            "FRESH_CONFIRMATION_CAPTURE"
+                        )
+                        recovery_attempted = False
+                        recovery_result = "NOT_ALLOWED"
+                        if (
+                            self.session_recoverer is not None
+                            and self.capture_recovery_policy.allows(
+                                failure,
+                                dispatch_count=dispatch_count,
+                                recovery_count=session_recovery_count,
+                            )
+                        ):
+                            recovery_attempted = True
+                            recovered = self.session_recoverer()
+                            session_recovery_count += 1
+                            session_generation_before_recovery = (
+                                recovered.previous_session_generation
+                            )
+                            session_generation_after_recovery = (
+                                recovered.current_session_generation
+                            )
+                            recovery_result = recovered.reason
+                            record_capture_fault(
+                                failure,
+                                recovery_attempted=True,
+                                recovery_result=recovery_result,
+                            )
+                            if recovered.success:
+                                # Never reuse observations across sessions.
+                                restart_pre_dispatch = True
+                                break
+                        capture_failure = failure
+                        capture_failure_stage = failure.failure_stage
+                        session_lifecycle_conflict = (
+                            failure.session_lifecycle_conflict
+                        )
+                        retry_exhausted = bool(
+                            recovery_attempted
+                            or session_recovery_count
+                            >= self.capture_recovery_policy.max_pre_dispatch_session_recovery
+                        )
+                        if not recovery_attempted:
+                            record_capture_fault(
+                                failure,
+                                recovery_attempted=False,
+                                recovery_result=recovery_result,
+                            )
+                        return finish(
+                            CityNavigationState.FAILED,
+                            "BLOCKED_SAFETY",
+                            "fresh_capture_failed",
+                        )
 
-                image = getattr(fresh_frame, "image", fresh_frame)
-                fresh_parent = resolve_navigation_parent_control(
-                    image,
-                    semantic_id="visit_city",
-                    anchor_bbox=fresh.city_entry.anchor_bbox,
-                    source_capture_id=fresh.source_capture_id,
-                    source_frame_sha256=fresh.screenshot_hash,
-                )
-                confirmed_parent = confirm_fresh_parent_control(
-                    initial_parent, fresh_parent
-                )
-                if confirmed_parent is None or confirmed_parent.safe_hit_point is None:
+                    fresh = observe_city_frame(fresh_frame, now=self.now)
+                    attempts += 1
+                    if (
+                        before.source_capture_id
+                        and fresh.source_capture_id
+                        and before.source_capture_id == fresh.source_capture_id
+                    ):
+                        record(fresh, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "stale_frame_action")
+                        return finish(CityNavigationState.FAILED, "BLOCKED", "stale_frame_action")
+                    if fresh.city_entry.candidate_count != 1 or fresh.city_entry.anchor_bbox is None:
+                        record(fresh, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_entry_candidate_not_unique")
+                        return finish(fresh.state, "BLOCKED", "city_entry_candidate_not_unique")
+                    if fresh.state is not CityNavigationState.CITY_ENTRY_VISIBLE:
+                        record(fresh, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_entry_candidate_mismatch")
+                        return finish(fresh.state, "BLOCKED", "city_entry_candidate_mismatch")
+
+                    image = getattr(fresh_frame, "image", fresh_frame)
+                    fresh_parent = resolve_navigation_parent_control(
+                        image,
+                        semantic_id="visit_city",
+                        anchor_bbox=fresh.city_entry.anchor_bbox,
+                        source_capture_id=fresh.source_capture_id,
+                        source_frame_sha256=fresh.screenshot_hash,
+                    )
+                    confirmed_parent = None
+                    for prior in reversed(parent_observations):
+                        confirmed_parent = confirm_fresh_parent_control(
+                            prior, fresh_parent
+                        )
+                        if confirmed_parent is not None:
+                            break
+                    if (
+                        confirmed_parent is not None
+                        and confirmed_parent.safe_hit_point is not None
+                    ):
+                        return fresh, image, confirmed_parent
+
+                    parent_observations.append(fresh_parent)
+                    more_observations_allowed = (
+                        fresh_index + 1
+                        < self.city_parent_control_fresh_observation_limit
+                        and attempts < self.max_attempts
+                        and self.monotonic() < deadline
+                    )
+                    if more_observations_allowed:
+                        record(
+                            fresh,
+                            "OBSERVE_CITY_PARENT_CONTROL",
+                            "NOT_REQUESTED",
+                            "NOT_CHECKED",
+                            "PENDING",
+                            "city_parent_control_confirmation_pending",
+                        )
+                        self.sleep(self.city_entry_observation_interval_seconds)
+                        continue
+
                     record(fresh, "enter_city", "NOT_REQUESTED", "NOT_CHECKED", "BLOCKED", "city_parent_control_unstable")
                     return finish(fresh.state, "BLOCKED", "city_parent_control_unstable")
-                return fresh, image, confirmed_parent
+
+                if restart_pre_dispatch:
+                    continue
 
         acquired = acquire_pre_dispatch()
         if isinstance(acquired, CityNavigationResult):
