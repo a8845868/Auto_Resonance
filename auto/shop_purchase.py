@@ -69,7 +69,7 @@ BUREAU_TAB_POS = (1002, 40)
 PRODUCT_REGION = (580, 150, 1260, 660)
 BUREAU_PRODUCT_REGION = (580, 130, 1260, 705)
 BUREAU_EXCHANGE_REGION = (1100, 130, 1255, 705)
-BUREAU_DIALOG_COST_REGION = (570, 420, 1120, 495)
+BUREAU_DIALOG_COST_REGION = (470, 260, 680, 340)
 PRODUCT_SCROLL_START = (800, 585)
 PRODUCT_SCROLL_END = (800, 365)
 PRODUCT_REWIND_START = PRODUCT_SCROLL_END
@@ -678,6 +678,80 @@ def _bureau_exchange_point(
     return candidates[0] if len(candidates) == 1 else None
 
 
+def _bureau_name_matches_alias(
+    text: str, aliases: tuple[str, ...],
+) -> bool:
+    """Return True when *text* matches at least one catalog alias.
+
+    PP-OCRv6 may reorder a recognised name (e.g. "改造凭证×1一般武"
+    instead of "一般武装改造凭证").  Substring matching handles the
+    common case; when it fails, a ≥75 % character-set overlap within
+    a 45–220 % length band covers reordered tokens as a last resort.
+    """
+
+    for alias in aliases:
+        norm = _normalize_text(alias)
+        if norm in text:
+            return True
+        # PP-OCRv6 may reorder characters, e.g. "改造凭证×1一般武"
+        # instead of "一般武装改造凭证".  When the alias is long
+        # enough, a high-threshold character-set overlap serves as
+        # a last-resort fallback.  The cost/period checks downstream
+        # provide the authoritative disambiguation.
+        if len(norm) >= 5:
+            ratio = len(text) / max(1, len(norm))
+            if 0.45 < ratio < 2.2:
+                overlap = sum(1 for ch in set(norm) if ch in set(text))
+                if overlap / max(1, len(set(norm))) >= 0.75:
+                    return True
+    return False
+
+
+_BUREAU_PERIOD_AMBIGUOUS_IDS: frozenset[str] | None = None
+
+
+def _bureau_period_ambiguous_ids() -> frozenset[str]:
+    """Return IDs whose cost multiset is shared with another item whose
+    aliases overlap at least one of this item's aliases.
+
+    When the period prefix is missing from live OCR for one of these items,
+    the match must be rejected — the physical row may belong to a different
+    catalog entry that shares the same name and price (e.g. weekly/monthly
+    variants of 进货采买书 or 广告投放券).
+    """
+
+    global _BUREAU_PERIOD_AMBIGUOUS_IDS
+    if _BUREAU_PERIOD_AMBIGUOUS_IDS is not None:
+        return _BUREAU_PERIOD_AMBIGUOUS_IDS
+    from core.services.shop_catalog import load_read_only_shop_catalog, load_shop_catalog
+
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    if not shop.read_only_catalog:
+        _BUREAU_PERIOD_AMBIGUOUS_IDS = frozenset()
+        return _BUREAU_PERIOD_AMBIGUOUS_IDS
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies,
+    )
+    items = list(observed.items)
+    aliases_by_id = {item.id: set(item.ocr_aliases) for item in items}
+    cost_by_id = {
+        item.id: tuple(sorted(cost.amount for cost in item.costs))
+        for item in items
+    }
+    ambiguous: set[str] = set()
+    for i, item_a in enumerate(items):
+        for item_b in items[i + 1:]:
+            if cost_by_id[item_a.id] != cost_by_id[item_b.id]:
+                continue
+            if not (aliases_by_id[item_a.id] & aliases_by_id[item_b.id]):
+                continue
+            ambiguous.add(item_a.id)
+            ambiguous.add(item_b.id)
+    _BUREAU_PERIOD_AMBIGUOUS_IDS = frozenset(ambiguous)
+    return _BUREAU_PERIOD_AMBIGUOUS_IDS
+
+
 def locate_read_only_bureau_item(
     ocr_items: Iterable[dict],
     item: ReadOnlyShopItem,
@@ -697,7 +771,7 @@ def locate_read_only_bureau_item(
     candidates: list[dict] = []
     for anchor in values:
         text = _normalize_text(anchor.get("text"))
-        if not any(_normalize_text(alias) in text for alias in item.ocr_aliases):
+        if not _bureau_name_matches_alias(text, item.ocr_aliases):
             continue
         center_x, center_y = _center(anchor)
         if not (
@@ -715,10 +789,19 @@ def locate_read_only_bureau_item(
             continue
         limit_texts = tuple(
             str(value.get("text", "")) for value in row
-            if re.search(r"(?:今日|当日|本周|本月)剩余\d+次", str(value.get("text", "")))
+            if re.search(r"(?:今日|当日|本周|本月)?剩余\d+次", str(value.get("text", "")))
         )
         observed_kind = _bureau_limit_kind("|".join(limit_texts))
-        if expected_kind != "unknown" and observed_kind != expected_kind:
+        if (
+            expected_kind != "unknown"
+            and observed_kind != "unknown"
+            and observed_kind != expected_kind
+        ):
+            continue
+        if (
+            observed_kind == "unknown"
+            and item.id in _bureau_period_ambiguous_ids()
+        ):
             continue
         candidates.append({
             "id": item.id,

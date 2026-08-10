@@ -83,8 +83,152 @@ def _dialog_ocr(
         _ocr("确定", 930, 520, 55),
     ]
     for index, total in enumerate(totals):
-        data.append(_ocr(str(total), 620 + index * 150, 440, 90))
+        data.append(_ocr(str(total), 515 + index * 70, 285, 42, 22))
     return data
+
+
+def test_bureau_name_matches_reordered_v6_ocr_token():
+    from auto.shop_purchase import _bureau_name_matches_alias
+
+    assert _bureau_name_matches_alias(
+        "改造凭证×1一般武",
+        ("般武装改造凭证", "一般武装改造凭证"),
+    ) is True
+    assert _bureau_name_matches_alias(
+        "殊武装改造特许",
+        ("殊武装改造特许", "特殊武装改造特许"),
+    ) is True
+    assert _bureau_name_matches_alias(
+        "逮捕令",
+        ("逮捕令",),
+    ) is True
+    # Short aliases do not use the subsequence fallback.
+    assert _bureau_name_matches_alias("xyz", ("abc", "def")) is False
+
+
+def test_bureau_alias_matching_is_unique_across_full_catalog():
+    """No live OCR text may match multiple catalog items via character overlap."""
+    from auto.shop_purchase import _bureau_name_matches_alias
+
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+
+    # Synthesize one representative live-ocr form per item.
+    live_forms: dict[str, str] = {}
+    for item in observed.items:
+        live_forms[item.id] = item.ocr_aliases[0]
+
+    # Add in plausible V6-reordered forms.
+    live_forms["bureau_general_weapon_fu"] = "改造凭证×1一般武"
+    live_forms["bureau_special_weapon_fu"] = "殊武装改造特许"
+    live_forms["bureau_general_weapon_jue"] = "改造凭证×1一般武"
+    live_forms["bureau_special_weapon_jue"] = "殊武装改造特许"
+
+    mismatch_ids: set[str] = set()
+    for test_id, live_text in live_forms.items():
+        test_item = next(i for i in observed.items if i.id == test_id)
+        matches = [
+            item.id
+            for item in observed.items
+            if _bureau_name_matches_alias(live_text, item.ocr_aliases)
+            and sorted(c.amount for c in item.costs)
+            == sorted(c.amount for c in test_item.costs)
+        ]
+        if matches != [test_id]:
+            mismatch_ids.add(test_id)
+
+    # purchase_book and advertising each have weekly+monthly variants that
+    # share the exact same aliases AND cost multiset — period is the sole
+    # disambiguator for those pairs, and the period-ambiguity guard handles
+    # them downstream.
+    expected = {
+        "bureau_purchase_book_weekly", "bureau_purchase_book_monthly",
+        "bureau_advertising_weekly", "bureau_advertising_monthly",
+    }
+    assert mismatch_ids == expected, (
+        f"unexpected alias+same-cost cross-matches: {sorted(mismatch_ids - expected)}"
+    )
+
+
+def test_bureau_period_ambiguous_ids_includes_same_cost_same_name_pairs():
+    from auto.shop_purchase import _bureau_period_ambiguous_ids
+
+    ambiguous = _bureau_period_ambiguous_ids()
+
+    assert "bureau_purchase_book_weekly" in ambiguous
+    assert "bureau_purchase_book_monthly" in ambiguous
+    assert "bureau_advertising_weekly" in ambiguous
+    assert "bureau_advertising_monthly" in ambiguous
+    # Weapons share the same alias but differ in cost → not ambiguous.
+    assert "bureau_general_weapon_fu" not in ambiguous
+    assert "bureau_general_weapon_jue" not in ambiguous
+
+
+def test_period_unknown_rejected_for_ambiguous_same_cost_probe():
+    """Purchase book with unknown period must be rejected because
+    weekly/monthly share the same name and cost."""
+    from auto.shop_purchase import (
+        _bureau_period_ambiguous_ids,
+        locate_read_only_bureau_item,
+    )
+
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    item = next(
+        i for i in observed.items if i.id == "bureau_purchase_book_weekly"
+    )
+    assert item.id in _bureau_period_ambiguous_ids()
+    # OCR row: purchase book with "剩余5次" — no period prefix.
+    ocr_items = [
+        _ocr("进货采买书", 710, 660, 120),
+        _ocr("65.3k/150", 855, 660, 90),
+        _ocr("剩余5次", 1190, 660, 70),
+    ]
+
+    assert locate_read_only_bureau_item(ocr_items, item) is None
+
+
+def test_period_known_allows_ambiguous_pair_despite_same_cost():
+    """Purchase book WITH period prefix must still match."""
+    from auto.shop_purchase import locate_read_only_bureau_item
+
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    item = next(
+        i for i in observed.items if i.id == "bureau_purchase_book_weekly"
+    )
+    ocr_items = [
+        _ocr("进货采买书", 710, 660, 120),
+        _ocr("65.3k/150", 855, 660, 90),
+        _ocr("本周剩余5次", 1190, 660, 70),
+    ]
+
+    result = locate_read_only_bureau_item(ocr_items, item)
+
+    assert result is not None
+    assert result["id"] == "bureau_purchase_book_weekly"
+
+
+def test_general_weapon_alias_does_not_match_special_weapon():
+    from auto.shop_purchase import _bureau_name_matches_alias
+
+    assert _bureau_name_matches_alias(
+        "改造凭证×1一般武",
+        ("殊武装改造特许", "特殊武装改造特许"),
+    ) is False
+    assert _bureau_name_matches_alias(
+        "殊武装改造特许",
+        ("般武装改造凭证", "一般武装改造凭证"),
+    ) is False
 
 
 def test_bureau_live_matcher_replays_all_22_evidence_bound_items():
