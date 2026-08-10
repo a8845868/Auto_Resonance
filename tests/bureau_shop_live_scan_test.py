@@ -810,6 +810,251 @@ def test_bureau_three_currency_warehouse_probe_reads_all_channels(monkeypatch):
     # essential — the old x≥470 boundary would miss this channel.
 
 
+def test_increment_session_frame_accepts_blank_confirmation_line():
+    """Continuity frame validator and _bureau_dialog_snapshot both accept
+    a blank confirmation line in post-increment mode."""
+    from auto.shop_purchase import (
+        _validate_increment_session_frame,
+        _bureau_dialog_snapshot,
+    )
+
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    item_id = "bureau_general_weapon_fu"
+    item = next(i for i in observed.items if i.id == item_id)
+    item = replace(item, observed_limit="当日剩余5次")
+
+    def frame(q, with_conf=True):
+        items = [
+            _ocr("改造凭证×1一般武", 560, 285, 200),
+            _ocr(f"{q}/5", 610, 345, 70),
+            _ocr("最少", 350, 350, 55),
+            _ocr("最多", 855, 350, 55),
+            _ocr(str(q * 50), 630, 285, 50),
+            _ocr("取消", 300, 520, 55),
+            _ocr("确定", 930, 520, 55),
+        ]
+        if with_conf:
+            items.append(_ocr(
+                "确认消耗以上素材兑换一般武装改造凭证" + str(q) + "吗？",
+                480, 435, 300, 22,
+            ))
+        return _DialogFrame(items)
+
+    # Helper: blank confirmation accepted.
+    f3 = frame(3, False)
+    assert _validate_increment_session_frame(
+        f3, f3.ocr(), item,
+        expected_quantity=3, expected_maximum=5,
+        channel_order=("fu_ming",),
+    ) is True
+
+    # _bureau_dialog_snapshot with channel_order: blank line must not
+    # trigger _bureau_dialog_item_visible rejection (P1 regression).
+    snap = _bureau_dialog_snapshot(
+        f3, f3.ocr(), item,
+        expected_quantity=3, expected_maximum=5,
+        channel_order=("fu_ming",),
+    )
+    assert snap["quantity"] == 3
+    assert snap["maximum"] == 5
+    assert isinstance(snap["channel_x_order"], tuple)
+    assert len(snap["channel_x_order"]) == 1
+
+    # Helper: wrong item confirmation rejected.
+    wrong = [
+        _ocr("特殊武装改造特许", 560, 285, 200),
+        _ocr("3/5", 610, 345, 70),
+        _ocr("最少", 350, 350, 55),
+        _ocr("最多", 855, 350, 55),
+        _ocr("450", 630, 285, 50),
+        _ocr("取消", 300, 520, 55),
+        _ocr("确定", 930, 520, 55),
+        _ocr("确认消耗以上素材兑换特殊武装改造特许3吗？", 480, 435, 300, 22),
+    ]
+    wrong_frame = _DialogFrame(wrong)
+    assert _validate_increment_session_frame(
+        wrong_frame, wrong_frame.ocr(), item,
+        expected_quantity=3, expected_maximum=5,
+        channel_order=("fu_ming",),
+    ) is False
+
+
+def test_split_confirmation_text_is_not_misread_as_absent():
+    """Two OCR tokens that together contain '确认消耗'+'兑换'+wrong item
+    must be rejected, not treated as 'confirmation absent'."""
+    from auto.shop_purchase import _validate_increment_session_frame
+
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    item = next(i for i in observed.items if i.id == "bureau_general_weapon_fu")
+    item = replace(item, observed_limit="当日剩余5次")
+
+    items = [
+        _ocr("改造凭证×1一般武", 560, 285, 200),
+        _ocr("3/5", 610, 345, 70),
+        _ocr("最少", 350, 350, 55),
+        _ocr("最多", 855, 350, 55),
+        _ocr("150", 630, 285, 50),
+        _ocr("取消", 300, 520, 55),
+        _ocr("确定", 930, 520, 55),
+        _ocr("确认消耗以上素材", 480, 440, 150, 22),
+        _ocr("兑换特殊武装改造特许3吗？", 630, 441, 180, 22),
+    ]
+    f = _DialogFrame(items)
+
+    # Must reject: merged text contains "确认消耗"+"兑换"+"特殊武装改造特许"
+    # which is NOT the current session's item.
+    assert _validate_increment_session_frame(
+        f, f.ocr(), item,
+        expected_quantity=3, expected_maximum=5,
+        channel_order=("fu_ming",),
+    ) is False
+
+
+def test_full_probe_accepts_blank_confirmation_frame_in_3_step_sequence(
+    monkeypatch,
+):
+    """State machine: strong first frame, blank third frame, 1→2→3/5."""
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    item_id = "bureau_general_weapon_fu"
+    item = next(i for i in observed.items if i.id == item_id)
+    item = replace(item, observed_limit="当日剩余3次")
+
+    def dialog(q, with_conf=True):
+        items = [
+            _ocr("改造凭证×1一般武", 560, 285, 200),
+            _ocr(f"{q}/3", 610, 345, 70),
+            _ocr("最少", 350, 350, 55),
+            _ocr("最多", 855, 350, 55),
+            _ocr(str(q * 50), 630, 285, 50),
+            _ocr("取消", 300, 520, 55),
+            _ocr("确定", 930, 520, 55),
+        ]
+        if with_conf:
+            items.append(_ocr(
+                "确认消耗以上素材兑换一般武装改造凭证" + str(q) + "吗？",
+                480, 435, 300, 22,
+            ))
+        return _DialogFrame(items)
+
+    shop_frame = _Frame([
+        _ocr("赴命商店", 760, 25),
+        _ocr("赴命商店", 960, 25),
+    ], 20)
+    frame_iter = iter((
+        dialog(1, True),    # open → first snapshot
+        dialog(2, True),    # +1 → q=2
+        dialog(3, False),   # +1 → q=3 (confirmation dropped)
+        shop_frame,         # cancel → verify bureau page
+        shop_frame,         # safety net
+    ))
+    taps = []
+    monkeypatch.setattr(
+        shop_purchase, "screenshot", lambda: next(frame_iter),
+    )
+    monkeypatch.setattr(
+        shop_purchase,
+        "input_tap",
+        lambda point, **kwargs: taps.append((point, kwargs)) or True,
+    )
+    monkeypatch.setattr(shop_purchase.time, "sleep", lambda _seconds: None)
+    adapter = shop_purchase.BureauReadOnlyCatalogAdapter(
+        shop, observed, _Recorder(),
+    )
+
+    result = adapter._probe_price_schedule(
+        {"observed_limit": "当日剩余3次", "exchange_point": (1190, 225)},
+        item,
+    )
+
+    assert result["status"] == "price_schedule_validated"
+    assert len(result["price_observations"]) == 3
+    assert [kwargs["intent"].action_key for _point, kwargs in taps] == [
+        "shop_bureau_quantity_open",
+        "shop_quantity_increment",
+        "shop_quantity_increment",
+        "shop_quantity_cancel",
+    ]
+    assert adapter.dialog_cancel_dispatches == 1
+    assert shop_purchase.DIALOG_CONFIRM_POS not in [
+        point for point, _ in taps
+    ]
+
+
+def test_cost_channel_x_shift_beyond_30px_is_rejected(monkeypatch):
+    """If a subsequent frame's cost channel drifts >30 px, fail-closed."""
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    item_id = "bureau_general_weapon_fu"
+    item = next(i for i in observed.items if i.id == item_id)
+    item = replace(item, observed_limit="当日剩余2次")
+
+    frame_iter = iter((
+        _DialogFrame([
+            _ocr("改造凭证×1一般武", 560, 285, 200),
+            _ocr("1/2", 610, 345, 70),
+            _ocr("最少", 350, 350, 55),
+            _ocr("最多", 855, 350, 55),
+            _ocr("50", 630, 285, 50),
+            _ocr("取消", 300, 520, 55),
+            _ocr("确定", 930, 520, 55),
+            _ocr("确认消耗以上素材兑换一般武装改造凭证1吗？", 480, 435, 300, 22),
+        ]),
+        _DialogFrame([
+            _ocr("改造凭证×1一般武", 560, 285, 200),
+            _ocr("2/2", 610, 345, 70),
+            _ocr("最少", 350, 350, 55),
+            _ocr("最多", 855, 350, 55),
+            _ocr("100", 630 + 35, 285, 50),
+            _ocr("取消", 300, 520, 55),
+            _ocr("确定", 930, 520, 55),
+            _ocr("确认消耗以上素材兑换一般武装改造凭证2吗？", 480, 435, 300, 22),
+        ]),
+        _Frame([
+            _ocr("赴命商店", 760, 25),
+            _ocr("赴命商店", 960, 25),
+        ], 20),
+        _Frame([
+            _ocr("赴命商店", 760, 25),
+            _ocr("赴命商店", 960, 25),
+        ], 20),
+    ))
+    monkeypatch.setattr(
+        shop_purchase, "screenshot", lambda: next(frame_iter),
+    )
+    monkeypatch.setattr(
+        shop_purchase, "input_tap",
+        lambda point, **kwargs: True,
+    )
+    monkeypatch.setattr(shop_purchase.time, "sleep", lambda _seconds: None)
+    adapter = shop_purchase.BureauReadOnlyCatalogAdapter(
+        shop, observed, _Recorder(),
+    )
+
+    with pytest.raises(shop_purchase.BlockedBySafetyError, match="身份不明"):
+        adapter._probe_price_schedule(
+            {"observed_limit": "当日剩余2次", "exchange_point": (1190, 225)},
+            item,
+        )
+    # Channel x-shift makes the page unverifiable; the probe must not
+    # emit a cancel tap on an unverified dialog frame.
+    assert adapter.dialog_cancel_dispatches == 0
+
+
 def test_bureau_unknown_page_after_increment_never_guesses_cancel(monkeypatch):
     catalog = load_shop_catalog()
     shop = catalog.shop("bureau_exchange")

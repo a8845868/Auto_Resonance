@@ -891,6 +891,81 @@ def _has_complete_quantity_dialog(image: object, ocr_items: Iterable[dict]) -> b
     return found == set(required_actions) and _dialog_quantity(data) is not None
 
 
+def _validate_increment_session_frame(
+    image: object,
+    ocr_items: Iterable[dict],
+    item: ReadOnlyShopItem,
+    *,
+    expected_quantity: int,
+    expected_maximum: int,
+    channel_order: tuple[str, ...],
+    channel_x_order: tuple[float, ...] = (),
+) -> bool:
+    """Weaker post-increment frame check for an in-session quantity probe.
+
+    V6 may intermittently drop the confirmation-text row while the rest of
+    the dialog stays identical.  The first frame is always validated by
+    :func:`_has_complete_bureau_quantity_dialog`; subsequent frames may
+    temporarily omit the item name / confirmation text as long as the
+    dialog structure, maximum quantity, quantity step, and cost channels
+    all remain consistent with the previously established session.
+
+    A *conflicting* item name still blocks immediately — only absence is
+    tolerated.
+    """
+
+    data = list(ocr_items)
+    if not _has_quantity_step_buttons(image):
+        return False
+    quantity = _dialog_quantity(data)
+    if quantity is None or quantity[0] != expected_quantity:
+        return False
+    if quantity[1] != expected_maximum:
+        return False
+    # Cancel and confirm must still be present.
+    buttons = {"取消": (180, 520, 500, 595), "确定": (800, 520, 1120, 600)}
+    found_buttons: set[str] = set()
+    for value in data:
+        text = _normalize_text(value.get("text"))
+        zone = buttons.get(text)
+        if zone is None:
+            continue
+        cx, cy = _center(value)
+        if zone[0] <= cx <= zone[2] and zone[1] <= cy <= zone[3]:
+            found_buttons.add(text)
+    if found_buttons != set(buttons):
+        return False
+    # Cost channel count and left-to-right order must match.
+    candidates = _bureau_dialog_cost_candidates(data)
+    if len(candidates) != len(channel_order):
+        return False
+    if channel_x_order:
+        for (_, x), first_x in zip(candidates, channel_x_order):
+            if abs(x - first_x) > 30:
+                return False
+    # Aggregate confirmation-band OCR text into a single block so V6-split
+    # tokens (e.g. "确认消耗以上素材" + "兑换商品X") are not misread as
+    # a harmless "confirmation absent".  The confirmation band sits between
+    # the quantity row (y≈340-380) and the cancel/confirm buttons (y≈520).
+    confirmation_texts: list[str] = []
+    for value in data:
+        text = _normalize_text(value.get("text"))
+        if "确认消耗" in text or "兑换" in text:
+            cy = _center(value)[1]
+            if 400 <= cy <= 500:
+                confirmation_texts.append(text)
+    if confirmation_texts:
+        merged = "".join(confirmation_texts)
+        has_bureau_markers = "确认消耗" in merged and "兑换" in merged
+        if not has_bureau_markers or not _bureau_dialog_item_visible(
+            [{"text": merged}], item,
+        ):
+            return False
+    # When no confirmation tokens at all exist in the band, tolerate
+    # (V6 dropped the line entirely while dialog structure is unchanged).
+    return True
+
+
 def _has_bureau_quantity_dialog(ocr_items: Iterable[dict]) -> bool:
     """Like :func:`_has_quantity_dialog` with a relaxed confirm-button zone.
 
@@ -1841,15 +1916,30 @@ def _bureau_dialog_snapshot(
     expected_quantity: int,
     expected_maximum: int | None = None,
     channel_order: tuple[str, ...] | None = None,
+    channel_x_order: tuple[float, ...] = (),
 ) -> dict:
     """Read one verified quantity-dialog state without emitting input."""
 
     data = list(ocr_items)
-    if not _has_complete_bureau_quantity_dialog(frame, data, item):
+    dialog_ok = (
+        _validate_increment_session_frame(
+            frame, data, item,
+            expected_quantity=expected_quantity,
+            expected_maximum=expected_maximum or 0,
+            channel_order=channel_order or (),
+            channel_x_order=channel_x_order,
+        )
+        if channel_order is not None
+        else _has_complete_bureau_quantity_dialog(frame, data, item)
+    )
+    if not dialog_ok:
         raise BlockedBySafetyError(
             f"赴命商品未出现完整数量弹窗: {item.name}"
         )
-    if not _bureau_dialog_item_visible(data, item):
+    # In continuity mode the frame validator already checked item identity;
+    # do not re-apply _bureau_dialog_item_visible (which would reject a
+    # frame where V6 temporarily dropped the confirmation line).
+    if channel_order is None and not _bureau_dialog_item_visible(data, item):
         raise BlockedBySafetyError(f"赴命商品弹窗身份不匹配: {item.name}")
     quantity = _dialog_quantity(data)
     if quantity is None or quantity[0] != expected_quantity:
@@ -1880,6 +1970,7 @@ def _bureau_dialog_snapshot(
             ordered.append((cost.currency, match[0], match[1]))
         ordered.sort(key=lambda entry: entry[2])
         channel_order = tuple(entry[0] for entry in ordered)
+        channel_x_order = tuple(entry[2] for entry in ordered)
         totals = {currency: amount for currency, amount, _x in ordered}
     else:
         if len(channel_order) != len(candidates):
@@ -1888,10 +1979,15 @@ def _bureau_dialog_snapshot(
             currency: candidates[index][0]
             for index, currency in enumerate(channel_order)
         }
+        channel_x_order = tuple(
+            float(candidates[index][1])
+            for index in range(len(channel_order))
+        )
     return {
         "quantity": quantity[0],
         "maximum": quantity[1],
         "channel_order": channel_order,
+        "channel_x_order": channel_x_order,
         "totals": totals,
     }
 
@@ -2066,6 +2162,7 @@ class BureauReadOnlyCatalogAdapter:
         previous_totals: dict[str, int] = {}
         previous_marginals: dict[str, int] = {}
         channel_order = tuple(first["channel_order"])
+        channel_x_order = tuple(first["channel_x_order"])
         snapshot = first
         probe_error: BlockedBySafetyError | None = None
         dialog_still_verified = True
@@ -2098,8 +2195,12 @@ class BureauReadOnlyCatalogAdapter:
                         frame,
                         ocr_items,
                     )
-                    if not _has_complete_bureau_quantity_dialog(
-                        frame, ocr_items, item
+                    if not _validate_increment_session_frame(
+                        frame, ocr_items, item,
+                        expected_quantity=quantity,
+                        expected_maximum=maximum,
+                        channel_order=channel_order,
+                        channel_x_order=channel_x_order,
                     ):
                         raise BlockedBySafetyError(
                             f"赴命商品数量增加后页面身份不明: {item.name}"
@@ -2112,6 +2213,7 @@ class BureauReadOnlyCatalogAdapter:
                         expected_quantity=quantity,
                         expected_maximum=maximum,
                         channel_order=channel_order,
+                        channel_x_order=channel_x_order,
                     )
                 costs: list[dict] = []
                 for currency in channel_order:
