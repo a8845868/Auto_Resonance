@@ -808,6 +808,64 @@ def _has_complete_quantity_dialog(image: object, ocr_items: Iterable[dict]) -> b
     return found == set(required_actions) and _dialog_quantity(data) is not None
 
 
+def _has_bureau_quantity_dialog(ocr_items: Iterable[dict]) -> bool:
+    """Like :func:`_has_quantity_dialog` with a relaxed confirm-button zone.
+
+    The bureau exchange quantity dialog places the "确定" button ~10 px
+    lower than the headquarters shop dialog.  The standard classifier
+    rejects a valid dialog when the centre is at y ≈ 590.5 (0.5 px
+    beyond the 590 hard cap).  This variant only widens the vertical
+    bound for "确定"; the other three controls still use the same zones.
+    """
+
+    zones = {
+        "最少": (320, 320, 450, 430),
+        "最多": (830, 320, 950, 430),
+        "取消": (180, 480, 500, 590),
+        "确定": (800, 480, 1120, 600),
+    }
+    found: set[str] = set()
+    for item in ocr_items:
+        text = _normalize_text(item.get("text"))
+        zone = zones.get(text)
+        if not zone:
+            continue
+        center_x, center_y = _center(item)
+        if zone[0] <= center_x <= zone[2] and zone[1] <= center_y <= zone[3]:
+            found.add(text)
+    return found == set(zones)
+
+
+def _has_complete_bureau_quantity_dialog(
+    image: object,
+    ocr_items: Iterable[dict],
+    item: ReadOnlyShopItem,
+) -> bool:
+    """Bureau-specific quantity-dialog classifier.
+
+    In addition to the relaxed button zones and visual step-button check,
+    this requires the dialog to contain the exchange-confirmation preamble
+    and at least one of the catalog's OCR aliases for the item.
+    """
+
+    data = list(ocr_items)
+    if not _has_quantity_step_buttons(image):
+        return False
+    layout_valid = _has_quantity_dialog(data) or _has_bureau_quantity_dialog(data)
+    if not layout_valid:
+        return False
+    texts = tuple(_normalize_text(value.get("text")) for value in data)
+    has_bureau_confirmation = any(
+        "确认消耗" in text
+        and "兑换" in text
+        and any(
+            _normalize_text(alias) in text for alias in item.ocr_aliases
+        )
+        for text in texts
+    )
+    return has_bureau_confirmation and _dialog_quantity(data) is not None
+
+
 class ShopEvidenceRecorder:
     def __init__(self, enabled: bool, label: str):
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1704,7 +1762,7 @@ def _bureau_dialog_snapshot(
     """Read one verified quantity-dialog state without emitting input."""
 
     data = list(ocr_items)
-    if not _has_complete_quantity_dialog(frame, data):
+    if not _has_complete_bureau_quantity_dialog(frame, data, item):
         raise BlockedBySafetyError(
             f"赴命商品未出现完整数量弹窗: {item.name}"
         )
@@ -1893,7 +1951,7 @@ class BureauReadOnlyCatalogAdapter:
         # No cancel is dispatched until the page is independently proven to be
         # a quantity dialog.  An unexpected post-page therefore terminates the
         # complete scan with zero additional input.
-        if not _has_complete_quantity_dialog(frame, ocr_items):
+        if not _has_complete_bureau_quantity_dialog(frame, ocr_items, item):
             raise BlockedBySafetyError(
                 f"赴命商品点击后未出现数量弹窗: {item.name}"
             )
@@ -1957,7 +2015,9 @@ class BureauReadOnlyCatalogAdapter:
                         frame,
                         ocr_items,
                     )
-                    if not _has_complete_quantity_dialog(frame, ocr_items):
+                    if not _has_complete_bureau_quantity_dialog(
+                        frame, ocr_items, item
+                    ):
                         raise BlockedBySafetyError(
                             f"赴命商品数量增加后页面身份不明: {item.name}"
                         )

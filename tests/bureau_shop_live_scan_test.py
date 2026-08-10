@@ -77,7 +77,8 @@ def _dialog_ocr(
         _ocr(f"{quantity}/{maximum}", 610, 345, 70),
         _ocr("最少", 350, 350, 55),
         _ocr("最多", 855, 350, 55),
-        _ocr("售价", 520, 435, 55),
+        # The bureau classifier requires "确认消耗" AND "兑换" in one text block.
+        _ocr(f"确认消耗以上素材兑换{name}", 480, 435, 260, 22),
         _ocr("取消", 300, 520, 55),
         _ocr("确定", 930, 520, 55),
     ]
@@ -139,6 +140,187 @@ def test_bureau_scan_finds_all_items_with_swipes_and_zero_item_taps(monkeypatch)
     assert taps == []
     assert len(swipes) == 7
     assert all(intent.action_key == "shop_catalog_scroll" for intent in swipes)
+
+
+def test_bureau_dialog_classifier_tolerates_lower_confirm_button():
+    """The bureau "确定" button is ~10px lower than the HQ dialog.
+
+    The evidence frame ``005-bureau-price-01-bureau_self_observation`` has
+    centre y ≈ 590.5 — 0.5 px beyond the HQ classifier's 590 cap.  The
+    bureau-specific classifier accepts it when the exchange confirm text
+    and item alias are also present.
+    """
+    from auto.shop_purchase import (
+        _has_bureau_quantity_dialog,
+        _has_complete_bureau_quantity_dialog,
+        _has_complete_quantity_dialog,
+    )
+
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    item = next(item for item in observed.items if item.id == "bureau_self_observation")
+
+    # Real evidence OCR from 005-bureau-price-01-bureau_self_observation.
+    # "确定" centre y = 590.5 — 0.5 px beyond the HQ cap of 590.
+    evidence = [
+        _ocr("自观测胶卷", 516, 289, 48),
+        _ocr("1/2", 618, 353, 45, 24),
+        _ocr("最少", 360, 370, 52),          # cx≈386 cy≈381
+        _ocr("最多", 867, 370, 50),           # cx≈892 cy≈381
+        _ocr("确认消耗以上素材兑换自观测胶卷（1次）", 486, 447, 297, 21),
+        _ocr("取消", 320, 547, 57, 20),        # cx≈348.5 cy≈557
+        _ocr("确定", 932, 579, 101, 23),       # cx≈982.5 cy≈590.5 > 590
+        _ocr("抵", 620, 692, 35),
+    ]
+    step_image = np.zeros((720, 1280, 3), dtype=np.uint8)
+    step_image[365:395, 435:475] = 255
+    step_image[365:395, 807:847] = 255
+
+    # HQ classifier rejects: 590.5 > 590.
+    assert _has_complete_quantity_dialog(step_image, evidence) is False
+
+    # Bureau classifier accepts: 590.5 ≤ 600, plus preamble + item alias.
+    assert _has_bureau_quantity_dialog(evidence) is True
+    assert _has_complete_bureau_quantity_dialog(step_image, evidence, item) is True
+
+    # Without item alias in dialog, rejects.
+    wrong_item = next(
+        i for i in observed.items if i.id == "bureau_nebula_4"
+    )
+    assert _has_complete_bureau_quantity_dialog(
+        step_image, evidence, wrong_item
+    ) is False
+
+
+def test_bureau_dialog_classifier_still_rejects_malformed_bureau_dialog():
+    """No false positives: missing quantity or missing bureau preamble → reject."""
+    from auto.shop_purchase import (
+        _has_complete_bureau_quantity_dialog,
+    )
+
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    item = next(item for item in observed.items if item.id == "bureau_self_observation")
+    evidence = [
+        _ocr("自观测胶卷", 516, 289, 48),
+        _ocr("最少", 360, 370, 52),
+        _ocr("最多", 867, 370, 50),
+        _ocr("确认消耗以上素材兑换自观测胶卷（1次）", 486, 447, 297, 21),
+        _ocr("取消", 320, 547, 57, 20),
+        _ocr("确定", 932, 579, 101, 23),       # cx≈982.5 cy≈590.5
+    ]
+    step_image = np.zeros((720, 1280, 3), dtype=np.uint8)
+    step_image[365:395, 435:475] = 255
+    step_image[365:395, 807:847] = 255
+
+    # Missing quantity "1/2" → reject.
+    assert _has_complete_bureau_quantity_dialog(step_image, evidence, item) is False
+
+
+def test_hq_layout_without_bureau_preamble_is_rejected_by_bureau_classifier():
+    """HQ visual layout + no exchange-confirmation text → reject.
+
+    Even though ``_has_quantity_dialog`` accepts the HQ button layout, the
+    bureau classifier must still require the exchange preamble and item alias.
+    """
+
+    from auto.shop_purchase import _has_complete_bureau_quantity_dialog
+
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    item = catalog.item("cactus_energy_weekly_iron")
+    bureau_item = next(
+        i for i in observed.items if i.id == "bureau_self_observation"
+    )
+    # HQ purchase dialog: standard button layout with "售价" — no "确认消耗"
+    # or "兑换" text anywhere on the page.
+    dialog_ocr = [
+        _ocr(item.name, 560, 290, 200),
+        _ocr("1/8", 605, 355, 65),
+        _ocr("最少", 360, 360, 50),
+        _ocr("最多", 870, 360, 50),
+        _ocr("售价", 525, 440, 55),
+        _ocr("10000", 650, 440, 70),
+        _ocr("取消", 310, 525, 55),
+        _ocr("确定", 930, 525, 55),
+    ]
+    dialog_image = np.zeros((720, 1280, 3), dtype=np.uint8)
+    dialog_image[372:382, 445:465] = 255
+    dialog_image[372:382, 817:837] = 255
+
+    # Rejected: HQ layout matches but no bureau preamble.
+    assert _has_complete_bureau_quantity_dialog(
+        dialog_image, dialog_ocr, bureau_item
+    ) is False
+
+
+def test_bureau_preamble_without_item_name_in_same_line_is_rejected():
+    """The item alias and exchange-confirmation text must be in the same line.
+
+    A generic "确认消耗以上素材兑换" line without the item alias, plus a
+    separate OCR line containing the alias by coincidence, must not pass.
+    """
+
+    from auto.shop_purchase import _has_complete_bureau_quantity_dialog
+
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    item = next(
+        i for i in observed.items if i.id == "bureau_self_observation"
+    )
+    evidence = [
+        _ocr("自观测胶卷", 516, 289, 48),
+        _ocr("1/2", 618, 353, 45, 24),
+        _ocr("最少", 360, 370, 52),
+        _ocr("最多", 867, 370, 50),
+        _ocr("确认消耗以上素材兑换", 486, 447, 180, 21),
+        _ocr("取消", 320, 547, 57, 20),
+        _ocr("确定", 932, 579, 101, 23),
+    ]
+    step_image = np.zeros((720, 1280, 3), dtype=np.uint8)
+    step_image[365:395, 435:475] = 255
+    step_image[365:395, 807:847] = 255
+
+    # Rejected: the confirmation line does not name the item.
+    assert _has_complete_bureau_quantity_dialog(
+        step_image, evidence, item
+    ) is False
+
+
+def test_standard_dialog_classifier_unchanged_for_headquarters_shop():
+    """The bureau change must not alter HQ shop dialog detection."""
+
+    from auto.shop_purchase import _has_complete_quantity_dialog
+
+    catalog = load_shop_catalog()
+    item = catalog.item("cactus_energy_weekly_iron")
+    dialog_ocr = [
+        _ocr(item.name, 560, 290, 200),
+        _ocr("最少", 360, 360, 50),
+        _ocr("最多", 870, 360, 50),
+        _ocr("售价", 525, 440, 55),
+        _ocr("10000", 650, 440, 70),
+        _ocr("取消", 310, 525, 55),
+        _ocr("确定", 930, 525, 55),
+        _ocr("1/8", 605, 355, 65),
+    ]
+    dialog_image = np.zeros((720, 1280, 3), dtype=np.uint8)
+    dialog_image[372:382, 445:465] = 255
+    dialog_image[372:382, 817:837] = 255
+
+    assert _has_complete_quantity_dialog(dialog_image, dialog_ocr) is True
 
 
 def test_bureau_quantity_probe_reads_all_marginals_and_cancels_once(monkeypatch):
