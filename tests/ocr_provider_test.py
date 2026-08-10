@@ -9,6 +9,53 @@ import numpy as np
 import pytest
 
 
+def test_windows_paddle_cuda_runtime_preloads_wheel_dlls(
+    monkeypatch, tmp_path,
+):
+    import core.image.ocr_backend as backend_module
+
+    site_packages = tmp_path / "Lib" / "site-packages"
+    cuda_dir = site_packages / "nvidia" / "cu13" / "bin" / "x86_64"
+    cudnn_dir = site_packages / "nvidia" / "cudnn" / "bin"
+    cuda_dir.mkdir(parents=True)
+    cudnn_dir.mkdir(parents=True)
+    libraries = [
+        cuda_dir / "cudart64_13.dll",
+        cuda_dir / "cublasLt64_13.dll",
+        cuda_dir / "cublas64_13.dll",
+        cudnn_dir / "cudnn64_9.dll",
+        cudnn_dir / "cudnn_ops64_9.dll",
+    ]
+    for library in libraries:
+        library.write_bytes(b"test")
+
+    added_directories = []
+    loaded_libraries = []
+    monkeypatch.setattr(backend_module.os, "name", "nt")
+    monkeypatch.setattr(backend_module.sys, "prefix", str(tmp_path))
+    monkeypatch.setattr(
+        backend_module.os,
+        "add_dll_directory",
+        lambda path: added_directories.append(path) or object(),
+    )
+    monkeypatch.setattr(
+        backend_module.ctypes,
+        "WinDLL",
+        lambda path: loaded_libraries.append(path) or object(),
+    )
+    monkeypatch.setattr(
+        backend_module, "_PADDLE_CUDA_RUNTIME_READY", False,
+    )
+    backend_module._PADDLE_CUDA_DLL_DIRECTORIES.clear()
+    backend_module._PADDLE_CUDA_DLL_HANDLES.clear()
+
+    backend_module._prepare_windows_paddle_cuda_runtime()
+
+    assert added_directories == [str(cuda_dir), str(cudnn_dir)]
+    assert loaded_libraries == [str(library) for library in libraries]
+    assert backend_module._PADDLE_CUDA_RUNTIME_READY is True
+
+
 def test_import_does_not_initialize_ocr_backend(monkeypatch):
     sys.modules.pop("core.image.ocr", None)
     sys.modules.pop("core.image.ocr_backend", None)

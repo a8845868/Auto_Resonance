@@ -7,7 +7,9 @@ and thread-safety guarantees that every caller already relies on.
 
 from __future__ import annotations
 
+import ctypes
 import os
+import sys
 import threading
 from collections.abc import Iterable
 from pathlib import Path
@@ -17,6 +19,86 @@ import cv2 as cv
 from loguru import logger
 
 from core.image.utils import crop_image
+
+
+_PADDLE_CUDA_RUNTIME_LOCK = threading.Lock()
+_PADDLE_CUDA_RUNTIME_READY = False
+_PADDLE_CUDA_DLL_DIRECTORIES: list[Any] = []
+_PADDLE_CUDA_DLL_HANDLES: list[Any] = []
+
+
+def _prepare_windows_paddle_cuda_runtime() -> None:
+    """Expose CUDA DLLs installed by Paddle's Windows dependency wheels.
+
+    The CUDA 13 Paddle wheel installs NVIDIA runtime DLLs below
+    ``site-packages/nvidia``.  Python 3.8+ no longer searches ``PATH`` for
+    extension-module dependencies by default, and Paddle's own dynamic loader
+    does not register those wheel directories.  Keep both directory and DLL
+    handles alive for the process so PP-OCRv6 can use the packaged runtime
+    without requiring a machine-wide PATH change.
+    """
+
+    global _PADDLE_CUDA_RUNTIME_READY
+    if os.name != "nt" or _PADDLE_CUDA_RUNTIME_READY:
+        return
+    with _PADDLE_CUDA_RUNTIME_LOCK:
+        if _PADDLE_CUDA_RUNTIME_READY:
+            return
+        site_packages = Path(sys.prefix) / "Lib" / "site-packages"
+        cuda_dir = site_packages / "nvidia" / "cu13" / "bin" / "x86_64"
+        cudnn_dir = site_packages / "nvidia" / "cudnn" / "bin"
+        if not cuda_dir.is_dir():
+            return
+
+        directories = [cuda_dir]
+        if cudnn_dir.is_dir():
+            directories.append(cudnn_dir)
+        add_directory = getattr(os, "add_dll_directory", None)
+        for directory in directories:
+            directory_text = str(directory)
+            path_parts = os.environ.get("PATH", "").split(os.pathsep)
+            if directory_text not in path_parts:
+                os.environ["PATH"] = (
+                    directory_text
+                    + os.pathsep
+                    + os.environ.get("PATH", "")
+                )
+            if callable(add_directory):
+                _PADDLE_CUDA_DLL_DIRECTORIES.append(
+                    add_directory(directory_text)
+                )
+
+        ordered_patterns = (
+            "cudart64_*.dll",
+            "nvJitLink_*.dll",
+            "cublasLt64_*.dll",
+            "cublas64_*.dll",
+            "cufft64_*.dll",
+            "curand64_*.dll",
+            "cusparse64_*.dll",
+            "cusolver64_*.dll",
+        )
+        try:
+            for pattern in ordered_patterns:
+                for library in sorted(cuda_dir.glob(pattern)):
+                    _PADDLE_CUDA_DLL_HANDLES.append(
+                        ctypes.WinDLL(str(library))
+                    )
+            if cudnn_dir.is_dir():
+                cudnn_libraries = sorted(cudnn_dir.glob("cudnn*.dll"))
+                cudnn_libraries.sort(
+                    key=lambda item: (item.name != "cudnn64_9.dll", item.name)
+                )
+                for library in cudnn_libraries:
+                    _PADDLE_CUDA_DLL_HANDLES.append(
+                        ctypes.WinDLL(str(library))
+                    )
+        except OSError as exc:
+            raise RuntimeError(
+                "paddle_cuda_runtime_dll_load_failed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        _PADDLE_CUDA_RUNTIME_READY = True
 
 
 class OcrBackend:
@@ -310,6 +392,7 @@ class PaddlePpocrV6Backend(OcrBackend):
     @staticmethod
     def _cuda_available() -> bool:
         try:
+            _prepare_windows_paddle_cuda_runtime()
             import paddle
 
             detector = getattr(paddle, "is_compiled_with_cuda", None)
@@ -325,6 +408,12 @@ class PaddlePpocrV6Backend(OcrBackend):
                 "the official Paddle GPU inference engine before selecting "
                 "PP-OCRv6"
             ) from exc
+        except RuntimeError as exc:
+            logger.warning(
+                "Paddle CUDA runtime unavailable; falling back to CPU: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
 
     @staticmethod
     def _create_ocr_model(*, provider: str):
