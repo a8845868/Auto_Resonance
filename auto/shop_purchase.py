@@ -2070,9 +2070,12 @@ class BureauReadOnlyCatalogAdapter:
     def _probe_price_schedule(self, match: dict, item: ReadOnlyShopItem) -> dict:
         """Open one quantity dialog, read every marginal, then cancel once.
 
-        The right-side exchange control is used only when the live row proves
-        that more than one unit remains.  A one-unit row already contains its
-        complete marginal schedule, so it never needs an item-level click.
+        The right-side exchange control is used when the live row proves that
+        more than one unit remains, or when the remaining count is unavailable
+        but the row identity and exchange control were uniquely bound.  In the
+        latter case the verified quantity dialog supplies the authoritative
+        probe maximum.  A one-unit row already contains its complete marginal
+        schedule, so it never needs an item-level click.
         """
 
         observed_limit = str(match.get("observed_limit") or "")
@@ -2083,13 +2086,6 @@ class BureauReadOnlyCatalogAdapter:
             "observed_limit": observed_limit or "未稳定识别",
             "source": "live_read_only_quantity_probe",
         }
-        if remaining is None:
-            return {
-                **base,
-                "status": "price_probe_unavailable",
-                "error": "未稳定识别剩余次数，未打开商品",
-                "price_observations": [],
-            }
         if remaining == 0:
             return {
                 **base,
@@ -2112,6 +2108,13 @@ class BureauReadOnlyCatalogAdapter:
                         for cost in item.costs
                     ],
                 }],
+            }
+        if remaining is None and str(match.get("id") or "") != item.id:
+            return {
+                **base,
+                "status": "price_probe_unavailable",
+                "error": "剩余次数未知且商品身份未唯一绑定，未打开商品",
+                "price_observations": [],
             }
         point = match.get("exchange_point")
         if not (
@@ -2164,14 +2167,23 @@ class BureauReadOnlyCatalogAdapter:
                 "price_observations": [],
             }
         maximum = int(first["maximum"])
-        if maximum > remaining or maximum - 1 > MAX_QUANTITY_PROBE_INCREMENTS:
+        exceeds_observed_remaining = (
+            remaining is not None and maximum > remaining
+        )
+        if (
+            exceeds_observed_remaining
+            or maximum - 1 > MAX_QUANTITY_PROBE_INCREMENTS
+        ):
             self._cancel_verified_quantity_dialog(item)
+            remaining_label = (
+                str(remaining) if remaining is not None else "UNKNOWN"
+            )
             return {
                 **base,
                 "status": "price_probe_failed",
                 "error": (
                     f"赴命商品弹窗上限超出只读探针预算: {item.name}，"
-                    f"剩余 {remaining}，弹窗 {maximum}"
+                    f"剩余 {remaining_label}，弹窗 {maximum}"
                 ),
                 "price_observations": [],
             }

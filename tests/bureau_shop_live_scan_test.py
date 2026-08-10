@@ -722,6 +722,147 @@ def test_bureau_single_remaining_uses_row_cost_without_item_click(monkeypatch):
     ]
 
 
+def test_bureau_unknown_remaining_uses_verified_dialog_maximum_once(monkeypatch):
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    item = next(
+        item for item in observed.items
+        if item.id == "bureau_general_weapon_jue"
+    )
+    frames = iter((
+        _DialogFrame(_dialog_ocr(item.name, 1, 2, [10])),
+        _DialogFrame(_dialog_ocr(item.name, 2, 2, [25])),
+        _Frame(_historical_frames()[0], 20),
+    ))
+    taps = []
+    monkeypatch.setattr(shop_purchase, "screenshot", lambda: next(frames))
+    monkeypatch.setattr(
+        shop_purchase,
+        "input_tap",
+        lambda point, **kwargs: taps.append((point, kwargs)) or True,
+    )
+    monkeypatch.setattr(shop_purchase.time, "sleep", lambda _seconds: None)
+    adapter = shop_purchase.BureauReadOnlyCatalogAdapter(
+        shop, observed, _Recorder()
+    )
+
+    result = adapter._probe_price_schedule(
+        {
+            "id": item.id,
+            "observed_limit": "未稳定识别",
+            "exchange_point": (1175, 210),
+        },
+        item,
+    )
+
+    assert result["status"] == "price_schedule_validated"
+    assert result["dialog_maximum"] == 2
+    assert result["price_observations"] == [
+        {
+            "quantity": 1,
+            "costs": [{
+                "currency": "jue_ming",
+                "marginal_cost": 10,
+                "cumulative_cost": 10,
+            }],
+        },
+        {
+            "quantity": 2,
+            "costs": [{
+                "currency": "jue_ming",
+                "marginal_cost": 15,
+                "cumulative_cost": 25,
+            }],
+        },
+    ]
+    action_keys = [kwargs["intent"].action_key for _, kwargs in taps]
+    assert action_keys == [
+        "shop_bureau_quantity_open",
+        "shop_quantity_increment",
+        "shop_quantity_cancel",
+    ]
+    assert all(kwargs["random_offset"] is False for _, kwargs in taps)
+    assert adapter.dialog_open_dispatches == 1
+    assert adapter.quantity_increment_dispatches == 1
+    assert adapter.dialog_cancel_dispatches == 1
+    assert "shop_confirm" not in action_keys
+
+
+def test_bureau_unknown_remaining_without_unique_control_never_clicks(monkeypatch):
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    item = next(
+        item for item in observed.items
+        if item.id == "bureau_general_weapon_jue"
+    )
+    monkeypatch.setattr(
+        shop_purchase,
+        "input_tap",
+        lambda *_args, **_kwargs: pytest.fail(
+            "unknown remaining without a unique control must not click"
+        ),
+    )
+    adapter = shop_purchase.BureauReadOnlyCatalogAdapter(
+        shop, observed, _Recorder()
+    )
+
+    result = adapter._probe_price_schedule(
+        {
+            "id": item.id,
+            "observed_limit": "未稳定识别",
+            "exchange_point": None,
+        },
+        item,
+    )
+
+    assert result["status"] == "price_probe_unavailable"
+    assert "未唯一识别本行兑换控件" in result["error"]
+    assert result["price_observations"] == []
+    assert adapter.dialog_open_dispatches == 0
+
+
+def test_bureau_unknown_remaining_without_bound_identity_never_clicks(monkeypatch):
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    item = next(
+        item for item in observed.items
+        if item.id == "bureau_general_weapon_jue"
+    )
+    monkeypatch.setattr(
+        shop_purchase,
+        "input_tap",
+        lambda *_args, **_kwargs: pytest.fail(
+            "unknown remaining without bound identity must not click"
+        ),
+    )
+    adapter = shop_purchase.BureauReadOnlyCatalogAdapter(
+        shop, observed, _Recorder()
+    )
+
+    result = adapter._probe_price_schedule(
+        {
+            "id": "bureau_general_weapon_fu",
+            "observed_limit": "未稳定识别",
+            "exchange_point": (1175, 210),
+        },
+        item,
+    )
+
+    assert result["status"] == "price_probe_unavailable"
+    assert "商品身份未唯一绑定" in result["error"]
+    assert result["price_observations"] == []
+    assert adapter.dialog_open_dispatches == 0
+
+
 def test_bureau_sold_out_item_is_reported_unavailable_without_click(monkeypatch):
     catalog = load_shop_catalog()
     shop = catalog.shop("bureau_exchange")
