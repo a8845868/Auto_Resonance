@@ -406,6 +406,54 @@ def _ambiguous_sibling_ids() -> frozenset[str]:
     )
 
 
+def _name_match_anchors(data: list[dict], expected_name: str) -> list[dict]:
+    """Return exact or safely reassembled same-line product-name anchors.
+
+    PP-OCRv6 may split a parenthesized material grade into a second token, for
+    example ``星云物质`` + ``(4钛)``.  Reassembly is deliberately narrow: the
+    base must be at least four characters, the missing suffix must be exactly
+    one parenthesized suffix, and the suffix token must be immediately to the
+    right on the same row.  Period, limit and price are still checked later.
+    """
+
+    anchors: list[dict] = []
+    for item in data:
+        observed = _normalize_text(item.get("text"))
+        if observed == expected_name:
+            anchors.append(item)
+            continue
+        if len(observed) < 4 or not expected_name.startswith(observed):
+            continue
+        suffix = expected_name[len(observed):]
+        if re.fullmatch(r"（[^）]+）", suffix) is None:
+            continue
+        item_x, item_y = _center(item)
+        suffix_items = [
+            candidate
+            for candidate in data
+            if _normalize_text(candidate.get("text")) == suffix
+            and 0 < _center(candidate)[0] - item_x <= 160
+            and abs(_center(candidate)[1] - item_y) <= 24
+        ]
+        if len(suffix_items) != 1:
+            continue
+        points = list(item.get("position", ())) + list(
+            suffix_items[0].get("position", ())
+        )
+        if not points:
+            continue
+        x1 = min(float(point[0]) for point in points)
+        y1 = min(float(point[1]) for point in points)
+        x2 = max(float(point[0]) for point in points)
+        y2 = max(float(point[1]) for point in points)
+        anchors.append({
+            **item,
+            "text": expected_name,
+            "position": [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+        })
+    return anchors
+
+
 def _card_price_roi_verify(
     page_image,
     x1: int,
@@ -469,9 +517,8 @@ def locate_product(
     expected_name = _normalize_text(target.name)
     matches = [
         item
-        for item in data
-        if _normalize_text(item.get("text")) == expected_name
-        and PRODUCT_REGION[1] <= _center(item)[1] <= PRODUCT_REGION[3]
+        for item in _name_match_anchors(data, expected_name)
+        if PRODUCT_REGION[1] <= _center(item)[1] <= PRODUCT_REGION[3]
     ]
     located: list[LocatedProduct] = []
     for match in matches:
@@ -602,7 +649,31 @@ def _has_quantity_step_buttons(image: object) -> bool:
 
 
 def _has_complete_quantity_dialog(image: object, ocr_items: Iterable[dict]) -> bool:
-    return _has_quantity_dialog(ocr_items) and _has_quantity_step_buttons(image)
+    data = list(ocr_items)
+    if not _has_quantity_step_buttons(image):
+        return False
+    if _has_quantity_dialog(data):
+        return True
+
+    # PP-OCRv6 can reduce the decorative "最多" label to "多" while the
+    # quantity, cancel and confirm controls remain unambiguous.  The min/max
+    # labels are not dispatch targets: the actual -1/+1 controls are verified
+    # visually above.  Require the two terminal action labels and a quantity
+    # value in their exact zones before accepting this OCR-tolerant path.
+    required_actions = {
+        "取消": (180, 480, 500, 590),
+        "确定": (800, 480, 1120, 590),
+    }
+    found: set[str] = set()
+    for item in data:
+        text = _normalize_text(item.get("text"))
+        zone = required_actions.get(text)
+        if zone is None:
+            continue
+        center_x, center_y = _center(item)
+        if zone[0] <= center_x <= zone[2] and zone[1] <= center_y <= zone[3]:
+            found.add(text)
+    return found == set(required_actions) and _dialog_quantity(data) is not None
 
 
 class ShopEvidenceRecorder:
@@ -635,6 +706,21 @@ class ShopEvidenceRecorder:
         )
         return ocr_items
 
+    def write_result(self, result: dict) -> str:
+        """Persist one privacy-safe final result beside the frame evidence."""
+
+        if not self.enabled:
+            return ""
+        self.root.mkdir(parents=True, exist_ok=True)
+        destination = self.root / "FINAL_RESULT.json"
+        temporary = destination.with_name(f"{destination.name}.tmp")
+        temporary.write_text(
+            json.dumps(result, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        temporary.replace(destination)
+        return str(destination)
+
 
 def _wait_for_text(
     expected: Iterable[str],
@@ -664,14 +750,36 @@ def _dialog_quantity(ocr_items: Iterable[dict]) -> tuple[int, int] | None:
 
 
 def _dialog_price(ocr_items: Iterable[dict]) -> int | None:
-    values = []
-    for item in ocr_items:
+    data = list(ocr_items)
+    candidates: list[tuple[int, float, float]] = []
+    for item in data:
         center_x, center_y = _center(item)
         if center_x >= 600 and 420 <= center_y <= 490:
             value = _numeric_value(item.get("text"))
             if value is not None:
-                values.append(value)
-    return values[-1] if values else None
+                candidates.append((value, center_x, center_y))
+    if not candidates:
+        return None
+
+    label_bbox = _price_label_bbox(data)
+    if label_bbox is not None:
+        _, label_y1, label_x2, label_y2 = label_bbox
+        label_center_y = (label_y1 + label_y2) / 2.0
+        anchored = [
+            candidate
+            for candidate in candidates
+            if label_x2 <= candidate[1] <= label_x2 + 220
+            and abs(candidate[2] - label_center_y) <= 35
+        ]
+        if anchored:
+            # The price is the first numeric text immediately to the right of
+            # "售价".  V6 may also detect stray zero-like glyphs farther right;
+            # OCR result order must not decide which number is authoritative.
+            return min(anchored, key=lambda item: (item[1] - label_x2, abs(item[2] - label_center_y)))[0]
+
+    # Compatibility for older/synthetic OCR without a visible price label.
+    # Prefer the stable dialog price anchor instead of the last OCR token.
+    return min(candidates, key=lambda item: abs(item[1] - 683) + abs(item[2] - 452))[0]
 
 
 def _price_label_bbox(
@@ -907,6 +1015,13 @@ class HeadquartersBlackMoonAdapter:
                 self._cancel_dialog(f"cancel-quantity-{located.item.id}")
                 raise BlockedBySafetyError(f"未识别数量控件: {located.item.name}")
             quantity = (1, 1)
+        dialog_maximum = quantity[1]
+        if not (1 <= quantity[0] <= dialog_maximum <= located.remaining):
+            self._cancel_dialog(f"cancel-dialog-limit-{located.item.id}")
+            raise BlockedBySafetyError(
+                f"商品弹窗可选上限不可信: {located.item.name}，"
+                f"本期剩余 {located.remaining}，弹窗 {quantity[0]}/{dialog_maximum}"
+            )
         if price_observations is not None:
             if quantity[1] - quantity[0] > MAX_QUANTITY_PROBE_INCREMENTS:
                 self._cancel_dialog(f"cancel-probe-limit-{located.item.id}")
@@ -993,15 +1108,15 @@ class HeadquartersBlackMoonAdapter:
                     f"未能安全识别上限模式实时总价: {located.item.name}"
                 )
         expected = (
-            located.remaining
-            if price_observations is not None
-            else (1 if quantity_mode == "one" else located.remaining)
+            dialog_maximum
+            if price_observations is not None or quantity_mode == "max"
+            else 1
         )
-        if quantity[0] != expected:
+        if quantity != (expected, dialog_maximum):
             self._cancel_dialog(f"cancel-quantity-mismatch-{located.item.id}")
             raise BlockedBySafetyError(
                 f"商品数量校验失败: {located.item.name}，"
-                f"期望 {expected}，实机 {quantity[0]}/{quantity[1]}"
+                f"期望 {expected}/{dialog_maximum}，实机 {quantity[0]}/{quantity[1]}"
             )
         return quantity[0], observed_total
 
@@ -1548,4 +1663,19 @@ def run_shop_purchase(dry_run: bool = False) -> dict:
             "shops": shop_results,
         }
 
-    return _connected_run(run)  # type: ignore[return-value]
+    result = _connected_run(run)
+    if not isinstance(result, dict):
+        raise TypeError("商店任务返回了无效结果")
+    result["completed_at"] = datetime.now().astimezone().isoformat(
+        timespec="seconds"
+    )
+    if bool(getattr(recorder, "enabled", False)):
+        result["result_file"] = str(recorder.root / "FINAL_RESULT.json")
+        try:
+            recorder.write_result(result)
+        except Exception:
+            result["result_file"] = ""
+            logger.exception("保存商店任务最终结果失败")
+    else:
+        result["result_file"] = ""
+    return result

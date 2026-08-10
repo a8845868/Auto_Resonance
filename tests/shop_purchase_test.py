@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pytest
 
@@ -5,6 +7,7 @@ import auto.shop_purchase as shop_purchase
 from auto.shop_purchase import (
     DIALOG_CANCEL_POS,
     DIALOG_CONFIRM_POS,
+    DIALOG_MAX_POS,
     DIALOG_PLUS_POS,
     HeadquartersBlackMoonAdapter,
     LocatedProduct,
@@ -36,6 +39,21 @@ def _ocr(text, x, y, width=110, height=24):
             [x, y + height],
         ],
     }
+
+
+def test_shop_evidence_recorder_persists_final_result_atomically(tmp_path):
+    recorder = ShopEvidenceRecorder(True, "dry")
+    recorder.root = tmp_path / "shop-run"
+    payload = {
+        "completed_at": "2026-08-10T10:19:53+08:00",
+        "shops": [{"results": [{"id": "sample", "status": "failed"}]}],
+    }
+
+    result_path = recorder.write_result(payload)
+
+    assert result_path == str(recorder.root / "FINAL_RESULT.json")
+    assert json.loads((recorder.root / "FINAL_RESULT.json").read_text("utf-8")) == payload
+    assert not (recorder.root / "FINAL_RESULT.json.tmp").exists()
 
 
 def test_parse_limit_and_quantity_dialog_text():
@@ -93,6 +111,35 @@ def test_locator_accepts_missing_list_price_before_dialog_price_check():
     assert located.total == 500
 
 
+def test_locator_reassembles_v6_split_parenthesized_product_name():
+    catalog = load_shop_catalog()
+    target = catalog.item("nebula_4_daily_iron")
+    ocr_items = [
+        _ocr("每日限购36/36", 1110, 295, 145),
+        _ocr("星云物质", 1080, 320, 105),
+        _ocr("(4钛)", 1175, 320, 55),
+        _ocr("30000", 1180, 358, 72),
+    ]
+
+    located = locate_product(ocr_items, target)
+
+    assert located is not None
+    assert located.remaining == 36
+    assert located.total == 36
+
+
+def test_locator_does_not_guess_parenthesized_suffix_when_v6_suffix_is_absent():
+    catalog = load_shop_catalog()
+    target = catalog.item("nebula_4_daily_iron")
+    ocr_items = [
+        _ocr("每日限购36/36", 1110, 295, 145),
+        _ocr("星云物质", 1080, 320, 105),
+        _ocr("30000", 1180, 358, 72),
+    ]
+
+    assert locate_product(ocr_items, target) is None
+
+
 def test_content_difference_only_uses_product_region():
     before = np.zeros((720, 1280, 3), dtype=np.uint8)
     after = before.copy()
@@ -133,8 +180,39 @@ def test_batch_toggle_and_quantity_dialog_safety_guards():
     ) is False
 
 
+def test_complete_quantity_dialog_tolerates_v6_truncated_max_label():
+    dialog_image = np.zeros((720, 1280, 3), dtype=np.uint8)
+    dialog_image[372:382, 445:465] = 255
+    dialog_image[372:382, 817:837] = 255
+    v6_ocr = [
+        _ocr("最少", 340, 355),
+        _ocr("多", 880, 355),
+        _ocr("取消", 260, 515),
+        _ocr("确定", 900, 515),
+        _ocr("2/10", 600, 355),
+    ]
+
+    assert _has_quantity_dialog(v6_ocr) is False
+    assert _has_complete_quantity_dialog(dialog_image, v6_ocr) is True
+    assert _has_complete_quantity_dialog(
+        dialog_image,
+        [item for item in v6_ocr if item["text"] != "确定"],
+    ) is False
+
+
 def test_dialog_total_uses_observed_ocr_value():
     assert _dialog_price([_ocr("540000", 650, 440)]) == 540000
+
+
+def test_dialog_total_is_anchored_to_price_label_not_v6_stray_digits():
+    ocr_items = [
+        _ocr("售价", 530, 440, 55),
+        _ocr("1900000", 640, 440, 86),
+        _ocr("0", 875, 452, 22),
+        _ocr("LD", 930, 444, 46),
+    ]
+
+    assert _dialog_price(ocr_items) == 1_900_000
 
 
 def test_catalog_probe_continues_after_all_known_items_until_stable_bottom(
@@ -335,6 +413,92 @@ def test_dry_run_quantity_probe_reads_each_increment_and_never_confirms(monkeypa
     assert taps[1][1]["random_offset"] is False
     assert taps[1][1]["intent"].action_key == "shop_quantity_increment"
     assert DIALOG_CONFIRM_POS not in [position for position, _kwargs in taps]
+
+
+def test_dry_run_quantity_probe_uses_dialog_cap_below_period_remaining(monkeypatch):
+    catalog = load_shop_catalog()
+    item = catalog.item("laplace_monthly_iron")
+    shop = catalog.shop(item.shop_id)
+    located = LocatedProduct(item, (850, 300), 10, 10, ())
+
+    def dialog_ocr(quantity, total):
+        return [
+            _ocr(item.name, 580, 306, 121),
+            _ocr("最少", 365, 363),
+            _ocr("+1", 813, 368),
+            _ocr("多", 880, 367),
+            _ocr("售价", 536, 442),
+            _ocr(str(total), 647, 442, 74),
+            _ocr("取消", 324, 521),
+            _ocr("确定", 959, 523),
+            _ocr(f"{quantity}/2", 619, 353),
+        ]
+
+    matrix = np.zeros((720, 1280, 3), dtype=np.uint8)
+    matrix[372:382, 445:465] = 255
+    matrix[372:382, 817:837] = 255
+    frames = iter([
+        _FakeImage(matrix, dialog_ocr(1, 100000)),
+        _FakeImage(matrix, dialog_ocr(2, 200000)),
+    ])
+    monkeypatch.setattr(shop_purchase, "screenshot", lambda: next(frames))
+    monkeypatch.setattr(shop_purchase, "input_tap", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(shop_purchase.time, "sleep", lambda *_: None)
+    observations = []
+
+    quantity, observed_total = HeadquartersBlackMoonAdapter(
+        shop, _FakeRecorder()
+    ).inspect_dialog(located, "one", price_observations=observations)
+
+    assert quantity == 2
+    assert observed_total == 200000
+    assert observations[-1] == {
+        "quantity": 2,
+        "marginal_cost": 100000,
+        "cumulative_cost": 200000,
+    }
+
+
+def test_max_quantity_uses_affordable_dialog_cap_below_period_remaining(monkeypatch):
+    catalog = load_shop_catalog()
+    item = catalog.item("nebula_8_monthly_resume")
+    shop = catalog.shop(item.shop_id)
+    located = LocatedProduct(item, (824, 329), 500, 500, ())
+
+    def dialog_ocr(quantity, total):
+        return [
+            _ocr(item.name, 560, 302, 145),
+            _ocr("最少", 365, 365),
+            _ocr("+1", 813, 368),
+            _ocr("最多", 871, 364),
+            _ocr("售价", 533, 439),
+            _ocr(str(total), 662, 440, 55),
+            _ocr("取消", 322, 521),
+            _ocr("确定", 957, 521),
+            _ocr(f"{quantity}/56", 606, 351),
+        ]
+
+    matrix = np.zeros((720, 1280, 3), dtype=np.uint8)
+    matrix[372:382, 445:465] = 255
+    matrix[372:382, 817:837] = 255
+    frames = iter([
+        _FakeImage(matrix, dialog_ocr(1, 4)),
+        _FakeImage(matrix, dialog_ocr(56, 224)),
+    ])
+    taps = []
+    monkeypatch.setattr(shop_purchase, "screenshot", lambda: next(frames))
+    monkeypatch.setattr(
+        shop_purchase, "input_tap", lambda pos, **_kwargs: taps.append(pos) or object()
+    )
+    monkeypatch.setattr(shop_purchase.time, "sleep", lambda *_: None)
+
+    quantity, observed_total = HeadquartersBlackMoonAdapter(
+        shop, _FakeRecorder()
+    ).inspect_dialog(located, "max")
+
+    assert quantity == 56
+    assert observed_total == 224
+    assert taps == [located.center, DIALOG_MAX_POS]
 
 
 def test_dry_run_quantity_probe_rejects_decreasing_marginal_cost(monkeypatch):

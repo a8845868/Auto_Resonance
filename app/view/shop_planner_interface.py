@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Qt, Signal
@@ -58,8 +59,8 @@ def _quantity_options(
     if not item.price_tiers:
         return QUANTITY_OPTIONS
     return (
-        ("one", "从当前状态仅买 1 件（按当前档位）"),
-        ("max", "买完当前剩余（弹窗实时总价）"),
+        ("one", "仅买 1 件（当前档位）"),
+        ("max", "买完剩余（实时总价）"),
     )
 
 
@@ -67,12 +68,14 @@ def _price_breakdown_text(item: ShopItem, currency: CurrencyDefinition) -> str:
     rows = []
     for number, _remaining, marginal, cumulative in item.price_breakdown():
         if marginal is None or cumulative is None:
-            rows.append(f"第 {number} 件：价格未采集（不可选为累计目标）")
+            rows.append(f"{number} 件  ｜  价格未采集（不可作为累计目标）")
         else:
             rows.append(
-                f"第 {number} 件：边际 {marginal:,}，累计 {cumulative:,} {currency.name}"
+                f"{number} 件  ｜  边际 {marginal:,}  ｜  累计 {cumulative:,}"
             )
-    return "  ·  ".join(rows)
+    if not rows:
+        return ""
+    return f"目录价格档位（{currency.name}）\n" + "\n".join(rows)
 
 
 def _observed_price_breakdown_text(
@@ -94,9 +97,9 @@ def _observed_price_breakdown_text(
         if quantity < 1 or marginal <= 0 or cumulative <= 0:
             return ""
         rows.append(
-            f"{quantity} 件：边际 {marginal:,}，累计 {cumulative:,} {currency.name}"
+            f"{quantity} 件  ｜  边际 {marginal:,}  ｜  累计 {cumulative:,}"
         )
-    return "实机只读观察 · " + "  ·  ".join(rows)
+    return f"本次实机只读观察（{currency.name}）\n" + "\n".join(rows)
 
 
 def _run_shop_dry_run() -> dict:
@@ -149,6 +152,44 @@ def _shop_dry_run_summary(result: dict) -> str:
     return "，".join(parts)
 
 
+def _shop_dry_run_diagnostics(result: dict) -> str:
+    """Return user-visible, copyable diagnostics for one completed scan."""
+
+    completed_at = str(result.get("completed_at") or "").strip()
+    if completed_at:
+        try:
+            completed_at = datetime.fromisoformat(completed_at).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        except ValueError:
+            completed_at = completed_at.replace("T", " ")
+    lines = [f"完成时间：{completed_at or '未知'}"]
+    for shop_result in result.get("shops") or []:
+        if not isinstance(shop_result, dict):
+            continue
+        for item_result in shop_result.get("results") or []:
+            if not isinstance(item_result, dict):
+                continue
+            if str(item_result.get("status") or "") != "failed":
+                continue
+            name = str(item_result.get("name") or item_result.get("id") or "未知商品")
+            item_id = str(item_result.get("id") or "").strip()
+            reason = str(item_result.get("error") or "未知错误")
+            identity = f"（{item_id}）" if item_id else ""
+            lines.append(f"失败商品：{name}{identity} — {reason}")
+        for missing in shop_result.get("missing") or []:
+            if not isinstance(missing, dict):
+                continue
+            name = str(missing.get("name") or missing.get("id") or "未知商品")
+            item_id = str(missing.get("id") or "").strip()
+            identity = f"（{item_id}）" if item_id else ""
+            lines.append(f"未定位商品：{name}{identity}")
+    result_file = str(result.get("result_file") or "").strip()
+    if result_file:
+        lines.append(f"结果文件：{result_file}")
+    return "\n".join(lines)
+
+
 class ShopDryRunWorker(QThread):
     succeeded = Signal(dict)
     failed = Signal(str)
@@ -188,8 +229,13 @@ class ShopItemCard(QFrame):
         self.currency = currency
         self.quantityOptions = _quantity_options(item, currency)
         self.setObjectName("shopItemCard")
-        self.setMinimumHeight(218 if item.price_tiers else 142)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        tier_rows = len(item.price_breakdown()) if item.price_tiers else 0
+        self._baseMinimumHeight = 142 if not tier_rows else 188 + (tier_rows * 21)
+        self.setMinimumHeight(self._baseMinimumHeight)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
 
         root = QHBoxLayout(self)
         root.setContentsMargins(14, 12, 14, 12)
@@ -199,10 +245,10 @@ class ShopItemCard(QFrame):
         icon.setFixedSize(82, 82)
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon.setPixmap(_pixmap(item.icon, 78, 78))
-        root.addWidget(icon)
+        root.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
 
         details = QVBoxLayout()
-        details.setSpacing(5)
+        details.setSpacing(7)
         name = QLabel(item.name, self)
         name.setWordWrap(True)
         name.setStyleSheet("font-size: 15px; font-weight: 650;")
@@ -225,18 +271,26 @@ class ShopItemCard(QFrame):
         details.addWidget(limit)
         details.addLayout(price_row)
         if item.price_tiers:
-            breakdown = QLabel(_price_breakdown_text(item, currency), self)
-            breakdown.setWordWrap(True)
-            breakdown.setStyleSheet("color: #c7c7c7; font-size: 12px;")
-            details.addWidget(breakdown)
+            self.catalogPriceLabel = QLabel(
+                _price_breakdown_text(item, currency),
+                self,
+            )
+            self.catalogPriceLabel.setWordWrap(True)
+            self.catalogPriceLabel.setContentsMargins(0, 5, 0, 5)
+            self.catalogPriceLabel.setStyleSheet(
+                "color: #d5d5d5; font-size: 12px;"
+            )
+            details.addWidget(self.catalogPriceLabel)
             self.observedPriceLabel = QLabel(self)
             self.observedPriceLabel.setWordWrap(True)
+            self.observedPriceLabel.setContentsMargins(0, 7, 0, 5)
             self.observedPriceLabel.setStyleSheet(
                 "color: #7fd8a8; font-size: 12px; font-weight: 600;"
             )
             self.observedPriceLabel.hide()
             details.addWidget(self.observedPriceLabel)
         else:
+            self.catalogPriceLabel = None
             self.observedPriceLabel = None
         self.failureLabel = QLabel(self)
         self.failureLabel.setWordWrap(True)
@@ -253,7 +307,7 @@ class ShopItemCard(QFrame):
         self.enabledCheck = CheckBox("自动购买", self)
         self.enabledCheck.setChecked(bool(rule.get("enabled", False)))
         self.quantityCombo = ComboBox(self)
-        self.quantityCombo.setMinimumWidth(158)
+        self.quantityCombo.setFixedWidth(210)
         for _, label in self.quantityOptions:
             self.quantityCombo.addItem(label)
         selected_mode = str(rule.get("quantity", "max"))
@@ -265,6 +319,7 @@ class ShopItemCard(QFrame):
         controls.addWidget(self.enabledCheck)
         controls.addWidget(self.quantityCombo)
         controls.addStretch(1)
+        controls.setAlignment(Qt.AlignmentFlag.AlignTop)
         root.addLayout(controls)
 
         self.enabledCheck.checkStateChanged.connect(self._on_changed)
@@ -305,12 +360,19 @@ class ShopItemCard(QFrame):
         self.observedPriceLabel.setVisible(bool(text))
         if text:
             self.failureLabel.hide()
+        observation_rows = max(0, text.count("\n")) if text else 0
+        self.setMinimumHeight(
+            self._baseMinimumHeight + (34 + observation_rows * 21 if text else 0)
+        )
+        self.updateGeometry()
 
     def setFailureReason(self, reason: str) -> None:
         self.failureLabel.setText(f"干跑失败：{reason}")
         self.failureLabel.show()
         if self.observedPriceLabel is not None:
             self.observedPriceLabel.hide()
+        self.setMinimumHeight(self._baseMinimumHeight + 48)
+        self.updateGeometry()
 
 
 class ReadOnlyShopItemCard(QFrame):
@@ -370,6 +432,7 @@ class ShopPlannerInterface(ScrollArea):
         self.currentShopId = self.catalog.shops[0].id
         self.itemCards: dict[str, ShopItemCard] = {}
         self.observedPriceSchedules: dict[str, list[dict]] = {}
+        self.dryRunFailures: dict[str, str] = {}
         self.shopButtons: dict[str, QPushButton] = {}
         self.dryRunWorker: ShopDryRunWorker | None = None
 
@@ -452,6 +515,19 @@ class ShopPlannerInterface(ScrollArea):
         dry_run_row.addWidget(self.dryRunButton)
         dry_run_row.addWidget(self.dryRunStatus, 1)
         self.rootLayout.addLayout(dry_run_row)
+
+        self.dryRunDetails = QLabel("", self.scrollWidget)
+        self.dryRunDetails.setWordWrap(True)
+        self.dryRunDetails.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.dryRunDetails.setStyleSheet(
+            "color: #ff7b7b; background: rgba(170,45,45,0.10); "
+            "border: 1px solid rgba(235,85,85,0.42); border-radius: 7px; "
+            "padding: 9px 12px;"
+        )
+        self.dryRunDetails.hide()
+        self.rootLayout.addWidget(self.dryRunDetails)
 
         self.scheduleCard = TaskScheduleCard("shop_purchase", self.scrollWidget)
         self.rootLayout.addWidget(self.scheduleCard)
@@ -578,6 +654,9 @@ class ShopPlannerInterface(ScrollArea):
             card.setObservedPriceSchedule(
                 self.observedPriceSchedules.get(item.id, [])
             )
+            failure = self.dryRunFailures.get(item.id)
+            if failure:
+                card.setFailureReason(failure)
             self.itemCards[item.id] = card
             self.productGrid.addWidget(card, index // 2, index % 2)
         self.productGrid.setColumnStretch(0, 1)
@@ -627,9 +706,12 @@ class ShopPlannerInterface(ScrollArea):
         if self.dryRunWorker and self.dryRunWorker.isRunning():
             return
         self.observedPriceSchedules.clear()
+        self.dryRunFailures.clear()
         for card in self.itemCards.values():
             card.setObservedPriceSchedule([])
             card.failureLabel.hide()
+        self.dryRunDetails.clear()
+        self.dryRunDetails.hide()
         self.dryRunButton.setEnabled(False)
         self.dryRunButton.setText("正在扫描商店…")
         self.dryRunStatus.setText(
@@ -654,15 +736,29 @@ class ShopPlannerInterface(ScrollArea):
                 observations = item_result.get("price_observations")
                 if isinstance(observations, list) and observations:
                     self.observedPriceSchedules[item_id] = observations
+                if status == "failed":
+                    reason = str(item_result.get("error", "未知错误"))
+                    self.dryRunFailures[item_id] = reason
+                    if card is not None:
+                        card.setFailureReason(reason)
+                elif card is not None:
+                    card.setObservedPriceSchedule(observations)
+            for missing in shop_result.get("missing") or []:
+                if not isinstance(missing, dict):
+                    continue
+                item_id = str(missing.get("id") or "")
+                if not item_id:
+                    continue
+                reason = "未定位：扫描结束仍未找到可核验的商品卡片"
+                self.dryRunFailures[item_id] = reason
+                card = self.itemCards.get(item_id)
                 if card is not None:
-                    if status == "failed":
-                        card.setFailureReason(
-                            str(item_result.get("error", "未知错误"))
-                        )
-                    else:
-                        card.setObservedPriceSchedule(observations)
+                    card.setFailureReason(reason)
         summary = _shop_dry_run_summary(result)
         self.dryRunStatus.setText(summary)
+        details = _shop_dry_run_diagnostics(result)
+        self.dryRunDetails.setText(details)
+        self.dryRunDetails.setVisible(bool(details))
         info = InfoBar.warning if bool(result.get("requires_attention")) else InfoBar.success
         info(
             "商店干跑完成",
@@ -674,6 +770,11 @@ class ShopPlannerInterface(ScrollArea):
 
     def _dryRunFailed(self, message: str):
         self.dryRunStatus.setText("商店干跑失败；未进入购买确认")
+        self.dryRunDetails.setText(
+            f"失败时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"运行错误：{message}"
+        )
+        self.dryRunDetails.show()
         InfoBar.error(
             "商店干跑失败",
             message,

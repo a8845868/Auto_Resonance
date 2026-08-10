@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QSizePolicy
 
 import app.view.shop_planner_interface as shop_interface
 import auto.shop_purchase as shop_purchase
@@ -137,6 +137,8 @@ def test_shop_dry_run_bypasses_attempt_lock_and_never_records_purchase(monkeypat
     assert result["success"] is True
     assert result["dry_run"] is True
     assert result["blocked_by_period"] == []
+    assert result["completed_at"]
+    assert result["result_file"] == ""
     assert calls == ["open", ((purchase,), True)]
 
 
@@ -169,12 +171,14 @@ def test_stepped_item_card_shows_marginal_and_cumulative_price_details():
     text = shop_interface._price_breakdown_text(item, currency)
     options = shop_interface._quantity_options(item, currency)
 
-    assert "第 1 件：边际 100,000，累计 100,000 铁盟币" in text
-    assert "第 2 件：边际 200,000，累计 300,000 铁盟币" in text
-    assert "第 3 件：价格未采集（不可选为累计目标）" in text
+    assert "1 件  ｜  边际 100,000  ｜  累计 100,000" in text
+    assert "2 件  ｜  边际 200,000  ｜  累计 300,000" in text
+    assert "3 件  ｜  价格未采集（不可作为累计目标）" in text
+    assert text.startswith("目录价格档位（铁盟币）\n")
+    assert "  ·  " not in text
     assert options == (
-        ("one", "从当前状态仅买 1 件（按当前档位）"),
-        ("max", "买完当前剩余（弹窗实时总价）"),
+        ("one", "仅买 1 件（当前档位）"),
+        ("max", "买完剩余（实时总价）"),
     )
     assert application is not None
 
@@ -202,8 +206,9 @@ def test_observed_price_breakdown_formats_live_marginal_and_cumulative_costs():
     )
 
     assert text == (
-        "实机只读观察 · 1 件：边际 200,000，累计 200,000 铁盟币"
-        "  ·  2 件：边际 200,000，累计 400,000 铁盟币"
+        "本次实机只读观察（铁盟币）\n"
+        "1 件  ｜  边际 200,000  ｜  累计 200,000\n"
+        "2 件  ｜  边际 200,000  ｜  累计 400,000"
     )
 
 
@@ -224,9 +229,13 @@ def test_stepped_card_can_show_read_only_observed_price_schedule():
     ])
 
     assert card.observedPriceLabel.isVisible() is False  # parent is not shown
-    assert "2 件：边际 200,000，累计 400,000 铁盟币" in (
+    assert "2 件  ｜  边际 200,000  ｜  累计 400,000" in (
         card.observedPriceLabel.text()
     )
+    assert card.catalogPriceLabel.text().startswith("目录价格档位（铁盟币）\n")
+    assert card.observedPriceLabel.text().startswith("本次实机只读观察（铁盟币）\n")
+    assert card.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Preferred
+    assert card.minimumHeight() > card._baseMinimumHeight
     assert application is not None
     card.deleteLater()
 
@@ -243,7 +252,7 @@ def test_observed_schedule_survives_shop_card_rebuild_in_same_gui_session():
 
     page.showShop("headquarters_black_moon")
 
-    assert "2 件：边际 200,000，累计 400,000 铁盟币" in (
+    assert "2 件  ｜  边际 200,000  ｜  累计 400,000" in (
         page.itemCards[item_id].observedPriceLabel.text()
     )
     assert application is not None
@@ -276,6 +285,75 @@ def test_shop_dry_run_summary_counts_failed_items():
     assert "2 项失败" in summary
     assert "未定位 1 项" in summary
     assert "需要人工复核" in summary
+
+
+def test_shop_dry_run_diagnostics_shows_time_failed_missing_and_result_file():
+    details = shop_interface._shop_dry_run_diagnostics({
+        "completed_at": "2026-08-10T10:19:53+08:00",
+        "result_file": "logs/shop_purchase/run/FINAL_RESULT.json",
+        "shops": [{
+            "results": [{
+                "id": "laplace_monthly_iron",
+                "name": "拉普拉斯协议",
+                "status": "failed",
+                "error": "商品数量只读探测结果不可信",
+            }],
+            "missing": [{
+                "id": "nebula_4_daily_iron",
+                "name": "星云物质（4钛）",
+            }],
+        }],
+    })
+
+    assert "完成时间：2026-08-10 10:19:53" in details
+    assert "失败商品：拉普拉斯协议（laplace_monthly_iron）" in details
+    assert "商品数量只读探测结果不可信" in details
+    assert "未定位商品：星云物质（4钛）（nebula_4_daily_iron）" in details
+    assert "结果文件：logs/shop_purchase/run/FINAL_RESULT.json" in details
+
+
+def test_shop_page_keeps_failed_and_missing_reasons_visible_after_rebuild():
+    application = QApplication.instance() or QApplication([])
+    page = shop_interface.ShopPlannerInterface()
+    result = {
+        "success": False,
+        "dry_run": True,
+        "requires_attention": True,
+        "completed_at": "2026-08-10T10:19:53+08:00",
+        "result_file": "logs/shop_purchase/run/FINAL_RESULT.json",
+        "shops": [{
+            "pages": 7,
+            "results": [{
+                "id": "laplace_monthly_iron",
+                "name": "拉普拉斯协议",
+                "status": "failed",
+                "error": "商品数量只读探测结果不可信",
+            }],
+            "missing": [{
+                "id": "nebula_4_daily_iron",
+                "name": "星云物质（4钛）",
+            }],
+        }],
+    }
+
+    page._dryRunSucceeded(result)
+
+    assert "失败商品：拉普拉斯协议" in page.dryRunDetails.text()
+    assert "未定位商品：星云物质（4钛）" in page.dryRunDetails.text()
+    assert "商品数量只读探测结果不可信" in (
+        page.itemCards["laplace_monthly_iron"].failureLabel.text()
+    )
+    assert "未定位" in page.itemCards["nebula_4_daily_iron"].failureLabel.text()
+
+    page.showShop("bureau_exchange")
+    page.showShop("headquarters_black_moon")
+
+    assert "商品数量只读探测结果不可信" in (
+        page.itemCards["laplace_monthly_iron"].failureLabel.text()
+    )
+    assert "未定位" in page.itemCards["nebula_4_daily_iron"].failureLabel.text()
+    assert application is not None
+    page.deleteLater()
 
 
 def test_failed_item_shows_error_in_card_without_claiming_observed_price():
