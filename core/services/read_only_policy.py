@@ -435,6 +435,17 @@ DEFAULT_POLICY_SPECS = {
         postcondition="shop_catalog_remains_safe",
         allowed_post_page_types=frozenset({"shop"}),
     ),
+    "shop_page_open": ReadOnlyPolicySpec(
+        "shop_page_open", frozenset({"home", "hud"}), "shop_entry",
+        postcondition="shop_page_visible",
+        allowed_post_page_types=frozenset({"shop"}),
+    ),
+    "shop_bureau_open": ReadOnlyPolicySpec(
+        "shop_bureau_open", frozenset({"shop"}), "bureau_shop_tab",
+        allowed_region=(940, 12, 1065, 68),
+        postcondition="bureau_shop_visible",
+        allowed_post_page_types=frozenset({"shop"}),
+    ),
     "shop_catalog_scroll": ReadOnlyPolicySpec(
         "shop_catalog_scroll", frozenset({"shop"}), "shop_catalog_content",
         action_kind=ActionKind.SWIPE,

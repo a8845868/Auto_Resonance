@@ -36,6 +36,8 @@ from core.preset.control import go_home
 from core.services.runtime_errors import BlockedBySafetyError
 from core.services.shop_catalog import (
     ConfiguredPurchase,
+    ReadOnlyShopCatalog,
+    ReadOnlyShopItem,
     ShopAttemptAlreadyActive,
     ShopDefinition,
     ShopItem,
@@ -43,6 +45,7 @@ from core.services.shop_catalog import (
     configured_purchases,
     load_shop_catalog,
     load_shop_plan,
+    load_read_only_shop_catalog,
     record_shop_attempt,
     shop_attempt_digest,
     shop_catalog_digest,
@@ -62,7 +65,9 @@ from core.services.read_only_policy import (
 
 SHOP_ENTRY_POS = (260, 30)
 HEADQUARTERS_TAB_POS = (858, 40)
+BUREAU_TAB_POS = (1002, 40)
 PRODUCT_REGION = (580, 150, 1260, 660)
+BUREAU_PRODUCT_REGION = (580, 130, 1260, 705)
 PRODUCT_SCROLL_START = (800, 585)
 PRODUCT_SCROLL_END = (800, 365)
 PRODUCT_REWIND_START = PRODUCT_SCROLL_END
@@ -90,7 +95,10 @@ def _shop_swipe_observation(action_key: str) -> PageObservation:
     if not source_id or source_sequence <= 0 or captured_at is None or not raw_hash:
         raise PermissionError("shop catalog swipe requires trusted capture provenance")
     in_shop = any(
-        _normalize_text(item.get("text")) in ("总部商店", "黑月商店", "NIGHTCHAINSSTORE")
+        _normalize_text(item.get("text")) in (
+            "总部商店", "黑月商店", "NIGHTCHAINSSTORE", "赴命商店",
+            "EXCHANGESTATION",
+        )
         for item in ocr_items
     )
     page_type = "shop" if in_shop else "unknown"
@@ -595,11 +603,104 @@ def locate_product(
     return located[0] if located else None
 
 
-def _content_difference(previous: np.ndarray, current: np.ndarray) -> float:
-    x1, y1, x2, y2 = PRODUCT_REGION
+def _content_difference(
+    previous: np.ndarray,
+    current: np.ndarray,
+    region: tuple[int, int, int, int] = PRODUCT_REGION,
+) -> float:
+    x1, y1, x2, y2 = region
     before = cv.cvtColor(previous[y1:y2, x1:x2], cv.COLOR_BGR2GRAY)
     after = cv.cvtColor(current[y1:y2, x1:x2], cv.COLOR_BGR2GRAY)
     return float(np.mean(cv.absdiff(before, after)))
+
+
+def _compact_amount(value: str) -> int | None:
+    """Parse a shop cost suffix such as ``500``, ``2.5k`` or ``1m``."""
+
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([km]?)", value.strip().lower())
+    if not match:
+        return None
+    multiplier = {"": 1, "k": 1_000, "m": 1_000_000}[match.group(2)]
+    return int(round(float(match.group(1)) * multiplier))
+
+
+def _bureau_row_costs(ocr_items: Iterable[dict]) -> tuple[int, ...]:
+    """Return denominator amounts from bureau balance/cost OCR strings."""
+
+    costs: list[int] = []
+    for item in ocr_items:
+        text = str(item.get("text", "")).replace(" ", "")
+        for raw in re.findall(r"/(\d+(?:\.\d+)?[kKmM]?)", text):
+            amount = _compact_amount(raw)
+            if amount is not None:
+                costs.append(amount)
+    return tuple(costs)
+
+
+def _bureau_limit_kind(value: str) -> str:
+    normalized = _normalize_text(value)
+    for source, kind in (
+        ("今日", "daily"), ("当日", "daily"),
+        ("本周", "weekly"), ("本月", "monthly"),
+    ):
+        if source in normalized:
+            return kind
+    return "unknown"
+
+
+def locate_read_only_bureau_item(
+    ocr_items: Iterable[dict],
+    item: ReadOnlyShopItem,
+) -> dict | None:
+    """Bind one live bureau row to an evidence-backed catalog item.
+
+    This function is analysis-only.  It requires a unique semantic name row,
+    the exact multiset of catalog cost amounts in that row, and (when the
+    historical catalog has a stable period) the same refresh-period kind.
+    Currency identity remains inherited from the historical evidence binding;
+    no live action or exchange authority is created here.
+    """
+
+    values = tuple(ocr_items)
+    expected_costs = sorted(cost.amount for cost in item.costs)
+    expected_kind = _bureau_limit_kind(item.observed_limit)
+    candidates: list[dict] = []
+    for anchor in values:
+        text = _normalize_text(anchor.get("text"))
+        if not any(_normalize_text(alias) in text for alias in item.ocr_aliases):
+            continue
+        center_x, center_y = _center(anchor)
+        if not (
+            BUREAU_PRODUCT_REGION[0] <= center_x <= BUREAU_PRODUCT_REGION[2]
+            and BUREAU_PRODUCT_REGION[1] <= center_y <= BUREAU_PRODUCT_REGION[3]
+        ):
+            continue
+        row = tuple(
+            value for value in values
+            if BUREAU_PRODUCT_REGION[0] <= _center(value)[0] <= BUREAU_PRODUCT_REGION[2]
+            and abs(_center(value)[1] - center_y) <= 28
+        )
+        observed_costs = sorted(_bureau_row_costs(row))
+        if observed_costs != expected_costs:
+            continue
+        limit_texts = tuple(
+            str(value.get("text", "")) for value in row
+            if re.search(r"(?:今日|当日|本周|本月)剩余\d+次", str(value.get("text", "")))
+        )
+        observed_kind = _bureau_limit_kind("|".join(limit_texts))
+        if expected_kind != "unknown" and observed_kind != expected_kind:
+            continue
+        candidates.append({
+            "id": item.id,
+            "name": item.name,
+            "status": "validated",
+            "observed_limit": limit_texts[0] if len(limit_texts) == 1 else "未稳定识别",
+            "observed_cost_amounts": observed_costs,
+            "source": "live_read_only_ocr",
+        })
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
 
 
 def _batch_purchase_enabled(image: object) -> bool:
@@ -1526,6 +1627,176 @@ class HeadquartersBlackMoonAdapter:
         }
 
 
+def _is_bureau_shop_page(ocr_items: Iterable[dict]) -> bool:
+    texts = tuple(_normalize_text(item.get("text")) for item in ocr_items)
+    bureau_titles = sum(text == "赴命商店" for text in texts)
+    return bureau_titles >= 2 or "EXCHANGESTATION" in texts
+
+
+class BureauReadOnlyCatalogAdapter:
+    """Live scrolling observer for the bureau exchange.
+
+    The adapter has no purchase or exchange method, never opens an item card,
+    and is deliberately absent from ``ADAPTERS``.  Its only physical inputs
+    are the store-navigation tab and catalog swipes.
+    """
+
+    key = "bureau_exchange_read_only"
+
+    def __init__(
+        self,
+        shop: ShopDefinition,
+        catalog: ReadOnlyShopCatalog,
+        recorder: ShopEvidenceRecorder,
+    ):
+        self.shop = shop
+        self.catalog = catalog
+        self.recorder = recorder
+
+    def _wait_for_bureau_page(self, timeout: float = 10.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            frame = screenshot()
+            ocr_items = frame.ocr()
+            if _is_bureau_shop_page(ocr_items):
+                return frame, ocr_items
+            time.sleep(0.35)
+        raise BlockedBySafetyError("未能确认进入赴命商店只读页面")
+
+    def open(self) -> None:
+        initial = screenshot()
+        initial_ocr = initial.ocr()
+        if _is_bureau_shop_page(initial_ocr):
+            self.recorder.capture("bureau-existing", initial, initial_ocr)
+        else:
+            initial_texts = {
+                _normalize_text(item.get("text")) for item in initial_ocr
+            }
+            if not {"总部商店", "赴命商店"}.issubset(initial_texts):
+                if not go_home():
+                    raise BlockedBySafetyError("无法返回主界面，未进入赴命商店")
+                self.recorder.capture("bureau-home")
+                input_tap(
+                    SHOP_ENTRY_POS,
+                    random_offset=False,
+                    intent=ActionIntent(
+                        "shop_page_open", "shop_entry", "bureau_exchange"
+                    ),
+                )
+                image, ocr_items = _wait_for_text(
+                    ("总部商店", "赴命商店"), timeout=10
+                )
+                self.recorder.capture("bureau-selector", image, ocr_items)
+            input_tap(
+                BUREAU_TAB_POS,
+                random_offset=False,
+                intent=ActionIntent(
+                    "shop_bureau_open", "bureau_shop_tab", "bureau_exchange"
+                ),
+            )
+            image, ocr_items = self._wait_for_bureau_page()
+            self.recorder.capture("bureau-open", image, ocr_items)
+        self._rewind_to_top()
+
+    def _rewind_to_top(self) -> None:
+        previous = screenshot()
+        stable = 0
+        for index in range(14):
+            input_swipe(
+                PRODUCT_REWIND_START,
+                PRODUCT_REWIND_END,
+                swipe_time=650,
+                intent=ActionIntent(
+                    "shop_catalog_rewind",
+                    "shop_catalog_content",
+                    f"bureau-rewind-{index:02d}",
+                ),
+            )
+            time.sleep(0.9)
+            current = screenshot()
+            ocr_items = current.ocr()
+            if not _is_bureau_shop_page(ocr_items):
+                raise BlockedBySafetyError("赴命商店回顶后页面身份丢失")
+            difference = _content_difference(
+                previous.image, current.image, BUREAU_PRODUCT_REGION
+            )
+            self.recorder.capture(
+                f"bureau-rewind-{index:02d}", current, ocr_items
+            )
+            stable = stable + 1 if difference <= 4.0 else 0
+            previous = current
+            if stable >= 2:
+                return
+        raise BlockedBySafetyError("赴命商店回顶超过安全滑动次数")
+
+    def scan(self, max_pages: int = MAX_SCAN_PAGES) -> dict:
+        if isinstance(max_pages, bool) or not isinstance(max_pages, int) or max_pages < 1:
+            raise ValueError("赴命商店扫描页数上限必须是正整数")
+        pending = {item.id: item for item in self.catalog.items}
+        results: list[dict] = []
+        page_count = 0
+        stable = 0
+        previous_matrix = None
+        while page_count < max_pages:
+            frame = screenshot()
+            ocr_items = frame.ocr()
+            if not _is_bureau_shop_page(ocr_items):
+                raise BlockedBySafetyError("赴命商店扫描期间页面身份丢失")
+            self.recorder.capture(
+                f"bureau-page-{page_count:02d}", frame, ocr_items
+            )
+            matrix = frame.image.copy()
+            page_count += 1
+            if previous_matrix is not None:
+                difference = _content_difference(
+                    previous_matrix, matrix, BUREAU_PRODUCT_REGION
+                )
+                stable = stable + 1 if difference <= 4.0 else 0
+            for item_id, item in list(pending.items()):
+                match = locate_read_only_bureau_item(ocr_items, item)
+                if match is None:
+                    continue
+                results.append(match)
+                pending.pop(item_id, None)
+            reached_bottom = stable >= 2
+            if reached_bottom:
+                break
+            previous_matrix = matrix
+            if page_count >= max_pages:
+                break
+            input_swipe(
+                PRODUCT_SCROLL_START,
+                PRODUCT_SCROLL_END,
+                swipe_time=650,
+                intent=ActionIntent(
+                    "shop_catalog_scroll",
+                    "shop_catalog_content",
+                    f"bureau-page-{page_count:02d}",
+                ),
+            )
+            time.sleep(1.0)
+        missing = [
+            {"id": item.id, "name": item.name}
+            for item in pending.values()
+        ]
+        reached_bottom = stable >= 2
+        requires_attention = bool(missing or not reached_bottom)
+        return {
+            "success": not requires_attention,
+            "shop": self.shop.id,
+            "mode": "read_only_catalog",
+            "pages": page_count,
+            "scan_page_limit": max_pages,
+            "reached_bottom": reached_bottom,
+            "page_limit_reached": page_count >= max_pages and not reached_bottom,
+            "requires_attention": requires_attention,
+            "results": results,
+            "missing": missing,
+            "business_actions": 0,
+            "exchange_actions": 0,
+        }
+
+
 ADAPTERS: dict[
     str,
     Callable[[ShopDefinition, ShopEvidenceRecorder], HeadquartersBlackMoonAdapter],
@@ -1580,6 +1851,52 @@ def probe_shop_catalog(capture_evidence: bool = True) -> dict:
         return adapter.scan(purchases=None)
 
     return _connected_run(run)  # type: ignore[return-value]
+
+
+def probe_bureau_shop_catalog(capture_evidence: bool = True) -> dict:
+    """Run the bureau's live read-only catalog observer.
+
+    This entry point is intentionally separate from ``run_shop_purchase`` and
+    from the executable adapter registry.  It cannot issue an exchange action.
+    """
+
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    if not shop.read_only_catalog:
+        raise BlockedBySafetyError("赴命商店缺少只读证据目录")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    recorder = ShopEvidenceRecorder(capture_evidence, "bureau-read-only")
+
+    def run() -> dict:
+        adapter = BureauReadOnlyCatalogAdapter(shop, observed, recorder)
+        adapter.open()
+        shop_result = adapter.scan()
+        return {
+            "success": bool(shop_result.get("success")),
+            "dry_run": True,
+            "read_only": True,
+            "requires_attention": bool(shop_result.get("requires_attention")),
+            "shops": [shop_result],
+        }
+
+    result = _connected_run(run)
+    if not isinstance(result, dict):
+        raise TypeError("赴命商店只读扫描返回了无效结果")
+    result["completed_at"] = datetime.now().astimezone().isoformat(
+        timespec="seconds"
+    )
+    if bool(getattr(recorder, "enabled", False)):
+        result["result_file"] = str(recorder.root / "FINAL_RESULT.json")
+        try:
+            recorder.write_result(result)
+        except Exception:
+            result["result_file"] = ""
+            logger.exception("保存赴命商店只读扫描结果失败")
+    else:
+        result["result_file"] = ""
+    return result
 
 
 def probe_shop_quantity_dialog(

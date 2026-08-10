@@ -102,12 +102,16 @@ def _observed_price_breakdown_text(
     return f"本次实机只读观察（{currency.name}）\n" + "\n".join(rows)
 
 
-def _run_shop_dry_run() -> dict:
-    """Run the existing shop scanner without enabling purchase confirmation."""
+def _run_shop_dry_run(shop_id: str = "headquarters_black_moon") -> dict:
+    """Run the selected shop's scanner without enabling a business action."""
 
-    from auto.shop_purchase import run_shop_purchase
+    from auto.shop_purchase import probe_bureau_shop_catalog, run_shop_purchase
 
-    result = run_shop_purchase(dry_run=True)
+    result = (
+        probe_bureau_shop_catalog(capture_evidence=True)
+        if shop_id == "bureau_exchange"
+        else run_shop_purchase(dry_run=True)
+    )
     if not isinstance(result, dict):
         raise TypeError("商店干跑返回了无效结果")
     return result
@@ -194,9 +198,13 @@ class ShopDryRunWorker(QThread):
     succeeded = Signal(dict)
     failed = Signal(str)
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.shop_id = "headquarters_black_moon"
+
     def run(self):
         try:
-            self.succeeded.emit(_run_shop_dry_run())
+            self.succeeded.emit(_run_shop_dry_run(self.shop_id))
         except Exception as error:  # noqa: BLE001 - report worker failure to GUI
             self.failed.emit(f"{type(error).__name__}: {error}")
 
@@ -385,6 +393,7 @@ class ReadOnlyShopItemCard(QFrame):
         parent=None,
     ):
         super().__init__(parent)
+        self.item = item
         self.setObjectName("readOnlyShopItemCard")
         self.setMinimumHeight(138)
         self.setStyleSheet(
@@ -414,13 +423,31 @@ class ReadOnlyShopItemCard(QFrame):
         costs = QLabel(cost_text, self)
         costs.setWordWrap(True)
         costs.setStyleSheet("color: #79b7ff; font-size: 13px; font-weight: 600;")
+        self.liveObservation = QLabel("", self)
+        self.liveObservation.setWordWrap(True)
+        self.liveObservation.setStyleSheet(
+            "color: #68d391; font-size: 12px; font-weight: 600;"
+        )
+        self.liveObservation.hide()
         evidence = QLabel("历史实机只读证据 · 自动兑换未启用", self)
         evidence.setStyleSheet("color: #76c893; font-size: 12px;")
         details.addWidget(name)
         details.addWidget(limit)
         details.addWidget(costs)
+        details.addWidget(self.liveObservation)
         details.addWidget(evidence)
         root.addLayout(details, 1)
+
+    def setLiveObservation(self, observation: dict | None) -> None:
+        if not isinstance(observation, dict):
+            self.liveObservation.clear()
+            self.liveObservation.hide()
+            self.setMinimumHeight(138)
+            return
+        limit = str(observation.get("observed_limit") or "未稳定识别")
+        self.liveObservation.setText(f"本次实机只读扫描：已核验 · {limit}")
+        self.liveObservation.show()
+        self.setMinimumHeight(158)
 
 class ShopPlannerInterface(ScrollArea):
     """Configure recurring shop purchases without hard-coding future shops."""
@@ -431,6 +458,8 @@ class ShopPlannerInterface(ScrollArea):
         self.plan = load_shop_plan(catalog=self.catalog)
         self.currentShopId = self.catalog.shops[0].id
         self.itemCards: dict[str, ShopItemCard] = {}
+        self.readOnlyItemCards: dict[str, ReadOnlyShopItemCard] = {}
+        self.readOnlyObservations: dict[str, dict] = {}
         self.observedPriceSchedules: dict[str, list[dict]] = {}
         self.dryRunFailures: dict[str, str] = {}
         self.shopButtons: dict[str, QPushButton] = {}
@@ -579,6 +608,7 @@ class ShopPlannerInterface(ScrollArea):
 
     def _clear_product_grid(self):
         self.itemCards.clear()
+        self.readOnlyItemCards.clear()
         while self.productGrid.count():
             item = self.productGrid.takeAt(0)
             widget = item.widget()
@@ -591,6 +621,14 @@ class ShopPlannerInterface(ScrollArea):
         self._clear_product_grid()
         self.shopTitle.setText(shop.name)
         self.shopDescription.setText(shop.description)
+        if not (self.dryRunWorker and self.dryRunWorker.isRunning()):
+            if shop_id == "bureau_exchange":
+                self.dryRunButton.setText("仅扫描赴命商店（不兑换）")
+                self.dryRunButton.setToolTip(
+                    "只读滚动核验赴命商店22项目录；不打开商品，不执行兑换"
+                )
+            else:
+                self.dryRunButton.setText("仅扫描商店（不购买）")
         self.shopHeader.setStyleSheet(
             "QFrame#shopHeader {"
             f"background: rgba(30,30,30,0.54); border-left: 5px solid {shop.accent}; "
@@ -623,6 +661,10 @@ class ShopPlannerInterface(ScrollArea):
                         self.catalog.currencies,
                         self.productWidget,
                     )
+                    card.setLiveObservation(
+                        self.readOnlyObservations.get(item.id)
+                    )
+                    self.readOnlyItemCards[item.id] = card
                     self.productGrid.addWidget(card, index // 2, index % 2)
                 self.productGrid.setColumnStretch(0, 1)
                 self.productGrid.setColumnStretch(1, 1)
@@ -707,6 +749,10 @@ class ShopPlannerInterface(ScrollArea):
             return
         self.observedPriceSchedules.clear()
         self.dryRunFailures.clear()
+        if self.currentShopId == "bureau_exchange":
+            self.readOnlyObservations.clear()
+            for card in self.readOnlyItemCards.values():
+                card.setLiveObservation(None)
         for card in self.itemCards.values():
             card.setObservedPriceSchedule([])
             card.failureLabel.hide()
@@ -715,9 +761,12 @@ class ShopPlannerInterface(ScrollArea):
         self.dryRunButton.setEnabled(False)
         self.dryRunButton.setText("正在扫描商店…")
         self.dryRunStatus.setText(
-            "正在独立执行干跑；只允许翻页、打开商品弹窗并取消"
+            "正在只读扫描赴命商店；仅允许导航与滚动，零兑换"
+            if self.currentShopId == "bureau_exchange"
+            else "正在独立执行干跑；只允许翻页、打开商品弹窗并取消"
         )
         self.dryRunWorker = ShopDryRunWorker(self)
+        self.dryRunWorker.shop_id = self.currentShopId
         self.dryRunWorker.succeeded.connect(self._dryRunSucceeded)
         self.dryRunWorker.failed.connect(self._dryRunFailed)
         self.dryRunWorker.finished.connect(self._dryRunFinished)
@@ -734,6 +783,14 @@ class ShopPlannerInterface(ScrollArea):
                 item_id = str(item_result.get("id") or "")
                 status = str(item_result.get("status") or "")
                 observations = item_result.get("price_observations")
+                if (
+                    str(shop_result.get("mode") or "") == "read_only_catalog"
+                    and status == "validated"
+                ):
+                    self.readOnlyObservations[item_id] = item_result
+                    read_only_card = self.readOnlyItemCards.get(item_id)
+                    if read_only_card is not None:
+                        read_only_card.setLiveObservation(item_result)
                 if isinstance(observations, list) and observations:
                     self.observedPriceSchedules[item_id] = observations
                 if status == "failed":
@@ -785,7 +842,11 @@ class ShopPlannerInterface(ScrollArea):
 
     def _dryRunFinished(self):
         self.dryRunButton.setEnabled(True)
-        self.dryRunButton.setText("仅扫描商店（不购买）")
+        self.dryRunButton.setText(
+            "仅扫描赴命商店（不兑换）"
+            if self.currentShopId == "bureau_exchange"
+            else "仅扫描商店（不购买）"
+        )
         if self.dryRunWorker is not None:
             self.dryRunWorker.deleteLater()
         self.dryRunWorker = None
