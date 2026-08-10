@@ -964,15 +964,9 @@ def _validate_increment_session_frame(
     # tokens (e.g. "确认消耗以上素材" + "兑换商品X") are not misread as
     # a harmless "confirmation absent".  The confirmation band sits between
     # the quantity row (y≈340-380) and the cancel/confirm buttons (y≈520).
-    confirmation_texts: list[str] = []
-    for value in data:
-        text = _normalize_text(value.get("text"))
-        if "确认消耗" in text or "兑换" in text:
-            cy = _center(value)[1]
-            if 400 <= cy <= 500:
-                confirmation_texts.append(text)
+    confirmation_texts = _bureau_confirmation_line_fragments(data)
     if confirmation_texts:
-        merged = "".join(confirmation_texts)
+        merged = _merge_overlapping_ocr_texts(confirmation_texts)
         has_bureau_markers = "确认消耗" in merged and "兑换" in merged
         if not has_bureau_markers or not _bureau_dialog_item_visible(
             [{"text": merged}], item,
@@ -981,6 +975,80 @@ def _validate_increment_session_frame(
     # When no confirmation tokens at all exist in the band, tolerate
     # (V6 dropped the line entirely while dialog structure is unchanged).
     return True
+
+
+def _merge_overlapping_ocr_texts(texts: Iterable[str]) -> str:
+    """Join left-to-right OCR fragments without duplicating overlap text."""
+
+    merged = ""
+    for raw in texts:
+        text = _normalize_text(raw)
+        if not text:
+            continue
+        if not merged:
+            merged = text
+            continue
+        overlap = 0
+        for size in range(min(len(merged), len(text)), 0, -1):
+            if merged.endswith(text[:size]):
+                overlap = size
+                break
+        merged += text[overlap:]
+    return merged
+
+
+def _bureau_confirmation_line_fragments(data: Iterable[dict]) -> list[str]:
+    """Return the geometrically connected OCR fragments of a confirmation row.
+
+    PP-OCRv6 sometimes emits the item suffix as a separate token which does
+    not itself contain ``确认消耗`` or ``兑换``.  Start from a marker-bearing
+    token, then extend only across horizontally contiguous tokens on the same
+    visual line.  No marker means the row was dropped entirely, which remains
+    the explicitly tolerated continuity case.
+    """
+
+    entries: list[tuple[float, float, float, float, str]] = []
+    for value in data:
+        text = _normalize_text(value.get("text"))
+        position = value.get("position", ())
+        if not text or len(position) < 4:
+            continue
+        xs = [float(point[0]) for point in position]
+        ys = [float(point[1]) for point in position]
+        x1, x2, y1, y2 = min(xs), max(xs), min(ys), max(ys)
+        cy = (y1 + y2) / 2
+        if 400 <= cy <= 500:
+            entries.append((x1, y1, x2, y2, text))
+
+    selected = {
+        index
+        for index, entry in enumerate(entries)
+        if "确认消耗" in entry[4] or "兑换" in entry[4]
+    }
+    if not selected:
+        return []
+
+    changed = True
+    while changed:
+        changed = False
+        for index, candidate in enumerate(entries):
+            if index in selected:
+                continue
+            cx1, cy1, cx2, cy2, _ = candidate
+            candidate_height = max(cy2 - cy1, 1.0)
+            for selected_index in tuple(selected):
+                sx1, sy1, sx2, sy2, _ = entries[selected_index]
+                selected_height = max(sy2 - sy1, 1.0)
+                vertical_overlap = max(0.0, min(cy2, sy2) - max(cy1, sy1))
+                if vertical_overlap / min(candidate_height, selected_height) < 0.45:
+                    continue
+                horizontal_gap = max(cx1 - sx2, sx1 - cx2, 0.0)
+                if horizontal_gap <= 24:
+                    selected.add(index)
+                    changed = True
+                    break
+
+    return [entries[index][4] for index in sorted(selected, key=lambda i: entries[i][0])]
 
 
 def _has_bureau_quantity_dialog(ocr_items: Iterable[dict]) -> bool:

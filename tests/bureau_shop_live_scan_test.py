@@ -1118,6 +1118,42 @@ def test_split_confirmation_text_is_not_misread_as_absent():
     ) is False
 
 
+def test_overlapping_v6_confirmation_suffix_preserves_bureau_item_identity():
+    """Live q=5 form splits at an overlapping '质'; retain and de-duplicate it."""
+    from auto.shop_purchase import _validate_increment_session_frame
+
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    item = next(i for i in observed.items if i.id == "bureau_nebula_4")
+    item = replace(item, observed_limit="剩余6次")
+    data = [
+        _ocr("星云物质（4钛）", 560, 285, 180),
+        _ocr("5/6", 610, 345, 70),
+        _ocr("最少", 350, 350, 55),
+        _ocr("最多", 855, 350, 55),
+        _ocr("500", 515, 285, 42),
+        _ocr("取消", 300, 520, 55),
+        _ocr("确定", 930, 520, 55),
+        _ocr("确认消耗以上素材兑换星云物质", 480, 429, 232, 27),
+        _ocr("质（4钛）×5吗？", 700, 430, 145, 26),
+        # Nearby decoration on another visual row must not join the identity.
+        _ocr("O", 738, 402, 12, 14),
+    ]
+    frame = _DialogFrame(data)
+
+    assert _validate_increment_session_frame(
+        frame,
+        frame.ocr(),
+        item,
+        expected_quantity=5,
+        expected_maximum=6,
+        channel_order=(item.costs[0].currency,),
+    ) is True
+
+
 def test_full_probe_accepts_blank_confirmation_frame_in_3_step_sequence(
     monkeypatch,
 ):
