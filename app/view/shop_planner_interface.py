@@ -144,7 +144,10 @@ def _shop_dry_run_summary(result: dict) -> str:
         for shop in shops
         if isinstance(shop, dict)
         for result in (shop.get("results") or [])
-        if isinstance(result, dict) and result.get("status") == "failed"
+        if isinstance(result, dict)
+        and result.get("status") in {
+            "failed", "price_probe_failed", "price_probe_unavailable"
+        }
     )
     parts = [f"干跑完成：扫描 {page_count} 页，处理 {found_count} 项"]
     if failed_count:
@@ -174,11 +177,13 @@ def _shop_dry_run_diagnostics(result: dict) -> str:
         for item_result in shop_result.get("results") or []:
             if not isinstance(item_result, dict):
                 continue
-            if str(item_result.get("status") or "") != "failed":
+            if str(item_result.get("status") or "") not in {
+                "failed", "price_probe_failed", "price_probe_unavailable"
+            }:
                 continue
             name = str(item_result.get("name") or item_result.get("id") or "未知商品")
             item_id = str(item_result.get("id") or "").strip()
-            reason = str(item_result.get("error") or "未知错误")
+            reason = str(item_result.get("error") or "价格档位未完整核验")
             identity = f"（{item_id}）" if item_id else ""
             lines.append(f"失败商品：{name}{identity} — {reason}")
         for missing in shop_result.get("missing") or []:
@@ -394,6 +399,7 @@ class ReadOnlyShopItemCard(QFrame):
     ):
         super().__init__(parent)
         self.item = item
+        self.currencies = currencies
         self.setObjectName("readOnlyShopItemCard")
         self.setMinimumHeight(138)
         self.setStyleSheet(
@@ -445,9 +451,47 @@ class ReadOnlyShopItemCard(QFrame):
             self.setMinimumHeight(138)
             return
         limit = str(observation.get("observed_limit") or "未稳定识别")
-        self.liveObservation.setText(f"本次实机只读扫描：已核验 · {limit}")
+        status = str(observation.get("status") or "")
+        price_rows = observation.get("price_observations")
+        if status == "price_schedule_validated" and isinstance(price_rows, list):
+            lines = [f"本次实机只读价格：已核验 · {limit}"]
+            for price_row in price_rows:
+                if not isinstance(price_row, dict):
+                    continue
+                quantity = int(price_row.get("quantity", 0) or 0)
+                costs = []
+                for cost in price_row.get("costs") or []:
+                    if not isinstance(cost, dict):
+                        continue
+                    currency_id = str(cost.get("currency") or "")
+                    currency = self.currencies.get(currency_id)
+                    name = currency.name if currency is not None else currency_id
+                    marginal = int(cost.get("marginal_cost", 0) or 0)
+                    cumulative = int(cost.get("cumulative_cost", 0) or 0)
+                    costs.append(
+                        f"{name} 边际 {marginal:,} / 累计 {cumulative:,}"
+                    )
+                if quantity > 0 and costs:
+                    lines.append(f"数量 {quantity}：" + "；".join(costs))
+            self.liveObservation.setText("\n".join(lines))
+            self.liveObservation.setStyleSheet(
+                "color: #68d391; font-size: 12px; font-weight: 600;"
+            )
+        elif status in {"price_probe_failed", "price_probe_unavailable"}:
+            reason = str(observation.get("error") or "价格档位未完整核验")
+            self.liveObservation.setText(f"本次价格探针未完成：{reason}")
+            self.liveObservation.setStyleSheet(
+                "color: #ff6b6b; font-size: 12px; font-weight: 600;"
+            )
+        else:
+            self.liveObservation.setText(f"本次实机只读扫描：已核验 · {limit}")
+            self.liveObservation.setStyleSheet(
+                "color: #68d391; font-size: 12px; font-weight: 600;"
+            )
         self.liveObservation.show()
-        self.setMinimumHeight(158)
+        rows = max(1, self.liveObservation.text().count("\n") + 1)
+        self.setMinimumHeight(138 + 20 * rows)
+        self.updateGeometry()
 
 class ShopPlannerInterface(ScrollArea):
     """Configure recurring shop purchases without hard-coding future shops."""
@@ -783,10 +827,7 @@ class ShopPlannerInterface(ScrollArea):
                 item_id = str(item_result.get("id") or "")
                 status = str(item_result.get("status") or "")
                 observations = item_result.get("price_observations")
-                if (
-                    str(shop_result.get("mode") or "") == "read_only_catalog"
-                    and status == "validated"
-                ):
+                if str(shop_result.get("mode") or "") == "read_only_catalog":
                     self.readOnlyObservations[item_id] = item_result
                     read_only_card = self.readOnlyItemCards.get(item_id)
                     if read_only_card is not None:

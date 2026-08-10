@@ -68,6 +68,8 @@ HEADQUARTERS_TAB_POS = (858, 40)
 BUREAU_TAB_POS = (1002, 40)
 PRODUCT_REGION = (580, 150, 1260, 660)
 BUREAU_PRODUCT_REGION = (580, 130, 1260, 705)
+BUREAU_EXCHANGE_REGION = (1100, 130, 1255, 705)
+BUREAU_DIALOG_COST_REGION = (570, 420, 1120, 495)
 PRODUCT_SCROLL_START = (800, 585)
 PRODUCT_SCROLL_END = (800, 365)
 PRODUCT_REWIND_START = PRODUCT_SCROLL_END
@@ -648,6 +650,34 @@ def _bureau_limit_kind(value: str) -> str:
     return "unknown"
 
 
+def _bureau_remaining(value: str) -> int | None:
+    match = re.search(r"(?:剩余|限购)(\d+)次", _normalize_text(value))
+    if match is None:
+        return None
+    remaining = int(match.group(1))
+    return remaining if remaining >= 0 else None
+
+
+def _bureau_exchange_point(
+    ocr_items: Iterable[dict], center_y: float,
+) -> tuple[int, int] | None:
+    """Resolve the unique exchange control belonging to one catalog row."""
+
+    candidates: list[tuple[int, int]] = []
+    for value in ocr_items:
+        text = _normalize_text(value.get("text"))
+        point_x, point_y = _center(value)
+        if not text.startswith("EXC"):
+            continue
+        if not (
+            BUREAU_EXCHANGE_REGION[0] <= point_x <= BUREAU_EXCHANGE_REGION[2]
+            and center_y - 90 <= point_y <= center_y - 20
+        ):
+            continue
+        candidates.append((int(round(point_x)), int(round(point_y))))
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def locate_read_only_bureau_item(
     ocr_items: Iterable[dict],
     item: ReadOnlyShopItem,
@@ -696,6 +726,7 @@ def locate_read_only_bureau_item(
             "status": "validated",
             "observed_limit": limit_texts[0] if len(limit_texts) == 1 else "未稳定识别",
             "observed_cost_amounts": observed_costs,
+            "exchange_point": _bureau_exchange_point(values, center_y),
             "source": "live_read_only_ocr",
         })
     if len(candidates) != 1:
@@ -1633,12 +1664,104 @@ def _is_bureau_shop_page(ocr_items: Iterable[dict]) -> bool:
     return bureau_titles >= 2 or "EXCHANGESTATION" in texts
 
 
-class BureauReadOnlyCatalogAdapter:
-    """Live scrolling observer for the bureau exchange.
+def _bureau_dialog_item_visible(
+    ocr_items: Iterable[dict], item: ReadOnlyShopItem,
+) -> bool:
+    texts = tuple(_normalize_text(value.get("text")) for value in ocr_items)
+    return any(
+        _normalize_text(alias) in text
+        for alias in item.ocr_aliases
+        for text in texts
+    )
 
-    The adapter has no purchase or exchange method, never opens an item card,
-    and is deliberately absent from ``ADAPTERS``.  Its only physical inputs
-    are the store-navigation tab and catalog swipes.
+
+def _bureau_dialog_cost_candidates(
+    ocr_items: Iterable[dict],
+) -> tuple[tuple[int, float], ...]:
+    values: list[tuple[int, float]] = []
+    for item in ocr_items:
+        center_x, center_y = _center(item)
+        if not (
+            BUREAU_DIALOG_COST_REGION[0] <= center_x <= BUREAU_DIALOG_COST_REGION[2]
+            and BUREAU_DIALOG_COST_REGION[1] <= center_y <= BUREAU_DIALOG_COST_REGION[3]
+        ):
+            continue
+        amount = _numeric_value(item.get("text"))
+        if amount is not None and amount > 0:
+            values.append((amount, center_x))
+    return tuple(sorted(values, key=lambda value: value[1]))
+
+
+def _bureau_dialog_snapshot(
+    frame: object,
+    ocr_items: Iterable[dict],
+    item: ReadOnlyShopItem,
+    *,
+    expected_quantity: int,
+    expected_maximum: int | None = None,
+    channel_order: tuple[str, ...] | None = None,
+) -> dict:
+    """Read one verified quantity-dialog state without emitting input."""
+
+    data = list(ocr_items)
+    if not _has_complete_quantity_dialog(frame, data):
+        raise BlockedBySafetyError(
+            f"赴命商品未出现完整数量弹窗: {item.name}"
+        )
+    if not _bureau_dialog_item_visible(data, item):
+        raise BlockedBySafetyError(f"赴命商品弹窗身份不匹配: {item.name}")
+    quantity = _dialog_quantity(data)
+    if quantity is None or quantity[0] != expected_quantity:
+        raise BlockedBySafetyError(
+            f"赴命商品数量变化不符合预期: {item.name}，预期 {expected_quantity}，实机 {quantity}"
+        )
+    if expected_maximum is not None and quantity[1] != expected_maximum:
+        raise BlockedBySafetyError(
+            f"赴命商品弹窗上限发生变化: {item.name}"
+        )
+    candidates = _bureau_dialog_cost_candidates(data)
+    if len(candidates) != len(item.costs):
+        raise BlockedBySafetyError(
+            f"赴命商品成本通道数量不稳定: {item.name}，"
+            f"目录 {len(item.costs)}，实机 {len(candidates)}"
+        )
+    if channel_order is None:
+        remaining = list(candidates)
+        ordered: list[tuple[str, int, float]] = []
+        for cost in item.costs:
+            matches = [entry for entry in remaining if entry[0] == cost.amount]
+            if len(matches) != 1:
+                raise BlockedBySafetyError(
+                    f"赴命商品首档成本无法唯一绑定: {item.name}:{cost.currency}"
+                )
+            match = matches[0]
+            remaining.remove(match)
+            ordered.append((cost.currency, match[0], match[1]))
+        ordered.sort(key=lambda entry: entry[2])
+        channel_order = tuple(entry[0] for entry in ordered)
+        totals = {currency: amount for currency, amount, _x in ordered}
+    else:
+        if len(channel_order) != len(candidates):
+            raise BlockedBySafetyError(f"赴命商品成本通道顺序丢失: {item.name}")
+        totals = {
+            currency: candidates[index][0]
+            for index, currency in enumerate(channel_order)
+        }
+    return {
+        "quantity": quantity[0],
+        "maximum": quantity[1],
+        "channel_order": channel_order,
+        "totals": totals,
+    }
+
+
+class BureauReadOnlyCatalogAdapter:
+    """Read-only bureau catalog and quantity-price observer.
+
+    The adapter is deliberately absent from ``ADAPTERS`` and has no exchange
+    confirmation path.  Its bounded detail probe may only open a proven row,
+    increment quantity, read cumulative costs, and cancel a still-proven
+    quantity dialog.
     """
 
     key = "bureau_exchange_read_only"
@@ -1652,6 +1775,9 @@ class BureauReadOnlyCatalogAdapter:
         self.shop = shop
         self.catalog = catalog
         self.recorder = recorder
+        self.dialog_open_dispatches = 0
+        self.quantity_increment_dispatches = 0
+        self.dialog_cancel_dispatches = 0
 
     def _wait_for_bureau_page(self, timeout: float = 10.0):
         deadline = time.monotonic() + timeout
@@ -1662,6 +1788,230 @@ class BureauReadOnlyCatalogAdapter:
                 return frame, ocr_items
             time.sleep(0.35)
         raise BlockedBySafetyError("未能确认进入赴命商店只读页面")
+
+    def _cancel_verified_quantity_dialog(self, item: ReadOnlyShopItem) -> None:
+        dismissed = input_tap(
+            DIALOG_CANCEL_POS,
+            random_offset=False,
+            intent=ActionIntent(
+                "shop_quantity_cancel", "shop_quantity_cancel_button", item.id
+            ),
+        )
+        if dismissed is False:
+            raise BlockedBySafetyError(
+                f"赴命商品数量弹窗取消点击被拒绝: {item.name}"
+            )
+        self.dialog_cancel_dispatches += 1
+        time.sleep(0.8)
+        frame = screenshot()
+        ocr_items = frame.ocr()
+        self.recorder.capture(
+            f"bureau-price-cancel-{item.id}", frame, ocr_items
+        )
+        if not _is_bureau_shop_page(ocr_items):
+            raise BlockedBySafetyError(
+                f"赴命商品数量弹窗取消后未返回商店: {item.name}"
+            )
+
+    def _probe_price_schedule(self, match: dict, item: ReadOnlyShopItem) -> dict:
+        """Open one quantity dialog, read every marginal, then cancel once.
+
+        The right-side exchange control is used only when the live row proves
+        that more than one unit remains.  A one-unit row already contains its
+        complete marginal schedule, so it never needs an item-level click.
+        """
+
+        observed_limit = str(match.get("observed_limit") or "")
+        remaining = _bureau_remaining(observed_limit)
+        base = {
+            "id": item.id,
+            "name": item.name,
+            "observed_limit": observed_limit or "未稳定识别",
+            "source": "live_read_only_quantity_probe",
+        }
+        if remaining is None:
+            return {
+                **base,
+                "status": "price_probe_unavailable",
+                "error": "未稳定识别剩余次数，未打开商品",
+                "price_observations": [],
+            }
+        if remaining == 0:
+            return {
+                **base,
+                "status": "price_probe_unavailable",
+                "error": "商品已售罄，无法打开数量弹窗核验边际价格",
+                "price_observations": [],
+            }
+        if remaining == 1:
+            return {
+                **base,
+                "status": "price_schedule_validated",
+                "price_observations": [{
+                    "quantity": 1,
+                    "costs": [
+                        {
+                            "currency": cost.currency,
+                            "marginal_cost": cost.amount,
+                            "cumulative_cost": cost.amount,
+                        }
+                        for cost in item.costs
+                    ],
+                }],
+            }
+        point = match.get("exchange_point")
+        if not (
+            isinstance(point, tuple)
+            and len(point) == 2
+            and all(isinstance(value, int) for value in point)
+        ):
+            return {
+                **base,
+                "status": "price_probe_unavailable",
+                "error": "未唯一识别本行兑换控件，未打开商品",
+                "price_observations": [],
+            }
+        opened = input_tap(
+            point,
+            random_offset=False,
+            intent=ActionIntent(
+                "shop_bureau_quantity_open", "bureau_exchange_control", item.id
+            ),
+        )
+        if opened is False:
+            return {
+                **base,
+                "status": "price_probe_unavailable",
+                "error": "数量弹窗打开点击被拒绝",
+                "price_observations": [],
+            }
+        self.dialog_open_dispatches += 1
+        time.sleep(0.8)
+        frame = screenshot()
+        ocr_items = frame.ocr()
+        self.recorder.capture(f"bureau-price-01-{item.id}", frame, ocr_items)
+        # No cancel is dispatched until the page is independently proven to be
+        # a quantity dialog.  An unexpected post-page therefore terminates the
+        # complete scan with zero additional input.
+        if not _has_complete_quantity_dialog(frame, ocr_items):
+            raise BlockedBySafetyError(
+                f"赴命商品点击后未出现数量弹窗: {item.name}"
+            )
+        try:
+            first = _bureau_dialog_snapshot(
+                frame, ocr_items, item, expected_quantity=1
+            )
+        except BlockedBySafetyError as error:
+            self._cancel_verified_quantity_dialog(item)
+            return {
+                **base,
+                "status": "price_probe_failed",
+                "error": str(error),
+                "price_observations": [],
+            }
+        maximum = int(first["maximum"])
+        if maximum > remaining or maximum - 1 > MAX_QUANTITY_PROBE_INCREMENTS:
+            self._cancel_verified_quantity_dialog(item)
+            return {
+                **base,
+                "status": "price_probe_failed",
+                "error": (
+                    f"赴命商品弹窗上限超出只读探针预算: {item.name}，"
+                    f"剩余 {remaining}，弹窗 {maximum}"
+                ),
+                "price_observations": [],
+            }
+        observations: list[dict] = []
+        previous_totals: dict[str, int] = {}
+        previous_marginals: dict[str, int] = {}
+        channel_order = tuple(first["channel_order"])
+        snapshot = first
+        probe_error: BlockedBySafetyError | None = None
+        dialog_still_verified = True
+        try:
+            for quantity in range(1, maximum + 1):
+                if quantity > 1:
+                    dispatched = input_tap(
+                        DIALOG_PLUS_POS,
+                        random_offset=False,
+                        intent=ActionIntent(
+                            "shop_quantity_increment",
+                            "shop_quantity_increment_button",
+                            item.id,
+                        ),
+                    )
+                    if dispatched is False:
+                        raise BlockedBySafetyError(
+                            f"赴命商品数量增加点击被拒绝: {item.name}"
+                        )
+                    self.quantity_increment_dispatches += 1
+                    # Once +1 was dispatched, no further coordinate input is
+                    # safe until a fresh frame independently proves that the
+                    # quantity dialog is still present.
+                    dialog_still_verified = False
+                    time.sleep(0.55)
+                    frame = screenshot()
+                    ocr_items = frame.ocr()
+                    self.recorder.capture(
+                        f"bureau-price-{quantity:02d}-{item.id}",
+                        frame,
+                        ocr_items,
+                    )
+                    if not _has_complete_quantity_dialog(frame, ocr_items):
+                        raise BlockedBySafetyError(
+                            f"赴命商品数量增加后页面身份不明: {item.name}"
+                        )
+                    dialog_still_verified = True
+                    snapshot = _bureau_dialog_snapshot(
+                        frame,
+                        ocr_items,
+                        item,
+                        expected_quantity=quantity,
+                        expected_maximum=maximum,
+                        channel_order=channel_order,
+                    )
+                costs: list[dict] = []
+                for currency in channel_order:
+                    total = int(snapshot["totals"][currency])
+                    previous_total = previous_totals.get(currency, 0)
+                    marginal = total - previous_total
+                    if marginal <= 0 or marginal < previous_marginals.get(currency, 0):
+                        raise BlockedBySafetyError(
+                            f"赴命商品边际成本不满足单调递增合同: "
+                            f"{item.name}:{currency}"
+                        )
+                    costs.append({
+                        "currency": currency,
+                        "marginal_cost": marginal,
+                        "cumulative_cost": total,
+                    })
+                    previous_totals[currency] = total
+                    previous_marginals[currency] = marginal
+                observations.append({"quantity": quantity, "costs": costs})
+        except BlockedBySafetyError as error:
+            if not dialog_still_verified:
+                # The post-dispatch page is unknown.  Do not guess that the
+                # old cancel coordinate is still valid.
+                raise
+            probe_error = error
+        except StopExecution:
+            raise
+        except Exception:
+            raise
+        self._cancel_verified_quantity_dialog(item)
+        if probe_error is not None:
+            return {
+                **base,
+                "status": "price_probe_failed",
+                "error": str(probe_error),
+                "price_observations": [],
+            }
+        return {
+            **base,
+            "status": "price_schedule_validated",
+            "dialog_maximum": maximum,
+            "price_observations": observations,
+        }
 
     def open(self) -> None:
         initial = screenshot()
@@ -1729,7 +2079,12 @@ class BureauReadOnlyCatalogAdapter:
                 return
         raise BlockedBySafetyError("赴命商店回顶超过安全滑动次数")
 
-    def scan(self, max_pages: int = MAX_SCAN_PAGES) -> dict:
+    def scan(
+        self,
+        max_pages: int = MAX_SCAN_PAGES,
+        *,
+        probe_prices: bool = False,
+    ) -> dict:
         if isinstance(max_pages, bool) or not isinstance(max_pages, int) or max_pages < 1:
             raise ValueError("赴命商店扫描页数上限必须是正整数")
         pending = {item.id: item for item in self.catalog.items}
@@ -1756,8 +2111,32 @@ class BureauReadOnlyCatalogAdapter:
                 match = locate_read_only_bureau_item(ocr_items, item)
                 if match is None:
                     continue
-                results.append(match)
+                open_dispatches_before = self.dialog_open_dispatches
+                results.append(
+                    self._probe_price_schedule(match, item)
+                    if probe_prices
+                    else match
+                )
                 pending.pop(item_id, None)
+                if (
+                    probe_prices
+                    and self.dialog_open_dispatches > open_dispatches_before
+                ):
+                    # Cancel has returned to the list, but every following row
+                    # must be rebound to a fresh frame rather than reusing the
+                    # coordinates captured before the dialog was opened.
+                    frame = screenshot()
+                    ocr_items = frame.ocr()
+                    if not _is_bureau_shop_page(ocr_items):
+                        raise BlockedBySafetyError(
+                            "赴命商品价格探针返回后页面身份丢失"
+                        )
+                    self.recorder.capture(
+                        f"bureau-price-list-refresh-{item.id}",
+                        frame,
+                        ocr_items,
+                    )
+                    matrix = frame.image.copy()
             reached_bottom = stable >= 2
             if reached_bottom:
                 break
@@ -1780,7 +2159,17 @@ class BureauReadOnlyCatalogAdapter:
             for item in pending.values()
         ]
         reached_bottom = stable >= 2
-        requires_attention = bool(missing or not reached_bottom)
+        incomplete_price_statuses = {
+            "price_probe_unavailable", "price_probe_failed"
+        }
+        requires_attention = bool(
+            missing
+            or not reached_bottom
+            or any(
+                result.get("status") in incomplete_price_statuses
+                for result in results
+            )
+        )
         return {
             "success": not requires_attention,
             "shop": self.shop.id,
@@ -1794,6 +2183,11 @@ class BureauReadOnlyCatalogAdapter:
             "missing": missing,
             "business_actions": 0,
             "exchange_actions": 0,
+            "dialog_open_dispatches": self.dialog_open_dispatches,
+            "quantity_increment_dispatches": self.quantity_increment_dispatches,
+            "dialog_cancel_dispatches": self.dialog_cancel_dispatches,
+            "confirm_dispatches": 0,
+            "same_action_retries": 0,
         }
 
 
@@ -1872,7 +2266,7 @@ def probe_bureau_shop_catalog(capture_evidence: bool = True) -> dict:
     def run() -> dict:
         adapter = BureauReadOnlyCatalogAdapter(shop, observed, recorder)
         adapter.open()
-        shop_result = adapter.scan()
+        shop_result = adapter.scan(probe_prices=True)
         return {
             "success": bool(shop_result.get("success")),
             "dry_run": True,

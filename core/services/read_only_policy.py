@@ -446,6 +446,13 @@ DEFAULT_POLICY_SPECS = {
         postcondition="bureau_shop_visible",
         allowed_post_page_types=frozenset({"shop"}),
     ),
+    "shop_bureau_quantity_open": ReadOnlyPolicySpec(
+        "shop_bureau_quantity_open", frozenset({"shop"}),
+        "bureau_exchange_control",
+        allowed_region=(1100, 130, 1255, 705),
+        postcondition="shop_quantity_dialog_visible",
+        allowed_post_page_types=frozenset({"shop_quantity_dialog"}),
+    ),
     "shop_catalog_scroll": ReadOnlyPolicySpec(
         "shop_catalog_scroll", frozenset({"shop"}), "shop_catalog_content",
         action_kind=ActionKind.SWIPE,
@@ -461,6 +468,14 @@ DEFAULT_POLICY_SPECS = {
         allowed_region=(790, 350, 850, 410),
         postcondition="shop_quantity_dialog_remains_safe",
         allowed_post_page_types=frozenset({"shop_quantity_dialog"}),
+    ),
+    "shop_quantity_cancel": ReadOnlyPolicySpec(
+        "shop_quantity_cancel",
+        frozenset({"shop_quantity_dialog"}),
+        "shop_quantity_cancel_button",
+        allowed_region=(180, 490, 640, 585),
+        postcondition="bureau_shop_visible",
+        allowed_post_page_types=frozenset({"shop"}),
     ),
 }
 
