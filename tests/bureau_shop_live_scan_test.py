@@ -102,7 +102,13 @@ def test_bureau_name_matches_reordered_v6_ocr_token():
         "逮捕令",
         ("逮捕令",),
     ) is True
-    # Short aliases do not use the subsequence fallback.
+    # Live V6 evidence form "正×1一般武装改造" must match the narrow
+    # evidence alias "一般武装改造" via substring matching.
+    assert _bureau_name_matches_alias(
+        "正×1一般武装改造",
+        ("一般武装改造", "般武装改造凭证"),
+    ) is True
+    # Short aliases do not use the character-set fallback.
     assert _bureau_name_matches_alias("xyz", ("abc", "def")) is False
 
 
@@ -216,6 +222,33 @@ def test_period_known_allows_ambiguous_pair_despite_same_cost():
 
     assert result is not None
     assert result["id"] == "bureau_purchase_book_weekly"
+
+
+def test_general_weapon_fu_matches_live_v6_ocr_form():
+    """Live V6 token '正×1一般武装改造' + cost 50 + '当日剩余5次' → match."""
+    from auto.shop_purchase import locate_read_only_bureau_item
+
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    item = next(
+        i for i in observed.items if i.id == "bureau_general_weapon_fu"
+    )
+    # Verify the new evidence alias is in the catalog JSON.
+    assert "一般武装改造" in item.ocr_aliases
+
+    ocr_items = [
+        _ocr("正×1一般武装改造", 711, 450, 180),
+        _ocr("65.3k/50", 855, 450, 90),
+        _ocr("当日剩余5次", 1190, 450, 80),
+    ]
+
+    result = locate_read_only_bureau_item(ocr_items, item)
+
+    assert result is not None
+    assert result["id"] == "bureau_general_weapon_fu"
 
 
 def test_general_weapon_alias_does_not_match_special_weapon():
@@ -704,6 +737,77 @@ def test_bureau_multi_currency_probe_preserves_channel_order(monkeypatch):
         "shop_quantity_increment",
         "shop_quantity_cancel",
     ]
+
+
+def test_bureau_three_currency_warehouse_probe_reads_all_channels(monkeypatch):
+    """Costs at cx≈354,517,635 — the leftmost (354) is below x=470."""
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    original = next(
+        item for item in observed.items
+        if item.id == "bureau_warehouse_expansion"
+    )
+    item = replace(original, observed_limit="今日剩余2次")
+
+    def warehouse_dialog_ocr(quantity, totals):
+        """Exact evidence from 088-bureau-price-01-bureau_warehouse_expansion.
+
+        300 @ cx≈389 (left of the old x=470 ROI boundary),
+        1500 @ cx≈517, 1000000 @ cx≈635."""
+        return [
+            _ocr(item.name, 560, 285, 180),
+            _ocr(f"{quantity}/2", 610, 345, 70),
+            _ocr("最少", 350, 350, 55),
+            _ocr("最多", 855, 350, 55),
+            _ocr(f"确认消耗以上素材兑换{item.name}", 480, 435, 260, 22),
+            _ocr("取消", 300, 520, 55),
+            _ocr("确定", 930, 520, 55),
+            _ocr(str(totals[0]), 375, 285, 42, 22),   # cx≈396
+            _ocr(str(totals[1]), 495, 285, 44, 22),   # cx≈517
+            _ocr(str(totals[2]), 595, 285, 80, 22),   # cx≈635
+        ]
+
+    frames = iter((
+        _DialogFrame(warehouse_dialog_ocr(1, [300, 1500, 1000000])),
+        _DialogFrame(warehouse_dialog_ocr(2, [700, 3100, 2100000])),
+        _Frame(_historical_frames()[5], 20),
+    ))
+    taps = []
+    monkeypatch.setattr(shop_purchase, "screenshot", lambda: next(frames))
+    monkeypatch.setattr(
+        shop_purchase,
+        "input_tap",
+        lambda point, **kwargs: taps.append((point, kwargs)) or True,
+    )
+    monkeypatch.setattr(shop_purchase.time, "sleep", lambda _seconds: None)
+    adapter = shop_purchase.BureauReadOnlyCatalogAdapter(
+        shop, observed, _Recorder()
+    )
+
+    result = adapter._probe_price_schedule(
+        {"observed_limit": "今日剩余2次", "exchange_point": (1190, 260)},
+        item,
+    )
+
+    assert result["status"] == "price_schedule_validated"
+    assert [kwargs["intent"].action_key for _point, kwargs in taps] == [
+        "shop_bureau_quantity_open",
+        "shop_quantity_increment",
+        "shop_quantity_cancel",
+    ]
+    # Verify all three channels were probed.
+    obs = result["price_observations"]
+    assert len(obs) == 2
+    assert obs[0]["costs"] == [
+        {"currency": "jue_ming", "marginal_cost": 300, "cumulative_cost": 300},
+        {"currency": "fu_ming", "marginal_cost": 1500, "cumulative_cost": 1500},
+        {"currency": "iron_coin", "marginal_cost": 1000000, "cumulative_cost": 1000000},
+    ]
+    # The leftmost cost at cx≈396 proves the widened ROI (x≥280) is
+    # essential — the old x≥470 boundary would miss this channel.
 
 
 def test_bureau_unknown_page_after_increment_never_guesses_cancel(monkeypatch):
