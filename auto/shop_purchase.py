@@ -766,13 +766,30 @@ def locate_read_only_bureau_item(
     """
 
     values = tuple(ocr_items)
+    data = list(values)
     expected_costs = sorted(cost.amount for cost in item.costs)
     expected_kind = _bureau_limit_kind(item.observed_limit)
-    candidates: list[dict] = []
-    for anchor in values:
-        text = _normalize_text(anchor.get("text"))
+    # Collect anchors: substring/overlap matching (primary) + name
+    # reassembly for parenthesized suffixes split by V6 (e.g.
+    # "星云物质" + "(4钛)").
+    anchors: list[dict] = []
+    seen: set[tuple[float, float]] = set()
+    for raw in data:
+        text = _normalize_text(raw.get("text"))
         if not _bureau_name_matches_alias(text, item.ocr_aliases):
             continue
+        cx, cy = _center(raw)
+        anchors.append(raw)
+        seen.add((round(float(cx), 3), round(float(cy), 3)))
+    for alias in item.ocr_aliases:
+        for reassembled in _name_match_anchors(data, alias):
+            cx, cy = _center(reassembled)
+            ckey = (round(float(cx), 3), round(float(cy), 3))
+            if ckey not in seen:
+                seen.add(ckey)
+                anchors.append(reassembled)
+    candidates: list[dict] = []
+    for anchor in anchors:
         center_x, center_y = _center(anchor)
         if not (
             BUREAU_PRODUCT_REGION[0] <= center_x <= BUREAU_PRODUCT_REGION[2]

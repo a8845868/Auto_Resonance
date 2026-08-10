@@ -264,6 +264,65 @@ def test_general_weapon_alias_does_not_match_special_weapon():
     ) is False
 
 
+def test_nebula_4_matched_via_reassembled_parenthesized_name():
+    """V6 splits '(4钛)' — reassembly must bind the unique correct item."""
+    from auto.shop_purchase import locate_read_only_bureau_item
+
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    item = next(i for i in observed.items if i.id == "bureau_nebula_4")
+
+    # Real live evidence: two adjacent OCR tokens plus cost and limit.
+    ocr_items = [
+        _ocr("67.1k/100", 855, 530, 90),
+        _ocr("星云物质", 670, 530, 85),
+        _ocr("(4钛) ×1", 755, 530, 80),
+        _ocr("当日剩余6次", 1190, 530, 80),
+    ]
+
+    result = locate_read_only_bureau_item(ocr_items, item)
+
+    assert result is not None
+    assert result["id"] == "bureau_nebula_4"
+
+
+def test_general_weapon_jue_matched_by_added_alias_cost_10():
+    """V6 token '正×1一般武装改造' + cost 10 must bind jue version,
+    not the fu version (cost 50), and stay unavailable without limit."""
+    from auto.shop_purchase import locate_read_only_bureau_item
+
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    jue_item = next(
+        i for i in observed.items if i.id == "bureau_general_weapon_jue"
+    )
+    fu_item = next(
+        i for i in observed.items if i.id == "bureau_general_weapon_fu"
+    )
+
+    # Verify the shared alias does not create ambiguity.
+    assert "一般武装改造" in jue_item.ocr_aliases
+    assert "一般武装改造" in fu_item.ocr_aliases
+    assert {c.amount for c in jue_item.costs} == {10}
+    assert {c.amount for c in fu_item.costs} == {50}
+
+    ocr_items = [
+        _ocr("正×1一般武装改造", 711, 480, 160),
+        _ocr("1.1k/10", 855, 480, 80),
+    ]
+
+    result = locate_read_only_bureau_item(ocr_items, jue_item)
+
+    assert result is not None
+    assert result["id"] == "bureau_general_weapon_jue"
+
+
 def test_bureau_live_matcher_replays_all_22_evidence_bound_items():
     catalog = load_shop_catalog()
     shop = catalog.shop("bureau_exchange")
