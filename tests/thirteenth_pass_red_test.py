@@ -283,7 +283,9 @@ def test_blurry_ocr_click_propagates_guard_denial(monkeypatch):
 
 def test_reward_driver_unknown_page_uses_specific_page_back_policy():
     driver = rewards.RewardDriver(sleep=lambda _seconds: None)
-    frames = iter([[{"text": "未识别页面"}], [{"text": "访问城市"}]])
+    frames = iter(
+        [[{"text": "未识别页面"}], [{"text": "访问城市"}, {"text": "作战终端"}]]
+    )
     driver.texts = lambda: next(frames)
     calls = []
     driver.tap = lambda *args, **kwargs: calls.append((args, kwargs)) or True

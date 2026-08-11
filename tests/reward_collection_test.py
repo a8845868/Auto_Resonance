@@ -278,7 +278,7 @@ def test_reward_go_home_enters_login_safely_without_clicking_top_left():
         [{"text": "点击屏幕进入游戏"}],
         [{"text": "81%"}],
         [{"text": "触碰空白区域退出"}],
-        [{"text": "访问城市"}],
+        [{"text": "访问城市"}, {"text": "作战终端"}],
     ])
     driver.tap = Mock()
 
@@ -299,7 +299,7 @@ def test_reward_go_home_cancels_clarity_replenish_prompt_before_retrying():
             ocr_box(333, 512, "取消"),
             ocr_box(987, 507, "确认"),
         ],
-        [{"text": "访问城市"}],
+        [{"text": "访问城市"}, {"text": "作战终端"}],
     ])
     driver.tap = Mock()
 
@@ -314,7 +314,7 @@ def test_reward_go_home_uses_guarded_cancel_coordinate_when_label_is_missed():
             ocr_box(684, 362, "您当前的澄明度不足，是否补充澄明度？"),
             ocr_box(987, 507, "确认"),
         ],
-        [{"text": "访问城市"}],
+        [{"text": "访问城市"}, {"text": "作战终端"}],
     ])
     driver.tap = Mock()
 

@@ -238,3 +238,15 @@ def test_existing_exchange_lobby_skips_city_navigation():
     navigate.assert_called_once_with(
         business.exchange_navigation.ExchangeAction.SELL, read_only=False
     )
+
+
+def test_shop_gift_page_percentages_are_not_mistaken_for_startup_loading():
+    """特惠礼包 page with 1000%/400%/800% must return None, not wait_for_game."""
+    assert startup_screen_action(
+        _items("特惠礼包", "1000%", "400%", "800%", "总部商店", "黑月商店")
+    ) is None
+
+
+def test_sparse_loading_percentage_still_returns_wait_for_game():
+    """81% on a nearly blank loading screen must still return wait_for_game."""
+    assert startup_screen_action(_items("81%")) == "wait_for_game"

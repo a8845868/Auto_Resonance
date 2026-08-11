@@ -289,12 +289,10 @@ def detect_current_station(
             f"station_detector_error:{type(error).__name__}",
         )
     known = tuple(dict.fromkeys(str(value).replace(" ", "") for value in station_ids if value))
-    exact = {station for station in known if station in texts}
-    matches = exact or {
-        station
-        for station in known
-        if any(station in text for text in texts)
-    }
+    # Station names are page identity, not free-form search terms. Mission and
+    # task text frequently embeds a different station name; only an independent
+    # OCR token may identify the current station.
+    matches = {station for station in known if station in texts}
     if not matches:
         return StationDetectionResult(
             "NO_MATCH", None, "UNKNOWN", ("station_name_absent",), 0,

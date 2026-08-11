@@ -413,10 +413,18 @@ def click_sell_button(timeout=25):
         if any(
             marker in text
             for text in texts
-            for marker in ("SETTLEMENTREPORT", "结算报告", "点击空白处退出")
+            for marker in ("SETTLEMENTREPORT", "结算报告")
         ):
             logger.info("Settlement report detected; sale completed")
             return True
+
+        if any("点击空白处退出" in text for text in texts):
+            # This phrase is shared by reward, announcement and item-detail
+            # overlays. Without the settlement title it is not sale evidence.
+            logger.warning(
+                "Generic dismiss overlay detected without settlement identity; "
+                "do not infer sale completion"
+            )
 
         if any("行情" in text and "波动" in text for text in texts):
             logger.warning("Market volatility prompt detected; confirm and revalidate sale")

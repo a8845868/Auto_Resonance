@@ -268,7 +268,9 @@ def go_home(*, attempt_limit: int = 45, deadline: float | None = None,
             logger.info("已返回主界面")
             return True
         visible = image.ocr()
-        home_state = resident_home_state(visible)
+        home_state = resident_home_state(
+            visible, frame_img=getattr(image, "image", None)
+        )
         if home_state is ResidentHomeState.HOME_READY:
             logger.info("已返回主界面（只读文本状态确认）")
             return True
@@ -299,7 +301,9 @@ def go_home(*, attempt_limit: int = 45, deadline: float | None = None,
             startup_recovery = False
             time.sleep(1.5)
             continue
-        startup_action = startup_screen_action(visible)
+        startup_action = startup_screen_action(
+            visible, frame_img=getattr(image, "image", None)
+        )
         if startup_action == "cancel_resource_repair":
             logger.warning("检测到资源完整性修复提示，取消修复")
             input_tap((320, 500), intent=ActionIntent("dialog_cancel", "cancel", "preset:resource-repair:cancel"))

@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 
 import auto.exchange_navigation as exchange
+import numpy as np
 from core.services.dispatch_outcome import DispatchStatus, outcome_from_receipt
 
 
@@ -62,6 +63,40 @@ def _city() -> list[dict]:
         _ocr("商会", 800, 350),
         _ocr("城市发展度", 300, 400),
     ]
+
+
+def test_exchange_city_parent_control_resolves_unique_circle_below_anchor(
+    monkeypatch,
+):
+    image = np.zeros((720, 1280, 3), dtype=np.uint8)
+    anchor = _ocr("交易所", 900, 276)
+    monkeypatch.setattr(
+        exchange.cv,
+        "HoughCircles",
+        lambda *_args, **_kwargs: np.array(
+            [[[74.0, 69.0, 45.0]]], dtype=np.float32
+        ),
+    )
+
+    assert exchange._exchange_city_parent_control(image, anchor) == (
+        (900, 350),
+        45,
+    )
+
+
+def test_exchange_city_parent_control_rejects_ambiguous_circles(monkeypatch):
+    image = np.zeros((720, 1280, 3), dtype=np.uint8)
+    anchor = _ocr("交易所", 900, 276)
+    monkeypatch.setattr(
+        exchange.cv,
+        "HoughCircles",
+        lambda *_args, **_kwargs: np.array(
+            [[[74.0, 69.0, 45.0], [92.0, 76.0, 42.0]]],
+            dtype=np.float32,
+        ),
+    )
+
+    assert exchange._exchange_city_parent_control(image, anchor) is None
 
 
 def _install_success_path(monkeypatch, *, dispatch_result=True):
@@ -385,6 +420,11 @@ def test_city_anchor_observation_traces_stability_cooldown_and_redispatch(
             (transition, kwargs["current_page_classification"])
         ),
     )
+    monkeypatch.setattr(
+        exchange,
+        "_exchange_city_parent_control",
+        lambda _frame, _anchor: ((900, 350), 45),
+    )
 
     result = exchange.open_exchange_action(
         exchange.ExchangeAction.BUY,
@@ -394,7 +434,7 @@ def test_city_anchor_observation_traces_stability_cooldown_and_redispatch(
     )
 
     assert result.success is True
-    assert taps == [(900, 276), (805, 324)]
+    assert taps == [(900, 350), (805, 324)]
     observations = [
         json.loads(classification)
         for transition, classification in captured
@@ -409,4 +449,6 @@ def test_city_anchor_observation_traces_stability_cooldown_and_redispatch(
     ]
     assert observations[2]["jaccard_to_previous"] == 1.0
     assert observations[2]["signature_stable"] is True
+    assert observations[2]["parent_control_coordinate"] == [900, 350]
+    assert observations[2]["parent_control_stable"] is True
     assert observations[3]["physical_dispatches"] == 2

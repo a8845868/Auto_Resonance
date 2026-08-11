@@ -19,6 +19,12 @@ def test_resident_home_ready_without_overlay():
     assert resident_home_state(_items("访问城市", "作战终端")) is ResidentHomeState.HOME_READY
 
 
+def test_city_task_text_does_not_create_single_marker_home_false_positive():
+    assert resident_home_state(
+        _items("前往作战终端", "交易所", "商会")
+    ) is None
+
+
 def test_announcement_overlay_is_observed_without_click():
     assert resident_home_state(
         _items("公告", "触碰空白区域退出")

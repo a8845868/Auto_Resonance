@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -17,6 +18,12 @@ from core.services.city_navigation import (
     CityNavigationState,
     ExchangeEntryAdapter,
     observe_city_frame,
+)
+from core.services.page_templates import (
+    EXCHANGE_MENU_TEMPLATE_PATH,
+    EXCHANGE_MENU_TEMPLATE_ROI,
+    _load_template,
+    match_page_template,
 )
 from core.services.read_only_policy import ActionIntent
 from core.services.runtime_control import RUNTIME_DIR
@@ -114,7 +121,13 @@ def _center(item: dict) -> tuple[int, int]:
     )
 
 
-def exchange_menu_matches(items: Iterable[dict]) -> bool:
+def exchange_menu_matches(items: Iterable[dict], *, frame_img=None) -> bool:
+    if match_page_template(
+        frame_img,
+        _load_template(EXCHANGE_MENU_TEMPLATE_PATH),
+        EXCHANGE_MENU_TEMPLATE_ROI,
+    ):
+        return True
     return observe_city_frame(list(items)).state is CityNavigationState.EXCHANGE_MENU
 
 
@@ -177,6 +190,85 @@ def _city_anchor_candidates(items: Iterable[dict]) -> list[dict]:
 def _unique_exchange_city_anchor(items: Iterable[dict]) -> dict | None:
     anchors = _city_anchor_candidates(items)
     return anchors[0] if len(anchors) == 1 else None
+
+
+def _exchange_city_parent_control(
+    frame: object,
+    anchor: dict,
+) -> tuple[tuple[int, int], int] | None:
+    """Resolve the unique circular NPC control below the exchange label."""
+
+    image = getattr(frame, "image", frame)
+    if image is None or not hasattr(image, "shape") or len(image.shape) < 2:
+        return None
+    points = anchor.get("position") or ()
+    if len(points) < 3:
+        return None
+    try:
+        xs = [float(point[0]) for point in points]
+        ys = [float(point[1]) for point in points]
+    except (TypeError, ValueError, IndexError):
+        return None
+    anchor_left, anchor_right = min(xs), max(xs)
+    anchor_bottom = max(ys)
+    anchor_center_x = (anchor_left + anchor_right) / 2.0
+    anchor_width = max(1.0, anchor_right - anchor_left)
+    capture_height, capture_width = map(int, image.shape[:2])
+    horizontal_margin = max(64, round(anchor_width * 0.85))
+    roi_left = max(0, round(anchor_left) - horizontal_margin)
+    roi_right = min(capture_width, round(anchor_right) + horizontal_margin)
+    roi_top = max(0, round(anchor_bottom) - 5)
+    roi_bottom = min(
+        capture_height,
+        round(anchor_bottom) + max(120, round(capture_height * 0.23)),
+    )
+    if roi_right - roi_left < 40 or roi_bottom - roi_top < 40:
+        return None
+    try:
+        gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
+        roi = cv.GaussianBlur(
+            gray[roi_top:roi_bottom, roi_left:roi_right], (9, 9), 2
+        )
+        circles = cv.HoughCircles(
+            roi,
+            cv.HOUGH_GRADIENT,
+            dp=1.2,
+            minDist=40,
+            param1=100,
+            param2=35,
+            minRadius=max(20, round(capture_height * 0.04)),
+            maxRadius=max(30, round(capture_height * 0.11)),
+        )
+    except (cv.error, TypeError, ValueError):
+        return None
+    if circles is None:
+        return None
+    candidates: list[tuple[tuple[int, int], int]] = []
+    for circle_x, circle_y, radius in circles[0]:
+        center = (
+            int(round(float(circle_x) + roi_left)),
+            int(round(float(circle_y) + roi_top)),
+        )
+        resolved_radius = int(round(float(radius)))
+        if center[1] <= anchor_bottom + 8:
+            continue
+        if abs(center[0] - anchor_center_x) > max(40.0, anchor_width * 0.75):
+            continue
+        candidates.append((center, resolved_radius))
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _stable_exchange_city_parent_controls(
+    controls: list[tuple[tuple[int, int], int]],
+) -> bool:
+    if len(controls) < _CITY_ANCHOR_STABLE_FRAME_COUNT:
+        return False
+    recent = controls[-_CITY_ANCHOR_STABLE_FRAME_COUNT:]
+    return all(
+        math.dist(recent[index - 1][0], recent[index][0]) <= 8.0
+        and abs(recent[index - 1][1] - recent[index][1]) <= 8
+        for index in range(1, len(recent))
+    )
 
 
 def _resolve_city_marker(items: Iterable[dict], outlet: object) -> str:
@@ -320,6 +412,8 @@ def _capture_city_anchor_observation(
     signature_stable: bool,
     cooldown_elapsed: float,
     physical_dispatches: int,
+    parent_control: tuple[tuple[int, int], int] | None = None,
+    parent_control_stable: bool = False,
 ) -> None:
     try:
         anchors = _city_anchor_candidates(items)
@@ -335,6 +429,13 @@ def _capture_city_anchor_observation(
             "page_state": observe_city_frame(items).state.value,
             "anchor_count": len(anchors),
             "anchor_coordinate": anchor_coordinate,
+            "parent_control_coordinate": (
+                None if parent_control is None else parent_control[0]
+            ),
+            "parent_control_radius": (
+                None if parent_control is None else parent_control[1]
+            ),
+            "parent_control_stable": bool(parent_control_stable),
             "retryable": bool(retryable),
             "rejection_reason": str(rejection_reason or "ok"),
             "jaccard_to_previous": (
@@ -412,7 +513,9 @@ class ExchangeNavigator:
             return ExchangeNavigationResult(False, selected, reason="cancelled")
         lobby_frame = self.frame_provider()
         lobby_items = _items(lobby_frame)
-        if not exchange_menu_matches(lobby_items):
+        if not exchange_menu_matches(
+            lobby_items, frame_img=getattr(lobby_frame, "image", None)
+        ):
             return self._failure(selected, "exchange_menu_not_confirmed", lobby_frame)
         label = "我要买" if selected is ExchangeAction.BUY else "我要卖"
         anchors = [item for item in lobby_items if label in _text(item) and item.get("position")]
@@ -512,7 +615,9 @@ def open_exchange_action(
     if monotonic() >= deadline:
         return deadline_failure("initial_capture")
     frame = screenshot()
-    if not exchange_menu_matches(_items(frame)):
+    if not exchange_menu_matches(
+        _items(frame), frame_img=getattr(frame, "image", None)
+    ):
         from core.preset import go_outlets
         from core.preset.control import go_home
 
@@ -586,10 +691,13 @@ def open_exchange_action(
                 anchor_coordinate=first_coordinate,
                 page_texts=_semantic_page_texts(candidate_items),
             )
-            if exchange_menu_matches(candidate_items):
+            if exchange_menu_matches(
+                candidate_items, frame_img=getattr(candidate, "image", None)
+            ):
                 frame = candidate
             else:
                 city_signatures: list[frozenset[str]] = []
+                city_parent_controls: list[tuple[tuple[int, int], int]] = []
                 physical_dispatches = 1
                 last_dispatch_at = monotonic()
 
@@ -599,6 +707,8 @@ def open_exchange_action(
                     retryable: bool,
                     jaccard_to_previous: float | None = None,
                     signature_stable: bool = False,
+                    parent_control: tuple[tuple[int, int], int] | None = None,
+                    parent_control_stable: bool = False,
                     dispatches: int | None = None,
                 ) -> None:
                     _capture_city_anchor_observation(
@@ -616,6 +726,8 @@ def open_exchange_action(
                             if dispatches is None
                             else dispatches
                         ),
+                        parent_control=parent_control,
+                        parent_control_stable=parent_control_stable,
                     )
 
                 for observation_index in range(_CITY_ANCHOR_OBSERVATION_LIMIT):
@@ -629,7 +741,10 @@ def open_exchange_action(
                         sleep(min(0.5, max(0.0, deadline - monotonic())))
                         candidate = screenshot()
                         candidate_items = _items(candidate)
-                    if exchange_menu_matches(candidate_items):
+                    if exchange_menu_matches(
+                        candidate_items,
+                        frame_img=getattr(candidate, "image", None),
+                    ):
                         record_observation(
                             "exchange_menu_visible", retryable=False
                         )
@@ -642,6 +757,7 @@ def open_exchange_action(
                     )
                     if retryable is None:
                         city_signatures.clear()
+                        city_parent_controls.clear()
                         record_observation(
                             _city_anchor_frame_rejection_reason(
                                 candidate_items, city_marker=city_marker
@@ -650,6 +766,15 @@ def open_exchange_action(
                         )
                         continue
                     page_texts, anchor = retryable
+                    parent_control = _exchange_city_parent_control(candidate, anchor)
+                    if parent_control is None:
+                        city_signatures.clear()
+                        city_parent_controls.clear()
+                        record_observation(
+                            "visual_parent_control_unresolved",
+                            retryable=False,
+                        )
+                        continue
                     previous_signature = (
                         city_signatures[-1] if city_signatures else None
                     )
@@ -660,13 +785,28 @@ def open_exchange_action(
                     )
                     city_signatures.append(page_texts)
                     del city_signatures[:-_CITY_ANCHOR_STABLE_FRAME_COUNT]
+                    city_parent_controls.append(parent_control)
+                    del city_parent_controls[:-_CITY_ANCHOR_STABLE_FRAME_COUNT]
                     signature_stable = _stable_city_signatures(city_signatures)
+                    parent_control_stable = _stable_exchange_city_parent_controls(
+                        city_parent_controls
+                    )
                     cooldown_elapsed = monotonic() - last_dispatch_at
                     if not signature_stable:
                         record_observation(
                             "semantic_signature_unstable",
                             retryable=True,
                             jaccard_to_previous=jaccard_to_previous,
+                            parent_control=parent_control,
+                        )
+                        continue
+                    if not parent_control_stable:
+                        record_observation(
+                            "visual_parent_control_unstable",
+                            retryable=True,
+                            jaccard_to_previous=jaccard_to_previous,
+                            signature_stable=True,
+                            parent_control=parent_control,
                         )
                         continue
                     if physical_dispatches >= _CITY_ANCHOR_TOTAL_DISPATCH_LIMIT:
@@ -675,6 +815,8 @@ def open_exchange_action(
                             retryable=True,
                             jaccard_to_previous=jaccard_to_previous,
                             signature_stable=True,
+                            parent_control=parent_control,
+                            parent_control_stable=True,
                         )
                         continue
                     if (
@@ -686,9 +828,11 @@ def open_exchange_action(
                             retryable=True,
                             jaccard_to_previous=jaccard_to_previous,
                             signature_stable=True,
+                            parent_control=parent_control,
+                            parent_control_stable=True,
                         )
                         continue
-                    coordinate = _center(anchor)
+                    coordinate = parent_control[0]
                     attempt = physical_dispatches + 1
                     dispatch_result = input_tap(
                         coordinate,
@@ -704,6 +848,8 @@ def open_exchange_action(
                         retryable=True,
                         jaccard_to_previous=jaccard_to_previous,
                         signature_stable=True,
+                        parent_control=parent_control,
+                        parent_control_stable=True,
                         dispatches=(
                             physical_dispatches
                             if dispatch_result is False
@@ -723,6 +869,7 @@ def open_exchange_action(
                     physical_dispatches += 1
                     last_dispatch_at = monotonic()
                     city_signatures.clear()
+                    city_parent_controls.clear()
         else:
             for _ in range(12):
                 if cancellation and cancellation():
@@ -731,7 +878,9 @@ def open_exchange_action(
                     return deadline_failure("exchange_menu_wait")
                 sleep(min(0.5, max(0.0, deadline - monotonic())))
                 candidate = screenshot()
-                if exchange_menu_matches(_items(candidate)):
+                if exchange_menu_matches(
+                    _items(candidate), frame_img=getattr(candidate, "image", None)
+                ):
                     frame = candidate
                     break
         if frame is None:

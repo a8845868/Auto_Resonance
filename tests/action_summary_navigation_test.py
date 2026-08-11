@@ -610,7 +610,7 @@ def test_fresh_terminal_bbox_jitter_preserves_semantic_identity():
 
 
 def test_fresh_terminal_disappearance_has_zero_input():
-    missing = Frame([item("访问城市", 1172, 486)])
+    missing = Frame([item("访问城市", 1172, 486), item("启程", 1190, 660)])
     result, taps, evidence = run([home("1"), missing])
     assert not result.success
     assert result.reason == "action_terminal_fresh_confirmation_failed"
