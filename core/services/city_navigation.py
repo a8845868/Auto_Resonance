@@ -11,6 +11,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Callable, Iterable
 
+from loguru import logger
+
 from core.control.nemu_capture import (
     CaptureSessionRecoveryResult,
     NemuCaptureError,
@@ -32,6 +34,7 @@ from core.services.navigation_evidence import (
 )
 from core.services.read_only_policy import ActionIntent
 from core.services.navigation_parent_control import (
+    NavigationParentControlObservation,
     confirm_fresh_parent_control,
     resolve_navigation_parent_control,
 )
@@ -41,12 +44,105 @@ from core.services.runtime_fault_telemetry import (
     RuntimeFaultEvent,
     record_runtime_fault,
 )
+from core.services.session_evidence import capture_session_evidence
 
 
 CITY_ENTRY_TRANSITION_TIMEOUT_SECONDS = 30.0
 CITY_ENTRY_OBSERVATION_INTERVAL_SECONDS = 0.5
 CITY_ENTRY_MINIMUM_GRACE_SECONDS = 2.0
 CITY_PARENT_CONTROL_FRESH_OBSERVATION_LIMIT = 2
+
+
+def _parent_control_bbox_iou(
+    first: tuple[int, int, int, int],
+    second: tuple[int, int, int, int],
+) -> float:
+    left, top = max(first[0], second[0]), max(first[1], second[1])
+    right, bottom = min(first[2], second[2]), min(first[3], second[3])
+    intersection = max(0, right - left) * max(0, bottom - top)
+    union = (
+        (first[2] - first[0]) * (first[3] - first[1])
+        + (second[2] - second[0]) * (second[3] - second[1])
+        - intersection
+    )
+    return intersection / union if union else 0.0
+
+
+def _parent_control_confirmation_reason(
+    initial: NavigationParentControlObservation,
+    fresh: NavigationParentControlObservation,
+) -> str:
+    """Explain the existing confirmation result without participating in it."""
+    if not initial.resolved:
+        return "initial_parent_unresolved"
+    if not fresh.resolved:
+        return "fresh_parent_unresolved"
+    if initial.semantic_id != fresh.semantic_id:
+        return "semantic_id_mismatch"
+    if initial.parent_detection_method != fresh.parent_detection_method:
+        return "parent_detection_method_mismatch"
+    if initial.source_capture_id and fresh.source_capture_id:
+        if initial.source_capture_id == fresh.source_capture_id:
+            return "source_capture_id_reused"
+    elif initial.source_frame_sha256 == fresh.source_frame_sha256:
+        return "source_frame_sha256_reused"
+    if _parent_control_bbox_iou(initial.anchor_bbox, fresh.anchor_bbox) < 0.75:
+        return "anchor_bbox_iou_below_0_75"
+    if initial.parent_control_bbox is None or fresh.parent_control_bbox is None:
+        return "parent_bbox_missing"
+    if initial.safe_hit_bbox is None or fresh.safe_hit_bbox is None:
+        return "safe_bbox_missing"
+    if initial.safe_hit_point is None or fresh.safe_hit_point is None:
+        return "safe_hit_point_missing"
+    if (
+        _parent_control_bbox_iou(
+            initial.parent_control_bbox, fresh.parent_control_bbox
+        )
+        < 0.82
+    ):
+        return "parent_bbox_iou_below_0_82"
+    if _parent_control_bbox_iou(initial.safe_hit_bbox, fresh.safe_hit_bbox) < 0.75:
+        return "safe_bbox_iou_below_0_75"
+    if math.dist(initial.safe_hit_point, fresh.safe_hit_point) > 8.0:
+        return "safe_hit_point_distance_above_8"
+    return "matched"
+
+
+def _capture_parent_control_observation(
+    *,
+    observation_index: int,
+    fresh: NavigationParentControlObservation,
+    comparisons: list[dict[str, object]],
+    confirm_matched: bool,
+) -> None:
+    failure_reason = "matched" if confirm_matched else "|".join(
+        f"prior[{item['prior_observation_index']}]={item['reason']}"
+        for item in comparisons
+    ) or "no_prior_observation"
+    payload = {
+        "observation_index": observation_index,
+        "anchor_bbox": fresh.anchor_bbox,
+        "parent_bbox": fresh.parent_control_bbox,
+        "safe_bbox": fresh.safe_hit_bbox,
+        "safe_hit_point": fresh.safe_hit_point,
+        "confirm_matched": confirm_matched,
+        "failure_reason": failure_reason,
+        "comparisons": comparisons,
+    }
+    try:
+        capture_session_evidence(
+            "CITY_PARENT_CONTROL_OBSERVE",
+            ledger_context=None,
+            leg_id="",
+            current_page_classification=json.dumps(
+                payload, ensure_ascii=False, separators=(",", ":")
+            ),
+        )
+    except Exception as error:
+        logger.warning(
+            "Unable to capture city parent-control evidence: "
+            f"{type(error).__name__}"
+        )
 
 
 class CityNavigationState(str, Enum):
@@ -864,12 +960,30 @@ class CityNavigationAdapter:
                         source_frame_sha256=fresh.screenshot_hash,
                     )
                     confirmed_parent = None
-                    for prior in reversed(parent_observations):
+                    comparisons: list[dict[str, object]] = []
+                    indexed_priors = list(enumerate(parent_observations, start=0))
+                    for prior_index, prior in reversed(indexed_priors):
                         confirmed_parent = confirm_fresh_parent_control(
                             prior, fresh_parent
                         )
+                        comparisons.append(
+                            {
+                                "prior_observation_index": prior_index,
+                                "matched": confirmed_parent is not None,
+                                "reason": _parent_control_confirmation_reason(
+                                    prior, fresh_parent
+                                ),
+                            }
+                        )
                         if confirmed_parent is not None:
                             break
+                    if confirmed_parent is None:
+                        _capture_parent_control_observation(
+                            observation_index=fresh_index + 1,
+                            fresh=fresh_parent,
+                            comparisons=comparisons,
+                            confirm_matched=False,
+                        )
                     if (
                         confirmed_parent is not None
                         and confirmed_parent.safe_hit_point is not None
