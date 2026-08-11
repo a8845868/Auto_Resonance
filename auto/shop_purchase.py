@@ -81,6 +81,19 @@ DIALOG_MAX_POS = (892, 380)
 BATCH_TOGGLE_POS = (1230, 117)
 MAX_SCAN_PAGES = 30
 MAX_QUANTITY_PROBE_INCREMENTS = 10
+BUREAU_ITEM_QUANTITY_PROBE_INCREMENT_LIMITS = {
+    # The live bureau dialog proves a 1/100 quantity range for this one item.
+    # Keep the global cap unchanged and make the larger read-only input budget
+    # explicit, auditable, and impossible to inherit by another catalog item.
+    "bureau_arrest_warrant": 99,
+}
+
+
+def _bureau_quantity_probe_increment_limit(item: ReadOnlyShopItem) -> int:
+    return BUREAU_ITEM_QUANTITY_PROBE_INCREMENT_LIMITS.get(
+        item.id,
+        MAX_QUANTITY_PROBE_INCREMENTS,
+    )
 
 
 def _shop_swipe_observation(action_key: str) -> PageObservation:
@@ -2235,12 +2248,13 @@ class BureauReadOnlyCatalogAdapter:
                 "price_observations": [],
             }
         maximum = int(first["maximum"])
+        increment_limit = _bureau_quantity_probe_increment_limit(item)
         exceeds_observed_remaining = (
             remaining is not None and maximum > remaining
         )
         if (
             exceeds_observed_remaining
-            or maximum - 1 > MAX_QUANTITY_PROBE_INCREMENTS
+            or maximum - 1 > increment_limit
         ):
             self._cancel_verified_quantity_dialog(item)
             remaining_label = (
@@ -2251,7 +2265,7 @@ class BureauReadOnlyCatalogAdapter:
                 "status": "price_probe_failed",
                 "error": (
                     f"赴命商品弹窗上限超出只读探针预算: {item.name}，"
-                    f"剩余 {remaining_label}，弹窗 {maximum}"
+                    f"剩余 {remaining_label}，弹窗 {maximum}，预算 {increment_limit}"
                 ),
                 "price_observations": [],
             }

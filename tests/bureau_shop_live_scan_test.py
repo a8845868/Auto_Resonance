@@ -791,6 +791,116 @@ def test_bureau_unknown_remaining_uses_verified_dialog_maximum_once(monkeypatch)
     assert "shop_confirm" not in action_keys
 
 
+def test_arrest_warrant_has_single_item_99_increment_probe_budget(monkeypatch):
+    """Only arrest warrant may prove its complete 1/100 marginal schedule."""
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    item = next(
+        item for item in observed.items if item.id == "bureau_arrest_warrant"
+    )
+    other = next(
+        item for item in observed.items if item.id == "bureau_general_weapon_jue"
+    )
+    assert shop_purchase.MAX_QUANTITY_PROBE_INCREMENTS == 10
+    assert shop_purchase._bureau_quantity_probe_increment_limit(item) == 99
+    assert shop_purchase._bureau_quantity_probe_increment_limit(other) == 10
+
+    frames = iter([
+        _DialogFrame(_dialog_ocr(item.name, quantity, 100, [20 * quantity]))
+        for quantity in range(1, 101)
+    ] + [_Frame(_historical_frames()[0], 20)])
+    taps = []
+    monkeypatch.setattr(shop_purchase, "screenshot", lambda: next(frames))
+    monkeypatch.setattr(
+        shop_purchase,
+        "input_tap",
+        lambda point, **kwargs: taps.append((point, kwargs)) or True,
+    )
+    monkeypatch.setattr(shop_purchase.time, "sleep", lambda _seconds: None)
+    adapter = shop_purchase.BureauReadOnlyCatalogAdapter(
+        shop, observed, _Recorder()
+    )
+
+    result = adapter._probe_price_schedule(
+        {
+            "id": item.id,
+            "observed_limit": "未稳定识别",
+            "exchange_point": (1175, 210),
+        },
+        item,
+    )
+
+    assert result["status"] == "price_schedule_validated"
+    assert result["dialog_maximum"] == 100
+    assert len(result["price_observations"]) == 100
+    assert result["price_observations"][0]["costs"] == [{
+        "currency": "fu_ming",
+        "marginal_cost": 20,
+        "cumulative_cost": 20,
+    }]
+    assert result["price_observations"][-1]["costs"] == [{
+        "currency": "fu_ming",
+        "marginal_cost": 20,
+        "cumulative_cost": 2000,
+    }]
+    action_keys = [kwargs["intent"].action_key for _, kwargs in taps]
+    assert action_keys.count("shop_bureau_quantity_open") == 1
+    assert action_keys.count("shop_quantity_increment") == 99
+    assert action_keys.count("shop_quantity_cancel") == 1
+    assert "shop_confirm" not in action_keys
+    assert all(kwargs["random_offset"] is False for _, kwargs in taps)
+    assert adapter.dialog_open_dispatches == 1
+    assert adapter.quantity_increment_dispatches == 99
+    assert adapter.dialog_cancel_dispatches == 1
+
+
+def test_non_arrest_bureau_item_keeps_global_10_increment_budget(monkeypatch):
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    item = next(
+        item for item in observed.items if item.id == "bureau_general_weapon_jue"
+    )
+    frames = iter((
+        _DialogFrame(_dialog_ocr(item.name, 1, 12, [10])),
+        _Frame(_historical_frames()[0], 20),
+    ))
+    taps = []
+    monkeypatch.setattr(shop_purchase, "screenshot", lambda: next(frames))
+    monkeypatch.setattr(
+        shop_purchase,
+        "input_tap",
+        lambda point, **kwargs: taps.append((point, kwargs)) or True,
+    )
+    monkeypatch.setattr(shop_purchase.time, "sleep", lambda _seconds: None)
+    adapter = shop_purchase.BureauReadOnlyCatalogAdapter(
+        shop, observed, _Recorder()
+    )
+
+    result = adapter._probe_price_schedule(
+        {
+            "id": item.id,
+            "observed_limit": "未稳定识别",
+            "exchange_point": (1175, 210),
+        },
+        item,
+    )
+
+    assert result["status"] == "price_probe_failed"
+    assert "预算 10" in result["error"]
+    action_keys = [kwargs["intent"].action_key for _, kwargs in taps]
+    assert action_keys == [
+        "shop_bureau_quantity_open",
+        "shop_quantity_cancel",
+    ]
+    assert adapter.quantity_increment_dispatches == 0
+
+
 def test_bureau_unknown_remaining_without_unique_control_never_clicks(monkeypatch):
     catalog = load_shop_catalog()
     shop = catalog.shop("bureau_exchange")
