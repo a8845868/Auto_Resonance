@@ -160,8 +160,8 @@ def _stable_city_signatures(signatures: list[frozenset[str]]) -> bool:
     )
 
 
-def _unique_exchange_city_anchor(items: Iterable[dict]) -> dict | None:
-    anchors = []
+def _city_anchor_candidates(items: Iterable[dict]) -> list[dict]:
+    candidates: list[dict] = []
     for item in items:
         if "交易所" not in _text(item) or not item.get("position"):
             continue
@@ -170,7 +170,12 @@ def _unique_exchange_city_anchor(items: Iterable[dict]) -> dict | None:
         except (TypeError, ValueError):
             continue
         if 160 <= center_x <= 1000 and 40 <= center_y <= 500:
-            anchors.append(item)
+            candidates.append(item)
+    return candidates
+
+
+def _unique_exchange_city_anchor(items: Iterable[dict]) -> dict | None:
+    anchors = _city_anchor_candidates(items)
     return anchors[0] if len(anchors) == 1 else None
 
 
@@ -253,6 +258,100 @@ def _capture_city_anchor_dispatch(
     except Exception as error:
         logger.warning(
             "Unable to capture city-anchor redispatch evidence: "
+            f"{type(error).__name__}"
+        )
+
+
+def _city_anchor_frame_rejection_reason(
+    items: list[dict],
+    *,
+    city_marker: str,
+) -> str:
+    try:
+        texts = _semantic_page_texts(items)
+        if not city_marker:
+            return "city_marker_unresolved"
+        if not any(city_marker in text for text in texts):
+            return "city_marker_missing"
+        if exchange_menu_matches(items):
+            return "exchange_menu_visible"
+        if exchange_page_matches(items, ExchangeAction.BUY):
+            return "exchange_buy_page_visible"
+        if exchange_page_matches(items, ExchangeAction.SELL):
+            return "exchange_sell_page_visible"
+        state = observe_city_frame(items).state
+        if state not in {
+            CityNavigationState.CITY_MAP,
+            CityNavigationState.CITY_DETAIL,
+            CityNavigationState.EXCHANGE_NPC_VISIBLE,
+        }:
+            return f"page_state_not_retryable:{state.value}"
+        anchor_count = len(_city_anchor_candidates(items))
+        if anchor_count == 0:
+            return "exchange_anchor_missing"
+        if anchor_count > 1:
+            return "exchange_anchor_ambiguous"
+        return ""
+    except Exception as error:
+        logger.warning(
+            "Unable to classify city-anchor observation evidence: "
+            f"{type(error).__name__}"
+        )
+        return f"evidence_derivation_failed:{type(error).__name__}"
+
+
+def _capture_city_anchor_observation(
+    *,
+    observation_index: int,
+    items: list[dict],
+    city_marker: str,
+    rejection_reason: str,
+    retryable: bool,
+    jaccard_to_previous: float | None,
+    stable_window_size: int,
+    signature_stable: bool,
+    cooldown_elapsed: float,
+    physical_dispatches: int,
+) -> None:
+    try:
+        anchors = _city_anchor_candidates(items)
+        anchor_coordinate = _center(anchors[0]) if len(anchors) == 1 else None
+        page_texts = _semantic_page_texts(items)
+        payload = {
+            "stage": "city_anchor_observe",
+            "observation_index": int(observation_index),
+            "city_marker": str(city_marker),
+            "city_marker_present": bool(
+                city_marker and any(city_marker in text for text in page_texts)
+            ),
+            "page_state": observe_city_frame(items).state.value,
+            "anchor_count": len(anchors),
+            "anchor_coordinate": anchor_coordinate,
+            "retryable": bool(retryable),
+            "rejection_reason": str(rejection_reason or "ok"),
+            "jaccard_to_previous": (
+                None
+                if jaccard_to_previous is None
+                else round(float(jaccard_to_previous), 6)
+            ),
+            "stable_window_size": int(stable_window_size),
+            "signature_stable": bool(signature_stable),
+            "cooldown_elapsed": round(max(0.0, float(cooldown_elapsed)), 6),
+            "physical_dispatches": int(physical_dispatches),
+            "dispatch_limit": _CITY_ANCHOR_TOTAL_DISPATCH_LIMIT,
+            "page_texts": sorted(page_texts),
+        }
+        capture_session_evidence(
+            "EXCHANGE_CITY_ANCHOR_OBSERVE",
+            ledger_context=None,
+            leg_id="",
+            current_page_classification=json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ),
+        )
+    except Exception as error:
+        logger.warning(
+            "Unable to capture city-anchor observation evidence: "
             f"{type(error).__name__}"
         )
 
@@ -485,6 +584,32 @@ def open_exchange_action(
                 city_signatures: list[frozenset[str]] = []
                 physical_dispatches = 1
                 last_dispatch_at = monotonic()
+
+                def record_observation(
+                    rejection_reason: str,
+                    *,
+                    retryable: bool,
+                    jaccard_to_previous: float | None = None,
+                    signature_stable: bool = False,
+                    dispatches: int | None = None,
+                ) -> None:
+                    _capture_city_anchor_observation(
+                        observation_index=observation_index,
+                        items=candidate_items,
+                        city_marker=city_marker,
+                        rejection_reason=rejection_reason,
+                        retryable=retryable,
+                        jaccard_to_previous=jaccard_to_previous,
+                        stable_window_size=len(city_signatures),
+                        signature_stable=signature_stable,
+                        cooldown_elapsed=monotonic() - last_dispatch_at,
+                        physical_dispatches=(
+                            physical_dispatches
+                            if dispatches is None
+                            else dispatches
+                        ),
+                    )
+
                 for observation_index in range(_CITY_ANCHOR_OBSERVATION_LIMIT):
                     if observation_index:
                         if cancellation and cancellation():
@@ -497,6 +622,9 @@ def open_exchange_action(
                         candidate = screenshot()
                         candidate_items = _items(candidate)
                     if exchange_menu_matches(candidate_items):
+                        record_observation(
+                            "exchange_menu_visible", retryable=False
+                        )
                         frame = candidate
                         break
                     if not city_marker:
@@ -506,18 +634,51 @@ def open_exchange_action(
                     )
                     if retryable is None:
                         city_signatures.clear()
+                        record_observation(
+                            _city_anchor_frame_rejection_reason(
+                                candidate_items, city_marker=city_marker
+                            ),
+                            retryable=False,
+                        )
                         continue
                     page_texts, anchor = retryable
+                    previous_signature = (
+                        city_signatures[-1] if city_signatures else None
+                    )
+                    jaccard_to_previous = (
+                        None
+                        if previous_signature is None
+                        else _text_jaccard(previous_signature, page_texts)
+                    )
                     city_signatures.append(page_texts)
                     del city_signatures[:-_CITY_ANCHOR_STABLE_FRAME_COUNT]
-                    if not _stable_city_signatures(city_signatures):
+                    signature_stable = _stable_city_signatures(city_signatures)
+                    cooldown_elapsed = monotonic() - last_dispatch_at
+                    if not signature_stable:
+                        record_observation(
+                            "semantic_signature_unstable",
+                            retryable=True,
+                            jaccard_to_previous=jaccard_to_previous,
+                        )
                         continue
                     if physical_dispatches >= _CITY_ANCHOR_TOTAL_DISPATCH_LIMIT:
+                        record_observation(
+                            "dispatch_limit_reached",
+                            retryable=True,
+                            jaccard_to_previous=jaccard_to_previous,
+                            signature_stable=True,
+                        )
                         continue
                     if (
-                        monotonic() - last_dispatch_at
+                        cooldown_elapsed
                         < _CITY_ANCHOR_REDISPATCH_COOLDOWN_SECONDS
                     ):
+                        record_observation(
+                            "cooldown_pending",
+                            retryable=True,
+                            jaccard_to_previous=jaccard_to_previous,
+                            signature_stable=True,
+                        )
                         continue
                     coordinate = _center(anchor)
                     attempt = physical_dispatches + 1
@@ -528,6 +689,17 @@ def open_exchange_action(
                             "navigation_anchor",
                             "交易所",
                             f"exchange:city-anchor:redispatch:{attempt}",
+                        ),
+                    )
+                    record_observation(
+                        "redispatch_authorized",
+                        retryable=True,
+                        jaccard_to_previous=jaccard_to_previous,
+                        signature_stable=True,
+                        dispatches=(
+                            physical_dispatches
+                            if dispatch_result is False
+                            else physical_dispatches + 1
                         ),
                     )
                     _capture_city_anchor_dispatch(

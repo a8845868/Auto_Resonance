@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import auto.exchange_navigation as exchange
@@ -14,6 +15,12 @@ class _OutletResult:
 
     def __bool__(self) -> bool:
         return self.success
+
+
+class _StructuredOutletResult(_OutletResult):
+    def __init__(self):
+        super().__init__(True, "outlet_selected")
+        self.city = SimpleNamespace(station_id="岚心城")
 
 
 def _ocr(text: str, x: int, y: int) -> dict:
@@ -45,6 +52,15 @@ def _buy() -> list[dict]:
         _ocr("全部买入", 900, 600),
         _ocr("买入总价(含税)", 900, 550),
         _ocr("载货量", 600, 650),
+    ]
+
+
+def _city() -> list[dict]:
+    return [
+        _ocr("岚心城", 200, 200),
+        _ocr("交易所", 900, 276),
+        _ocr("商会", 800, 350),
+        _ocr("城市发展度", 300, 400),
     ]
 
 
@@ -210,3 +226,157 @@ def test_city_signature_still_rejects_material_chinese_page_change():
     ]
 
     assert exchange._stable_city_signatures(signatures) is False
+
+
+def test_city_anchor_observation_evidence_contains_each_gate_value(monkeypatch):
+    captured: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        exchange,
+        "capture_session_evidence",
+        lambda transition, **kwargs: captured.append(
+            (
+                transition,
+                json.loads(kwargs["current_page_classification"]),
+            )
+        ),
+    )
+
+    exchange._capture_city_anchor_observation(
+        observation_index=4,
+        items=_city(),
+        city_marker="岚心城",
+        rejection_reason="semantic_signature_unstable",
+        retryable=True,
+        jaccard_to_previous=0.81234567,
+        stable_window_size=2,
+        signature_stable=False,
+        cooldown_elapsed=1.25,
+        physical_dispatches=1,
+    )
+
+    assert captured[0][0] == "EXCHANGE_CITY_ANCHOR_OBSERVE"
+    payload = captured[0][1]
+    assert payload["observation_index"] == 4
+    assert payload["city_marker"] == "岚心城"
+    assert payload["city_marker_present"] is True
+    assert payload["page_state"] == "EXCHANGE_NPC_VISIBLE"
+    assert payload["anchor_count"] == 1
+    assert payload["anchor_coordinate"] == [900, 276]
+    assert payload["rejection_reason"] == "semantic_signature_unstable"
+    assert payload["jaccard_to_previous"] == 0.812346
+    assert payload["stable_window_size"] == 2
+    assert payload["signature_stable"] is False
+    assert payload["cooldown_elapsed"] == 1.25
+    assert payload["physical_dispatches"] == 1
+    assert payload["dispatch_limit"] == 3
+    assert set(payload["page_texts"]) == {
+        "岚心城",
+        "交易所",
+        "商会",
+        "城市发展度",
+    }
+
+
+def test_city_anchor_observation_capture_failure_is_non_blocking(monkeypatch):
+    monkeypatch.setattr(
+        exchange,
+        "capture_session_evidence",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    exchange._capture_city_anchor_observation(
+        observation_index=0,
+        items=_city(),
+        city_marker="岚心城",
+        rejection_reason="semantic_signature_unstable",
+        retryable=True,
+        jaccard_to_previous=None,
+        stable_window_size=1,
+        signature_stable=False,
+        cooldown_elapsed=0.0,
+        physical_dispatches=1,
+    )
+
+
+def test_city_anchor_observation_derivation_failure_is_non_blocking(monkeypatch):
+    monkeypatch.setattr(
+        exchange,
+        "observe_city_frame",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("bad frame")),
+    )
+
+    exchange._capture_city_anchor_observation(
+        observation_index=0,
+        items=_city(),
+        city_marker="岚心城",
+        rejection_reason="semantic_signature_unstable",
+        retryable=True,
+        jaccard_to_previous=None,
+        stable_window_size=1,
+        signature_stable=False,
+        cooldown_elapsed=0.0,
+        physical_dispatches=1,
+    )
+
+
+def test_city_anchor_observation_traces_stability_cooldown_and_redispatch(
+    monkeypatch,
+):
+    frames = iter(
+        [
+            [],
+            _city(),
+            _city(),
+            _city(),
+            _city(),
+            _lobby(),
+            _buy(),
+            _buy(),
+        ]
+    )
+    clock = [0.0]
+    taps: list[tuple[int, int]] = []
+    captured: list[tuple[str, str]] = []
+    monkeypatch.setattr(exchange, "screenshot", lambda: next(frames))
+    monkeypatch.setattr(
+        exchange,
+        "input_tap",
+        lambda point, **_kwargs: taps.append(point) or True,
+    )
+    monkeypatch.setattr("core.preset.control.go_home", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        "core.preset.go_outlets",
+        lambda *_args, **_kwargs: _StructuredOutletResult(),
+    )
+    monkeypatch.setattr(
+        exchange,
+        "capture_session_evidence",
+        lambda transition, **kwargs: captured.append(
+            (transition, kwargs["current_page_classification"])
+        ),
+    )
+
+    result = exchange.open_exchange_action(
+        exchange.ExchangeAction.BUY,
+        read_only=True,
+        monotonic=lambda: clock[0],
+        sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    )
+
+    assert result.success is True
+    assert taps == [(900, 276), (805, 324)]
+    observations = [
+        json.loads(classification)
+        for transition, classification in captured
+        if transition == "EXCHANGE_CITY_ANCHOR_OBSERVE"
+    ]
+    assert [item["rejection_reason"] for item in observations] == [
+        "semantic_signature_unstable",
+        "semantic_signature_unstable",
+        "cooldown_pending",
+        "redispatch_authorized",
+        "exchange_menu_visible",
+    ]
+    assert observations[2]["jaccard_to_previous"] == 1.0
+    assert observations[2]["signature_stable"] is True
+    assert observations[3]["physical_dispatches"] == 2
