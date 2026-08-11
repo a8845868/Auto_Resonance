@@ -45,6 +45,9 @@ from core.services.dispatch_outcome import (
     physical_input_count_from_dispatch_error,
     receipt_from_dispatch_error,
 )
+from core.services.session_evidence import (
+    capture_session_evidence as _capture_run_business_evidence,
+)
 from core.services.runtime_errors import BlockedBySafetyError
 from core.services.home_backpack_cube import (
     HomeAssetsBalanceDisplay,
@@ -1055,20 +1058,61 @@ def _inventory_page_signature(items: list[dict]) -> tuple[str, ...]:
 
 def read_restock_book_count(max_pages: int = 10) -> int | None:
     """Best-effort inventory read; return None instead of blocking trading."""
+    def capture_evidence(
+        state_transition_name: str,
+        current_page_classification: str,
+    ) -> None:
+        try:
+            _capture_run_business_evidence(
+                state_transition_name,
+                ledger_context=None,
+                leg_id="",
+                current_page_classification=current_page_classification,
+            )
+        except Exception as error:  # noqa: BLE001 - evidence must never alter inventory semantics
+            logger.warning(
+                "Unable to capture inventory run-business evidence for "
+                f"{state_transition_name}: {type(error).__name__}"
+            )
+
     stopped = False
     should_restore_home = False
+    uncertain_observation = False
     try:
         if not connect():
             logger.warning("ADB 连接失败，无法读取背包进货书")
+            capture_evidence("INVENTORY_CONNECT_FAILED", "CONNECTION_NOT_AVAILABLE")
+            capture_evidence("INVENTORY_SCAN_INCOMPLETE", "INVENTORY_CONNECT_FAILED")
             return None
         if _is_train_in_transit(screenshot().ocr()):
             logger.info("列车正在行驶，跳过进货书背包扫描，交给跑商恢复流程等待到站")
             return None
-        if not go_home():
+        capture_evidence("INVENTORY_SCAN_START", "INVENTORY_PRE_NAVIGATION")
+        capture_evidence("INVENTORY_GO_HOME_BEFORE", "INVENTORY_PRE_NAVIGATION")
+        home_verified = bool(go_home())
+        capture_evidence(
+            "INVENTORY_GO_HOME_AFTER",
+            "HOME_VERIFIED" if home_verified else "HOME_NOT_VERIFIED",
+        )
+        if not home_verified:
+            capture_evidence("INVENTORY_SCAN_INCOMPLETE", "HOME_NOT_VERIFIED")
             return None
         should_restore_home = True
-        if not _open_assets_entry():
+        capture_evidence("INVENTORY_OPEN_ASSETS_BEFORE", "HOME_VERIFIED")
+        assets_entry_verified = bool(_open_assets_entry())
+        capture_evidence(
+            "INVENTORY_OPEN_ASSETS_AFTER",
+            (
+                "ASSETS_ENTRY_VERIFIED"
+                if assets_entry_verified
+                else "ASSETS_ENTRY_NOT_VERIFIED"
+            ),
+        )
+        if not assets_entry_verified:
             logger.warning("未找到背包入口，将使用界面填写的进货书库存")
+            capture_evidence(
+                "INVENTORY_SCAN_INCOMPLETE", "ASSETS_ENTRY_NOT_VERIFIED"
+            )
             return None
         time.sleep(1.2)
         previous_signature = None
@@ -1076,6 +1120,7 @@ def read_restock_book_count(max_pages: int = 10) -> int | None:
         for page in range(1, max_pages + 1):
             page_frame = screenshot()
             items = page_frame.ocr()
+            capture_evidence("INVENTORY_PAGE_SCANNED", "INVENTORY_PAGE_SCANNED")
             signature = _inventory_page_signature(items)
             logger.info(f"扫描背包第 {page}/{max_pages} 页")
 
@@ -1091,7 +1136,12 @@ def read_restock_book_count(max_pages: int = 10) -> int | None:
                 if confirmed:
                     count, raw = confirmed
                     logger.info(f"背包进货书数量: {count}（多帧 OCR: {raw}）")
+                    capture_evidence(
+                        "INVENTORY_COMPLETE_CONFIRMED",
+                        "INVENTORY_COMPLETE_CONFIRMED",
+                    )
                     return count
+                uncertain_observation = True
                 logger.warning("已找到进货采买书，但多帧数量核对失败，继续扫描")
             else:
                 icon, score = _find_restock_book_icon(getattr(page_frame, "image", None))
@@ -1118,7 +1168,12 @@ def read_restock_book_count(max_pages: int = 10) -> int | None:
                                 f"背包进货书数量: {count}（格位多帧 OCR: {grid_raw}；"
                                 f"详情多帧 OCR: {detail_raw}）"
                             )
+                            capture_evidence(
+                                "INVENTORY_COMPLETE_CONFIRMED",
+                                "INVENTORY_COMPLETE_CONFIRMED",
+                            )
                             return count
+                        uncertain_observation = True
                         logger.warning(
                             "疑似进货书图标的详情名称/拥有数量未通过多帧确认，继续扫描"
                         )
@@ -1126,6 +1181,7 @@ def read_restock_book_count(max_pages: int = 10) -> int | None:
                             input_tap((640, 600))
                             time.sleep(0.4)
                     else:
+                        uncertain_observation = True
                         logger.warning(
                             f"疑似进货书图标匹配度 {score:.3f}，但下方数量未通过多帧核对"
                         )
@@ -1143,12 +1199,25 @@ def read_restock_book_count(max_pages: int = 10) -> int | None:
                 time.sleep(0.9)
 
         logger.warning(f"已翻查背包 {min(page, max_pages)} 页，仍未确认进货采买书数量")
+        if uncertain_observation:
+            capture_evidence(
+                "INVENTORY_MULTI_FRAME_FAILED", "INVENTORY_MULTI_FRAME_FAILED"
+            )
+        capture_evidence(
+            "INVENTORY_SCAN_INCOMPLETE",
+            (
+                "INVENTORY_ITEM_COUNT_UNCERTAIN"
+                if uncertain_observation
+                else "INVENTORY_ITEM_NOT_FOUND"
+            ),
+        )
         return None
     except StopExecution:
         stopped = True
         raise
     except Exception:
         logger.exception("读取背包进货书失败，将使用界面填写值")
+        capture_evidence("INVENTORY_SCAN_INCOMPLETE", "INVENTORY_SCAN_EXCEPTION")
         return None
     finally:
         if should_restore_home and not stopped:
