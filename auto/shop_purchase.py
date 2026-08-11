@@ -368,6 +368,12 @@ def _normalize_text(value: object) -> str:
     ).replace(")", "）")
 
 
+def _normalize_bureau_dialog_identity(value: object) -> str:
+    """Remove only dot-like OCR noise immediately before a parenthesized suffix."""
+
+    return re.sub(r"[·・•]+(?=（)", "", _normalize_text(value))
+
+
 def _center(item: dict) -> tuple[float, float]:
     position = item["position"]
     return (
@@ -1988,9 +1994,12 @@ def _is_bureau_shop_page(ocr_items: Iterable[dict]) -> bool:
 def _bureau_dialog_item_visible(
     ocr_items: Iterable[dict], item: ReadOnlyShopItem,
 ) -> bool:
-    texts = tuple(_normalize_text(value.get("text")) for value in ocr_items)
+    texts = tuple(
+        _normalize_bureau_dialog_identity(value.get("text"))
+        for value in ocr_items
+    )
     return any(
-        _normalize_text(alias) in text
+        _normalize_bureau_dialog_identity(alias) in text
         for alias in item.ocr_aliases
         for text in texts
     )

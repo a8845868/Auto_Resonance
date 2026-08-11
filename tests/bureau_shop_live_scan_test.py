@@ -1297,6 +1297,60 @@ def test_overlapping_v6_confirmation_suffix_preserves_bureau_item_identity():
     ) is True
 
 
+def test_v6_dot_before_parenthesized_suffix_preserves_bureau_item_identity():
+    """Live q=3 form inserts a middle dot before '(4钛)'; treat it as OCR noise."""
+    from auto.shop_purchase import (
+        _normalize_bureau_dialog_identity,
+        _validate_increment_session_frame,
+    )
+
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    item = next(i for i in observed.items if i.id == "bureau_nebula_4")
+    item = replace(item, observed_limit="剩余6次")
+    data = [
+        _ocr("星云物质（4钛）", 560, 285, 180),
+        _ocr("3/6", 610, 345, 70),
+        _ocr("最少", 350, 350, 55),
+        _ocr("最多", 855, 350, 55),
+        _ocr("300", 515, 285, 42),
+        _ocr("取消", 300, 520, 55),
+        _ocr("确定", 930, 520, 55),
+        _ocr("确认消耗以上素材兑换星云物质·(4钛）3吗？", 480, 435, 365, 24),
+    ]
+    frame = _DialogFrame(data)
+
+    assert _normalize_bureau_dialog_identity("星云物质·(4钛）") == "星云物质（4钛）"
+    assert _normalize_bureau_dialog_identity("特供·救世") == "特供·救世"
+    assert _validate_increment_session_frame(
+        frame,
+        frame.ocr(),
+        item,
+        expected_quantity=3,
+        expected_maximum=6,
+        channel_order=(item.costs[0].currency,),
+    ) is True
+
+    wrong_suffix = [
+        dict(value)
+        if "星云物质·" not in str(value.get("text"))
+        else {**value, "text": "确认消耗以上素材兑换星云物质·(8钛）3吗？"}
+        for value in data
+    ]
+    wrong_frame = _DialogFrame(wrong_suffix)
+    assert _validate_increment_session_frame(
+        wrong_frame,
+        wrong_frame.ocr(),
+        item,
+        expected_quantity=3,
+        expected_maximum=6,
+        channel_order=(item.costs[0].currency,),
+    ) is False
+
+
 def test_full_probe_accepts_blank_confirmation_frame_in_3_step_sequence(
     monkeypatch,
 ):
