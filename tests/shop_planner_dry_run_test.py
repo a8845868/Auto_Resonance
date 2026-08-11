@@ -312,6 +312,33 @@ def test_shop_dry_run_diagnostics_shows_time_failed_missing_and_result_file():
     assert "结果文件：logs/shop_purchase/run/FINAL_RESULT.json" in details
 
 
+def test_shop_dry_run_details_style_distinguishes_success_attention_and_error():
+    application = QApplication.instance() or QApplication([])
+    page = shop_interface.ShopPlannerInterface()
+
+    page._dryRunSucceeded({
+        "success": True,
+        "requires_attention": False,
+        "completed_at": "2026-08-11T13:03:43+08:00",
+        "shops": [{"pages": 10, "results": [], "missing": []}],
+    })
+    assert "#76c893" in page.dryRunDetails.styleSheet()
+    assert "#ff7b7b" not in page.dryRunDetails.styleSheet()
+
+    page._dryRunSucceeded({
+        "success": False,
+        "requires_attention": True,
+        "completed_at": "2026-08-11T13:04:00+08:00",
+        "shops": [{"pages": 10, "results": [], "missing": []}],
+    })
+    assert "#f2c66d" in page.dryRunDetails.styleSheet()
+    assert "#76c893" not in page.dryRunDetails.styleSheet()
+
+    page._dryRunFailed("BlockedBySafetyError: test")
+    assert "#ff7b7b" in page.dryRunDetails.styleSheet()
+    assert "#f2c66d" not in page.dryRunDetails.styleSheet()
+
+
 def test_shop_page_keeps_failed_and_missing_reasons_visible_after_rebuild():
     application = QApplication.instance() or QApplication([])
     page = shop_interface.ShopPlannerInterface()

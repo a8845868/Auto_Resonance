@@ -199,6 +199,31 @@ def _shop_dry_run_diagnostics(result: dict) -> str:
     return "\n".join(lines)
 
 
+_DRY_RUN_DETAILS_SUCCESS_STYLE = (
+    "color: #76c893; background: rgba(45,145,92,0.10); "
+    "border: 1px solid rgba(92,190,128,0.42); border-radius: 7px; "
+    "padding: 9px 12px;"
+)
+_DRY_RUN_DETAILS_WARNING_STYLE = (
+    "color: #f2c66d; background: rgba(170,125,35,0.10); "
+    "border: 1px solid rgba(225,174,70,0.42); border-radius: 7px; "
+    "padding: 9px 12px;"
+)
+_DRY_RUN_DETAILS_ERROR_STYLE = (
+    "color: #ff7b7b; background: rgba(170,45,45,0.10); "
+    "border: 1px solid rgba(235,85,85,0.42); border-radius: 7px; "
+    "padding: 9px 12px;"
+)
+
+
+def _shop_dry_run_details_style(result: dict) -> str:
+    """Return a non-misleading diagnostic style for a completed dry-run."""
+
+    if bool(result.get("requires_attention")):
+        return _DRY_RUN_DETAILS_WARNING_STYLE
+    return _DRY_RUN_DETAILS_SUCCESS_STYLE
+
+
 class ShopDryRunWorker(QThread):
     succeeded = Signal(dict)
     failed = Signal(str)
@@ -594,11 +619,7 @@ class ShopPlannerInterface(ScrollArea):
         self.dryRunDetails.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        self.dryRunDetails.setStyleSheet(
-            "color: #ff7b7b; background: rgba(170,45,45,0.10); "
-            "border: 1px solid rgba(235,85,85,0.42); border-radius: 7px; "
-            "padding: 9px 12px;"
-        )
+        self.dryRunDetails.setStyleSheet(_DRY_RUN_DETAILS_SUCCESS_STYLE)
         self.dryRunDetails.hide()
         self.rootLayout.addWidget(self.dryRunDetails)
 
@@ -856,6 +877,7 @@ class ShopPlannerInterface(ScrollArea):
         self.dryRunStatus.setText(summary)
         details = _shop_dry_run_diagnostics(result)
         self.dryRunDetails.setText(details)
+        self.dryRunDetails.setStyleSheet(_shop_dry_run_details_style(result))
         self.dryRunDetails.setVisible(bool(details))
         info = InfoBar.warning if bool(result.get("requires_attention")) else InfoBar.success
         info(
@@ -868,6 +890,7 @@ class ShopPlannerInterface(ScrollArea):
 
     def _dryRunFailed(self, message: str):
         self.dryRunStatus.setText("商店干跑失败；未进入购买确认")
+        self.dryRunDetails.setStyleSheet(_DRY_RUN_DETAILS_ERROR_STYLE)
         self.dryRunDetails.setText(
             f"失败时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"运行错误：{message}"
