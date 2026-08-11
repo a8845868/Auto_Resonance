@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from auto.run_business import main as business
+from core.services import session_evidence
 
 
 class _Frame:
@@ -49,7 +50,7 @@ def test_capture_writes_transition_and_cycle_metadata(tmp_path, monkeypatch):
         screenshot_calls.append(True)
         return frame
 
-    monkeypatch.setattr(business, "screenshot", fake_screenshot)
+    monkeypatch.setattr("core.control.control.screenshot", fake_screenshot)
     recorder = business.RunBusinessEvidenceRecorder(True, "cycle-42")
 
     observed = recorder.capture(
@@ -85,7 +86,7 @@ def test_evidence_disabled_has_no_capture_or_file_overhead(tmp_path, monkeypatch
     def forbidden_screenshot():
         raise AssertionError("disabled evidence must not capture a frame")
 
-    monkeypatch.setattr(business, "screenshot", forbidden_screenshot)
+    monkeypatch.setattr("core.control.control.screenshot", forbidden_screenshot)
     recorder = business.RunBusinessEvidenceRecorder(False, "disabled-cycle")
     assert recorder.capture(
         "disabled",
@@ -125,7 +126,7 @@ def test_adaptive_preflight_failure_writes_navigation_evidence(
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("AUTO_RESONANCE_RUN_BUSINESS_EVIDENCE", "1")
-    monkeypatch.setattr(business, "screenshot", lambda: _Frame())
+    monkeypatch.setattr("core.control.control.screenshot", lambda: _Frame())
     monkeypatch.setattr(
         config_module,
         "cfg",
@@ -193,10 +194,10 @@ def test_preflight_and_inner_run_share_one_evidence_session(
 ):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("AUTO_RESONANCE_RUN_BUSINESS_EVIDENCE", "1")
-    monkeypatch.setattr(business, "screenshot", lambda: _Frame())
+    monkeypatch.setattr("core.control.control.screenshot", lambda: _Frame())
     ledger_context = {"cycle_id": "ledger-cycle"}
     monkeypatch.setattr(
-        business,
+        session_evidence,
         "_run_business_ledger_event_count",
         lambda context: 9 if context is ledger_context else 0,
     )

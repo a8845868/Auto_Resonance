@@ -5,19 +5,13 @@ LastEditTime: 2025-02-11 19:26:08
 LastEditors: Night-stars-1 nujj1042633805@gmail.com
 """
 
-import json
-import os
-import re
 import time
 import uuid
-from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
 from functools import wraps
-from pathlib import Path
 from typing import Any, Dict, Literal
 
-import cv2 as cv
 from loguru import logger
 
 from auto import exchange_navigation
@@ -51,6 +45,13 @@ from core.services.task_schedule_state import (
 from core.utils.utils import read_json, RESOURCES_PATH
 from core.services.game_recovery import is_game_running, recover_game
 from core.services.station_availability import unavailable_stations
+from core.services.session_evidence import (
+    SessionEvidenceRecorder as RunBusinessEvidenceRecorder,
+    _SESSION_EVIDENCE as _RUN_BUSINESS_EVIDENCE_RECORDER,
+    _session_evidence_enabled as _run_business_evidence_enabled,
+    capture_session_evidence as _capture_run_business_evidence,
+    _write_session_final_result as _write_run_business_final_result,
+)
 
 _city_sell_data: Any = read_json(RESOURCES_PATH / "goods/CityGoodsSellData.json")
 _city_tired_data: Dict[str, int] = read_json(RESOURCES_PATH / "goods/CityTiredData.json")
@@ -58,166 +59,6 @@ city_sell_data = {
     city: dict(sorted(goods.items(), key=lambda item: item[1]["price"], reverse=True))
     for city, goods in _city_sell_data.items()
 }
-
-
-class RunBusinessEvidenceRecorder:
-    """Persist opt-in frame/OCR evidence without changing trade decisions."""
-
-    def __init__(self, enabled: bool, cycle_id: str):
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        self.enabled = bool(enabled)
-        self.cycle_id = str(cycle_id)
-        self.root = Path("logs") / "run_business" / f"{timestamp}-cycle"
-        self.index = 0
-        self.latest_ledger_context: dict | None = None
-
-    @staticmethod
-    def _write_json_atomic(destination: Path, payload: object) -> None:
-        temporary = destination.with_name(
-            f"{destination.name}.{uuid.uuid4().hex}.tmp"
-        )
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
-            encoding="utf-8",
-        )
-        temporary.replace(destination)
-
-    def capture(
-        self,
-        label: str,
-        *,
-        state_transition_name: str,
-        cycle_id: str,
-        leg_id: str,
-        ledger_event_count: int | None,
-        current_page_classification: str,
-        image=None,
-        ocr_items: list[dict] | None = None,
-    ) -> list[dict]:
-        if not self.enabled:
-            return []
-        if image is None:
-            image = screenshot()
-        if ocr_items is None:
-            ocr_items = image.ocr()
-
-        safe_label = re.sub(r"[^0-9A-Za-z_-]+", "-", label).strip("-") or "step"
-        self.root.mkdir(parents=True, exist_ok=True)
-        stem = f"{self.index:03d}-{safe_label}"
-        self.index += 1
-        if not cv.imwrite(str(self.root / f"{stem}.png"), image.image):
-            raise OSError(f"run-business evidence image write failed: {stem}")
-        self._write_json_atomic(self.root / f"{stem}.ocr.json", ocr_items)
-        self._write_json_atomic(
-            self.root / f"{stem}.metadata.json",
-            {
-                "state_transition_name": str(state_transition_name),
-                "cycle_id": str(cycle_id),
-                "leg_id": str(leg_id),
-                "ledger_event_count": ledger_event_count,
-                "current_page_classification": str(current_page_classification),
-                "captured_at": datetime.now().isoformat(timespec="seconds"),
-            },
-        )
-        return ocr_items
-
-    def write_result(self, result: dict) -> str:
-        if not self.enabled:
-            return ""
-        self.root.mkdir(parents=True, exist_ok=True)
-        destination = self.root / "FINAL_CYCLE.json"
-        self._write_json_atomic(destination, result)
-        return str(destination)
-
-
-_RUN_BUSINESS_EVIDENCE_RECORDER: ContextVar[
-    RunBusinessEvidenceRecorder | None
-] = ContextVar("run_business_evidence_recorder", default=None)
-
-
-def _run_business_evidence_enabled() -> bool:
-    return os.environ.get("AUTO_RESONANCE_RUN_BUSINESS_EVIDENCE") == "1"
-
-
-def _run_business_ledger_event_count(context: dict | None) -> int | None:
-    if context is None:
-        return 0
-    try:
-        from core.services.trade_ledger import LEDGER_PATH, load_trade_cycle_state
-
-        state = load_trade_cycle_state(
-            context.get("ledger_path", LEDGER_PATH), context["cycle_id"]
-        )
-        return len(state.events)
-    except Exception as error:
-        logger.warning(
-            "Unable to count trade-ledger events for evidence: "
-            f"{type(error).__name__}"
-        )
-        return None
-
-
-def _capture_run_business_evidence(
-    state_transition_name: str,
-    *,
-    ledger_context: dict | None,
-    leg_id: str,
-    current_page_classification: str,
-) -> None:
-    recorder = _RUN_BUSINESS_EVIDENCE_RECORDER.get()
-    if recorder is None:
-        return
-    try:
-        if ledger_context is not None:
-            recorder.latest_ledger_context = ledger_context
-        recorder.capture(
-            state_transition_name.lower(),
-            state_transition_name=state_transition_name,
-            cycle_id=recorder.cycle_id,
-            leg_id=leg_id,
-            ledger_event_count=_run_business_ledger_event_count(ledger_context),
-            current_page_classification=current_page_classification,
-        )
-    except Exception as error:
-        logger.warning(
-            "Unable to capture run-business evidence for "
-            f"{state_transition_name}: {type(error).__name__}"
-        )
-
-
-def _write_run_business_final_result(
-    recorder: RunBusinessEvidenceRecorder,
-    *,
-    ledger_context: dict | None,
-    result: object = None,
-    error: Exception | None = None,
-) -> None:
-    effective_ledger_context = (
-        ledger_context
-        if ledger_context is not None
-        else recorder.latest_ledger_context
-    )
-    payload = {
-        "cycle_id": recorder.cycle_id,
-        "ledger_event_count": _run_business_ledger_event_count(
-            effective_ledger_context
-        ),
-        "completed_at": datetime.now().isoformat(timespec="seconds"),
-        "status": "EXCEPTION" if error is not None else "RETURNED",
-        "result": result,
-        "exception": (
-            {"type": type(error).__name__, "message": str(error)}
-            if error is not None
-            else None
-        ),
-    }
-    try:
-        recorder.write_result(payload)
-    except Exception as write_error:
-        logger.warning(
-            "Unable to write final run-business evidence: "
-            f"{type(write_error).__name__}"
-        )
 
 
 def _with_run_business_evidence(function):
