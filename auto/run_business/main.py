@@ -5,12 +5,19 @@ LastEditTime: 2025-02-11 19:26:08
 LastEditors: Night-stars-1 nujj1042633805@gmail.com
 """
 
+import json
+import os
+import re
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
+from functools import wraps
+from pathlib import Path
 from typing import Any, Dict, Literal
 
+import cv2 as cv
 from loguru import logger
 
 from auto import exchange_navigation
@@ -51,6 +58,222 @@ city_sell_data = {
     city: dict(sorted(goods.items(), key=lambda item: item[1]["price"], reverse=True))
     for city, goods in _city_sell_data.items()
 }
+
+
+class RunBusinessEvidenceRecorder:
+    """Persist opt-in frame/OCR evidence without changing trade decisions."""
+
+    def __init__(self, enabled: bool, cycle_id: str):
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        self.enabled = bool(enabled)
+        self.cycle_id = str(cycle_id)
+        self.root = Path("logs") / "run_business" / f"{timestamp}-cycle"
+        self.index = 0
+
+    @staticmethod
+    def _write_json_atomic(destination: Path, payload: object) -> None:
+        temporary = destination.with_name(
+            f"{destination.name}.{uuid.uuid4().hex}.tmp"
+        )
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        temporary.replace(destination)
+
+    def capture(
+        self,
+        label: str,
+        *,
+        state_transition_name: str,
+        cycle_id: str,
+        leg_id: str,
+        ledger_event_count: int | None,
+        current_page_classification: str,
+        image=None,
+        ocr_items: list[dict] | None = None,
+    ) -> list[dict]:
+        if not self.enabled:
+            return []
+        if image is None:
+            image = screenshot()
+        if ocr_items is None:
+            ocr_items = image.ocr()
+
+        safe_label = re.sub(r"[^0-9A-Za-z_-]+", "-", label).strip("-") or "step"
+        self.root.mkdir(parents=True, exist_ok=True)
+        stem = f"{self.index:03d}-{safe_label}"
+        self.index += 1
+        if not cv.imwrite(str(self.root / f"{stem}.png"), image.image):
+            raise OSError(f"run-business evidence image write failed: {stem}")
+        self._write_json_atomic(self.root / f"{stem}.ocr.json", ocr_items)
+        self._write_json_atomic(
+            self.root / f"{stem}.metadata.json",
+            {
+                "state_transition_name": str(state_transition_name),
+                "cycle_id": str(cycle_id),
+                "leg_id": str(leg_id),
+                "ledger_event_count": ledger_event_count,
+                "current_page_classification": str(current_page_classification),
+                "captured_at": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
+        return ocr_items
+
+    def write_result(self, result: dict) -> str:
+        if not self.enabled:
+            return ""
+        self.root.mkdir(parents=True, exist_ok=True)
+        destination = self.root / "FINAL_CYCLE.json"
+        self._write_json_atomic(destination, result)
+        return str(destination)
+
+
+_RUN_BUSINESS_EVIDENCE_RECORDER: ContextVar[
+    RunBusinessEvidenceRecorder | None
+] = ContextVar("run_business_evidence_recorder", default=None)
+
+
+def _run_business_evidence_enabled() -> bool:
+    return os.environ.get("AUTO_RESONANCE_RUN_BUSINESS_EVIDENCE") == "1"
+
+
+def _run_business_ledger_event_count(context: dict | None) -> int | None:
+    if context is None:
+        return 0
+    try:
+        from core.services.trade_ledger import LEDGER_PATH, load_trade_cycle_state
+
+        state = load_trade_cycle_state(
+            context.get("ledger_path", LEDGER_PATH), context["cycle_id"]
+        )
+        return len(state.events)
+    except Exception as error:
+        logger.warning(
+            "Unable to count trade-ledger events for evidence: "
+            f"{type(error).__name__}"
+        )
+        return None
+
+
+def _capture_run_business_evidence(
+    state_transition_name: str,
+    *,
+    ledger_context: dict | None,
+    leg_id: str,
+    current_page_classification: str,
+) -> None:
+    recorder = _RUN_BUSINESS_EVIDENCE_RECORDER.get()
+    if recorder is None:
+        return
+    try:
+        recorder.capture(
+            state_transition_name.lower(),
+            state_transition_name=state_transition_name,
+            cycle_id=recorder.cycle_id,
+            leg_id=leg_id,
+            ledger_event_count=_run_business_ledger_event_count(ledger_context),
+            current_page_classification=current_page_classification,
+        )
+    except Exception as error:
+        logger.warning(
+            "Unable to capture run-business evidence for "
+            f"{state_transition_name}: {type(error).__name__}"
+        )
+
+
+def _write_run_business_final_result(
+    recorder: RunBusinessEvidenceRecorder,
+    *,
+    ledger_context: dict | None,
+    result: object = None,
+    error: Exception | None = None,
+) -> None:
+    payload = {
+        "cycle_id": recorder.cycle_id,
+        "ledger_event_count": _run_business_ledger_event_count(ledger_context),
+        "completed_at": datetime.now().isoformat(timespec="seconds"),
+        "status": "EXCEPTION" if error is not None else "RETURNED",
+        "result": result,
+        "exception": (
+            {"type": type(error).__name__, "message": str(error)}
+            if error is not None
+            else None
+        ),
+    }
+    try:
+        recorder.write_result(payload)
+    except Exception as write_error:
+        logger.warning(
+            "Unable to write final run-business evidence: "
+            f"{type(write_error).__name__}"
+        )
+
+
+def _with_run_business_evidence(function):
+    @wraps(function)
+    def wrapped(
+        routes: RoutesModel,
+        recovery_attempts: int = 2,
+        ledger_context: dict | None = None,
+    ):
+        if not _run_business_evidence_enabled():
+            return function(
+                routes,
+                recovery_attempts=recovery_attempts,
+                ledger_context=ledger_context,
+            )
+
+        cycle_id = (
+            str(ledger_context.get("cycle_id"))
+            if ledger_context and ledger_context.get("cycle_id")
+            else f"evidence-{uuid.uuid4().hex}"
+        )
+        recorder = RunBusinessEvidenceRecorder(True, cycle_id)
+        token = _RUN_BUSINESS_EVIDENCE_RECORDER.set(recorder)
+        try:
+            result = function(
+                routes,
+                recovery_attempts=recovery_attempts,
+                ledger_context=ledger_context,
+            )
+        except Exception as error:
+            _capture_run_business_evidence(
+                "FINAL_CYCLE_RESULT",
+                ledger_context=ledger_context,
+                leg_id="",
+                current_page_classification="RUN_EXCEPTION",
+            )
+            _write_run_business_final_result(
+                recorder,
+                ledger_context=ledger_context,
+                error=error,
+            )
+            raise
+        else:
+            succeeded = (
+                bool(result.get("success"))
+                if isinstance(result, dict)
+                else bool(result)
+            )
+            _capture_run_business_evidence(
+                "FINAL_CYCLE_RESULT",
+                ledger_context=ledger_context,
+                leg_id="",
+                current_page_classification=(
+                    "CYCLE_COMPLETED" if succeeded else "RUN_TERMINATED"
+                ),
+            )
+            _write_run_business_final_result(
+                recorder,
+                ledger_context=ledger_context,
+                result=result,
+            )
+            return result
+        finally:
+            _RUN_BUSINESS_EVIDENCE_RECORDER.reset(token)
+
+    return wrapped
 
 
 def _prepare_max_sell_haggle():
@@ -519,6 +742,7 @@ def _revalidate_purchase_guard(
     return _stale_price_deferral("purchase_guard_rejected")
 
 
+@_with_run_business_evidence
 def run(
     routes: RoutesModel,
     recovery_attempts: int = 2,
@@ -722,8 +946,26 @@ def run(
                     logger.error(f"无法到达买货城市 {city.buy_city_name}，停止本次跑商")
                     return False
                 city_name = city.buy_city_name
+            _capture_run_business_evidence(
+                "ENTER_BUY_PAGE_BEFORE",
+                ledger_context=ledger_context,
+                leg_id=leg_id,
+                current_page_classification="STATION_CONTEXT_FROM_ROUTE",
+            )
             if not go_business("buy"):
+                _capture_run_business_evidence(
+                    "ENTER_BUY_PAGE_AFTER",
+                    ledger_context=ledger_context,
+                    leg_id=leg_id,
+                    current_page_classification="BUY_PAGE_NOT_VERIFIED",
+                )
                 return False
+            _capture_run_business_evidence(
+                "ENTER_BUY_PAGE_AFTER",
+                ledger_context=ledger_context,
+                leg_id=leg_id,
+                current_page_classification="BUY_PAGE_VERIFIED_BY_NAVIGATION",
+            )
             buy_haggle = prepare_negotiation("buy", min(city.haggle_num, 2))
             if buy_haggle == 0 and not can_afford_fatigue(travel_cost):
                 logger.warning(
@@ -789,11 +1031,37 @@ def run(
                 resume_action, city_name, city.sell_city_name
             ):
                 before_travel = read_strength()
+                _capture_run_business_evidence(
+                    "DEPARTURE_CONFIRMATION_BEFORE",
+                    ledger_context=ledger_context,
+                    leg_id=leg_id,
+                    current_page_classification="BUY_PAGE_AFTER_PURCHASE",
+                )
                 travel = _begin_departure(
                     ledger_context,
                     origin=city.buy_city_name,
                     destination=city.sell_city_name,
                     leg_id=leg_id,
+                )
+                _capture_run_business_evidence(
+                    "DEPARTURE_CONFIRMATION_AFTER",
+                    ledger_context=ledger_context,
+                    leg_id=leg_id,
+                    current_page_classification=(
+                        "TRAIN_IN_TRANSIT_VERIFIED_BY_DEPARTURE"
+                        if travel
+                        else "DEPARTURE_NOT_VERIFIED"
+                    ),
+                )
+                _capture_run_business_evidence(
+                    "ARRIVAL_CONFIRMATION_BEFORE",
+                    ledger_context=ledger_context,
+                    leg_id=leg_id,
+                    current_page_classification=(
+                        "TRAIN_IN_TRANSIT_VERIFIED_BY_DEPARTURE"
+                        if travel
+                        else "DEPARTURE_NOT_VERIFIED"
+                    ),
                 )
                 if not travel.wait():
                     logger.error(f"无法到达卖货城市 {city.sell_city_name}，停止本次跑商")
@@ -817,6 +1085,12 @@ def run(
                 leg_id=leg_id,
                 fatigue_delta=actual_fatigue,
             )
+            _capture_run_business_evidence(
+                "ARRIVAL_CONFIRMATION_AFTER",
+                ledger_context=ledger_context,
+                leg_id=leg_id,
+                current_page_classification="ARRIVAL_VERIFIED_BY_NAVIGATION_WAIT",
+            )
             from core.services.fatigue_triggers import notify_fatigue_event
 
             notify_fatigue_event("arrival", city.sell_city_name)
@@ -825,8 +1099,26 @@ def run(
                     "fatigue_threshold",
                     fatigue_used=int(after_travel[0]),
                 )
+        _capture_run_business_evidence(
+            "ENTER_SELL_PAGE_BEFORE",
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification="ARRIVAL_CONTEXT",
+        )
         if not (is_sell_page() or go_business("sell")):
+            _capture_run_business_evidence(
+                "ENTER_SELL_PAGE_AFTER",
+                ledger_context=ledger_context,
+                leg_id=leg_id,
+                current_page_classification="SELL_PAGE_NOT_VERIFIED",
+            )
             return False
+        _capture_run_business_evidence(
+            "ENTER_SELL_PAGE_AFTER",
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification="SELL_PAGE_VERIFIED",
+        )
         # Selling profit is always maximized: pursue the game's two-success cap
         # regardless of the per-city buy-side haggle setting.
         sell_haggle = _prepare_max_sell_haggle()
