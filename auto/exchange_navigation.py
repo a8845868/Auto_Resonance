@@ -19,6 +19,7 @@ from core.services.city_navigation import (
 )
 from core.services.read_only_policy import ActionIntent
 from core.services.runtime_control import RUNTIME_DIR
+from core.services.session_evidence import capture_session_evidence
 
 
 class ExchangeAction(str, Enum):
@@ -37,6 +38,53 @@ class ExchangeNavigationResult:
     diagnostic_path: str = ""
     stage: str = ""
     elapsed_seconds: float = 0.0
+
+
+def _capture_exchange_evidence(
+    state_transition_name: str,
+    result: ExchangeNavigationResult,
+) -> None:
+    """Record navigation evidence without changing the navigation outcome."""
+
+    try:
+        capture_session_evidence(
+            state_transition_name,
+            ledger_context=None,
+            leg_id="",
+            current_page_classification=(
+                f"stage={result.stage}|reason={result.reason or 'ok'}|"
+                f"clicked={result.clicked}"
+            ),
+        )
+    except Exception as error:
+        logger.warning(
+            "Unable to capture exchange-navigation evidence for "
+            f"{state_transition_name}: {type(error).__name__}"
+        )
+
+
+def _dispatch_evidence_reason(dispatch_result: object) -> str:
+    """Describe the guarded dispatch receipt without interpreting success."""
+
+    if dispatch_result is False:
+        return "read_only_denied"
+    receipt = getattr(dispatch_result, "receipt", None)
+    delivery_status = str(
+        getattr(dispatch_result, "delivery_status", "")
+        or getattr(receipt, "delivery_status", "")
+        or ""
+    )
+    release_status = str(
+        getattr(dispatch_result, "release_status", "")
+        or getattr(receipt, "release_status", "")
+        or ""
+    )
+    if delivery_status or release_status:
+        return (
+            f"delivery_status={delivery_status or 'unknown'},"
+            f"release_status={release_status or 'unknown'}"
+        )
+    return str(getattr(dispatch_result, "reason", "") or "call_returned")
 
 
 def _action(value: ExchangeAction | str) -> ExchangeAction:
@@ -202,13 +250,24 @@ def open_exchange_action(
         )
         target = "buy_navigation" if selected is ExchangeAction.BUY else "sell_navigation"
         label = "我要买" if selected is ExchangeAction.BUY else "我要卖"
-        return input_tap(
+        dispatch_result = input_tap(
             pos,
             intent=ActionIntent(
                 action_key, target,
                 f"exchange:{selected.value.lower()}:anchor",
             ),
         )
+        _capture_exchange_evidence(
+            "EXCHANGE_ANCHOR_DISPATCH",
+            ExchangeNavigationResult(
+                dispatch_result is not False,
+                selected,
+                reason=_dispatch_evidence_reason(dispatch_result),
+                clicked=pos,
+                stage="action_anchor_dispatch",
+            ),
+        )
+        return dispatch_result
     if monotonic() >= deadline:
         return deadline_failure("initial_capture")
     frame = screenshot()
@@ -222,12 +281,23 @@ def open_exchange_action(
             if "unexpected keyword" not in str(error):
                 raise
             home_ok = go_home()
+        home_result = ExchangeNavigationResult(
+            bool(home_ok),
+            selected,
+            reason=(
+                ""
+                if home_ok
+                else (
+                    "overall_deadline_exceeded"
+                    if monotonic() >= deadline
+                    else "home_navigation_failed"
+                )
+            ),
+            stage="home_navigation",
+        )
+        _capture_exchange_evidence("EXCHANGE_HOME_VERIFY", home_result)
         if not home_ok:
-            reason = (
-                "overall_deadline_exceeded"
-                if monotonic() >= deadline else "home_navigation_failed"
-            )
-            return deadline_failure("home_navigation", reason)
+            return deadline_failure("home_navigation", home_result.reason)
         if monotonic() >= deadline:
             return deadline_failure("home_navigation")
         try:
@@ -239,6 +309,13 @@ def open_exchange_action(
             if "unexpected keyword" not in str(error):
                 raise
             outlet = go_outlets("交易所")
+        outlet_result = ExchangeNavigationResult(
+            bool(outlet),
+            selected,
+            reason=str(getattr(outlet, "reason", "") or ""),
+            stage=str(getattr(outlet, "stage", "outlet_navigation")),
+        )
+        _capture_exchange_evidence("EXCHANGE_ANCHOR_SEARCH", outlet_result)
         if not outlet:
             return deadline_failure(
                 "outlet_navigation",
@@ -260,7 +337,7 @@ def open_exchange_action(
                 frame = candidate
                 break
         if frame is None:
-            return ExchangeNavigator(
+            result = ExchangeNavigator(
                 lambda: candidate,
                 safe_anchor_tap,
                 sleep,
@@ -269,6 +346,28 @@ def open_exchange_action(
                 deadline=deadline,
                 monotonic=monotonic,
             )._failure(selected, "exchange_menu_not_confirmed", candidate)
+            menu_result = ExchangeNavigationResult(
+                result.success,
+                selected,
+                reason=result.reason,
+                clicked=result.clicked,
+                verified_frames=result.verified_frames,
+                diagnostic_path=result.diagnostic_path,
+                stage="exchange_menu_wait",
+                elapsed_seconds=max(0.0, monotonic() - started),
+            )
+            _capture_exchange_evidence("EXCHANGE_MENU_OBSERVE", menu_result)
+            return result
+    else:
+        _capture_exchange_evidence(
+            "EXCHANGE_HOME_VERIFY",
+            ExchangeNavigationResult(
+                True,
+                selected,
+                reason="exchange_menu_already_visible",
+                stage="home_navigation",
+            ),
+        )
     first_frame = frame
     first_pending = True
 
@@ -288,6 +387,19 @@ def open_exchange_action(
         deadline=deadline,
         monotonic=monotonic,
     ).open(selected)
+    _capture_exchange_evidence(
+        "EXCHANGE_MENU_OBSERVE",
+        ExchangeNavigationResult(
+            result.success,
+            selected,
+            reason=result.reason,
+            clicked=result.clicked,
+            verified_frames=result.verified_frames,
+            diagnostic_path=result.diagnostic_path,
+            stage=result.stage or "exchange_action_postcondition",
+            elapsed_seconds=max(0.0, monotonic() - started),
+        ),
+    )
     logger.info(
         "交易所导航 action={} read_only={} success={} source={} reason={}".format(
             selected.value, bool(read_only), result.success, result.source, result.reason
