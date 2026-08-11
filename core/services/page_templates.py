@@ -13,11 +13,27 @@ import numpy as np
 TEMPLATE_DIR = Path(__file__).resolve().parents[2] / "resources" / "templates"
 HOME_TEMPLATE_PATH = TEMPLATE_DIR / "home_button.png"
 EXCHANGE_MENU_TEMPLATE_PATH = TEMPLATE_DIR / "exchange_menu.png"
+PASSENGER_MANAGEMENT_TITLE_TEMPLATE_PATH = (
+    TEMPLATE_DIR / "passenger_management_title.png"
+)
+PASSENGER_MANAGEMENT_CATEGORY_CARDS_TEMPLATE_PATH = (
+    TEMPLATE_DIR / "passenger_management_category_cards.png"
+)
+STATION_DETAIL_ANCHOR_STRUCTURE_TEMPLATE_PATH = (
+    TEMPLATE_DIR / "station_detail_anchor_structure.png"
+)
 
 # Runtime frames are normalized to 1280x720.  Matching is restricted to these
 # fixed UI regions; templates are never searched over the full frame.
 HOME_TEMPLATE_ROI = (1050, 445, 1280, 530)
 EXCHANGE_MENU_TEMPLATE_ROI = (710, 270, 1210, 455)
+PASSENGER_MANAGEMENT_TITLE_TEMPLATE_ROI = (145, 90, 370, 195)
+PASSENGER_MANAGEMENT_CATEGORY_CARDS_TEMPLATE_ROI = (1060, 210, 1220, 600)
+STATION_DETAIL_ANCHOR_STRUCTURE_TEMPLATE_ROI = (185, 585, 500, 720)
+
+PASSENGER_MANAGEMENT_TITLE_TEMPLATE_THRESHOLD = 0.85
+PASSENGER_MANAGEMENT_CATEGORY_CARDS_TEMPLATE_THRESHOLD = 0.85
+STATION_DETAIL_ANCHOR_STRUCTURE_TEMPLATE_THRESHOLD = 0.85
 
 
 @lru_cache(maxsize=8)
@@ -77,3 +93,30 @@ def match_page_template(
         return bool(np.isfinite(score) and score >= float(threshold))
     except Exception:
         return False
+
+
+def passenger_management_matches(frame_img: Any) -> bool:
+    """Require both audited anchors before identifying passenger management."""
+
+    return match_page_template(
+        frame_img,
+        _load_template(PASSENGER_MANAGEMENT_TITLE_TEMPLATE_PATH),
+        PASSENGER_MANAGEMENT_TITLE_TEMPLATE_ROI,
+        PASSENGER_MANAGEMENT_TITLE_TEMPLATE_THRESHOLD,
+    ) and match_page_template(
+        frame_img,
+        _load_template(PASSENGER_MANAGEMENT_CATEGORY_CARDS_TEMPLATE_PATH),
+        PASSENGER_MANAGEMENT_CATEGORY_CARDS_TEMPLATE_ROI,
+        PASSENGER_MANAGEMENT_CATEGORY_CARDS_TEMPLATE_THRESHOLD,
+    )
+
+
+def station_detail_matches(frame_img: Any) -> bool:
+    """Identify the audited station-detail structure inside its fixed ROI."""
+
+    return match_page_template(
+        frame_img,
+        _load_template(STATION_DETAIL_ANCHOR_STRUCTURE_TEMPLATE_PATH),
+        STATION_DETAIL_ANCHOR_STRUCTURE_TEMPLATE_ROI,
+        STATION_DETAIL_ANCHOR_STRUCTURE_TEMPLATE_THRESHOLD,
+    )

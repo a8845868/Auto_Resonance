@@ -7,6 +7,7 @@ from core.services.page_templates import (
     HOME_TEMPLATE_ROI,
     _load_template,
     match_page_template,
+    passenger_management_matches,
 )
 
 
@@ -143,6 +144,12 @@ def startup_screen_action(items: list[dict], *, frame_img=None) -> str | None:
     # startup overlay.  Treating a backpack detail as startup makes go_home()
     # enter a sticky wait loop after the detail is closed.
     if is_inventory_item_detail(items):
+        return None
+    # Passenger-management cards contain several percentage labels.  Require
+    # both independently audited fixed-ROI anchors before excluding that page
+    # from startup loading detection; a single visual coincidence is not
+    # sufficient.
+    if passenger_management_matches(frame_img):
         return None
     if any("修复资源完整性" in text for text in texts):
         return "cancel_resource_repair"

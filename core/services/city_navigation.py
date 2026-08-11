@@ -13,6 +13,8 @@ from typing import Callable, Iterable
 
 from loguru import logger
 
+from core.services.page_templates import station_detail_matches
+
 from core.control.nemu_capture import (
     CaptureSessionRecoveryResult,
     NemuCaptureError,
@@ -388,6 +390,9 @@ def observe_city_frame(
     captured_at = getattr(frame, "captured_at", None) or now()
     timestamp = captured_at.isoformat(timespec="milliseconds")
     evidence: list[str] = []
+    station_detail_template = station_detail_matches(
+        getattr(frame, "image", None)
+    )
 
     city_entry_candidates = [
         (bounds, float(item.get("score", 1.0)))
@@ -440,6 +445,10 @@ def observe_city_frame(
         state = CityNavigationState.NPC_DIALOG
         reason = "npc_dialog_evidence_confirmed"
         evidence.append("npc_dialog")
+    elif station_detail_template:
+        state = CityNavigationState.CITY_DETAIL
+        reason = "station_detail_template_confirmed"
+        evidence.append("station_detail_template")
     elif city_title and _contains(texts, ("城市地图", "地图")):
         state = CityNavigationState.CITY_MAP
         reason = "city_map_evidence_confirmed"
