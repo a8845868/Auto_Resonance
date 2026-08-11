@@ -8,6 +8,7 @@ from PySide6.QtWidgets import QApplication, QSizePolicy
 import app.view.shop_planner_interface as shop_interface
 import auto.shop_purchase as shop_purchase
 from core.services.shop_catalog import load_shop_catalog
+from core.services.runtime_errors import BlockedBySafetyError
 
 
 class _Signal:
@@ -51,6 +52,55 @@ def test_dry_run_entry_calls_shop_runtime_with_dry_run_true(monkeypatch):
 
     assert shop_interface._run_shop_dry_run() is expected
     assert calls == [True]
+
+
+def test_unmodeled_shop_never_falls_back_to_black_moon_runtime(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        shop_purchase,
+        "run_shop_purchase",
+        lambda **kwargs: calls.append(("headquarters", kwargs)),
+    )
+    monkeypatch.setattr(
+        shop_purchase,
+        "probe_bureau_shop_catalog",
+        lambda **kwargs: calls.append(("bureau", kwargs)),
+    )
+
+    for shop_id in ("furniture_shop", "aquarium_shop"):
+        try:
+            shop_interface._run_shop_dry_run(shop_id)
+        except BlockedBySafetyError as error:
+            assert "阻止回退扫描其他商店" in str(error)
+        else:
+            raise AssertionError("unmodeled shop must be blocked")
+
+    assert calls == []
+
+
+def test_unmodeled_shop_disables_dry_run_and_starts_no_worker(monkeypatch):
+    application = QApplication.instance() or QApplication([])
+    _DryRunWorker.instances.clear()
+    monkeypatch.setattr(shop_interface, "ShopDryRunWorker", _DryRunWorker)
+    page = shop_interface.ShopPlannerInterface()
+
+    page.showShop("furniture_shop")
+
+    assert page.dryRunButton.isEnabled() is False
+    assert "等待实机证据" in page.dryRunButton.text()
+    page.startDryRun()
+    assert _DryRunWorker.instances == []
+    assert page.dryRunWorker is None
+    assert "零输入" in page.dryRunStatus.text()
+    assert "不会回退扫描黑月商店" in page.dryRunDetails.text()
+
+    page.showShop("aquarium_shop")
+    assert page.dryRunButton.isEnabled() is False
+    page.showShop("headquarters_black_moon")
+    assert page.dryRunButton.isEnabled() is True
+    assert page.dryRunButton.text() == "仅扫描商店（不购买）"
+    assert application is not None
+    page.deleteLater()
 
 
 def test_shop_page_starts_independent_dry_run_worker(monkeypatch):

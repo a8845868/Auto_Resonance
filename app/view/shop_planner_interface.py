@@ -106,12 +106,19 @@ def _run_shop_dry_run(shop_id: str = "headquarters_black_moon") -> dict:
     """Run the selected shop's scanner without enabling a business action."""
 
     from auto.shop_purchase import probe_bureau_shop_catalog, run_shop_purchase
+    from core.services.runtime_errors import BlockedBySafetyError
 
-    result = (
-        probe_bureau_shop_catalog(capture_evidence=True)
-        if shop_id == "bureau_exchange"
-        else run_shop_purchase(dry_run=True)
-    )
+    if shop_id == "headquarters_black_moon":
+        result = run_shop_purchase(dry_run=True)
+    elif shop_id == "bureau_exchange":
+        result = probe_bureau_shop_catalog(capture_evidence=True)
+    elif shop_id in {"furniture_shop", "aquarium_shop"}:
+        raise BlockedBySafetyError(
+            "该店铺尚无经实机证明的导航与商品目录；"
+            "已阻止回退扫描其他商店"
+        )
+    else:
+        raise KeyError(f"未知商店: {shop_id}")
     if not isinstance(result, dict):
         raise TypeError("商店干跑返回了无效结果")
     return result
@@ -687,13 +694,7 @@ class ShopPlannerInterface(ScrollArea):
         self.shopTitle.setText(shop.name)
         self.shopDescription.setText(shop.description)
         if not (self.dryRunWorker and self.dryRunWorker.isRunning()):
-            if shop_id == "bureau_exchange":
-                self.dryRunButton.setText("仅扫描赴命商店（不兑换）")
-                self.dryRunButton.setToolTip(
-                    "只读滚动核验赴命商店22项目录；不打开商品，不执行兑换"
-                )
-            else:
-                self.dryRunButton.setText("仅扫描商店（不购买）")
+            self._configureDryRunButton()
         self.shopHeader.setStyleSheet(
             "QFrame#shopHeader {"
             f"background: rgba(30,30,30,0.54); border-left: 5px solid {shop.accent}; "
@@ -812,6 +813,17 @@ class ShopPlannerInterface(ScrollArea):
     def startDryRun(self):
         if self.dryRunWorker and self.dryRunWorker.isRunning():
             return
+        if self.currentShopId in {"furniture_shop", "aquarium_shop"}:
+            shop = self.catalog.shop(self.currentShopId)
+            message = (
+                f"{shop.short_name}尚无经实机证明的导航与商品目录；"
+                "本次未启动扫描，也不会回退扫描黑月商店"
+            )
+            self.dryRunStatus.setText("只读采集尚未开放；零输入")
+            self.dryRunDetails.setStyleSheet(_DRY_RUN_DETAILS_WARNING_STYLE)
+            self.dryRunDetails.setText(message)
+            self.dryRunDetails.show()
+            return
         self.observedPriceSchedules.clear()
         self.dryRunFailures.clear()
         if self.currentShopId == "bureau_exchange":
@@ -905,15 +917,31 @@ class ShopPlannerInterface(ScrollArea):
         )
 
     def _dryRunFinished(self):
-        self.dryRunButton.setEnabled(True)
-        self.dryRunButton.setText(
-            "仅扫描赴命商店（不兑换）"
-            if self.currentShopId == "bureau_exchange"
-            else "仅扫描商店（不购买）"
-        )
+        self._configureDryRunButton()
         if self.dryRunWorker is not None:
             self.dryRunWorker.deleteLater()
         self.dryRunWorker = None
+
+    def _configureDryRunButton(self):
+        if self.currentShopId == "bureau_exchange":
+            self.dryRunButton.setEnabled(True)
+            self.dryRunButton.setText("仅扫描赴命商店（不兑换）")
+            self.dryRunButton.setToolTip(
+                "只读滚动核验赴命商店22项目录；不执行兑换"
+            )
+            return
+        if self.currentShopId == "headquarters_black_moon":
+            self.dryRunButton.setEnabled(True)
+            self.dryRunButton.setText("仅扫描商店（不购买）")
+            self.dryRunButton.setToolTip(
+                "只读扫描黑月商店并取消数量弹窗；不确认购买"
+            )
+            return
+        self.dryRunButton.setEnabled(False)
+        self.dryRunButton.setText("等待实机证据后开放只读采集")
+        self.dryRunButton.setToolTip(
+            "该店铺尚无可信导航、页面身份和商品目录证据；不会回退扫描其他商店"
+        )
 
     def buildQueuedTask(self):
         if not shop_plan_enabled(self.plan, self.catalog):
