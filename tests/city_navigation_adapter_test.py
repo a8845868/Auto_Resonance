@@ -143,13 +143,16 @@ def _parent_observation(
     capture_id: str,
     *,
     safe_hit_point: tuple[int, int],
+    anchor_bbox: tuple[int, int, int, int] = (1070, 468, 1130, 492),
+    parent_control_bbox: tuple[int, int, int, int] = (1000, 440, 1280, 520),
+    safe_hit_bbox: tuple[int, int, int, int] | None = None,
 ) -> NavigationParentControlObservation:
     x, y = safe_hit_point
     return NavigationParentControlObservation(
         semantic_id="visit_city",
-        anchor_bbox=(1070, 468, 1130, 492),
-        parent_control_bbox=(1000, 440, 1280, 520),
-        safe_hit_bbox=(x - 12, y - 12, x + 12, y + 12),
+        anchor_bbox=anchor_bbox,
+        parent_control_bbox=parent_control_bbox,
+        safe_hit_bbox=safe_hit_bbox or (x - 12, y - 12, x + 12, y + 12),
         safe_hit_point=safe_hit_point,
         parent_detection_method="SEMANTIC_CONTROL_SLOT",
         candidate_count=1,
@@ -158,6 +161,27 @@ def _parent_observation(
         source_frame_sha256=capture_id.encode("utf-8").hex().ljust(64, "0")[:64],
         reason_codes=(),
         evidence_ids=("parent_control_unique",),
+    )
+
+
+def _unresolved_parent_observation(
+    capture_id: str,
+    *,
+    anchor_bbox: tuple[int, int, int, int],
+) -> NavigationParentControlObservation:
+    return NavigationParentControlObservation(
+        semantic_id="visit_city",
+        anchor_bbox=anchor_bbox,
+        parent_control_bbox=None,
+        safe_hit_bbox=None,
+        safe_hit_point=None,
+        parent_detection_method="SEMANTIC_CONTROL_SLOT",
+        candidate_count=0,
+        confidence="UNKNOWN",
+        source_capture_id=capture_id,
+        source_frame_sha256=capture_id.encode("utf-8").hex().ljust(64, "0")[:64],
+        reason_codes=("fresh_parent_unresolved",),
+        evidence_ids=(),
     )
 
 
@@ -339,6 +363,68 @@ def test_parent_control_transient_drift_uses_bounded_third_frame_consensus(
         and event.status == "PENDING"
         for event in result.trace
     )
+
+
+def test_parent_control_unresolved_first_fresh_allows_fourth_frame_consensus(
+    monkeypatch,
+):
+    taps = []
+    anchor_bbox = (1131, 474, 1215, 498)
+    safe_hit_bbox = (1219, 480, 1259, 510)
+    parent_observations = iter((
+        _parent_observation(
+            "home-1",
+            safe_hit_point=(1239, 495),
+            anchor_bbox=anchor_bbox,
+            parent_control_bbox=(1071, 468, 1280, 526),
+            safe_hit_bbox=safe_hit_bbox,
+        ),
+        _unresolved_parent_observation(
+            "home-2",
+            anchor_bbox=anchor_bbox,
+        ),
+        _parent_observation(
+            "home-3",
+            safe_hit_point=(1239, 495),
+            anchor_bbox=anchor_bbox,
+            parent_control_bbox=(1007, 468, 1280, 526),
+            safe_hit_bbox=safe_hit_bbox,
+        ),
+        _parent_observation(
+            "home-4",
+            safe_hit_point=(1239, 495),
+            anchor_bbox=anchor_bbox,
+            parent_control_bbox=(1007, 468, 1280, 526),
+            safe_hit_bbox=safe_hit_bbox,
+        ),
+    ))
+    monkeypatch.setattr(
+        city_navigation_module,
+        "resolve_navigation_parent_control",
+        lambda *_args, **_kwargs: next(parent_observations),
+    )
+
+    result = _adapter(
+        [
+            _home(),
+            _home(pixel=2),
+            _home(pixel=3),
+            _home(pixel=4),
+            _city_detail(pixel=5),
+        ],
+        tap=lambda *args, **kwargs: taps.append((args, kwargs)) or True,
+    ).enter_city()
+
+    assert result.status == "PASS"
+    assert result.dispatch_count == 1
+    assert result.physical_input_count == 1
+    assert len(taps) == 1
+    assert taps[0][0][0] == (1239, 495)
+    assert taps[0][1]["random_offset"] is False
+    assert sum(
+        event.reason == "city_parent_control_confirmation_pending"
+        for event in result.trace
+    ) == 2
 
 
 def test_parent_control_without_two_frame_consensus_blocks_without_dispatch(
