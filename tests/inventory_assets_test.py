@@ -212,6 +212,70 @@ def test_assets_entry_dispatch_and_backpack_postcondition_share_evidence():
     assert document["candidate_bbox"] == (1079, 29, 1123, 73)
 
 
+def test_assets_entry_waits_through_transition_frame_for_inventory_page():
+    transition = OcrFrame([box(500, 300, "如如如面"), box(700, 420, "TE")])
+    provider = FrameProvider([
+        _home_frame(capture_id="home-1"),
+        _home_frame(pixel=2, capture_id="home-2"),
+        transition,
+        _inventory_frame(),
+    ])
+    clock = Clock()
+    dispatches = []
+    evidence = []
+
+    result = inventory._open_assets_entry(
+        frame_provider=provider,
+        dispatcher=lambda point, **kwargs: dispatches.append(point) or True,
+        candidate_resolver=lambda _image: [_candidate()],
+        geometry_provider=_geometry,
+        evidence_recorder=evidence.append,
+        timeout=2,
+        poll_interval=0.4,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert result is True
+    assert dispatches == [(1101, 51)]
+    document = evidence[0].to_dict()
+    assert [observation["post_state"] for observation in document["post_observations"]] == [
+        "UNEXPECTED_PAGE",
+        "INVENTORY_PAGE_VISIBLE",
+    ]
+    assert document["postcondition_result"] == "PASS"
+
+
+def test_assets_entry_accepts_inventory_after_three_distinct_transition_frames():
+    transitions = [
+        OcrFrame([box(500, 300, f"transition-{index}")], pixel=index + 10)
+        for index in range(3)
+    ]
+    provider = FrameProvider([
+        _home_frame(capture_id="home-1"),
+        _home_frame(pixel=2, capture_id="home-2"),
+        *transitions,
+        _inventory_frame(),
+    ])
+    clock = Clock()
+    dispatches = []
+
+    result = inventory._open_assets_entry(
+        frame_provider=provider,
+        dispatcher=lambda point, **kwargs: dispatches.append(point) or True,
+        candidate_resolver=lambda _image: [_candidate()],
+        geometry_provider=_geometry,
+        evidence_recorder=lambda _evidence: None,
+        timeout=3,
+        poll_interval=0.4,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert result is True
+    assert dispatches == [(1101, 51)]
+
+
 def test_assets_entry_home_unchanged_fails_after_one_dispatch():
     provider = FrameProvider([
         _home_frame(capture_id="home-1"),
@@ -238,7 +302,36 @@ def test_assets_entry_home_unchanged_fails_after_one_dispatch():
     assert evidence[0].to_dict()["reason_codes"] == ("home_unchanged",)
 
 
-def test_assets_entry_unexpected_page_fails_without_retry():
+def test_assets_entry_three_stable_home_frames_fail_before_long_deadline():
+    provider = FrameProvider([
+        _home_frame(capture_id="home-1"),
+        _home_frame(pixel=2, capture_id="home-2"),
+        _home_frame(pixel=3, capture_id="home-stable"),
+    ])
+    clock = Clock()
+    dispatches = []
+    evidence = []
+
+    result = inventory._open_assets_entry(
+        frame_provider=provider,
+        dispatcher=lambda point, **kwargs: dispatches.append(point) or True,
+        candidate_resolver=lambda _image: [_candidate()],
+        geometry_provider=_geometry,
+        evidence_recorder=evidence.append,
+        timeout=10,
+        poll_interval=0.4,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert result is False
+    assert dispatches == [(1101, 51)]
+    assert provider.calls == 5
+    assert clock.now < 10
+    assert evidence[0].to_dict()["reason_codes"] == ("home_unchanged",)
+
+
+def test_assets_entry_stable_unexpected_page_fails_without_retry():
     unexpected = OcrFrame([box(500, 300, "活动总览")])
     provider = FrameProvider([
         _home_frame(capture_id="home-1"),
@@ -263,6 +356,37 @@ def test_assets_entry_unexpected_page_fails_without_retry():
 
     assert result is False
     assert len(dispatches) == 1
+    assert provider.calls == 5
+    assert evidence[0].to_dict()["reason_codes"] == ("unexpected_page",)
+
+
+def test_assets_entry_varied_unexpected_pages_fail_at_deadline_without_retry():
+    provider = FrameProvider([
+        _home_frame(capture_id="home-1"),
+        _home_frame(pixel=2, capture_id="home-2"),
+        OcrFrame([box(500, 300, "transition-a")], pixel=10),
+        OcrFrame([box(500, 300, "transition-b")], pixel=11),
+        OcrFrame([box(500, 300, "transition-c")], pixel=12),
+    ])
+    clock = Clock()
+    dispatches = []
+    evidence = []
+
+    result = inventory._open_assets_entry(
+        frame_provider=provider,
+        dispatcher=lambda point, **kwargs: dispatches.append(point) or True,
+        candidate_resolver=lambda _image: [_candidate()],
+        geometry_provider=_geometry,
+        evidence_recorder=evidence.append,
+        timeout=1.2,
+        poll_interval=0.4,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert result is False
+    assert dispatches == [(1101, 51)]
+    assert provider.calls == 5
     assert evidence[0].to_dict()["reason_codes"] == ("unexpected_page",)
 
 

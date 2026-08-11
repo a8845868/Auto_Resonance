@@ -587,6 +587,10 @@ def _open_assets_entry(
 
     deadline = monotonic() + max(0.0, float(timeout))
     final_state = "UNKNOWN"
+    stable_non_target_state = ""
+    stable_non_target_hash = ""
+    stable_non_target_frames = 0
+    stable_non_target_limit = 3
     while monotonic() < deadline:
         if poll_interval > 0:
             sleep(poll_interval)
@@ -612,7 +616,21 @@ def _open_assets_entry(
             evidence_recorder(evidence)
             logger.info("已确认进入背包（识别到右侧道具/材料分类栏）")
             return True
-        if state == "UNEXPECTED_PAGE":
+
+        post_hash = frame_sha256(post_frame)
+        stable_candidate = state in {"HOME_READY", "UNEXPECTED_PAGE"}
+        if stable_candidate and post_hash:
+            if state == stable_non_target_state and post_hash == stable_non_target_hash:
+                stable_non_target_frames += 1
+            else:
+                stable_non_target_state = state
+                stable_non_target_hash = post_hash
+                stable_non_target_frames = 1
+        else:
+            stable_non_target_state = ""
+            stable_non_target_hash = ""
+            stable_non_target_frames = 0
+        if stable_non_target_frames >= stable_non_target_limit:
             break
 
     reason = (
