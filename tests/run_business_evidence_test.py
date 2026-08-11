@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -105,4 +106,137 @@ def test_evidence_disabled_has_no_capture_or_file_overhead(tmp_path, monkeypatch
 
     assert sample_run("routes", recovery_attempts=1, ledger_context=None) is True
     assert calls == [("routes", 1, None)]
+
+    @business._with_run_business_preflight_evidence
+    def sample_preflight():
+        calls.append("preflight")
+        return False
+
+    assert sample_preflight() is False
+    assert calls[-1] == "preflight"
     assert not (tmp_path / "logs").exists()
+
+
+def test_adaptive_preflight_failure_writes_navigation_evidence(
+    tmp_path, monkeypatch
+):
+    import app.common.config as config_module
+    import core.services as services
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AUTO_RESONANCE_RUN_BUSINESS_EVIDENCE", "1")
+    monkeypatch.setattr(business, "screenshot", lambda: _Frame())
+    monkeypatch.setattr(
+        config_module,
+        "cfg",
+        SimpleNamespace(
+            InventoryBooks=SimpleNamespace(value=3),
+            AutoReadInventoryBooks=SimpleNamespace(value=False),
+        ),
+    )
+    monkeypatch.setattr(
+        services,
+        "load_weekly_plan",
+        lambda: {"cycle": ["岚心城", "武林源"]},
+    )
+    monkeypatch.setattr(
+        services,
+        "progress_summary",
+        lambda _state: {"finished": False, "remaining_books": 1},
+    )
+    monkeypatch.setattr(business, "unavailable_stations", lambda _cycle: [])
+    monkeypatch.setattr(business, "is_sell_page", lambda: False)
+    navigation_calls = []
+
+    def failed_buy_navigation(mode):
+        navigation_calls.append(mode)
+        return False
+
+    monkeypatch.setattr(business, "go_business", failed_buy_navigation)
+
+    assert business.adaptive_weekly_run() is False
+    assert navigation_calls == ["buy"]
+
+    evidence_roots = list((tmp_path / "logs" / "run_business").iterdir())
+    assert len(evidence_roots) == 1
+    metadata = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(evidence_roots[0].glob("*.metadata.json"))
+    ]
+    transitions = [row["state_transition_name"] for row in metadata]
+    assert transitions == [
+        "ADAPTIVE_PREFLIGHT_START",
+        "ADAPTIVE_PREFLIGHT_PLAN_READY",
+        "ADAPTIVE_PREFLIGHT_INVENTORY_BEFORE",
+        "ADAPTIVE_PREFLIGHT_INVENTORY_AFTER",
+        "ADAPTIVE_PREFLIGHT_BUY_PAGE_BEFORE",
+        "ADAPTIVE_PREFLIGHT_BUY_PAGE_AFTER",
+        "FINAL_CYCLE_RESULT",
+    ]
+    assert metadata[-2]["current_page_classification"] == "BUY_PAGE_NOT_VERIFIED"
+    assert {row["cycle_id"] for row in metadata} == {metadata[0]["cycle_id"]}
+    assert all(
+        row["leg_id"] == "岚心城|武林源"
+        for row in metadata[1:-1]
+    )
+
+    final = json.loads(
+        (evidence_roots[0] / "FINAL_CYCLE.json").read_text(encoding="utf-8")
+    )
+    assert final["cycle_id"] == metadata[0]["cycle_id"]
+    assert final["status"] == "RETURNED"
+    assert final["result"] is False
+
+
+def test_preflight_and_inner_run_share_one_evidence_session(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AUTO_RESONANCE_RUN_BUSINESS_EVIDENCE", "1")
+    monkeypatch.setattr(business, "screenshot", lambda: _Frame())
+    ledger_context = {"cycle_id": "ledger-cycle"}
+    monkeypatch.setattr(
+        business,
+        "_run_business_ledger_event_count",
+        lambda context: 9 if context is ledger_context else 0,
+    )
+
+    @business._with_run_business_evidence
+    def inner_run(routes, recovery_attempts=2, ledger_context=None):
+        business._capture_run_business_evidence(
+            "INNER_RUN_TRANSITION",
+            ledger_context=ledger_context,
+            leg_id="A|B",
+            current_page_classification="INNER_PAGE",
+        )
+        return True
+
+    @business._with_run_business_preflight_evidence
+    def outer_preflight():
+        business._capture_run_business_evidence(
+            "OUTER_PREFLIGHT_TRANSITION",
+            ledger_context=None,
+            leg_id="A|B",
+            current_page_classification="OUTER_PAGE",
+        )
+        return inner_run("routes", ledger_context=ledger_context)
+
+    assert outer_preflight() is True
+    evidence_roots = list((tmp_path / "logs" / "run_business").iterdir())
+    assert len(evidence_roots) == 1
+    metadata = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(evidence_roots[0].glob("*.metadata.json"))
+    ]
+    assert [row["state_transition_name"] for row in metadata] == [
+        "ADAPTIVE_PREFLIGHT_START",
+        "OUTER_PREFLIGHT_TRANSITION",
+        "INNER_RUN_TRANSITION",
+        "FINAL_CYCLE_RESULT",
+    ]
+    assert len({row["cycle_id"] for row in metadata}) == 1
+    final = json.loads(
+        (evidence_roots[0] / "FINAL_CYCLE.json").read_text(encoding="utf-8")
+    )
+    assert final["ledger_event_count"] == 9
+    assert final["result"] is True

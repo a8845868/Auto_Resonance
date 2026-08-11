@@ -69,6 +69,7 @@ class RunBusinessEvidenceRecorder:
         self.cycle_id = str(cycle_id)
         self.root = Path("logs") / "run_business" / f"{timestamp}-cycle"
         self.index = 0
+        self.latest_ledger_context: dict | None = None
 
     @staticmethod
     def _write_json_atomic(destination: Path, payload: object) -> None:
@@ -167,6 +168,8 @@ def _capture_run_business_evidence(
     if recorder is None:
         return
     try:
+        if ledger_context is not None:
+            recorder.latest_ledger_context = ledger_context
         recorder.capture(
             state_transition_name.lower(),
             state_transition_name=state_transition_name,
@@ -189,9 +192,16 @@ def _write_run_business_final_result(
     result: object = None,
     error: Exception | None = None,
 ) -> None:
+    effective_ledger_context = (
+        ledger_context
+        if ledger_context is not None
+        else recorder.latest_ledger_context
+    )
     payload = {
         "cycle_id": recorder.cycle_id,
-        "ledger_event_count": _run_business_ledger_event_count(ledger_context),
+        "ledger_event_count": _run_business_ledger_event_count(
+            effective_ledger_context
+        ),
         "completed_at": datetime.now().isoformat(timespec="seconds"),
         "status": "EXCEPTION" if error is not None else "RETURNED",
         "result": result,
@@ -218,6 +228,13 @@ def _with_run_business_evidence(function):
         ledger_context: dict | None = None,
     ):
         if not _run_business_evidence_enabled():
+            return function(
+                routes,
+                recovery_attempts=recovery_attempts,
+                ledger_context=ledger_context,
+            )
+
+        if _RUN_BUSINESS_EVIDENCE_RECORDER.get() is not None:
             return function(
                 routes,
                 recovery_attempts=recovery_attempts,
@@ -267,6 +284,68 @@ def _with_run_business_evidence(function):
             _write_run_business_final_result(
                 recorder,
                 ledger_context=ledger_context,
+                result=result,
+            )
+            return result
+        finally:
+            _RUN_BUSINESS_EVIDENCE_RECORDER.reset(token)
+
+    return wrapped
+
+
+def _with_run_business_preflight_evidence(function):
+    """Own one evidence session across adaptive preflight and the inner run."""
+
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        if (
+            not _run_business_evidence_enabled()
+            or _RUN_BUSINESS_EVIDENCE_RECORDER.get() is not None
+        ):
+            return function(*args, **kwargs)
+
+        recorder = RunBusinessEvidenceRecorder(
+            True, f"adaptive-{uuid.uuid4().hex}"
+        )
+        token = _RUN_BUSINESS_EVIDENCE_RECORDER.set(recorder)
+        try:
+            _capture_run_business_evidence(
+                "ADAPTIVE_PREFLIGHT_START",
+                ledger_context=None,
+                leg_id="",
+                current_page_classification="PREFLIGHT_ENTRY",
+            )
+            result = function(*args, **kwargs)
+        except Exception as error:
+            _capture_run_business_evidence(
+                "FINAL_CYCLE_RESULT",
+                ledger_context=None,
+                leg_id="",
+                current_page_classification="RUN_EXCEPTION",
+            )
+            _write_run_business_final_result(
+                recorder,
+                ledger_context=None,
+                error=error,
+            )
+            raise
+        else:
+            succeeded = (
+                bool(result.get("success"))
+                if isinstance(result, dict)
+                else bool(result)
+            )
+            _capture_run_business_evidence(
+                "FINAL_CYCLE_RESULT",
+                ledger_context=None,
+                leg_id="",
+                current_page_classification=(
+                    "CYCLE_COMPLETED" if succeeded else "PREFLIGHT_TERMINATED"
+                ),
+            )
+            _write_run_business_final_result(
+                recorder,
+                ledger_context=None,
                 result=result,
             )
             return result
@@ -1476,6 +1555,7 @@ def two_city_weekly_run(
     return True
 
 
+@_with_run_business_preflight_evidence
 def adaptive_weekly_run():
     """Verify actual books, then keep or replace the remaining live-price plan."""
     from app.common.config import cfg
@@ -1511,6 +1591,14 @@ def adaptive_weekly_run():
     if not state or not summary or summary["finished"]:
         logger.info("没有待执行的本周跑商计划")
         return bool(state and summary and summary["finished"])
+    preflight_cycle = tuple(state.get("cycle") or ())
+    preflight_leg_id = "|".join(str(value) for value in preflight_cycle[:2])
+    _capture_run_business_evidence(
+        "ADAPTIVE_PREFLIGHT_PLAN_READY",
+        ledger_context=None,
+        leg_id=preflight_leg_id,
+        current_page_classification="WEEKLY_PLAN_READY",
+    )
     unavailable_cycle = unavailable_stations(state["cycle"])
     fallback = int(cfg.InventoryBooks.value)
     sell_resume = is_sell_page()
@@ -1524,7 +1612,27 @@ def adaptive_weekly_run():
         logger.info("当前处于卖货中间态，跳过进货书背包扫描以保留议价幅度")
         actual = None
     else:
+        _capture_run_business_evidence(
+            "ADAPTIVE_PREFLIGHT_INVENTORY_BEFORE",
+            ledger_context=None,
+            leg_id=preflight_leg_id,
+            current_page_classification="INVENTORY_READ_PENDING",
+        )
         actual = read_restock_book_count() if bool(cfg.AutoReadInventoryBooks.value) else None
+        _capture_run_business_evidence(
+            "ADAPTIVE_PREFLIGHT_INVENTORY_AFTER",
+            ledger_context=None,
+            leg_id=preflight_leg_id,
+            current_page_classification=(
+                "INVENTORY_READ_CONFIRMED"
+                if actual is not None
+                else (
+                    "INVENTORY_READ_DISABLED"
+                    if not bool(cfg.AutoReadInventoryBooks.value)
+                    else "INVENTORY_READ_NOT_CONFIRMED"
+                )
+            ),
+        )
         if bool(cfg.AutoReadInventoryBooks.value) and actual is None:
             logger.error(
                 "已开启自动读取进货书，但本次未能确认真实数量；"
@@ -1538,11 +1646,44 @@ def adaptive_weekly_run():
     required = int(summary["remaining_books"])
     observed_available_fatigue = None
     if not sell_resume:
-        if not go_business("buy"):
+        _capture_run_business_evidence(
+            "ADAPTIVE_PREFLIGHT_BUY_PAGE_BEFORE",
+            ledger_context=None,
+            leg_id=preflight_leg_id,
+            current_page_classification="BUY_PAGE_NAVIGATION_PENDING",
+        )
+        buy_page_ready = go_business("buy")
+        _capture_run_business_evidence(
+            "ADAPTIVE_PREFLIGHT_BUY_PAGE_AFTER",
+            ledger_context=None,
+            leg_id=preflight_leg_id,
+            current_page_classification=(
+                "BUY_PAGE_VERIFIED_BY_NAVIGATION"
+                if buy_page_ready
+                else "BUY_PAGE_NOT_VERIFIED"
+            ),
+        )
+        if not buy_page_ready:
             logger.error("未能进入已验证的买入页，实际疲劳资源保持 UNKNOWN")
             return False
+        _capture_run_business_evidence(
+            "ADAPTIVE_PREFLIGHT_RESOURCES_BEFORE",
+            ledger_context=None,
+            leg_id=preflight_leg_id,
+            current_page_classification="RESOURCE_OBSERVATION_PENDING",
+        )
         strength = read_strength()
         station = get_station()
+        _capture_run_business_evidence(
+            "ADAPTIVE_PREFLIGHT_RESOURCES_AFTER",
+            ledger_context=None,
+            leg_id=preflight_leg_id,
+            current_page_classification=(
+                "RESOURCE_OBSERVATION_CONFIRMED"
+                if strength is not None and station
+                else "RESOURCE_OBSERVATION_NOT_CONFIRMED"
+            ),
+        )
         if strength is None or not station:
             logger.error("未能同时确认当前疲劳与站点，禁止把计划需求当作实际预算")
             return False
