@@ -188,10 +188,18 @@ def _resolve_city_marker(items: Iterable[dict], outlet: object) -> str:
     try:
         from core.preset.presets import STATION_NAME2PNG
 
+        known_stations = tuple(
+            str(name).replace(" ", "") for name in STATION_NAME2PNG
+        )
+        exact_matches = {station for station in known_stations if station in texts}
+        if len(exact_matches) == 1:
+            return next(iter(exact_matches))
+        if exact_matches:
+            return ""
         matches = {
-            str(name).replace(" ", "")
-            for name in STATION_NAME2PNG
-            if any(str(name).replace(" ", "") in text for text in texts)
+            station
+            for station in known_stations
+            if any(station in text for text in texts)
         }
     except Exception as error:
         logger.warning(

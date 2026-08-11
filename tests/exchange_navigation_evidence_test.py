@@ -228,6 +228,36 @@ def test_city_signature_still_rejects_material_chinese_page_change():
     assert exchange._stable_city_signatures(signatures) is False
 
 
+def test_city_marker_prefers_exact_city_label_over_station_in_mission_text():
+    items = [
+        _ocr("岚心城", 226, 552),
+        _ocr("于汇流塔完成10个作战计划", 1159, 239),
+        _ocr("交易所", 901, 274),
+    ]
+
+    marker = exchange._resolve_city_marker(
+        items,
+        SimpleNamespace(city=SimpleNamespace(station_id="")),
+    )
+
+    assert marker == "岚心城"
+
+
+def test_city_marker_rejects_two_exact_station_labels_as_ambiguous():
+    items = [
+        _ocr("岚心城", 226, 552),
+        _ocr("汇流塔", 1159, 239),
+        _ocr("交易所", 901, 274),
+    ]
+
+    marker = exchange._resolve_city_marker(
+        items,
+        SimpleNamespace(city=SimpleNamespace(station_id="")),
+    )
+
+    assert marker == ""
+
+
 def test_city_anchor_observation_evidence_contains_each_gate_value(monkeypatch):
     captured: list[tuple[str, dict]] = []
     monkeypatch.setattr(
