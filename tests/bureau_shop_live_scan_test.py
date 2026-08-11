@@ -87,6 +87,39 @@ def _dialog_ocr(
     return data
 
 
+def test_v6_terminal_dot_keeps_arrest_quantity_frame_bound_to_session():
+    """Live q=88 OCR appends a dot to ``88/100``; it is still the same dialog."""
+    from auto.shop_purchase import (
+        _validate_increment_session_frame,
+        parse_quantity_text,
+    )
+
+    catalog = load_shop_catalog()
+    shop = catalog.shop("bureau_exchange")
+    observed = load_read_only_shop_catalog(
+        shop.read_only_catalog, catalog.currencies
+    )
+    item = next(
+        value for value in observed.items
+        if value.id == "bureau_arrest_warrant"
+    )
+    data = _dialog_ocr(item.name, 88, 100, [1760])
+    quantity_token = next(value for value in data if value["text"] == "88/100")
+    quantity_token["text"] = "88/100."
+    frame = _DialogFrame(data)
+
+    assert parse_quantity_text("88/100.") == (88, 100)
+    assert parse_quantity_text("88/100x") is None
+    assert _validate_increment_session_frame(
+        frame,
+        frame.ocr(),
+        item,
+        expected_quantity=88,
+        expected_maximum=100,
+        channel_order=(item.costs[0].currency,),
+    ) is True
+
+
 def test_bureau_name_matches_reordered_v6_ocr_token():
     from auto.shop_purchase import _bureau_name_matches_alias
 

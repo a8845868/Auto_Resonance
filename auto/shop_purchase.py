@@ -385,7 +385,14 @@ def parse_limit_text(text: object) -> tuple[str, int, int] | None:
 
 
 def parse_quantity_text(text: object) -> tuple[int, int] | None:
-    match = re.fullmatch(r"\s*(\d+)\s*/\s*(\d+)\s*", str(text))
+    # PP-OCRv6 can attach a sentence-ending dot to the otherwise exact
+    # quantity token (observed live as ``88/100.``).  Accept only terminal
+    # punctuation after the denominator; all non-punctuation suffixes remain
+    # rejected so this does not weaken quantity identity.
+    match = re.fullmatch(
+        r"\s*(\d+)\s*/\s*(\d+)\s*[\.。·]?\s*",
+        str(text),
+    )
     return (int(match[1]), int(match[2])) if match else None
 
 
