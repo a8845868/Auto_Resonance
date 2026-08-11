@@ -132,9 +132,14 @@ _CITY_ANCHOR_OBSERVATION_LIMIT = 36
 
 
 def _semantic_page_texts(items: Iterable[dict]) -> frozenset[str]:
-    """Return an OCR page signature without single-character detector noise."""
+    """Return a city-page signature without unstable Latin detector noise."""
 
-    return frozenset(text for item in items if len(text := _text(item)) > 1)
+    texts: set[str] = set()
+    for item in items:
+        text = _text(item)
+        if any("\u4e00" <= character <= "\u9fff" for character in text):
+            texts.add(text)
+    return frozenset(texts)
 
 
 def _text_jaccard(left: frozenset[str], right: frozenset[str]) -> float:

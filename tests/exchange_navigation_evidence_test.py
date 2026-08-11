@@ -182,3 +182,31 @@ def test_evidence_capture_exception_does_not_change_return_value(monkeypatch):
     assert result.success is True
     assert result.clicked == (805, 324)
     assert taps == [(805, 324)]
+
+
+def test_city_signature_ignores_multichar_latin_ocr_noise():
+    stable_city_texts = [
+        _ocr("岚心城", 200, 200),
+        _ocr("交易所", 900, 276),
+        _ocr("商会", 800, 350),
+        _ocr("前往作战终端", 500, 400),
+    ]
+    signatures = [
+        exchange._semantic_page_texts(stable_city_texts + [_ocr(noise, 50, 50)])
+        for noise in ("SHN", "SHHN", "D.U.N")
+    ]
+
+    assert signatures == [
+        frozenset({"岚心城", "交易所", "商会", "前往作战终端"})
+    ] * 3
+    assert exchange._stable_city_signatures(signatures) is True
+
+
+def test_city_signature_still_rejects_material_chinese_page_change():
+    signatures = [
+        frozenset({"岚心城", "交易所", "商会", "前往作战终端"}),
+        frozenset({"岚心城", "交易所", "商会", "前往作战终端"}),
+        frozenset({"总部商店", "黑月商店", "特惠礼包"}),
+    ]
+
+    assert exchange._stable_city_signatures(signatures) is False
