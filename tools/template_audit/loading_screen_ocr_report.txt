@@ -1,0 +1,14 @@
+TEMPLATE_ASSET_NORMALIZATION_AUDIT_V1 - loading transition OCR report
+generated_at=2026-08-12T03:39:08
+classification=TRANSITION_SAMPLE_ONLY
+template_created=NO
+note=The game currently uses animated transitions rather than a stable dedicated loading page.
+ocr_status=PASS
+gameplay_marker_count=29
+ocr_texts:
+- 60
+- 正在确认闸瓦压力是否处于安全区间
+- 89%
+gameplay_marker_hits:
+- NONE
+assessment=NO_GAMEPLAY_MARKER_HIT_IN_THIS_TRANSITION_SAMPLE

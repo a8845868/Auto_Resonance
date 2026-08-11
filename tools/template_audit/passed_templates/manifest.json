@@ -1,0 +1,121 @@
+{
+  "audit": "TEMPLATE_ASSET_NORMALIZATION_AUDIT_V1",
+  "generated_at": "2026-08-12T03:39:08",
+  "canonical_viewport": [
+    1280,
+    720
+  ],
+  "method": "TM_CCOEFF_NORMED on fixed ROI, no full-frame search",
+  "pass_rule": {
+    "positive_min_gte": 0.85,
+    "gap_gte": 0.3
+  },
+  "loading_screen_template_created": false,
+  "templates": [
+    {
+      "template_name": "revenue_report_title",
+      "file": "revenue_report_title.png",
+      "roi": [
+        1030,
+        0,
+        1190,
+        130
+      ],
+      "threshold": 0.85,
+      "positive_min": 1.0,
+      "negative_max": 0.297359,
+      "gap": 0.702641,
+      "positive_count": 1,
+      "negative_count": 222,
+      "evidence_strength": "single_positive",
+      "reference_source": "C:\\Users\\Administrator\\Desktop\\Resonance_Template\\营收报告.png",
+      "reference_sha256": "aa6ca9a688a7e6e6c7dbc6be6ae3ad8871fd963951e6e62a2e4a3951c71c644a",
+      "negative_max_source": "C:\\Users\\Administrator\\Desktop\\Resonance_Template\\成就.png",
+      "code_block": "REVENUE_REPORT_TITLE_TEMPLATE_PATH = TEMPLATE_DIR / \"revenue_report_title.png\"\nREVENUE_REPORT_TITLE_TEMPLATE_ROI = (1030, 0, 1190, 130)\nREVENUE_REPORT_TITLE_TEMPLATE_THRESHOLD = 0.85"
+    },
+    {
+      "template_name": "passenger_management_title",
+      "file": "passenger_management_title.png",
+      "roi": [
+        145,
+        90,
+        370,
+        195
+      ],
+      "threshold": 0.85,
+      "positive_min": 0.998878,
+      "negative_max": 0.213622,
+      "gap": 0.785257,
+      "positive_count": 2,
+      "negative_count": 221,
+      "evidence_strength": "multi_positive",
+      "reference_source": "C:\\Users\\Administrator\\Desktop\\Resonance_Template\\客运管理.png",
+      "reference_sha256": "fe7232ef633a01ef2e08339f989f4a68736d134022cab0e165ea3de30afe2b2c",
+      "negative_max_source": "C:\\Users\\Administrator\\Desktop\\Resonance_Template\\整备列车武装.png",
+      "code_block": "PASSENGER_MANAGEMENT_TITLE_TEMPLATE_PATH = TEMPLATE_DIR / \"passenger_management_title.png\"\nPASSENGER_MANAGEMENT_TITLE_TEMPLATE_ROI = (145, 90, 370, 195)\nPASSENGER_MANAGEMENT_TITLE_TEMPLATE_THRESHOLD = 0.85"
+    },
+    {
+      "template_name": "passenger_management_category_cards",
+      "file": "passenger_management_category_cards.png",
+      "roi": [
+        1060,
+        210,
+        1220,
+        600
+      ],
+      "threshold": 0.85,
+      "positive_min": 0.999061,
+      "negative_max": 0.181917,
+      "gap": 0.817145,
+      "positive_count": 2,
+      "negative_count": 221,
+      "evidence_strength": "multi_positive",
+      "reference_source": "C:\\Users\\Administrator\\Desktop\\Resonance_Template\\客运管理.png",
+      "reference_sha256": "fe7232ef633a01ef2e08339f989f4a68736d134022cab0e165ea3de30afe2b2c",
+      "negative_max_source": "C:\\Users\\Administrator\\Documents\\xwechat_files\\wxid_rg4th3wgnes422_8515\\temp\\RWTemp\\2026-08\\8d002fbb45705babab1fb722dead4888\\cf788558c06f8cc5414a2ad67cf8a6c3.png",
+      "code_block": "PASSENGER_MANAGEMENT_CATEGORY_CARDS_TEMPLATE_PATH = TEMPLATE_DIR / \"passenger_management_category_cards.png\"\nPASSENGER_MANAGEMENT_CATEGORY_CARDS_TEMPLATE_ROI = (1060, 210, 1220, 600)\nPASSENGER_MANAGEMENT_CATEGORY_CARDS_TEMPLATE_THRESHOLD = 0.85"
+    },
+    {
+      "template_name": "carriage_navigation_selector",
+      "file": "carriage_navigation_selector.png",
+      "roi": [
+        245,
+        420,
+        1280,
+        545
+      ],
+      "threshold": 0.85,
+      "positive_min": 1.0,
+      "negative_max": 0.202935,
+      "gap": 0.797065,
+      "positive_count": 1,
+      "negative_count": 222,
+      "evidence_strength": "single_positive",
+      "reference_source": "C:\\Users\\Administrator\\Desktop\\Resonance_Template\\车厢内车厢导航.png",
+      "reference_sha256": "3beef0f911563c6075607032625bbc3bc12fdaa50cca9c5258534bc680c60ee1",
+      "negative_max_source": "C:\\Users\\Administrator\\Desktop\\Resonance_Template\\整备列车.png",
+      "code_block": "CARRIAGE_NAVIGATION_SELECTOR_TEMPLATE_PATH = TEMPLATE_DIR / \"carriage_navigation_selector.png\"\nCARRIAGE_NAVIGATION_SELECTOR_TEMPLATE_ROI = (245, 420, 1280, 545)\nCARRIAGE_NAVIGATION_SELECTOR_TEMPLATE_THRESHOLD = 0.85"
+    },
+    {
+      "template_name": "station_detail_anchor_structure",
+      "file": "station_detail_anchor_structure.png",
+      "roi": [
+        185,
+        585,
+        500,
+        720
+      ],
+      "threshold": 0.85,
+      "positive_min": 0.951384,
+      "negative_max": 0.394073,
+      "gap": 0.557312,
+      "positive_count": 2,
+      "negative_count": 221,
+      "evidence_strength": "multi_positive",
+      "reference_source": "C:\\Users\\Administrator\\Desktop\\Resonance_Template\\列车所在站点.png",
+      "reference_sha256": "735fff725dd3e63b1bab175a40d0d41f1907c807dea15ec65ef06149371c8668",
+      "negative_max_source": "C:\\Users\\Administrator\\Desktop\\Resonance_Template\\副官室.png",
+      "code_block": "STATION_DETAIL_ANCHOR_STRUCTURE_TEMPLATE_PATH = TEMPLATE_DIR / \"station_detail_anchor_structure.png\"\nSTATION_DETAIL_ANCHOR_STRUCTURE_TEMPLATE_ROI = (185, 585, 500, 720)\nSTATION_DETAIL_ANCHOR_STRUCTURE_TEMPLATE_THRESHOLD = 0.85"
+    }
+  ]
+}
