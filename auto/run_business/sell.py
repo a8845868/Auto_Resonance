@@ -13,6 +13,7 @@ from loguru import logger
 from app.common.config import cfg
 from core.control.control import input_swipe, input_tap, screenshot
 from core.services.read_only_policy import ActionIntent
+from core.services.session_evidence import capture_session_evidence
 from core.exception.exceptions import StopExecution
 from core.module.bgr import BGR
 from core.preset import go_home
@@ -22,6 +23,28 @@ from auto.module.strength import exit_negotiation_safely
 SELL_BARGAIN_TIMEOUT = 45
 RAISE_RESULT_TIMEOUT = 3.0
 FRAME_RETRY_INTERVAL = 0.2
+
+
+def _capture_sell_evidence(
+    state_transition_name: str,
+    *,
+    ledger_context: dict | None,
+    leg_id: str,
+    current_page_classification: str,
+) -> None:
+    """Record opt-in sell-flow evidence without changing sale decisions."""
+    try:
+        capture_session_evidence(
+            state_transition_name,
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification=current_page_classification,
+        )
+    except Exception as error:
+        logger.warning(
+            "Unable to capture sell-flow evidence for "
+            f"{state_transition_name}: {type(error).__name__}"
+        )
 
 
 def _sell_tap(pos: tuple[int, int], action_key: str = "transaction_sell") -> object:
@@ -72,7 +95,15 @@ def _wait_for_raise_result(timeout=RAISE_RESULT_TIMEOUT):
     return False
 
 
-def sell_business(num=0, empty_ok=False, expected_goods=None, *, detailed=False):
+def sell_business(
+    num=0,
+    empty_ok=False,
+    expected_goods=None,
+    *,
+    detailed=False,
+    ledger_context: dict | None = None,
+    leg_id: str = "",
+):
     """
     说明:
         出售所有商品
@@ -82,12 +113,37 @@ def sell_business(num=0, empty_ok=False, expected_goods=None, *, detailed=False)
     # Validate the planned route while cargo is still visible. After "sell
     # all", the game moves every card to the right selection panel and the
     # left-side cargo OCR can no longer be used for route matching.
+    _capture_sell_evidence(
+        "SELL_FLOW_START",
+        ledger_context=ledger_context,
+        leg_id=leg_id,
+        current_page_classification=(
+            f"SELL_PAGE_READY|expected_goods={len(expected_goods or ())}|"
+            f"haggle_target={num}"
+        ),
+    )
     selection_preserved = is_all_cargo_selected()
+    _capture_sell_evidence(
+        "SELL_CARGO_VALIDATE",
+        ledger_context=ledger_context,
+        leg_id=leg_id,
+        current_page_classification=(
+            "CARGO_SELECTION_PRESERVED"
+            if selection_preserved
+            else "CARGO_SELECTION_NOT_PRESERVED"
+        ),
+    )
     if (
         expected_goods
         and not selection_preserved
         and not cargo_contains_expected_goods(expected_goods)
     ):
+        _capture_sell_evidence(
+            "SELL_FLOW_FAILED",
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification="ROUTE_CARGO_MISMATCH",
+        )
         logger.error("Cargo does not match the planned endpoint route; cancel sale")
         return False
     if selection_preserved:
@@ -97,16 +153,56 @@ def sell_business(num=0, empty_ok=False, expected_goods=None, *, detailed=False)
     # the single "sell all" click. A resumed 20% sell page is already at the
     # cap and must not be exited or bargained again.
     current_raise = read_raise_percent()
+    _capture_sell_evidence(
+        "SELL_RAISE_OBSERVE",
+        ledger_context=ledger_context,
+        leg_id=leg_id,
+        current_page_classification=f"SELL_RAISE_PERCENT|value={current_raise}",
+    )
     if current_raise is not None:
         logger.info(f"Current sell raise: {current_raise:.1f}%")
     bargain_complete = current_raise is not None and current_raise >= 20.0
     if bargain_complete:
         logger.info("Sell raise already reached 20%; reuse the current sell state")
-    elif num > 0 and not click_bargain_button(num):
-        logger.error("Maximum sell bargain was not completed; cancel sale")
-        return False
+    elif num > 0:
+        _capture_sell_evidence(
+            "SELL_BARGAIN_BEFORE",
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification=f"SELL_BARGAIN_PENDING|target={num}",
+        )
+        if not click_bargain_button(num):
+            _capture_sell_evidence(
+                "SELL_BARGAIN_AFTER",
+                ledger_context=ledger_context,
+                leg_id=leg_id,
+                current_page_classification="SELL_BARGAIN_NOT_CONFIRMED",
+            )
+            logger.error("Maximum sell bargain was not completed; cancel sale")
+            return False
+        _capture_sell_evidence(
+            "SELL_BARGAIN_AFTER",
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification="SELL_BARGAIN_COMPLETED",
+        )
 
-    if not is_all_cargo_selected() and not select_all_sellable_cargo():
+    _capture_sell_evidence(
+        "SELL_SELECT_ALL_BEFORE",
+        ledger_context=ledger_context,
+        leg_id=leg_id,
+        current_page_classification="SELL_SELECTION_PENDING",
+    )
+    selected = is_all_cargo_selected() or select_all_sellable_cargo()
+    _capture_sell_evidence(
+        "SELL_SELECT_ALL_AFTER",
+        ledger_context=ledger_context,
+        leg_id=leg_id,
+        current_page_classification=(
+            "SELL_SELECTION_CONFIRMED" if selected else "SELL_SELECTION_NOT_CONFIRMED"
+        ),
+    )
+    if not selected:
         # The left warehouse list and the right selected list are different
         # states. A blank right panel means "selection did not apply", not
         # "the warehouse is empty". Never restock while known cargo remains.
@@ -115,18 +211,54 @@ def sell_business(num=0, empty_ok=False, expected_goods=None, *, detailed=False)
 
     quote = read_selected_sell_quote()
     if not quote:
+        _capture_sell_evidence(
+            "SELL_QUOTE_OBSERVE",
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification="SELL_QUOTE_UNREADABLE",
+        )
         logger.error("Unable to read selected sale profit and total; cancel sale")
         return False
     profit, total = quote
+    _capture_sell_evidence(
+        "SELL_QUOTE_OBSERVE",
+        ledger_context=ledger_context,
+        leg_id=leg_id,
+        current_page_classification=f"SELL_QUOTE_READ|profit={profit}|total={total}",
+    )
     logger.info(f"Selected endpoint sale verified: profit={profit}, total={total}")
     if profit <= 0 or total <= 0:
         logger.error("Selected cargo is not a profitable endpoint sale; cancel sale")
         return False
+    _capture_sell_evidence(
+        "SELL_CONFIRM_BEFORE",
+        ledger_context=ledger_context,
+        leg_id=leg_id,
+        current_page_classification="SALE_CONFIRMATION_PENDING",
+    )
     if not click_sell_button():
+        _capture_sell_evidence(
+            "SELL_CONFIRM_AFTER",
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification="SALE_NOT_CONFIRMED",
+        )
         logger.error("Sell confirmation did not complete")
         return False
+    _capture_sell_evidence(
+        "SELL_CONFIRM_AFTER",
+        ledger_context=ledger_context,
+        leg_id=leg_id,
+        current_page_classification="SALE_CONFIRMED",
+    )
     time.sleep(0.5)
     _sell_tap((896, 676))
+    _capture_sell_evidence(
+        "SELL_FLOW_COMPLETE",
+        ledger_context=ledger_context,
+        leg_id=leg_id,
+        current_page_classification=f"SELL_COMPLETED|profit={profit}|total={total}",
+    )
     time.sleep(0.5)
     _sell_tap((896, 676))
     _sell_tap((896, 676))

@@ -1053,6 +1053,8 @@ def run(
             sell_haggle,
             expected_goods=list(city.goods_data),
             detailed=ledger_context is not None,
+            ledger_context=ledger_context,
+            leg_id=leg_id,
         )
         if not sell_result:
             logger.error("卖货未完成，不将本轮记为完成")
