@@ -92,15 +92,15 @@ def _purchase_completion_observed(
     timeout: float = BUY_CONFIRM_TIMEOUT,
     stable_frames: int = BUY_CONFIRM_STABLE_FRAMES,
 ) -> bool:
-    """Require a stable cargo increase after the confirmation dispatch.
+    """Require affirmative purchase evidence after the confirmation dispatch.
 
-    A reward overlay may temporarily cover the cargo counter. It is dismissed
-    once only after both affirmative result markers are visible in one frame.
+    A stable cargo increase and the complete reward overlay marker pair are
+    independent confirmation channels.  Overlay dismissal is best-effort UI
+    cleanup and cannot invalidate an already observed purchase fact.
     """
     deadline = time.perf_counter() + max(0.0, float(timeout))
     stable = 0
     expected_capacity = before[1]
-    overlay_dismissed = False
     while time.perf_counter() < deadline:
         items = screenshot().ocr()
         texts = {
@@ -108,16 +108,12 @@ def _purchase_completion_observed(
             for item in items
             if item.get("text")
         }
-        if (
-            not overlay_dismissed
-            and {"获得物品", "触碰空白区域退出"}.issubset(texts)
-        ):
+        if {"获得物品", "触碰空白区域退出"}.issubset(texts):
             if _buy_tap((896, 676)) is False:
-                return False
-            overlay_dismissed = True
-            stable = 0
-            time.sleep(BUY_RESULT_POLL_INTERVAL)
-            continue
+                logger.warning(
+                    "购买结果已确认，但奖励覆盖层关闭点击被拒绝；保留购买事实"
+                )
+            return True
 
         observed = _cargo_capacity_value(items)
         if (

@@ -70,7 +70,7 @@ def test_buy_confirmation_blank_or_unrelated_frames_never_confirm_or_redispatch(
     tap.assert_called_once_with((1056, 647))
 
 
-def test_buy_confirmation_dismisses_only_affirmative_overlay_then_checks_cargo():
+def test_affirmative_overlay_confirms_without_waiting_for_cargo_observation():
     before = [ocr_item("100/1121", 1157, 386, 1247, 405)]
     overlay = [
         {"text": "获得物品"},
@@ -89,6 +89,27 @@ def test_buy_confirmation_dismisses_only_affirmative_overlay_then_checks_cargo()
     ), patch.object(buy, "_buy_tap", return_value=object()) as tap, patch.object(
         buy.time, "sleep"
     ):
+        assert buy.click_buy_button() is True
+
+    assert tap.call_args_list == [
+        call((1056, 647)),
+        call((896, 676)),
+    ]
+
+
+def test_affirmative_overlay_confirms_purchase_when_dismissal_is_denied():
+    before = [ocr_item("100/1121", 1157, 386, 1247, 405)]
+    overlay = [
+        {"text": "获得物品"},
+        {"text": "触碰空白区域退出"},
+    ]
+    with patch.object(
+        buy,
+        "screenshot",
+        side_effect=[FakeOcrImage(before), FakeOcrImage(overlay)],
+    ), patch.object(
+        buy, "_buy_tap", side_effect=[object(), False]
+    ) as tap, patch.object(buy.time, "sleep"):
         assert buy.click_buy_button() is True
 
     assert tap.call_args_list == [
