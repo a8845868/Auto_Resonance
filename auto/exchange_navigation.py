@@ -13,7 +13,7 @@ from typing import Callable, Iterable
 import cv2 as cv
 from loguru import logger
 
-from core.control.control import input_tap, screenshot
+from core.control.control import input_swipe, input_tap, screenshot
 from core.services.city_navigation import (
     CityNavigationState,
     ExchangeEntryAdapter,
@@ -579,6 +579,12 @@ def open_exchange_action(
     selected = _action(action)
     started = monotonic()
     deadline = started + max(0.0, float(timeout))
+    initial_city_anchor_dispatch: dict[str, object] = {
+        "terminal_block": False,
+        "reason": "",
+        "coordinate": None,
+        "dispatch_result": None,
+    }
 
     def deadline_failure(stage: str, reason: str = "overall_deadline_exceeded"):
         return ExchangeNavigationResult(
@@ -612,6 +618,69 @@ def open_exchange_action(
             ),
         )
         return dispatch_result
+
+    def safe_city_outlet_click(
+        text: str,
+        *_args,
+        **_kwargs,
+    ) -> bool:
+        """Dispatch the city outlet through its unique visual parent control."""
+
+        if text != "交易所":
+            initial_city_anchor_dispatch.update(
+                terminal_block=True,
+                reason="unexpected_outlet_target",
+            )
+            return False
+        observed = screenshot()
+        observed_items = _items(observed)
+        anchors = _city_anchor_candidates(observed_items)
+        if len(anchors) != 1:
+            # A missing anchor may legitimately require the existing bounded
+            # outlet-list scroll.  Ambiguity, however, must never be scrolled
+            # or guessed through.
+            if len(anchors) > 1:
+                initial_city_anchor_dispatch.update(
+                    terminal_block=True,
+                    reason="exchange_anchor_ambiguous",
+                )
+            return False
+        parent_control = _exchange_city_parent_control(observed, anchors[0])
+        if parent_control is None:
+            initial_city_anchor_dispatch.update(
+                terminal_block=True,
+                reason="visual_parent_control_unresolved",
+            )
+            return False
+        coordinate = parent_control[0]
+        dispatch_result = input_tap(
+            coordinate,
+            random_offset=False,
+            intent=ActionIntent(
+                "navigation_anchor",
+                "交易所",
+                "exchange:city-anchor:initial-parent-control",
+            ),
+        )
+        initial_city_anchor_dispatch.update(
+            terminal_block=(dispatch_result is False),
+            reason=("read_only_denied" if dispatch_result is False else ""),
+            coordinate=coordinate,
+            dispatch_result=dispatch_result,
+        )
+        _capture_city_anchor_dispatch(
+            attempt=1,
+            dispatch_result=_dispatch_evidence_reason(dispatch_result),
+            anchor_coordinate=coordinate,
+            page_texts=_semantic_page_texts(observed_items),
+        )
+        return dispatch_result is not False
+
+    def safe_outlet_scroll(*args, **kwargs):
+        if bool(initial_city_anchor_dispatch["terminal_block"]):
+            return False
+        return input_swipe(*args, **kwargs)
+
     if monotonic() >= deadline:
         return deadline_failure("initial_capture")
     frame = screenshot()
@@ -650,6 +719,8 @@ def open_exchange_action(
             outlet = go_outlets(
                 "交易所", deadline=deadline, cancellation=cancellation,
                 monotonic=monotonic,
+                ocr_click=safe_city_outlet_click,
+                swipe=safe_outlet_scroll,
             )
         except TypeError as error:
             if "unexpected keyword" not in str(error):
@@ -665,7 +736,10 @@ def open_exchange_action(
         if not outlet:
             return deadline_failure(
                 "outlet_navigation",
-                getattr(outlet, "reason", "exchange_navigation_failed"),
+                str(
+                    initial_city_anchor_dispatch["reason"]
+                    or getattr(outlet, "reason", "exchange_navigation_failed")
+                ),
             )
         # ``go_outlets`` returns as soon as the guarded city-anchor call
         # returns.  On the live client that click can occasionally be ignored.
@@ -678,19 +752,6 @@ def open_exchange_action(
             candidate = screenshot()
             candidate_items = _items(candidate)
             city_marker = _resolve_city_marker(candidate_items, outlet)
-            first_anchor = _unique_exchange_city_anchor(candidate_items)
-            first_coordinate = _center(first_anchor) if first_anchor is not None else None
-            _capture_city_anchor_dispatch(
-                attempt=1,
-                dispatch_result=(
-                    "go_outlets_returned:stage={}:reason={}".format(
-                        getattr(outlet, "stage", "outlet_navigation"),
-                        getattr(outlet, "reason", "") or "ok",
-                    )
-                ),
-                anchor_coordinate=first_coordinate,
-                page_texts=_semantic_page_texts(candidate_items),
-            )
             if exchange_menu_matches(
                 candidate_items, frame_img=getattr(candidate, "image", None)
             ):

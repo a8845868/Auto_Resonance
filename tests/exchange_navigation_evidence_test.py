@@ -132,6 +132,113 @@ def test_real_exchange_city_frames_resolve_stable_npc_control_below_text():
         assert center_y - anchor_center[1] >= 55
 
 
+def test_initial_exchange_outlet_dispatch_uses_visual_parent_control(
+    monkeypatch,
+):
+    city_frame = SimpleNamespace(
+        image=np.zeros((720, 1280, 3), dtype=np.uint8),
+        ocr=lambda: _city(),
+    )
+    frames = iter([[], city_frame, _lobby(), _buy(), _buy()])
+    taps: list[tuple[tuple[int, int], dict]] = []
+    captured: list[tuple[str, str]] = []
+
+    def fake_go_outlets(_name, *, ocr_click, swipe, **_kwargs):
+        assert ocr_click("交易所") is True
+        return _StructuredOutletResult()
+
+    monkeypatch.setattr(exchange, "screenshot", lambda: next(frames))
+    monkeypatch.setattr(
+        exchange,
+        "input_tap",
+        lambda point, **kwargs: taps.append((point, kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        exchange,
+        "_exchange_city_parent_control",
+        lambda _frame, _anchor: ((900, 350), 45),
+    )
+    monkeypatch.setattr("core.preset.control.go_home", lambda **_kwargs: True)
+    monkeypatch.setattr("core.preset.go_outlets", fake_go_outlets)
+    monkeypatch.setattr(
+        exchange,
+        "capture_session_evidence",
+        lambda transition, **kwargs: captured.append(
+            (transition, kwargs["current_page_classification"])
+        ),
+    )
+
+    result = exchange.open_exchange_action(
+        exchange.ExchangeAction.BUY,
+        read_only=True,
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.success is True
+    assert [point for point, _kwargs in taps] == [(900, 350), (805, 324)]
+    assert taps[0][1]["random_offset"] is False
+    assert taps[0][1]["intent"].action_key == "navigation_anchor"
+    dispatches = [
+        json.loads(classification)
+        for transition, classification in captured
+        if transition == "EXCHANGE_CITY_ANCHOR_REDISPATCH"
+    ]
+    assert len(dispatches) == 1
+    assert dispatches[0]["anchor_coordinate"] == [900, 350]
+    assert dispatches[0]["attempt"] == 1
+    assert dispatches[0]["total"] == 3
+    assert dispatches[0]["dispatch_result"] == "call_returned"
+    assert set(dispatches[0]["page_texts"]) == {
+        "交易所", "城市发展度", "商会", "岚心城",
+    }
+    assert dispatches[0]["stage"] == "city_anchor_redispatch"
+
+
+def test_initial_exchange_outlet_blocks_when_parent_control_is_unresolved(
+    monkeypatch,
+):
+    city_frame = SimpleNamespace(
+        image=np.zeros((720, 1280, 3), dtype=np.uint8),
+        ocr=lambda: _city(),
+    )
+    frames = iter([[], city_frame])
+    taps: list[tuple[int, int]] = []
+
+    def fake_go_outlets(_name, *, ocr_click, swipe, **_kwargs):
+        assert ocr_click("交易所") is False
+        assert swipe((1, 2), (3, 4)) is False
+        return _OutletResult(False, "outlet_scroll", "read_only_denied")
+
+    monkeypatch.setattr(exchange, "screenshot", lambda: next(frames))
+    monkeypatch.setattr(
+        exchange,
+        "input_tap",
+        lambda point, **_kwargs: taps.append(point) or True,
+    )
+    monkeypatch.setattr(
+        exchange,
+        "input_swipe",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("terminal parent-control block must not swipe")
+        ),
+    )
+    monkeypatch.setattr(
+        exchange, "_exchange_city_parent_control", lambda _frame, _anchor: None
+    )
+    monkeypatch.setattr("core.preset.control.go_home", lambda **_kwargs: True)
+    monkeypatch.setattr("core.preset.go_outlets", fake_go_outlets)
+
+    result = exchange.open_exchange_action(
+        exchange.ExchangeAction.BUY,
+        read_only=True,
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.success is False
+    assert result.reason == "visual_parent_control_unresolved"
+    assert taps == []
+
+
 def _install_success_path(monkeypatch, *, dispatch_result=True):
     frames = iter([[], _lobby(), _buy(), _buy()])
     monkeypatch.setattr(exchange, "screenshot", lambda: next(frames))
