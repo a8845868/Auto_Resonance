@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import auto.exchange_navigation as exchange
 import numpy as np
 from core.services.dispatch_outcome import DispatchStatus, outcome_from_receipt
+
+
+PARENT_CONTROL_EVIDENCE = (
+    Path(__file__).parent / "fixtures" / "exchange_city_parent_control"
+)
 
 
 class _OutletResult:
@@ -97,6 +103,33 @@ def test_exchange_city_parent_control_rejects_ambiguous_circles(monkeypatch):
     )
 
     assert exchange._exchange_city_parent_control(image, anchor) is None
+
+
+def test_real_exchange_city_frames_resolve_stable_npc_control_below_text():
+    """The guarded target is the NPC portrait, never the OCR label center."""
+
+    anchor = {
+        "text": "交易所",
+        "position": [[854, 263], [950, 263], [950, 291], [854, 291]],
+    }
+    anchor_center = exchange._center(anchor)
+    controls: list[tuple[tuple[int, int], int]] = []
+    for evidence_path in sorted(PARENT_CONTROL_EVIDENCE.glob("*.png")):
+        crop = exchange.cv.imread(str(evidence_path))
+        assert crop is not None
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        frame[275:470, 760:1040] = crop
+        resolved = exchange._exchange_city_parent_control(frame, anchor)
+        assert resolved is not None
+        controls.append(resolved)
+
+    assert len(controls) == 3
+    assert exchange._stable_exchange_city_parent_controls(controls) is True
+    for (center_x, center_y), radius in controls:
+        assert abs(center_x - 900) <= 4
+        assert 335 <= center_y <= 355
+        assert 40 <= radius <= 55
+        assert center_y - anchor_center[1] >= 55
 
 
 def _install_success_path(monkeypatch, *, dispatch_result=True):
