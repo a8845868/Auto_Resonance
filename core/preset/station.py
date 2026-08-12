@@ -52,6 +52,7 @@ class STATION:
         """
         self.station = station
         self.is_destine = is_destine
+        self.last_wait_outcome = "NOT_STARTED"
 
     def __bool__(self) -> bool:
         return self.station
@@ -62,11 +63,14 @@ class STATION:
             等待进入站点
         """
         if self.station == False:
+            self.last_wait_outcome = "DEPARTURE_NOT_ESTABLISHED"
             logger.error("进入列车行驶状态失败")
             return False
         if self.is_destine:
+            self.last_wait_outcome = "DESTINATION_ALREADY_CONFIRMED"
             return True
         logger.info("进入行车监听")
+        self.last_wait_outcome = "MONITORING"
         start = time.perf_counter()
         estimator = TrainArrivalEstimator()
         eta_seconds = None
@@ -115,11 +119,13 @@ class STATION:
                 and BGR(250, 250, 250) <= reach_bgrs[1] <= BGR(255, 255, 255)
             ):
                 logger.info("站点到达")
+                self.last_wait_outcome = "ARRIVAL_FIXED_PIXEL_CONFIRMED"
                 input_tap((877, 359))
                 # go_home()
                 return True
             elif BGR(0, 174, 243) == run_bgr:
                 logger.info("站点到达")
+                self.last_wait_outcome = "ARRIVAL_HUD_CONFIRMED"
                 return True
             elif _should_use_speed_boost(
                 reach_bgrs[2], config.global_config.is_speed
@@ -135,6 +141,7 @@ class STATION:
                 )
             )
         logger.error("站点超时")
+        self.last_wait_outcome = "ARRIVAL_MONITOR_TIMEOUT"
         return False
 
     def wait_join(self):

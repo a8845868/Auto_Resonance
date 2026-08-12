@@ -2,9 +2,10 @@ from auto.run_business import main as business
 
 
 class _Travel:
-    def __init__(self, success, *, arrived=None):
+    def __init__(self, success, *, arrived=None, outcome="TEST_OUTCOME"):
         self.success = success
         self.arrived = success if arrived is None else arrived
+        self.last_wait_outcome = outcome
 
     def __bool__(self):
         return self.success
@@ -92,7 +93,7 @@ def test_arrival_wait_records_success_and_failure_without_changing_result(monkey
         "ARRIVAL_CONFIRMATION_AFTER",
     ]
     assert [call[3] for call in calls] == [
-        "ARRIVAL_VERIFIED_BY_NAVIGATION_WAIT",
-        "ARRIVAL_NOT_VERIFIED_BY_NAVIGATION_WAIT",
+        "ARRIVAL_VERIFIED_BY_NAVIGATION_WAIT|monitor_outcome=TEST_OUTCOME",
+        "ARRIVAL_NOT_VERIFIED_BY_NAVIGATION_WAIT|monitor_outcome=TEST_OUTCOME",
     ]
     assert all(call[1] is ledger and call[2] == "A|B" for call in calls)

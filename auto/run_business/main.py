@@ -634,6 +634,7 @@ def _wait_for_arrival_with_evidence(
     leg_id: str,
 ) -> bool:
     arrived = bool(travel.wait())
+    monitor_outcome = str(getattr(travel, "last_wait_outcome", "UNKNOWN"))
     _capture_run_business_evidence(
         "ARRIVAL_CONFIRMATION_AFTER",
         ledger_context=ledger_context,
@@ -642,7 +643,8 @@ def _wait_for_arrival_with_evidence(
             "ARRIVAL_VERIFIED_BY_NAVIGATION_WAIT"
             if arrived
             else "ARRIVAL_NOT_VERIFIED_BY_NAVIGATION_WAIT"
-        ),
+        )
+        + f"|monitor_outcome={monitor_outcome}",
     )
     return arrived
 
