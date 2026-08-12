@@ -583,6 +583,14 @@ def _begin_departure(
             destination=destination,
             leg_id=leg_id,
         )
+        _capture_run_business_evidence(
+            "DEPARTURE_REQUEST_DISPATCHED",
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification=(
+                f"origin={origin}|destination={destination}|requested=true"
+            ),
+        )
 
     travel = click_station(
         destination,
@@ -599,7 +607,44 @@ def _begin_departure(
             destination=destination,
             leg_id=leg_id,
         )
+        _capture_run_business_evidence(
+            "DEPARTURE_TRANSIT_VERIFIED",
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification=(
+                f"origin={origin}|destination={destination}|transit_verified=true"
+            ),
+        )
+    else:
+        _capture_run_business_evidence(
+            "DEPARTURE_TRANSIT_NOT_VERIFIED",
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification=(
+                f"origin={origin}|destination={destination}|transit_verified=false"
+            ),
+        )
     return travel
+
+
+def _wait_for_arrival_with_evidence(
+    travel,
+    *,
+    ledger_context: dict | None,
+    leg_id: str,
+) -> bool:
+    arrived = bool(travel.wait())
+    _capture_run_business_evidence(
+        "ARRIVAL_CONFIRMATION_AFTER",
+        ledger_context=ledger_context,
+        leg_id=leg_id,
+        current_page_classification=(
+            "ARRIVAL_VERIFIED_BY_NAVIGATION_WAIT"
+            if arrived
+            else "ARRIVAL_NOT_VERIFIED_BY_NAVIGATION_WAIT"
+        ),
+    )
+    return arrived
 
 
 def _cycle_books_used(context: dict | None) -> int:
@@ -985,7 +1030,11 @@ def run(
                         else "DEPARTURE_NOT_VERIFIED"
                     ),
                 )
-                if not travel.wait():
+                if not _wait_for_arrival_with_evidence(
+                    travel,
+                    ledger_context=ledger_context,
+                    leg_id=leg_id,
+                ):
                     logger.error(f"无法到达卖货城市 {city.sell_city_name}，停止本次跑商")
                     return False
                 after_travel = read_strength()
@@ -1006,12 +1055,6 @@ def run(
                 destination=city.sell_city_name,
                 leg_id=leg_id,
                 fatigue_delta=actual_fatigue,
-            )
-            _capture_run_business_evidence(
-                "ARRIVAL_CONFIRMATION_AFTER",
-                ledger_context=ledger_context,
-                leg_id=leg_id,
-                current_page_classification="ARRIVAL_VERIFIED_BY_NAVIGATION_WAIT",
             )
             from core.services.fatigue_triggers import notify_fatigue_event
 
