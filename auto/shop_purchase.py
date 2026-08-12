@@ -144,11 +144,33 @@ def _shop_swipe_observer(action_key: str) -> PageObserver:
     return PageObserver(lambda: _shop_swipe_observation(action_key))
 
 
+def _shop_confirmation_result_markers(ocr_items: Iterable[dict]) -> tuple[str, ...]:
+    """Return markers only for an affirmative purchase-result overlay."""
+
+    texts = {
+        _normalize_text(value.get("text"))
+        for value in ocr_items
+        if _normalize_text(value.get("text"))
+    }
+    if {"获得物品", "触碰空白区域退出"}.issubset(texts):
+        return ("shop_confirmation_resolved", "shop_purchase_reward_overlay")
+    return ()
+
+
 def _shop_confirm_observation(item: ShopItem) -> PageObservation:
     """Classify a new capture for the final shop confirmation policy only."""
 
     frame = screenshot()
-    ocr_items = frame.ocr()
+    try:
+        ocr_items = frame.ocr()
+    except StopExecution:
+        raise
+    except Exception as error:
+        logger.warning(
+            "商店确认后置 OCR 失败，按未知页面保守处理: {}: {}",
+            type(error).__name__, error,
+        )
+        ocr_items = ()
     identity = current_bound_device_identity()
     geometry = current_display_geometry()
     source_id = str(getattr(frame, "source_capture_id", ""))
@@ -165,7 +187,8 @@ def _shop_confirm_observation(item: ShopItem) -> PageObservation:
         and quantity is not None
         and price is not None
     )
-    markers = ["shop_quantity_dialog"] if is_source else ["shop_confirmation_resolved"]
+    result_markers = () if is_source else _shop_confirmation_result_markers(ocr_items)
+    markers = ["shop_quantity_dialog"] if is_source else list(result_markers)
     if is_source:
         currency = load_shop_catalog().currencies.get(item.currency)
         visible_currency = bool(currency) and (
@@ -194,7 +217,11 @@ def _shop_confirm_observation(item: ShopItem) -> PageObservation:
         ),)
     return PageObservation(
         observation_id=f"shop-confirm:{source_id}", screenshot_hash=raw_hash,
-        page_type="shop_quantity_dialog" if is_source else "shop_purchase_result",
+        page_type=(
+            "shop_quantity_dialog" if is_source
+            else "shop_purchase_result" if result_markers
+            else "unknown"
+        ),
         markers=tuple(markers), anchors=(), captured_at=captured_at,
         display_geometry=geometry, static_regions=regions,
         capture_sequence=source_sequence, source_capture_id=source_id,

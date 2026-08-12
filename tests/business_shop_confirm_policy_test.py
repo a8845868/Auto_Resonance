@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -84,6 +85,85 @@ def _observation(sequence: int, *, page="shop_quantity_dialog"):
     )
 
 
+def _capture_frame(sequence: int, ocr_items=(), *, ocr_error: Exception | None = None):
+    positioned_items = []
+    for index, item in enumerate(ocr_items):
+        positioned = dict(item)
+        x1 = 100 + index * 140
+        positioned.setdefault(
+            "position", ((x1, 420), (x1 + 120, 420), (x1 + 120, 450), (x1, 450)),
+        )
+        positioned_items.append(positioned)
+
+    def ocr():
+        if ocr_error is not None:
+            raise ocr_error
+        return list(positioned_items)
+
+    return SimpleNamespace(
+        image=np.zeros((720, 1280, 3), dtype=np.uint8),
+        ocr=ocr,
+        source_capture_id=f"capture-{sequence}",
+        capture_sequence=sequence,
+        captured_at=NOW + timedelta(microseconds=sequence),
+        raw_frame_hash=f"{sequence:064x}",
+    )
+
+
+def _classify_confirm_frame(monkeypatch, frame):
+    item = load_shop_catalog().item("cactus_energy_weekly_iron")
+    monkeypatch.setattr(shop_purchase, "screenshot", lambda: frame)
+    monkeypatch.setattr(shop_purchase, "current_bound_device_identity", _identity)
+    monkeypatch.setattr(shop_purchase, "current_display_geometry", DisplayGeometry)
+    monkeypatch.setattr(shop_purchase, "_has_complete_quantity_dialog", lambda *_args: False)
+    return shop_purchase._shop_confirm_observation(item)
+
+
+def test_shop_confirm_observation_accepts_only_affirmative_reward_overlay(monkeypatch):
+    observation = _classify_confirm_frame(
+        monkeypatch,
+        _capture_frame(10, (
+            {"text": "获得物品"},
+            {"text": "触碰空白区域退出"},
+        )),
+    )
+    assert observation.page_type == "shop_purchase_result"
+    assert "shop_confirmation_resolved" in observation.markers
+    assert "shop_purchase_reward_overlay" in observation.markers
+
+
+@pytest.mark.parametrize(
+    "ocr_items",
+    (
+        (),
+        ({"text": "1/3"}, {"text": "取消"}, {"text": "确定"}),
+        ({"text": "总部商店"}, {"text": "黑月商店"}),
+        ({"text": "获得物品"},),
+        ({"text": "触碰空白区域退出"},),
+    ),
+    ids=("blank", "partial-dialog", "unrelated-shop", "reward-only", "dismiss-only"),
+)
+def test_shop_confirm_observation_keeps_ambiguous_frames_unknown(monkeypatch, ocr_items):
+    observation = _classify_confirm_frame(monkeypatch, _capture_frame(11, ocr_items))
+    assert observation.page_type == "unknown"
+    assert "shop_confirmation_resolved" not in observation.markers
+
+
+def test_shop_confirm_observation_treats_ocr_failure_as_unknown(monkeypatch):
+    observation = _classify_confirm_frame(
+        monkeypatch, _capture_frame(12, ocr_error=OSError("capture OCR failed")),
+    )
+    assert observation.page_type == "unknown"
+    assert observation.markers == ()
+
+
+def test_shop_confirm_observation_still_requires_trusted_provenance(monkeypatch):
+    frame = _capture_frame(13, ({"text": "获得物品"}, {"text": "触碰空白区域退出"}))
+    frame.source_capture_id = ""
+    with pytest.raises(PermissionError, match="trusted capture provenance"):
+        _classify_confirm_frame(monkeypatch, frame)
+
+
 def _snapshot():
     return BusinessActionSnapshot(
         item_id="item-a", shop_id="shop-a", currency="iron", quantity_mode="one",
@@ -154,6 +234,21 @@ def test_business_postcondition_failure_is_truthy_and_never_repeats_confirm(monk
     backend, session = _production_session(
         monkeypatch,
         iter((_observation(1), _observation(2), _observation(3), _observation(4), _observation(5))),
+    )
+    with installed_read_only_guard(session):
+        outcome = control_module.input_tap(
+            (960, 535), random_offset=False,
+            intent=ActionIntent("shop_confirm", "shop_confirm_button", "item-a"),
+        )
+    assert outcome
+    assert outcome.status is DispatchStatus.DISPATCHED_UNVERIFIED
+    assert backend.taps == [(960, 535)]
+
+
+def test_unknown_shop_postcondition_is_unverified_and_never_repeats_confirm(monkeypatch):
+    backend, session = _production_session(
+        monkeypatch,
+        iter((_observation(1), _observation(2), _observation(3, page="unknown"))),
     )
     with installed_read_only_guard(session):
         outcome = control_module.input_tap(
