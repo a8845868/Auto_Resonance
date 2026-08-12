@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import threading
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -323,26 +324,342 @@ def test_session_recovery_closes_failed_session_once_and_replaces_generation(
     previous.nemu = SimpleNamespace(
         nemu_disconnect=lambda handle: disconnects.append(handle)
     )
-    replacement = object.__new__(NEMU)
-    replacement.session_generation = 8
-    monkeypatch.setattr(control_module, "control", previous)
-    monkeypatch.setattr(
-        control_module, "get_runtime_device", lambda: SimpleNamespace(port=16384)
+    device = SimpleNamespace(
+        port=16384,
+        index=0,
+        type="MUMUV5",
+        path=r"C:\Program Files\NetEase\MuMu",
     )
-
-    def connect_replacement(_port):
-        control_module.control = replacement
-        return True
-
-    monkeypatch.setattr(control_module, "connect", connect_replacement)
+    replacement = SimpleNamespace(
+        device=device,
+        path=r"C:\Program Files\NetEase\MuMu",
+        session_generation=8,
+        health_capture_return_code=0,
+        health_capture_session_generation=8,
+        session_quarantined=False,
+        connect_id=12,
+        display_id=0,
+        connect=lambda _port: True,
+        kill=lambda: None,
+    )
+    monkeypatch.setattr(control_module, "control", previous)
+    monkeypatch.setattr(control_module, "get_runtime_device", lambda: device)
+    monkeypatch.setattr(control_module, "NEMU", lambda _device: replacement)
+    monkeypatch.setattr(
+        control_module,
+        "resolve_mumu_launcher",
+        lambda _device: SimpleNamespace(
+            install_root=r"C:\Program Files\NetEase\MuMu"
+        ),
+    )
+    monkeypatch.setattr(
+        control_module,
+        "connect",
+        lambda *_args, **_kwargs: pytest.fail(
+            "capture recovery must not call general connect()"
+        ),
+    )
+    monkeypatch.setattr(
+        control_module,
+        "ADB",
+        lambda: pytest.fail("capture recovery must not construct ADB"),
+    )
     recovered = control_module.recover_nemu_capture_session()
 
     assert recovered.success is True
     assert recovered.previous_session_generation == 7
     assert recovered.current_session_generation == 8
+    assert control_module.control is replacement
     assert disconnects == [11]
     assert previous.kill_call_count == 1
     assert previous.disconnect_call_count == 1
+
+
+def _recovery_previous_backend():
+    previous = object.__new__(NEMU)
+    previous.connect_id = 11
+    previous.display_id = 3
+    previous.session_generation = 7
+    previous.health_capture_return_code = 0
+    previous.health_capture_session_generation = 7
+    previous._health_capture_instance_handle = 11
+    previous._health_capture_display_id = 3
+    previous._health_capture_disconnect_call_count = 0
+    previous.disconnect_call_count = 0
+    previous.kill_call_count = 0
+    previous._health_adb = None
+    previous.nemu = SimpleNamespace(nemu_disconnect=lambda _handle: None)
+    return previous
+
+
+def _recovery_device(*, index=0):
+    return SimpleNamespace(
+        port=16384,
+        index=index,
+        type="MUMUV5",
+        path=r"C:\Program Files\NetEase\MuMu",
+    )
+
+
+def _healthy_recovery_candidate(device, *, generation=8):
+    kills = []
+    candidate = SimpleNamespace(
+        device=device,
+        path=r"C:\Program Files\NetEase\MuMu",
+        session_generation=generation,
+        health_capture_return_code=0,
+        health_capture_session_generation=generation,
+        session_quarantined=False,
+        connect_id=12,
+        display_id=0,
+        connect=lambda _port: True,
+        kill=lambda: kills.append("kill"),
+    )
+    candidate.kills = kills
+    return candidate
+
+
+def _patch_recovery_environment(monkeypatch, previous, device):
+    monkeypatch.setattr(control_module, "control", previous)
+    monkeypatch.setattr(control_module, "get_runtime_device", lambda: device)
+    monkeypatch.setattr(
+        control_module,
+        "resolve_mumu_launcher",
+        lambda _device: SimpleNamespace(
+            install_root=r"C:\Program Files\NetEase\MuMu"
+        ),
+    )
+    monkeypatch.setattr(
+        control_module,
+        "connect",
+        lambda *_args, **_kwargs: pytest.fail(
+            "capture recovery must not call general connect()"
+        ),
+    )
+    monkeypatch.setattr(
+        control_module,
+        "ADB",
+        lambda: pytest.fail("capture recovery must not construct ADB"),
+    )
+
+
+def test_session_recovery_unavailable_nemu_never_publishes_adb(monkeypatch):
+    previous = _recovery_previous_backend()
+    device = _recovery_device()
+    _patch_recovery_environment(monkeypatch, previous, device)
+    monkeypatch.setattr(
+        control_module,
+        "NEMU",
+        lambda _device: (_ for _ in ()).throw(FileNotFoundError("missing DLL")),
+    )
+
+    recovered = control_module.recover_nemu_capture_session()
+
+    assert recovered.success is False
+    assert recovered.reason == "replacement_nemu_unavailable"
+    assert control_module.control is previous
+    assert previous.connect_id is None
+
+
+def test_session_recovery_connect_false_keeps_closed_nemu_backend(monkeypatch):
+    previous = _recovery_previous_backend()
+    device = _recovery_device()
+    candidate = _healthy_recovery_candidate(device)
+    candidate.connect = lambda _port: False
+    _patch_recovery_environment(monkeypatch, previous, device)
+    monkeypatch.setattr(control_module, "NEMU", lambda _device: candidate)
+
+    recovered = control_module.recover_nemu_capture_session()
+
+    assert recovered.success is False
+    assert recovered.reason == "replacement_session_connect_rejected"
+    assert control_module.control is previous
+    assert candidate.kills == ["kill"]
+
+
+def test_session_recovery_capture_failure_never_publishes_candidate(monkeypatch):
+    previous = _recovery_previous_backend()
+    device = _recovery_device()
+    candidate = _healthy_recovery_candidate(device)
+    failure = NemuCaptureError(
+        native_return_code=2,
+        session_generation=8,
+        failure_stage="CONNECT_HEALTH_CAPTURE",
+    )
+
+    def fail_capture(_port):
+        raise failure
+
+    candidate.connect = fail_capture
+    _patch_recovery_environment(monkeypatch, previous, device)
+    monkeypatch.setattr(control_module, "NEMU", lambda _device: candidate)
+
+    recovered = control_module.recover_nemu_capture_session()
+
+    assert recovered.success is False
+    assert recovered.reason == "replacement_session_capture_failed"
+    assert recovered.capture_failure is failure
+    assert control_module.control is previous
+    assert candidate.kills == ["kill"]
+
+
+def test_session_recovery_target_mismatch_is_closed_without_publication(monkeypatch):
+    previous = _recovery_previous_backend()
+    device = _recovery_device(index=0)
+    candidate = _healthy_recovery_candidate(_recovery_device(index=6))
+    _patch_recovery_environment(monkeypatch, previous, device)
+    monkeypatch.setattr(control_module, "NEMU", lambda _device: candidate)
+
+    recovered = control_module.recover_nemu_capture_session()
+
+    assert recovered.success is False
+    assert recovered.reason == "replacement_session_target_mismatch"
+    assert control_module.control is previous
+    assert candidate.kills == ["kill"]
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    [
+        ("session_generation", "invalid"),
+        ("health_capture_return_code", 2),
+        ("health_capture_session_generation", 7),
+        ("session_quarantined", True),
+        ("connect_id", None),
+        ("display_id", None),
+    ],
+)
+def test_session_recovery_unproven_health_is_closed_without_publication(
+    monkeypatch, attribute, value
+):
+    previous = _recovery_previous_backend()
+    device = _recovery_device()
+    candidate = _healthy_recovery_candidate(device)
+    setattr(candidate, attribute, value)
+    _patch_recovery_environment(monkeypatch, previous, device)
+    monkeypatch.setattr(control_module, "NEMU", lambda _device: candidate)
+
+    recovered = control_module.recover_nemu_capture_session()
+
+    assert recovered.success is False
+    assert recovered.reason == "replacement_session_health_unproven"
+    assert control_module.control is previous
+    assert candidate.kills == ["kill"]
+
+
+def test_session_recovery_target_resolution_error_closes_candidate(monkeypatch):
+    previous = _recovery_previous_backend()
+    device = _recovery_device()
+    candidate = _healthy_recovery_candidate(device)
+    _patch_recovery_environment(monkeypatch, previous, device)
+    monkeypatch.setattr(control_module, "NEMU", lambda _device: candidate)
+    monkeypatch.setattr(
+        control_module,
+        "resolve_mumu_launcher",
+        lambda _device: (_ for _ in ()).throw(RuntimeError("resolver failed")),
+    )
+
+    recovered = control_module.recover_nemu_capture_session()
+
+    assert recovered.success is False
+    assert recovered.reason == "replacement_session_target_mismatch"
+    assert control_module.control is previous
+    assert candidate.kills == ["kill"]
+
+
+def test_concurrent_connect_waits_for_atomic_nemu_recovery(monkeypatch):
+    device = SimpleNamespace(
+        is_mumu=True,
+        port=16384,
+        index=0,
+        type="MUMUV5",
+        path=r"C:\Program Files\NetEase\MuMu",
+    )
+    recovery_connect_entered = threading.Event()
+    concurrent_connect_started = threading.Event()
+    release_recovery = threading.Event()
+    created = []
+
+    class RecoveryBackend:
+        def __init__(self, target, generation, *, connected=True):
+            self.device = target
+            self.path = r"C:\Program Files\NetEase\MuMu"
+            self.session_generation = generation
+            self.health_capture_return_code = 0
+            self.health_capture_session_generation = generation
+            self.session_quarantined = False
+            self.connect_id = 11 if connected else None
+            self.display_id = 0
+            self.kill_call_count = 0
+
+        def _capture_lifecycle_conflict(self):
+            return "NO"
+
+        def connect(self, _port):
+            recovery_connect_entered.set()
+            assert concurrent_connect_started.wait(timeout=2)
+            assert release_recovery.wait(timeout=2)
+            self.connect_id = 12
+            return True
+
+        def kill(self):
+            if self.connect_id is None:
+                return
+            self.kill_call_count += 1
+            self.connect_id = None
+
+    previous = RecoveryBackend(device, 7)
+
+    def create_nemu(target):
+        candidate = RecoveryBackend(target, 8, connected=False)
+        created.append(candidate)
+        return candidate
+
+    monkeypatch.setattr(control_module, "control", previous)
+    monkeypatch.setattr(control_module, "get_runtime_device", lambda: device)
+    monkeypatch.setattr(control_module, "NEMU", create_nemu)
+    monkeypatch.setattr(control_module, "_NEMU_BACKEND_TYPE", RecoveryBackend)
+    monkeypatch.setattr(
+        control_module,
+        "resolve_mumu_launcher",
+        lambda _device: SimpleNamespace(
+            install_root=r"C:\Program Files\NetEase\MuMu"
+        ),
+    )
+    monkeypatch.setattr(
+        control_module,
+        "ADB",
+        lambda: pytest.fail("concurrent recovery must never construct ADB"),
+    )
+    recovery_results = []
+    connect_results = []
+
+    recovery_thread = threading.Thread(
+        target=lambda: recovery_results.append(
+            control_module.recover_nemu_capture_session()
+        )
+    )
+
+    def concurrent_connect():
+        concurrent_connect_started.set()
+        connect_results.append(control_module.connect(16384))
+
+    connect_thread = threading.Thread(target=concurrent_connect)
+    recovery_thread.start()
+    assert recovery_connect_entered.wait(timeout=2)
+    connect_thread.start()
+    assert concurrent_connect_started.wait(timeout=2)
+    release_recovery.set()
+    recovery_thread.join(timeout=2)
+    connect_thread.join(timeout=2)
+
+    assert not recovery_thread.is_alive()
+    assert not connect_thread.is_alive()
+    assert [result.success for result in recovery_results] == [True]
+    assert connect_results == [True]
+    assert len(created) == 1
+    assert control_module.control is created[0]
+    assert previous.kill_call_count == 1
 
 
 def test_runtime_fault_telemetry_contains_only_allowlisted_metadata(tmp_path):

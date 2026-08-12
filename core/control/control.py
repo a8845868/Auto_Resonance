@@ -24,7 +24,7 @@ from core.control.adb import ADB
 from core.control.adb_port import EmulatorInfo, EmulatorType, resolve_mumu_launcher
 from core.control.base_control import IADB
 from core.control.nemu import IPCUnavailableError, NEMU
-from core.control.nemu_capture import CaptureSessionRecoveryResult
+from core.control.nemu_capture import CaptureSessionRecoveryResult, NemuCaptureError
 from core.exception.exceptions import StopExecution
 from core.image.image import Image
 from core.model import app
@@ -585,7 +585,7 @@ def recover_nemu_capture_session() -> CaptureSessionRecoveryResult:
     ensure_automation_allowed("恢复 NEMU 截图会话")
     with _BACKEND_LOCK:
         previous = control
-        if not isinstance(previous, NEMU):
+        if not isinstance(previous, _NEMU_BACKEND_TYPE):
             return CaptureSessionRecoveryResult(
                 False, "active_backend_is_not_nemu"
             )
@@ -605,34 +605,108 @@ def recover_nemu_capture_session() -> CaptureSessionRecoveryResult:
             )
         previous.kill()
 
-    try:
-        status = connect(getattr(get_runtime_device(), "port", None))
-    except Exception as error:
-        from core.control.nemu_capture import NemuCaptureError
+        device = get_runtime_device()
+        candidate = None
+        try:
+            candidate = NEMU(device)
+            status = candidate.connect(getattr(device, "port", None))
+        except Exception as error:
+            if candidate is not None:
+                _close_backend(candidate, "NEMU恢复候选")
+            if isinstance(error, NemuCaptureError):
+                return CaptureSessionRecoveryResult(
+                    False,
+                    "replacement_session_capture_failed",
+                    previous_generation,
+                    previous_generation,
+                    lifecycle_conflict,
+                    error,
+                )
+            if _known_nemu_unavailable(error):
+                return CaptureSessionRecoveryResult(
+                    False,
+                    "replacement_nemu_unavailable",
+                    previous_generation,
+                    previous_generation,
+                    lifecycle_conflict,
+                )
+            raise
 
-        if isinstance(error, NemuCaptureError):
+        if not status:
+            if candidate is not None:
+                _close_backend(candidate, "NEMU恢复候选")
             return CaptureSessionRecoveryResult(
                 False,
-                "replacement_session_capture_failed",
+                "replacement_session_connect_rejected",
                 previous_generation,
-                int(getattr(control, "session_generation", 0)),
+                previous_generation,
                 lifecycle_conflict,
-                error,
             )
-        raise
-    current_generation = int(getattr(control, "session_generation", 0))
-    success = bool(
-        status
-        and isinstance(control, NEMU)
-        and current_generation > previous_generation
-    )
-    return CaptureSessionRecoveryResult(
-        success,
-        "replacement_session_ready" if success else "replacement_session_unavailable",
-        previous_generation,
-        current_generation,
-        lifecycle_conflict,
-    )
+
+        try:
+            current_generation = int(
+                getattr(candidate, "session_generation", 0) or 0
+            )
+            candidate_generation_healthy = (
+                current_generation > previous_generation
+                and getattr(candidate, "health_capture_return_code", None) == 0
+                and int(
+                    getattr(candidate, "health_capture_session_generation", 0) or 0
+                )
+                == current_generation
+                and not bool(getattr(candidate, "session_quarantined", False))
+                and int(getattr(candidate, "connect_id", 0) or 0) > 0
+                and getattr(candidate, "display_id", None) is not None
+                and int(getattr(candidate, "display_id")) >= 0
+            )
+        except (TypeError, ValueError):
+            current_generation = 0
+            candidate_generation_healthy = False
+        if not candidate_generation_healthy:
+            _close_backend(candidate, "NEMU恢复候选")
+            return CaptureSessionRecoveryResult(
+                False,
+                "replacement_session_health_unproven",
+                previous_generation,
+                current_generation,
+                lifecycle_conflict,
+            )
+
+        candidate_device = getattr(candidate, "device", None)
+        try:
+            same_target = (
+                candidate_device is not None
+                and int(getattr(candidate_device, "index", -1))
+                == int(getattr(device, "index", -2))
+                and getattr(candidate_device, "type", None)
+                == getattr(device, "type", None)
+                and os.path.normcase(os.path.abspath(str(candidate.path)))
+                == os.path.normcase(
+                    os.path.abspath(
+                        os.fspath(resolve_mumu_launcher(device).install_root)
+                    )
+                )
+            )
+        except Exception:
+            same_target = False
+        if not same_target:
+            _close_backend(candidate, "NEMU恢复候选")
+            return CaptureSessionRecoveryResult(
+                False,
+                "replacement_session_target_mismatch",
+                previous_generation,
+                current_generation,
+                lifecycle_conflict,
+            )
+
+        _activate_backend(candidate)
+        return CaptureSessionRecoveryResult(
+            True,
+            "replacement_session_ready",
+            previous_generation,
+            current_generation,
+            lifecycle_conflict,
+        )
 
 
 def _legacy_input_swipe(
