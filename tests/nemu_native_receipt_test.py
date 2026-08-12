@@ -328,9 +328,12 @@ def test_swipe_rejected_later_down_stops_and_quarantines(monkeypatch):
 
     receipt = caught.value.receipt
     assert receipt.delivery_status == "UNKNOWN_AFTER_PARTIAL_DISPATCH"
-    assert receipt.release_status == "UNKNOWN"
+    assert receipt.release_status == "CONFIRMED"
+    assert receipt.touch_up_called is True
+    assert receipt.touch_up_return_code == 0
+    assert receipt.touch_up_status == "ACCEPTED"
     assert len(library.nemu_input_event_touch_down.calls) == 2
-    assert library.nemu_input_event_touch_up.calls == []
+    assert len(library.nemu_input_event_touch_up.calls) == 1
     assert backend.session_quarantined is True
 
 
@@ -342,9 +345,13 @@ def test_swipe_unknown_down_stops_and_quarantines(monkeypatch):
     with pytest.raises(NemuInputDispatchError) as caught:
         backend.input_swipe(100, 200, 300, 200, 30)
 
-    assert caught.value.receipt.delivery_status == "UNKNOWN_AFTER_EXCEPTION"
+    receipt = caught.value.receipt
+    assert receipt.delivery_status == "UNKNOWN_AFTER_EXCEPTION"
+    assert receipt.release_status == "CONFIRMED"
+    assert receipt.touch_up_called is True
+    assert receipt.touch_up_status == "ACCEPTED"
     assert len(library.nemu_input_event_touch_down.calls) == 1
-    assert library.nemu_input_event_touch_up.calls == []
+    assert len(library.nemu_input_event_touch_up.calls) == 1
     assert backend.session_quarantined is True
 
 
@@ -362,17 +369,26 @@ def test_swipe_nonaccepted_up_is_partial_and_quarantines(monkeypatch, up_code):
     assert backend.session_quarantined is True
 
 
-def test_swipe_python_exception_quarantines_without_fallback(monkeypatch):
+def test_swipe_python_exception_best_effort_release_failure_is_recorded(monkeypatch):
     monkeypatch.setattr("core.control.nemu.time.sleep", lambda _seconds: None)
-    library = _library(down_error=OSError("native swipe fault"))
+    library = _library(
+        down_error=OSError("native swipe fault"),
+        up_error=OSError("native release fault"),
+    )
     backend = _backend(library)
 
     with pytest.raises(NemuInputDispatchError) as caught:
         backend.input_swipe(100, 200, 300, 200, 30)
 
-    assert caught.value.receipt.delivery_status == "UNKNOWN_AFTER_EXCEPTION"
+    receipt = caught.value.receipt
+    assert receipt.delivery_status == "UNKNOWN_AFTER_EXCEPTION"
+    assert receipt.release_status == "UNKNOWN"
+    assert receipt.touch_up_called is True
+    assert receipt.touch_up_return_code is None
+    assert receipt.touch_up_status == "UNKNOWN"
+    assert "swipe_best_effort_touch_up_exception:OSError" in receipt.reason_codes
     assert backend.session_quarantined is True
-    assert library.nemu_input_event_touch_up.calls == []
+    assert len(library.nemu_input_event_touch_up.calls) == 1
 
 
 def test_swipe_all_native_calls_accepted_produce_receipt(monkeypatch):

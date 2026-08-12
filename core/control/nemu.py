@@ -296,6 +296,7 @@ class NEMU(IADB):
                         f"swipe_touch_down_native_rejected_at_{point_index}"
                     )
                     if accepted_down:
+                        self._best_effort_swipe_release(builder)
                         self.session_quarantined = True
                     receipt = builder.finish(python_call_returned=True)
                     self.last_touch_receipt = receipt
@@ -306,6 +307,7 @@ class NEMU(IADB):
                     builder.reasons.append(
                         f"swipe_touch_down_return_code_unknown_at_{point_index}"
                     )
+                    self._best_effort_swipe_release(builder)
                     self.session_quarantined = True
                     receipt = builder.finish(python_call_returned=True)
                     self.last_touch_receipt = receipt
@@ -335,9 +337,10 @@ class NEMU(IADB):
             raise
         except Exception:
             builder.delivery = DeliveryStatus.UNKNOWN_AFTER_EXCEPTION
-            builder.release = (
-                ReleaseStatus.UNKNOWN if builder.down_called else ReleaseStatus.NOT_REQUIRED
-            )
+            if builder.down_called:
+                self._best_effort_swipe_release(builder)
+            else:
+                builder.release = ReleaseStatus.NOT_REQUIRED
             builder.reasons.append("swipe_python_exception_after_native_call")
             self.session_quarantined = True
             receipt = builder.finish(python_call_returned=False)
@@ -345,6 +348,33 @@ class NEMU(IADB):
             raise NemuInputDispatchError(receipt)
         time.sleep(0.05)
         return receipt
+
+    def _best_effort_swipe_release(
+        self, builder: NemuTouchReceiptBuilder
+    ) -> None:
+        """Attempt one native release without masking the dispatch failure."""
+        if builder.up_called:
+            return
+        builder.up_called = True
+        try:
+            builder.up_code = int(
+                self.nemu.nemu_input_event_touch_up(
+                    self.connect_id, self.display_id
+                )
+            )
+            builder.up_status = self._native_status(builder.up_code)
+            if builder.up_status is NativeCallStatus.ACCEPTED:
+                builder.release = ReleaseStatus.CONFIRMED
+                builder.reasons.append("swipe_best_effort_touch_up_accepted")
+            else:
+                builder.release = ReleaseStatus.UNKNOWN
+                builder.reasons.append("swipe_best_effort_touch_up_not_accepted")
+        except Exception as error:
+            builder.up_status = NativeCallStatus.UNKNOWN
+            builder.release = ReleaseStatus.UNKNOWN
+            builder.reasons.append(
+                f"swipe_best_effort_touch_up_exception:{type(error).__name__}"
+            )
 
 
     @staticmethod
