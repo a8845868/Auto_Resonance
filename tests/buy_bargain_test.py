@@ -1,6 +1,9 @@
 from unittest.mock import call, patch
 
+import pytest
+
 import auto.run_business.buy as buy
+from core.exception.exceptions import StopExecution
 from core.module.bgr import BGR
 
 
@@ -111,6 +114,49 @@ def test_affirmative_overlay_confirms_purchase_when_dismissal_is_denied():
         buy, "_buy_tap", side_effect=[object(), False]
     ) as tap, patch.object(buy.time, "sleep"):
         assert buy.click_buy_button() is True
+
+    assert tap.call_args_list == [
+        call((1056, 647)),
+        call((896, 676)),
+    ]
+
+
+def test_affirmative_overlay_confirms_purchase_when_dismissal_raises():
+    before = [ocr_item("100/1121", 1157, 386, 1247, 405)]
+    overlay = [
+        {"text": "获得物品"},
+        {"text": "触碰空白区域退出"},
+    ]
+    with patch.object(
+        buy,
+        "screenshot",
+        side_effect=[FakeOcrImage(before), FakeOcrImage(overlay)],
+    ), patch.object(
+        buy, "_buy_tap", side_effect=[object(), OSError("dismiss failed")]
+    ) as tap, patch.object(buy.time, "sleep"):
+        assert buy.click_buy_button() is True
+
+    assert tap.call_args_list == [
+        call((1056, 647)),
+        call((896, 676)),
+    ]
+
+
+def test_affirmative_overlay_dismissal_propagates_stop_execution():
+    before = [ocr_item("100/1121", 1157, 386, 1247, 405)]
+    overlay = [
+        {"text": "获得物品"},
+        {"text": "触碰空白区域退出"},
+    ]
+    with patch.object(
+        buy,
+        "screenshot",
+        side_effect=[FakeOcrImage(before), FakeOcrImage(overlay)],
+    ), patch.object(
+        buy, "_buy_tap", side_effect=[object(), StopExecution()]
+    ) as tap, patch.object(buy.time, "sleep"):
+        with pytest.raises(StopExecution):
+            buy.click_buy_button()
 
     assert tap.call_args_list == [
         call((1056, 647)),

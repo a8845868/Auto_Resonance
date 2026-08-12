@@ -14,12 +14,13 @@ import numpy as np
 from loguru import logger
 
 from core.control.control import input_swipe, input_tap, screenshot, screenshot_image
-from core.services.read_only_policy import ActionIntent
 from core.exception.exception_handling import get_excption
+from core.exception.exceptions import StopExecution
 from core.image.image import Image
 from core.module.bgr import BGR
 from core.module.hsv import HSV
 from core.preset import click, find_text, go_home
+from core.services.read_only_policy import ActionIntent
 from core.services.session_evidence import capture_session_evidence
 from auto.module.strength import exit_negotiation_safely
 
@@ -109,10 +110,20 @@ def _purchase_completion_observed(
             if item.get("text")
         }
         if {"获得物品", "触碰空白区域退出"}.issubset(texts):
-            if _buy_tap((896, 676)) is False:
+            try:
+                dismissed = _buy_tap((896, 676))
+            except StopExecution:
+                raise
+            except Exception as error:
                 logger.warning(
-                    "购买结果已确认，但奖励覆盖层关闭点击被拒绝；保留购买事实"
+                    "购买结果已确认，但奖励覆盖层关闭异常；保留购买事实: "
+                    f"{type(error).__name__}"
                 )
+            else:
+                if dismissed is False:
+                    logger.warning(
+                        "购买结果已确认，但奖励覆盖层关闭点击被拒绝；保留购买事实"
+                    )
             return True
 
         observed = _cargo_capacity_value(items)
