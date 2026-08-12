@@ -33,6 +33,16 @@ class _Function:
         return self.result
 
 
+class _SequenceFunction(_Function):
+    def __init__(self, results):
+        super().__init__()
+        self.results = iter(results)
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        return next(self.results)
+
+
 def _library(down=0, up=0, *, down_error=None, up_error=None):
     names = (
         "nemu_connect", "nemu_disconnect", "nemu_get_display_id",
@@ -242,6 +252,141 @@ def test_down_and_up_accepted_produce_native_receipt(monkeypatch):
     assert receipt.release_status == "CONFIRMED"
     assert receipt.python_call_returned is True
     assert receipt.capture_point == receipt.mapped_nemu_point == (100, 200)
+
+
+def test_swipe_quarantined_session_makes_zero_native_calls():
+    library = _library()
+    backend = _backend(library)
+    backend.session_quarantined = True
+
+    with pytest.raises(RuntimeError, match="session_quarantined"):
+        backend.input_swipe(100, 200, 300, 200, 30)
+
+    assert library.nemu_input_event_touch_down.calls == []
+    assert library.nemu_input_event_touch_up.calls == []
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "reason"),
+    (
+        ("connect_id", None, "session_not_connected"),
+        ("session_generation", 0, "session_not_connected"),
+        ("display_id", None, "display_id_invalid"),
+    ),
+)
+def test_swipe_invalid_session_identity_makes_zero_native_calls(
+    attribute, value, reason
+):
+    library = _library()
+    backend = _backend(library)
+    setattr(backend, attribute, value)
+
+    with pytest.raises(RuntimeError, match=reason):
+        backend.input_swipe(100, 200, 300, 200, 30)
+
+    assert library.nemu_input_event_touch_down.calls == []
+    assert library.nemu_input_event_touch_up.calls == []
+
+
+def test_swipe_unhealthy_session_is_rejected_before_native_delivery():
+    library = _library()
+    backend = _backend(library)
+    backend._health_adb = None
+
+    with pytest.raises(NemuInputDispatchError) as caught:
+        backend.input_swipe(100, 200, 300, 200, 30)
+
+    assert caught.value.receipt.delivery_status == "REJECTED_BEFORE_DELIVERY"
+    assert library.nemu_input_event_touch_down.calls == []
+    assert library.nemu_input_event_touch_up.calls == []
+
+
+def test_swipe_rejected_first_down_stops_without_release_or_quarantine(monkeypatch):
+    monkeypatch.setattr("core.control.nemu.time.sleep", lambda _seconds: None)
+    library = _library(down=5)
+    backend = _backend(library)
+
+    with pytest.raises(NemuInputDispatchError) as caught:
+        backend.input_swipe(100, 200, 300, 200, 30)
+
+    receipt = caught.value.receipt
+    assert receipt.delivery_status == "REJECTED_BEFORE_DELIVERY"
+    assert receipt.touch_up_called is False
+    assert len(library.nemu_input_event_touch_down.calls) == 1
+    assert library.nemu_input_event_touch_up.calls == []
+    assert backend.session_quarantined is False
+
+
+def test_swipe_rejected_later_down_stops_and_quarantines(monkeypatch):
+    monkeypatch.setattr("core.control.nemu.time.sleep", lambda _seconds: None)
+    library = _library()
+    library.nemu_input_event_touch_down = _SequenceFunction((0, 7, 0))
+    backend = _backend(library)
+
+    with pytest.raises(NemuInputDispatchError) as caught:
+        backend.input_swipe(100, 200, 300, 200, 30)
+
+    receipt = caught.value.receipt
+    assert receipt.delivery_status == "UNKNOWN_AFTER_PARTIAL_DISPATCH"
+    assert receipt.release_status == "UNKNOWN"
+    assert len(library.nemu_input_event_touch_down.calls) == 2
+    assert library.nemu_input_event_touch_up.calls == []
+    assert backend.session_quarantined is True
+
+
+def test_swipe_unknown_down_stops_and_quarantines(monkeypatch):
+    monkeypatch.setattr("core.control.nemu.time.sleep", lambda _seconds: None)
+    library = _library(down=-2)
+    backend = _backend(library)
+
+    with pytest.raises(NemuInputDispatchError) as caught:
+        backend.input_swipe(100, 200, 300, 200, 30)
+
+    assert caught.value.receipt.delivery_status == "UNKNOWN_AFTER_EXCEPTION"
+    assert len(library.nemu_input_event_touch_down.calls) == 1
+    assert library.nemu_input_event_touch_up.calls == []
+    assert backend.session_quarantined is True
+
+
+@pytest.mark.parametrize("up_code", (9, -2))
+def test_swipe_nonaccepted_up_is_partial_and_quarantines(monkeypatch, up_code):
+    monkeypatch.setattr("core.control.nemu.time.sleep", lambda _seconds: None)
+    library = _library(down=0, up=up_code)
+    backend = _backend(library)
+
+    with pytest.raises(NemuInputDispatchError) as caught:
+        backend.input_swipe(100, 200, 300, 200, 30)
+
+    assert caught.value.receipt.delivery_status == "UNKNOWN_AFTER_PARTIAL_DISPATCH"
+    assert caught.value.receipt.release_status == "UNKNOWN"
+    assert backend.session_quarantined is True
+
+
+def test_swipe_python_exception_quarantines_without_fallback(monkeypatch):
+    monkeypatch.setattr("core.control.nemu.time.sleep", lambda _seconds: None)
+    library = _library(down_error=OSError("native swipe fault"))
+    backend = _backend(library)
+
+    with pytest.raises(NemuInputDispatchError) as caught:
+        backend.input_swipe(100, 200, 300, 200, 30)
+
+    assert caught.value.receipt.delivery_status == "UNKNOWN_AFTER_EXCEPTION"
+    assert backend.session_quarantined is True
+    assert library.nemu_input_event_touch_up.calls == []
+
+
+def test_swipe_all_native_calls_accepted_produce_receipt(monkeypatch):
+    monkeypatch.setattr("core.control.nemu.time.sleep", lambda _seconds: None)
+    library = _library()
+    backend = _backend(library)
+
+    receipt = backend.input_swipe(100, 200, 300, 200, 30)
+
+    assert receipt.delivery_status == "NATIVE_ACCEPTED"
+    assert receipt.release_status == "CONFIRMED"
+    assert len(library.nemu_input_event_touch_down.calls) == 3
+    assert len(library.nemu_input_event_touch_up.calls) == 1
+    assert backend.session_quarantined is False
 
 
 def test_unproven_process_and_foreground_block_before_native_delivery():

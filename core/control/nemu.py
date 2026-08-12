@@ -231,14 +231,120 @@ class NEMU(IADB):
                 logger.exception("NEMUIPC连接失败后的资源清理也失败")
             raise
 
-    def input_swipe(self, x1: int, y1: int, x2: int, y2: int, millisecond: int = 100) -> None:
+    def input_swipe(
+        self, x1: int, y1: int, x2: int, y2: int, millisecond: int = 100
+    ) -> NemuTouchReceipt:
         ensure_automation_allowed("通过 NEMU 滑动游戏界面")
-        points = swipe_path((x1, y1), (x2, y2), millisecond)
-        for point in points:
-            self.nemu.nemu_input_event_touch_down(self.connect_id, self.display_id, *point)
-            time.sleep(0.01)
-        self.nemu.nemu_input_event_touch_up(self.connect_id, self.display_id)
+        if self.session_quarantined:
+            raise RuntimeError("nemu_session_quarantined")
+        if self.connect_id is None or self.session_generation <= 0:
+            raise RuntimeError("nemu_session_not_connected")
+        if self.display_id is None or int(self.display_id) < 0:
+            raise RuntimeError("nemu_display_id_invalid")
+
+        capture_points = tuple(
+            (int(point[0]), int(point[1]))
+            for point in swipe_path((x1, y1), (x2, y2), millisecond)
+        )
+        if not capture_points:
+            raise RuntimeError("nemu_swipe_path_empty")
+        mapped_points = tuple(
+            map_capture_to_nemu(
+                point,
+                capture_size=(self.width, self.height),
+                display_size=(self.width, self.height),
+                rotation=0,
+            )
+            for point in capture_points
+        )
+        builder = NemuTouchReceiptBuilder(
+            instance_id=str(self.device.index),
+            display_id=int(self.display_id),
+            session_generation=self.session_generation,
+            capture_size=(self.width, self.height),
+            display_size=(self.width, self.height),
+            rotation=0,
+            capture_point=capture_points[0],
+            mapped_nemu_point=mapped_points[0],
+        )
+        healthy, health_reasons = self.input_health()
+        if not healthy:
+            builder.delivery = DeliveryStatus.REJECTED_BEFORE_DELIVERY
+            builder.reasons.extend(health_reasons)
+            receipt = builder.finish(python_call_returned=True)
+            self.last_touch_receipt = receipt
+            raise NemuInputDispatchError(receipt)
+
+        accepted_down = False
+        try:
+            for point_index, point in enumerate(mapped_points):
+                builder.down_called = True
+                builder.down_code = int(self.nemu.nemu_input_event_touch_down(
+                    self.connect_id, self.display_id, *point
+                ))
+                builder.down_status = self._native_status(builder.down_code)
+                if builder.down_status is NativeCallStatus.REJECTED:
+                    builder.delivery = (
+                        DeliveryStatus.UNKNOWN_AFTER_PARTIAL_DISPATCH
+                        if accepted_down
+                        else DeliveryStatus.REJECTED_BEFORE_DELIVERY
+                    )
+                    builder.release = (
+                        ReleaseStatus.UNKNOWN if accepted_down else ReleaseStatus.NOT_REQUIRED
+                    )
+                    builder.reasons.append(
+                        f"swipe_touch_down_native_rejected_at_{point_index}"
+                    )
+                    if accepted_down:
+                        self.session_quarantined = True
+                    receipt = builder.finish(python_call_returned=True)
+                    self.last_touch_receipt = receipt
+                    raise NemuInputDispatchError(receipt)
+                if builder.down_status is NativeCallStatus.UNKNOWN:
+                    builder.delivery = DeliveryStatus.UNKNOWN_AFTER_EXCEPTION
+                    builder.release = ReleaseStatus.UNKNOWN
+                    builder.reasons.append(
+                        f"swipe_touch_down_return_code_unknown_at_{point_index}"
+                    )
+                    self.session_quarantined = True
+                    receipt = builder.finish(python_call_returned=True)
+                    self.last_touch_receipt = receipt
+                    raise NemuInputDispatchError(receipt)
+                accepted_down = True
+                time.sleep(0.01)
+
+            builder.up_called = True
+            builder.up_code = int(self.nemu.nemu_input_event_touch_up(
+                self.connect_id, self.display_id
+            ))
+            builder.up_status = self._native_status(builder.up_code)
+            if builder.up_status is not NativeCallStatus.ACCEPTED:
+                builder.delivery = DeliveryStatus.UNKNOWN_AFTER_PARTIAL_DISPATCH
+                builder.release = ReleaseStatus.UNKNOWN
+                builder.reasons.append("swipe_touch_up_not_accepted")
+                self.session_quarantined = True
+                receipt = builder.finish(python_call_returned=True)
+                self.last_touch_receipt = receipt
+                raise NemuInputDispatchError(receipt)
+
+            builder.delivery = DeliveryStatus.NATIVE_ACCEPTED
+            builder.release = ReleaseStatus.CONFIRMED
+            receipt = builder.finish(python_call_returned=True)
+            self.last_touch_receipt = receipt
+        except NemuInputDispatchError:
+            raise
+        except Exception:
+            builder.delivery = DeliveryStatus.UNKNOWN_AFTER_EXCEPTION
+            builder.release = (
+                ReleaseStatus.UNKNOWN if builder.down_called else ReleaseStatus.NOT_REQUIRED
+            )
+            builder.reasons.append("swipe_python_exception_after_native_call")
+            self.session_quarantined = True
+            receipt = builder.finish(python_call_returned=False)
+            self.last_touch_receipt = receipt
+            raise NemuInputDispatchError(receipt)
         time.sleep(0.05)
+        return receipt
 
 
     @staticmethod

@@ -11,6 +11,7 @@ import core.control.control as control_module
 from core.control.adb import ADB
 from core.control.adb_port import EmulatorInfo, EmulatorType
 from core.control.nemu import NEMU
+from core.control.nemu_receipt import NemuTouchReceipt
 from core.exception.exceptions import StopExecution
 from core.image.utils import match_template
 from core.services.read_only_policy import ActionIntent
@@ -591,6 +592,43 @@ class FakeSwipeControl:
             self.on_swipe(len(self.swipes))
         if self.max_calls is not None and len(self.swipes) > self.max_calls:
             raise AssertionError("swipe segmentation did not make progress")
+
+
+def test_bound_swipe_executor_propagates_native_receipt():
+    receipt = NemuTouchReceipt(
+        schema_version="1.0",
+        attempt_id="attempt",
+        dispatch_id="dispatch",
+        instance_id="0",
+        display_id=0,
+        session_generation=1,
+        capture_width=1280,
+        capture_height=720,
+        display_width=1280,
+        display_height=720,
+        rotation=0,
+        capture_point=(100, 100),
+        mapped_nemu_point=(100, 100),
+        touch_down_called=True,
+        touch_down_return_code=0,
+        touch_down_status="ACCEPTED",
+        touch_up_called=True,
+        touch_up_return_code=0,
+        touch_up_status="ACCEPTED",
+        python_call_returned=True,
+        delivery_status="NATIVE_ACCEPTED",
+        release_status="CONFIRMED",
+        started_at="2026-08-13T00:00:00+08:00",
+        finished_at="2026-08-13T00:00:01+08:00",
+    )
+
+    class Backend:
+        def input_swipe(self, *_args):
+            return receipt
+
+    executor = control_module._create_bound_input_executor(Backend())
+
+    assert executor.swipe(((100, 100), (300, 250)), 80) is receipt
 
 
 def _patch_swipe_runtime(monkeypatch, fake_control):

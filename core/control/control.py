@@ -97,7 +97,7 @@ class _BoundControlInputExecutor:
         duration_ms: int,
     ):
         start, end = physical_trajectory[0], physical_trajectory[-1]
-        self.__backend.input_swipe(
+        return self.__backend.input_swipe(
             int(start[0]), int(start[1]), int(end[0]), int(end[1]), int(duration_ms)
         )
 
