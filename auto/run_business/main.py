@@ -932,6 +932,8 @@ def run(
                 confirmed_books=confirmed_before,
                 on_book_confirmed=book_committed,
                 on_purchase_confirmed=purchase_committed,
+                ledger_context=ledger_context,
+                leg_id=leg_id,
             )
             if not buy_result:
                 return False

@@ -20,6 +20,7 @@ from core.image.image import Image
 from core.module.bgr import BGR
 from core.module.hsv import HSV
 from core.preset import click, find_text, go_home
+from core.services.session_evidence import capture_session_evidence
 from auto.module.strength import exit_negotiation_safely
 
 
@@ -27,6 +28,28 @@ BUY_BARGAIN_TIMEOUT = 45
 BUY_RESULT_TIMEOUT = 3.0
 BUY_RESULT_POLL_INTERVAL = 0.2
 CARGO_CAPACITY_ROI = (1080, 350, 1270, 430)
+
+
+def _capture_buy_evidence(
+    state_transition_name: str,
+    *,
+    ledger_context: dict | None,
+    leg_id: str,
+    current_page_classification: str,
+) -> None:
+    """Record opt-in buy-flow evidence without affecting trade decisions."""
+    try:
+        capture_session_evidence(
+            state_transition_name,
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification=current_page_classification,
+        )
+    except Exception as error:
+        logger.warning(
+            "Unable to capture buy-flow evidence for "
+            f"{state_transition_name}: {type(error).__name__}"
+        )
 
 
 def _buy_tap(pos: tuple[int, int]) -> object:
@@ -90,6 +113,8 @@ def buy_business(
     confirmed_books: int = 0,
     on_book_confirmed: Callable[[int], None] | None = None,
     on_purchase_confirmed: Callable[[], None] | None = None,
+    ledger_context: dict | None = None,
+    leg_id: str = "",
 ):
     """
     购买商品
@@ -100,20 +125,52 @@ def buy_business(
     :param max_book: 最大使用进货书量
     """
 
+    _capture_buy_evidence(
+        "BUY_FLOW_START",
+        ledger_context=ledger_context,
+        leg_id=leg_id,
+        current_page_classification=(
+            f"BUY_PAGE_READY|primary={len(primary_goods)}|"
+            f"secondary={len(secondary_goods)}|max_book={max_book}"
+        ),
+    )
+
     def process_goods(book, good):
         nonlocal cargo_full
         if (boatload := get_boatload()) == 0:
             cargo_full = _confirm_cargo_full()
+            _capture_buy_evidence(
+                "BUY_CARGO_CAPACITY_OBSERVE",
+                ledger_context=ledger_context,
+                leg_id=leg_id,
+                current_page_classification=(
+                    "CARGO_FULL_CONFIRMED" if cargo_full else "CARGO_ZERO_UNVERIFIED"
+                ),
+            )
             if cargo_full:
                 logger.info("载货量已连续确认满载，跳过购买")
             else:
                 logger.warning("载货条显示无剩余空间，但未确认满载数值，停止购买")
             return True
+        _capture_buy_evidence(
+            "BUY_GOOD_BEFORE",
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification=f"GOOD_SELECTION_PENDING|good={good}|book={book}",
+        )
         result, book = buy_good(
             good,
             book,
             max_book,
             on_book_confirmed=on_book_confirmed,
+        )
+        _capture_buy_evidence(
+            "BUY_GOOD_AFTER",
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification=(
+                f"GOOD_SELECTION_RESULT|good={good}|result={result}|book={book}"
+            ),
         )
         if result is None:
             logger.info(f"进货书已用完")
@@ -136,20 +193,74 @@ def buy_business(
         if (book := process_goods(book, good)) is True:
             break
     if not is_empty_goods():
+        _capture_buy_evidence(
+            "BUY_BARGAIN_BEFORE",
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification=f"BUY_CART_NONEMPTY|attempts={num}",
+        )
         if not click_bargain_button(num):
+            _capture_buy_evidence(
+                "BUY_BARGAIN_AFTER",
+                ledger_context=ledger_context,
+                leg_id=leg_id,
+                current_page_classification="BARGAIN_NOT_CONFIRMED",
+            )
             logger.error("购买议价未完成")
             return False
+        _capture_buy_evidence(
+            "BUY_BARGAIN_AFTER",
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification="BARGAIN_COMPLETED",
+        )
+        _capture_buy_evidence(
+            "BUY_CONFIRM_BEFORE",
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification="PURCHASE_CONFIRMATION_PENDING",
+        )
         if not click_buy_button():
+            _capture_buy_evidence(
+                "BUY_CONFIRM_AFTER",
+                ledger_context=ledger_context,
+                leg_id=leg_id,
+                current_page_classification="PURCHASE_NOT_CONFIRMED",
+            )
             logger.error("点击购买后未确认成交")
             return False
+        _capture_buy_evidence(
+            "BUY_CONFIRM_AFTER",
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification="PURCHASE_CONFIRMED",
+        )
         if on_purchase_confirmed is not None:
             on_purchase_confirmed()
         time.sleep(0.5)
         _buy_tap((896, 676))
+        _capture_buy_evidence(
+            "BUY_FLOW_COMPLETE",
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification=f"BUY_COMPLETED|confirmed_books={book}",
+        )
         return {"success": True, "confirmed_books": book} if detailed else True
     elif cargo_full:
+        _capture_buy_evidence(
+            "BUY_FLOW_COMPLETE",
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification=f"CARGO_ALREADY_FULL|confirmed_books={book}",
+        )
         return {"success": True, "confirmed_books": book} if detailed else True
     else:
+        _capture_buy_evidence(
+            "BUY_FLOW_FAILED",
+            ledger_context=ledger_context,
+            leg_id=leg_id,
+            current_page_classification="BUY_CART_EMPTY",
+        )
         logger.error("未购买物品")
         go_home()
         return False
