@@ -616,12 +616,16 @@ def _begin_departure(
             ),
         )
     else:
+        departure_outcome = str(
+            getattr(travel, "last_wait_outcome", "DEPARTURE_NOT_ESTABLISHED")
+        )
         _capture_run_business_evidence(
             "DEPARTURE_TRANSIT_NOT_VERIFIED",
             ledger_context=ledger_context,
             leg_id=leg_id,
             current_page_classification=(
                 f"origin={origin}|destination={destination}|transit_verified=false"
+                f"|departure_outcome={departure_outcome}"
             ),
         )
     return travel

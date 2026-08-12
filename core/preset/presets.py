@@ -337,7 +337,7 @@ def click_station(
     unavailable_reason = station_unavailable_reason(name)
     if unavailable_reason:
         logger.warning(f"拒绝前往未开放站点: {unavailable_reason}")
-        return STATION(False)
+        return STATION(False, departure_outcome="STATION_UNAVAILABLE")
     if screenshot().match_template(RESOURCES_PATH / "main_map.png", 0.95) == False:
         logger.info("未检测到主地图界面，返回主地图")
         go_home()
@@ -374,7 +374,7 @@ def click_station(
         )
         if move is None:
             logger.error("没有该站点的坐标信息")
-            return STATION(False)
+            return STATION(False, departure_outcome="ROUTE_VECTOR_UNAVAILABLE")
         move_x, move_y = move
         base_move = _world_map_pan_vector(station, name)
         best_anchor_distance = max(abs(base_move[0]), abs(base_move[1]))
@@ -465,7 +465,7 @@ def click_station(
             input_tap((target_anchor[1], target_anchor[2]))
         else:
             logger.error(f"未找到站点: {name}")
-            return STATION(False)
+            return STATION(False, departure_outcome="TARGET_STATION_NOT_FOUND")
         # Clicking a station label can first recenter the map and place the red
         # destination pin without opening the action panel. Reacquire the
         # target in the new frame and retry the station click before failing.
@@ -485,7 +485,10 @@ def click_station(
                 if _wait_for_departure():
                     return STATION(True)
                 logger.error("站台过渡超时，未确认进入自动巡航")
-                return STATION(False)
+                return STATION(
+                    False,
+                    departure_outcome="DEPARTURE_TRANSITION_NOT_CONFIRMED",
+                )
             if selection_attempt == 2:
                 break
 
@@ -510,9 +513,10 @@ def click_station(
             )
             input_tap(retry_pos)
         logger.error(f"未找到前往目的地按钮: {name}")
+        return STATION(False, departure_outcome="GO_STATION_BUTTON_NOT_FOUND")
     else:
         logger.error("没有该站点的坐标信息")
-    return STATION(False)
+        return STATION(False, departure_outcome="ROUTE_COORDINATES_UNAVAILABLE")
 
 
 def get_station(

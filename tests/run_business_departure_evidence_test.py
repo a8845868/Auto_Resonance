@@ -74,7 +74,10 @@ def test_begin_departure_records_missing_transit_without_inventing_request(monke
         ledger, origin="A", destination="B", leg_id="A|B"
     ) is travel
     assert [call[0] for call in calls] == ["DEPARTURE_TRANSIT_NOT_VERIFIED"]
-    assert calls[0][3] == "origin=A|destination=B|transit_verified=false"
+    assert calls[0][3] == (
+        "origin=A|destination=B|transit_verified=false"
+        "|departure_outcome=TEST_OUTCOME"
+    )
 
 
 def test_arrival_wait_records_success_and_failure_without_changing_result(monkeypatch):

@@ -41,7 +41,13 @@ def _should_use_speed_boost(color: BGR, enabled: bool) -> bool:
 
 class STATION:
 
-    def __init__(self, station: bool, is_destine: bool = False) -> None:
+    def __init__(
+        self,
+        station: bool,
+        is_destine: bool = False,
+        *,
+        departure_outcome: str = "NOT_STARTED",
+    ) -> None:
         """
         站点类
 
@@ -52,7 +58,7 @@ class STATION:
         """
         self.station = station
         self.is_destine = is_destine
-        self.last_wait_outcome = "NOT_STARTED"
+        self.last_wait_outcome = str(departure_outcome)
 
     def __bool__(self) -> bool:
         return self.station
@@ -63,7 +69,8 @@ class STATION:
             等待进入站点
         """
         if self.station == False:
-            self.last_wait_outcome = "DEPARTURE_NOT_ESTABLISHED"
+            if self.last_wait_outcome == "NOT_STARTED":
+                self.last_wait_outcome = "DEPARTURE_NOT_ESTABLISHED"
             logger.error("进入列车行驶状态失败")
             return False
         if self.is_destine:

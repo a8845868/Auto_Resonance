@@ -26,6 +26,15 @@ def test_station_wait_reports_departure_not_established():
     assert travel.last_wait_outcome == "DEPARTURE_NOT_ESTABLISHED"
 
 
+def test_station_wait_preserves_specific_departure_failure():
+    travel = station_module.STATION(
+        False,
+        departure_outcome="GO_STATION_BUTTON_NOT_FOUND",
+    )
+    assert travel.wait() is False
+    assert travel.last_wait_outcome == "GO_STATION_BUTTON_NOT_FOUND"
+
+
 def test_station_wait_reports_destination_already_confirmed():
     travel = station_module.STATION(True, is_destine=True)
     assert travel.wait() is True
