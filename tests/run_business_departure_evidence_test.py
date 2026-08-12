@@ -100,3 +100,21 @@ def test_arrival_wait_records_success_and_failure_without_changing_result(monkey
         "ARRIVAL_NOT_VERIFIED_BY_NAVIGATION_WAIT|monitor_outcome=TEST_OUTCOME",
     ]
     assert all(call[1] is ledger and call[2] == "A|B" for call in calls)
+
+
+def test_departure_classification_preserves_outcome_for_adjacent_boundaries():
+    travel = _Travel(False, outcome="GO_STATION_BUTTON_NOT_FOUND")
+
+    assert business._departure_boundary_classification(travel) == (
+        "DEPARTURE_NOT_VERIFIED"
+        "|departure_outcome=GO_STATION_BUTTON_NOT_FOUND"
+    )
+
+
+def test_departure_classification_preserves_success_state():
+    travel = _Travel(True, outcome="DEPARTURE_TRANSIT_CONFIRMED")
+
+    assert business._departure_boundary_classification(travel) == (
+        "TRAIN_IN_TRANSIT_VERIFIED_BY_DEPARTURE"
+        "|departure_outcome=DEPARTURE_TRANSIT_CONFIRMED"
+    )

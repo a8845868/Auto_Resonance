@@ -566,6 +566,18 @@ def should_issue_departure(
     return resume_action != "WAIT_ARRIVAL" and current_city != destination
 
 
+def _departure_outcome(travel) -> str:
+    return str(getattr(travel, "last_wait_outcome", "UNKNOWN"))
+
+
+def _departure_boundary_classification(travel) -> str:
+    return (
+        "TRAIN_IN_TRANSIT_VERIFIED_BY_DEPARTURE"
+        if travel
+        else "DEPARTURE_NOT_VERIFIED"
+    ) + f"|departure_outcome={_departure_outcome(travel)}"
+
+
 def _begin_departure(
     ledger_context: dict | None,
     *,
@@ -616,16 +628,13 @@ def _begin_departure(
             ),
         )
     else:
-        departure_outcome = str(
-            getattr(travel, "last_wait_outcome", "DEPARTURE_NOT_ESTABLISHED")
-        )
         _capture_run_business_evidence(
             "DEPARTURE_TRANSIT_NOT_VERIFIED",
             ledger_context=ledger_context,
             leg_id=leg_id,
             current_page_classification=(
                 f"origin={origin}|destination={destination}|transit_verified=false"
-                f"|departure_outcome={departure_outcome}"
+                f"|departure_outcome={_departure_outcome(travel)}"
             ),
         )
     return travel
@@ -1016,25 +1025,18 @@ def run(
                     destination=city.sell_city_name,
                     leg_id=leg_id,
                 )
+                departure_classification = _departure_boundary_classification(travel)
                 _capture_run_business_evidence(
                     "DEPARTURE_CONFIRMATION_AFTER",
                     ledger_context=ledger_context,
                     leg_id=leg_id,
-                    current_page_classification=(
-                        "TRAIN_IN_TRANSIT_VERIFIED_BY_DEPARTURE"
-                        if travel
-                        else "DEPARTURE_NOT_VERIFIED"
-                    ),
+                    current_page_classification=departure_classification,
                 )
                 _capture_run_business_evidence(
                     "ARRIVAL_CONFIRMATION_BEFORE",
                     ledger_context=ledger_context,
                     leg_id=leg_id,
-                    current_page_classification=(
-                        "TRAIN_IN_TRANSIT_VERIFIED_BY_DEPARTURE"
-                        if travel
-                        else "DEPARTURE_NOT_VERIFIED"
-                    ),
+                    current_page_classification=departure_classification,
                 )
                 if not _wait_for_arrival_with_evidence(
                     travel,

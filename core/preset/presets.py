@@ -483,7 +483,10 @@ def click_station(
                     on_departure_requested()
                 time.sleep(1.0)
                 if _wait_for_departure():
-                    return STATION(True)
+                    return STATION(
+                        True,
+                        departure_outcome="DEPARTURE_TRANSIT_CONFIRMED",
+                    )
                 logger.error("站台过渡超时，未确认进入自动巡航")
                 return STATION(
                     False,
