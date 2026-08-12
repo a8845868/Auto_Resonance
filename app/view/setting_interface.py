@@ -8,15 +8,20 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QLabel, QWidget
-from qfluentwidgets import ExpandLayout, PrimaryPushSettingCard
+from qfluentwidgets import (
+    ComboBoxSettingCard,
+    ExpandLayout,
+    PrimaryPushSettingCard,
+    SwitchSettingCard,
+)
 from qfluentwidgets import FluentIcon as FIF
-from qfluentwidgets import ScrollArea, SettingCardGroup, SwitchSettingCard
+from qfluentwidgets import ScrollArea, SettingCardGroup
 
 from app.common.config import cfg
 from app.common.style_sheet import StyleSheet
 from app.components.settings.custom_adb_setting_card import CustomAdbSettingCard
 from app.components.settings.line_edit_setting_card import LineEditSettingCard
-from core.model.config import config
+from app.components.settings.spin_box_setting_card import SpinBoxSettingCard
 from core.model.emulator import emulator_list
 
 MIRROR_URL = "https://mirrorchyan.com/zh/projects?rid=Auto_Resonance&source=auto-resonance-release"
@@ -35,6 +40,9 @@ class SettingInterface(ScrollArea):
 
         # music folders
         self.musicInThisPCGroup = SettingCardGroup("配置", self.scrollWidget)
+        self.lifecycleGroup = SettingCardGroup("任务资源管理", self.scrollWidget)
+        self.ocrGroup = SettingCardGroup("OCR 识别", self.scrollWidget)
+        self.selfHealingGroup = SettingCardGroup("Codex 自愈", self.scrollWidget)
         self.mirrorCdkCard = LineEditSettingCard(
             cfg.mirrorCdk,
             "Mirror酱 CDK",
@@ -79,6 +87,87 @@ class SettingInterface(ScrollArea):
             "修改该内容自动变为自定义ADB端口",
             parent=self.musicInThisPCGroup,
         )
+        self.autoGameLifecycleCard = SwitchSettingCard(
+            FIF.PLAY,
+            "任务自动管理游戏进程",
+            "队列有任务时启动并管理当前 MuMu 多开实例和游戏",
+            configItem=cfg.enableAutoGameLifecycle,
+            parent=self.lifecycleGroup,
+        )
+        self.autoStartEmulatorCard = SwitchSettingCard(
+            FIF.GAME,
+            "模拟器未启动时自动开启",
+            "按当前选择的 MuMu 安装路径和多开 index 精确启动对应实例",
+            configItem=cfg.autoStartEmulator,
+            parent=self.lifecycleGroup,
+        )
+        self.closeGameWhenIdleCard = SwitchSettingCard(
+            FIF.POWER_BUTTON,
+            "队列结束后关闭游戏",
+            "关闭后会保留游戏；若同时关闭模拟器，游戏仍会随模拟器结束",
+            configItem=cfg.closeGameWhenIdle,
+            parent=self.lifecycleGroup,
+        )
+        self.closeEmulatorWhenIdleCard = SwitchSettingCard(
+            FIF.POWER_BUTTON,
+            "队列结束后同时关闭模拟器",
+            "开启后，队列结束时还会关闭对应 MuMu 多开实例",
+            configItem=cfg.closeEmulatorWhenIdle,
+            parent=self.lifecycleGroup,
+        )
+        self.autoConfirmResourceUpdateCard = SwitchSettingCard(
+            FIF.DOWNLOAD,
+            "自动确认资源更新",
+            "仅在识别到受控资源更新且大小未超过配置上限时确认",
+            configItem=cfg.autoConfirmResourceUpdate,
+            parent=self.lifecycleGroup,
+        )
+        self.personalStartupEpisodeCard = SwitchSettingCard(
+            FIF.PLAY,
+            "启动任务前自动准备游戏",
+            "自动启动指定模拟器和游戏，处理已知启动页面，并恢复到后续任务可以接管的已知页面。不会固定前往某个城市。",
+            configItem=cfg.enablePersonalStartupEpisode,
+            parent=self.lifecycleGroup,
+        )
+        self.maximumResourceUpdateMbCard = SpinBoxSettingCard(
+            cfg.maximumResourceUpdateMb,
+            FIF.DOWNLOAD,
+            "资源更新最大允许大小（MB）",
+            "实际识别大小超过该上限时停止，不执行确认",
+            spin_box_min=1,
+            spin_box_max=102400,
+            parent=self.lifecycleGroup,
+        )
+        self.ocrBackendCard = ComboBoxSettingCard(
+            cfg.ocrBackend,
+            FIF.SETTING,
+            "OCR 引擎（重启后生效）",
+            "PP-OCRv4 为内置兼容后端；PP-OCRv6 Medium 需先安装可选 OCR 资源",
+            texts=["PP-OCRv4（内置）", "PP-OCRv6 Medium（可选）"],
+            parent=self.ocrGroup,
+        )
+        self.ocrProviderCard = ComboBoxSettingCard(
+            cfg.ocrProvider,
+            FIF.SPEED_HIGH,
+            "OCR 运行设备（重启后生效）",
+            "自动选择、强制 CPU，或优先 CUDA；CUDA 不可用时会明确回退 CPU",
+            texts=["自动", "CPU", "CUDA"],
+            parent=self.ocrGroup,
+        )
+        self.codexSelfHealingCard = SwitchSettingCard(
+            FIF.SYNC,
+            "启用 Codex 自愈智能体",
+            "异常会保留本地现场；开启后在隔离工作树中启动 Codex 诊断",
+            configItem=cfg.enableCodexSelfHealing,
+            parent=self.selfHealingGroup,
+        )
+        self.codexIsolatedRepairCard = SwitchSettingCard(
+            FIF.SETTING,
+            "允许生成隔离修复",
+            "Codex 可在隔离沙箱内修改工作树并运行测试；候选仍需人工验证",
+            configItem=cfg.allowCodexIsolatedRepair,
+            parent=self.selfHealingGroup,
+        )
         # self.adbOrderCard = LineEditSettingCard(
         #     cfg.adbOrder,
         #     "ADB地址",
@@ -86,32 +175,10 @@ class SettingInterface(ScrollArea):
         #     "ADB地址",
         #     parent=self.musicInThisPCGroup,
         # )
-        self.isSpeedCard = SwitchSettingCard(
-            FIF.MARKET,
-            "是否自动加速",
-            "是否自动使用加速弹丸",
-            parent=self.musicInThisPCGroup,
-        )
-        self.isAutoPickCard = SwitchSettingCard(
-            FIF.TILES,
-            "是否自动拾取",
-            "是否自动拾取掉落物",
-            parent=self.musicInThisPCGroup,
-        )
-        self.isSpeedCard.setValue(config.global_config.is_speed)
-        self.isSpeedCard.switchButton.checkedChanged.connect(self.__onCheckedChanged)
-        self.isAutoPickCard.setValue(config.global_config.is_auto_pick)
-        self.isAutoPickCard.switchButton.checkedChanged.connect(self.__onCheckedChanged)
-
         self.mirrorCard.clicked.connect(
             lambda: QDesktopServices.openUrl(QUrl(MIRROR_URL))
         )
         self.__initWidget()
-
-    def __onCheckedChanged(self):
-        config.global_config.is_speed = self.isSpeedCard.isChecked()
-        config.global_config.is_auto_pick = self.isAutoPickCard.isChecked()
-        config.save_config()
 
     def __initWidget(self):
         self.resize(1000, 800)
@@ -139,13 +206,25 @@ class SettingInterface(ScrollArea):
         self.musicInThisPCGroup.addSettingCard(self.mirrorCdkCard)
         self.musicInThisPCGroup.addSettingCard(self.mirrorCard)
         self.musicInThisPCGroup.addSettingCard(self.adbOrderCard)
-        self.musicInThisPCGroup.addSettingCard(self.isSpeedCard)
-        self.musicInThisPCGroup.addSettingCard(self.isAutoPickCard)
+        self.lifecycleGroup.addSettingCard(self.autoGameLifecycleCard)
+        self.lifecycleGroup.addSettingCard(self.autoStartEmulatorCard)
+        self.lifecycleGroup.addSettingCard(self.closeGameWhenIdleCard)
+        self.lifecycleGroup.addSettingCard(self.closeEmulatorWhenIdleCard)
+        self.lifecycleGroup.addSettingCard(self.personalStartupEpisodeCard)
+        self.lifecycleGroup.addSettingCard(self.autoConfirmResourceUpdateCard)
+        self.lifecycleGroup.addSettingCard(self.maximumResourceUpdateMbCard)
+        self.ocrGroup.addSettingCard(self.ocrBackendCard)
+        self.ocrGroup.addSettingCard(self.ocrProviderCard)
+        self.selfHealingGroup.addSettingCard(self.codexSelfHealingCard)
+        self.selfHealingGroup.addSettingCard(self.codexIsolatedRepairCard)
 
         # add setting card group to layout
         self.expandLayout.setSpacing(28)
         self.expandLayout.setContentsMargins(36, 10, 36, 0)
         self.expandLayout.addWidget(self.musicInThisPCGroup)
+        self.expandLayout.addWidget(self.lifecycleGroup)
+        self.expandLayout.addWidget(self.ocrGroup)
+        self.expandLayout.addWidget(self.selfHealingGroup)
 
     def showEvent(self, event):
         """当切换到该页面时，触发这个事件"""

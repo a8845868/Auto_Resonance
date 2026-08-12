@@ -5,8 +5,21 @@ LastEditTime: 2024-04-14 14:20:47
 LastEditors: Night-stars-1 nujj1042633805@gmail.com
 """
 
-from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
+import re
+
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QColor,
+    QFontDatabase,
+    QTextCharFormat,
+    QTextCursor,
+)
+from PySide6.QtWidgets import (
+    QLabel,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 from qfluentwidgets import PlainTextEdit, ScrollArea
 
 from core.logger import logger
@@ -20,12 +33,98 @@ class LoguruHandler(QObject):
     def __init__(self, widget: PlainTextEdit):
         super().__init__()
         self.widget = widget
-        self.widget.setReadOnly(True)
+        if hasattr(self.widget, "setReadOnly"):
+            self.widget.setReadOnly(True)
         
-        self.new_log_signal.connect(self.widget.appendPlainText)
+        receiver = (
+            self.widget.appendLog
+            if hasattr(self.widget, "appendLog")
+            else self.widget.appendPlainText
+        )
+        self.new_log_signal.connect(receiver)
 
     def write(self, message):
-        self.new_log_signal.emit(message[:-1])
+        message = message.rstrip("\r\n")
+        if message:
+            self.new_log_signal.emit(message)
+
+
+class StructuredLogWidget(QTextEdit):
+    """Colour-coded text log with stable columns and native text selection."""
+
+    _HISTORY_PATTERN = re.compile(
+        r"^(?P<time>\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s*-\s*"
+        r"(?P<level>[A-Z]+)\s*\|\s*"
+        r"(?:[^|]*?\s+-\s+)?(?P<message>.*)$"
+    )
+    _LEVEL_COLOURS = {
+        "TRACE": QColor("#8b949e"),
+        "DEBUG": QColor("#8b949e"),
+        "INFO": QColor("#3b8eea"),
+        "SUCCESS": QColor("#55b86a"),
+        "WARNING": QColor("#e5a445"),
+        "ERROR": QColor("#ef6461"),
+        "CRITICAL": QColor("#ff4d4f"),
+    }
+
+    def __init__(self, parent=None, maximum_rows=1000):
+        super().__init__(parent)
+        self.maximumRows = maximum_rows
+        self._scrollTimer = QTimer(self)
+        self._scrollTimer.setSingleShot(True)
+        self._scrollTimer.setInterval(0)
+        self._scrollTimer.timeout.connect(self._scrollToBottom)
+        self.setReadOnly(True)
+        self.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        self.document().setMaximumBlockCount(maximum_rows)
+        self.setStyleSheet(
+            "QTextEdit { border: 1px solid rgba(128,128,128,0.28); "
+            "border-radius: 6px; background: rgba(20,20,20,0.12); }"
+        )
+
+    def _scrollToBottom(self):
+        scroll_bar = self.verticalScrollBar()
+        scroll_bar.setValue(scroll_bar.maximum())
+
+    @classmethod
+    def parseLine(cls, line):
+        if "\x1f" in line:
+            parts = line.split("\x1f", 2)
+            if len(parts) == 3:
+                return tuple(part.strip() for part in parts)
+        match = cls._HISTORY_PATTERN.match(line.strip())
+        if match:
+            return (
+                match.group("level"),
+                match.group("time"),
+                match.group("message").strip(),
+            )
+        return "INFO", "--:--:--", line.strip()
+
+    def appendLog(self, line):
+        level, timestamp, message = self.parseLine(line)
+        cursor = QTextCursor(self.document())
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if not self.document().isEmpty():
+            cursor.insertBlock()
+
+        level_format = QTextCharFormat()
+        level_format.setForeground(
+            self._LEVEL_COLOURS.get(level, self._LEVEL_COLOURS["INFO"])
+        )
+        level_format.setFontWeight(700)
+        time_format = QTextCharFormat()
+        time_format.setForeground(QColor("#22b8cf"))
+        message_format = QTextCharFormat()
+
+        cursor.insertText(f"{level:<8} ", level_format)
+        cursor.insertText(f"{timestamp:<12}", time_format)
+        cursor.insertText(" │ ", message_format)
+        cursor.insertText(message, message_format)
+        # Restarting one owned timer coalesces history and live bursts into a
+        # single scroll operation.  Qt also stops it automatically on destroy.
+        self._scrollTimer.start()
 
 
 class LoggerInterface(ScrollArea):

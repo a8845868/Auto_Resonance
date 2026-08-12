@@ -1,0 +1,1016 @@
+"""Verified navigation from the current exchange NPC menu to BUY or SELL."""
+
+from __future__ import annotations
+
+import json
+import math
+import time
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Callable, Iterable
+
+import cv2 as cv
+from loguru import logger
+
+from core.control.control import input_swipe, input_tap, screenshot
+from core.services.city_navigation import (
+    CityNavigationState,
+    ExchangeEntryAdapter,
+    observe_city_frame,
+)
+from core.services.page_templates import (
+    EXCHANGE_MENU_TEMPLATE_PATH,
+    EXCHANGE_MENU_TEMPLATE_ROI,
+    _load_template,
+    match_page_template,
+)
+from core.services.read_only_policy import ActionIntent
+from core.services.runtime_control import RUNTIME_DIR
+from core.services.session_evidence import capture_session_evidence
+
+
+class ExchangeAction(str, Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+
+
+@dataclass(frozen=True)
+class ExchangeNavigationResult:
+    success: bool
+    action: ExchangeAction
+    source: str = "ocr_anchor"
+    reason: str = ""
+    clicked: tuple[int, int] | None = None
+    verified_frames: int = 0
+    diagnostic_path: str = ""
+    stage: str = ""
+    elapsed_seconds: float = 0.0
+
+
+def _capture_exchange_evidence(
+    state_transition_name: str,
+    result: ExchangeNavigationResult,
+) -> None:
+    """Record navigation evidence without changing the navigation outcome."""
+
+    try:
+        capture_session_evidence(
+            state_transition_name,
+            ledger_context=None,
+            leg_id="",
+            current_page_classification=(
+                f"stage={result.stage}|reason={result.reason or 'ok'}|"
+                f"clicked={result.clicked}"
+            ),
+        )
+    except Exception as error:
+        logger.warning(
+            "Unable to capture exchange-navigation evidence for "
+            f"{state_transition_name}: {type(error).__name__}"
+        )
+
+
+def _dispatch_evidence_reason(dispatch_result: object) -> str:
+    """Describe the guarded dispatch receipt without interpreting success."""
+
+    if dispatch_result is False:
+        return "read_only_denied"
+    receipt = getattr(dispatch_result, "receipt", None)
+    delivery_status = str(
+        getattr(dispatch_result, "delivery_status", "")
+        or getattr(receipt, "delivery_status", "")
+        or ""
+    )
+    release_status = str(
+        getattr(dispatch_result, "release_status", "")
+        or getattr(receipt, "release_status", "")
+        or ""
+    )
+    if delivery_status or release_status:
+        return (
+            f"delivery_status={delivery_status or 'unknown'},"
+            f"release_status={release_status or 'unknown'}"
+        )
+    return str(getattr(dispatch_result, "reason", "") or "call_returned")
+
+
+def _action(value: ExchangeAction | str) -> ExchangeAction:
+    return value if isinstance(value, ExchangeAction) else ExchangeAction(str(value).upper())
+
+
+def _items(frame: object) -> list[dict]:
+    if isinstance(frame, list):
+        return frame
+    if hasattr(frame, "ocr"):
+        return list(frame.ocr())
+    return []
+
+
+def _text(item: dict) -> str:
+    return str(item.get("text", "")).replace(" ", "")
+
+
+def _center(item: dict) -> tuple[int, int]:
+    points = item.get("position") or ()
+    if len(points) < 3:
+        raise ValueError("OCR item has no bounding box")
+    return (
+        int(round((float(points[0][0]) + float(points[2][0])) / 2)),
+        int(round((float(points[0][1]) + float(points[2][1])) / 2)),
+    )
+
+
+def exchange_menu_matches(items: Iterable[dict], *, frame_img=None) -> bool:
+    if match_page_template(
+        frame_img,
+        _load_template(EXCHANGE_MENU_TEMPLATE_PATH),
+        EXCHANGE_MENU_TEMPLATE_ROI,
+    ):
+        return True
+    return observe_city_frame(list(items)).state is CityNavigationState.EXCHANGE_MENU
+
+
+def exchange_page_matches(items: Iterable[dict], action: ExchangeAction | str) -> bool:
+    selected = _action(action)
+    observation = observe_city_frame(list(items))
+    return ExchangeEntryAdapter.page_matches(observation, selected.value)
+
+
+_CITY_ANCHOR_TOTAL_DISPATCH_LIMIT = 3
+_CITY_ANCHOR_STABLE_FRAME_COUNT = 3
+_CITY_ANCHOR_TEXT_JACCARD_MINIMUM = 0.85
+_CITY_ANCHOR_REDISPATCH_COOLDOWN_SECONDS = 1.5
+_CITY_ANCHOR_OBSERVATION_LIMIT = 36
+
+
+def _semantic_page_texts(items: Iterable[dict]) -> frozenset[str]:
+    """Return a city-page signature without unstable Latin detector noise."""
+
+    texts: set[str] = set()
+    for item in items:
+        text = _text(item)
+        if any("\u4e00" <= character <= "\u9fff" for character in text):
+            texts.add(text)
+    return frozenset(texts)
+
+
+def _text_jaccard(left: frozenset[str], right: frozenset[str]) -> float:
+    union = left | right
+    if not union:
+        return 0.0
+    return len(left & right) / len(union)
+
+
+def _stable_city_signatures(signatures: list[frozenset[str]]) -> bool:
+    if len(signatures) < _CITY_ANCHOR_STABLE_FRAME_COUNT:
+        return False
+    recent = signatures[-_CITY_ANCHOR_STABLE_FRAME_COUNT:]
+    return all(
+        _text_jaccard(recent[index - 1], recent[index])
+        >= _CITY_ANCHOR_TEXT_JACCARD_MINIMUM
+        for index in range(1, len(recent))
+    )
+
+
+def _city_anchor_candidates(items: Iterable[dict]) -> list[dict]:
+    candidates: list[dict] = []
+    for item in items:
+        if "交易所" not in _text(item) or not item.get("position"):
+            continue
+        try:
+            center_x, center_y = _center(item)
+        except (TypeError, ValueError):
+            continue
+        if 160 <= center_x <= 1000 and 40 <= center_y <= 500:
+            candidates.append(item)
+    return candidates
+
+
+def _unique_exchange_city_anchor(items: Iterable[dict]) -> dict | None:
+    anchors = _city_anchor_candidates(items)
+    return anchors[0] if len(anchors) == 1 else None
+
+
+def _exchange_city_parent_control(
+    frame: object,
+    anchor: dict,
+) -> tuple[tuple[int, int], int] | None:
+    """Resolve the unique circular NPC control below the exchange label."""
+
+    image = getattr(frame, "image", frame)
+    if image is None or not hasattr(image, "shape") or len(image.shape) < 2:
+        return None
+    points = anchor.get("position") or ()
+    if len(points) < 3:
+        return None
+    try:
+        xs = [float(point[0]) for point in points]
+        ys = [float(point[1]) for point in points]
+    except (TypeError, ValueError, IndexError):
+        return None
+    anchor_left, anchor_right = min(xs), max(xs)
+    anchor_bottom = max(ys)
+    anchor_center_x = (anchor_left + anchor_right) / 2.0
+    anchor_width = max(1.0, anchor_right - anchor_left)
+    capture_height, capture_width = map(int, image.shape[:2])
+    horizontal_margin = max(64, round(anchor_width * 0.85))
+    roi_left = max(0, round(anchor_left) - horizontal_margin)
+    roi_right = min(capture_width, round(anchor_right) + horizontal_margin)
+    roi_top = max(0, round(anchor_bottom) - 5)
+    roi_bottom = min(
+        capture_height,
+        round(anchor_bottom) + max(120, round(capture_height * 0.23)),
+    )
+    if roi_right - roi_left < 40 or roi_bottom - roi_top < 40:
+        return None
+    try:
+        gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
+        roi = cv.GaussianBlur(
+            gray[roi_top:roi_bottom, roi_left:roi_right], (9, 9), 2
+        )
+        circles = cv.HoughCircles(
+            roi,
+            cv.HOUGH_GRADIENT,
+            dp=1.2,
+            minDist=40,
+            param1=100,
+            param2=35,
+            minRadius=max(20, round(capture_height * 0.04)),
+            maxRadius=max(30, round(capture_height * 0.11)),
+        )
+    except (cv.error, TypeError, ValueError):
+        return None
+    if circles is None:
+        return None
+    candidates: list[tuple[tuple[int, int], int]] = []
+    for circle_x, circle_y, radius in circles[0]:
+        center = (
+            int(round(float(circle_x) + roi_left)),
+            int(round(float(circle_y) + roi_top)),
+        )
+        resolved_radius = int(round(float(radius)))
+        if center[1] <= anchor_bottom + 8:
+            continue
+        if abs(center[0] - anchor_center_x) > max(40.0, anchor_width * 0.75):
+            continue
+        candidates.append((center, resolved_radius))
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _stable_exchange_city_parent_controls(
+    controls: list[tuple[tuple[int, int], int]],
+) -> bool:
+    if len(controls) < _CITY_ANCHOR_STABLE_FRAME_COUNT:
+        return False
+    recent = controls[-_CITY_ANCHOR_STABLE_FRAME_COUNT:]
+    return all(
+        math.dist(recent[index - 1][0], recent[index][0]) <= 8.0
+        and abs(recent[index - 1][1] - recent[index][1]) <= 8
+        for index in range(1, len(recent))
+    )
+
+
+def _resolve_city_marker(items: Iterable[dict], outlet: object) -> str:
+    texts = _semantic_page_texts(items)
+    city = getattr(outlet, "city", None)
+    station_id = str(getattr(city, "station_id", "") or "").replace(" ", "")
+    if station_id and any(station_id in text for text in texts):
+        return station_id
+    try:
+        from core.preset.presets import STATION_NAME2PNG
+
+        known_stations = tuple(
+            str(name).replace(" ", "") for name in STATION_NAME2PNG
+        )
+        exact_matches = {station for station in known_stations if station in texts}
+        if len(exact_matches) == 1:
+            return next(iter(exact_matches))
+        if exact_matches:
+            return ""
+        matches = {
+            station
+            for station in known_stations
+            if any(station in text for text in texts)
+        }
+    except Exception as error:
+        logger.warning(
+            "Unable to resolve city marker for exchange-anchor redispatch: "
+            f"{type(error).__name__}"
+        )
+        return ""
+    return next(iter(matches)) if len(matches) == 1 else ""
+
+
+def _retryable_city_anchor_frame(
+    items: list[dict],
+    *,
+    city_marker: str,
+) -> tuple[frozenset[str], dict] | None:
+    if not city_marker:
+        return None
+    texts = _semantic_page_texts(items)
+    if not any(city_marker in text for text in texts):
+        return None
+    if exchange_menu_matches(items):
+        return None
+    if exchange_page_matches(items, ExchangeAction.BUY) or exchange_page_matches(
+        items, ExchangeAction.SELL
+    ):
+        return None
+    observation = observe_city_frame(items)
+    if observation.state not in {
+        CityNavigationState.CITY_MAP,
+        CityNavigationState.CITY_DETAIL,
+        CityNavigationState.EXCHANGE_NPC_VISIBLE,
+    }:
+        return None
+    anchor = _unique_exchange_city_anchor(items)
+    if anchor is None:
+        return None
+    return texts, anchor
+
+
+def _capture_city_anchor_dispatch(
+    *,
+    attempt: int,
+    dispatch_result: str,
+    anchor_coordinate: tuple[int, int] | None,
+    page_texts: frozenset[str],
+) -> None:
+    payload = {
+        "stage": "city_anchor_redispatch",
+        "attempt": int(attempt),
+        "total": _CITY_ANCHOR_TOTAL_DISPATCH_LIMIT,
+        "dispatch_result": str(dispatch_result),
+        "anchor_coordinate": anchor_coordinate,
+        "page_texts": sorted(page_texts),
+    }
+    try:
+        capture_session_evidence(
+            "EXCHANGE_CITY_ANCHOR_REDISPATCH",
+            ledger_context=None,
+            leg_id="",
+            current_page_classification=json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ),
+        )
+    except Exception as error:
+        logger.warning(
+            "Unable to capture city-anchor redispatch evidence: "
+            f"{type(error).__name__}"
+        )
+
+
+def _city_anchor_frame_rejection_reason(
+    items: list[dict],
+    *,
+    city_marker: str,
+) -> str:
+    try:
+        texts = _semantic_page_texts(items)
+        if not city_marker:
+            return "city_marker_unresolved"
+        if not any(city_marker in text for text in texts):
+            return "city_marker_missing"
+        if exchange_menu_matches(items):
+            return "exchange_menu_visible"
+        if exchange_page_matches(items, ExchangeAction.BUY):
+            return "exchange_buy_page_visible"
+        if exchange_page_matches(items, ExchangeAction.SELL):
+            return "exchange_sell_page_visible"
+        state = observe_city_frame(items).state
+        if state not in {
+            CityNavigationState.CITY_MAP,
+            CityNavigationState.CITY_DETAIL,
+            CityNavigationState.EXCHANGE_NPC_VISIBLE,
+        }:
+            return f"page_state_not_retryable:{state.value}"
+        anchor_count = len(_city_anchor_candidates(items))
+        if anchor_count == 0:
+            return "exchange_anchor_missing"
+        if anchor_count > 1:
+            return "exchange_anchor_ambiguous"
+        return ""
+    except Exception as error:
+        logger.warning(
+            "Unable to classify city-anchor observation evidence: "
+            f"{type(error).__name__}"
+        )
+        return f"evidence_derivation_failed:{type(error).__name__}"
+
+
+def _capture_city_anchor_observation(
+    *,
+    observation_index: int,
+    items: list[dict],
+    city_marker: str,
+    rejection_reason: str,
+    retryable: bool,
+    jaccard_to_previous: float | None,
+    stable_window_size: int,
+    signature_stable: bool,
+    cooldown_elapsed: float,
+    physical_dispatches: int,
+    parent_control: tuple[tuple[int, int], int] | None = None,
+    parent_control_stable: bool = False,
+) -> None:
+    try:
+        anchors = _city_anchor_candidates(items)
+        anchor_coordinate = _center(anchors[0]) if len(anchors) == 1 else None
+        page_texts = _semantic_page_texts(items)
+        payload = {
+            "stage": "city_anchor_observe",
+            "observation_index": int(observation_index),
+            "city_marker": str(city_marker),
+            "city_marker_present": bool(
+                city_marker and any(city_marker in text for text in page_texts)
+            ),
+            "page_state": observe_city_frame(items).state.value,
+            "anchor_count": len(anchors),
+            "anchor_coordinate": anchor_coordinate,
+            "parent_control_coordinate": (
+                None if parent_control is None else parent_control[0]
+            ),
+            "parent_control_radius": (
+                None if parent_control is None else parent_control[1]
+            ),
+            "parent_control_stable": bool(parent_control_stable),
+            "retryable": bool(retryable),
+            "rejection_reason": str(rejection_reason or "ok"),
+            "jaccard_to_previous": (
+                None
+                if jaccard_to_previous is None
+                else round(float(jaccard_to_previous), 6)
+            ),
+            "stable_window_size": int(stable_window_size),
+            "signature_stable": bool(signature_stable),
+            "cooldown_elapsed": round(max(0.0, float(cooldown_elapsed)), 6),
+            "physical_dispatches": int(physical_dispatches),
+            "dispatch_limit": _CITY_ANCHOR_TOTAL_DISPATCH_LIMIT,
+            "page_texts": sorted(page_texts),
+        }
+        capture_session_evidence(
+            "EXCHANGE_CITY_ANCHOR_OBSERVE",
+            ledger_context=None,
+            leg_id="",
+            current_page_classification=json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ),
+        )
+    except Exception as error:
+        logger.warning(
+            "Unable to capture city-anchor observation evidence: "
+            f"{type(error).__name__}"
+        )
+
+
+class ExchangeNavigator:
+    def __init__(
+        self,
+        frame_provider: Callable[[], object],
+        tap: Callable[[tuple[int, int]], None],
+        sleep: Callable[[float], None],
+        *,
+        diagnostic: Callable[[object, ExchangeAction, str], str] | None = None,
+        cancellation: Callable[[], bool] | None = None,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ):
+        self.frame_provider = frame_provider
+        self.tap = tap
+        self.sleep = sleep
+        self.diagnostic = diagnostic
+        self.cancellation = cancellation or (lambda: False)
+        self.deadline = deadline
+        self.monotonic = monotonic
+
+    def _failure(
+        self,
+        action: ExchangeAction,
+        reason: str,
+        frame: object,
+        *,
+        clicked: tuple[int, int] | None = None,
+        verified_frames: int = 0,
+    ) -> ExchangeNavigationResult:
+        path = self.diagnostic(frame, action, reason) if self.diagnostic else ""
+        return ExchangeNavigationResult(
+            False, action, reason=reason, clicked=clicked,
+            verified_frames=verified_frames, diagnostic_path=path,
+        )
+
+    def open(
+        self,
+        action: ExchangeAction | str,
+        *,
+        verify_frames: int = 2,
+    ) -> ExchangeNavigationResult:
+        selected = _action(action)
+        if self.cancellation() or (
+            self.deadline is not None and self.monotonic() >= self.deadline
+        ):
+            return ExchangeNavigationResult(False, selected, reason="cancelled")
+        lobby_frame = self.frame_provider()
+        lobby_items = _items(lobby_frame)
+        if not exchange_menu_matches(
+            lobby_items, frame_img=getattr(lobby_frame, "image", None)
+        ):
+            return self._failure(selected, "exchange_menu_not_confirmed", lobby_frame)
+        label = "我要买" if selected is ExchangeAction.BUY else "我要卖"
+        anchors = [item for item in lobby_items if label in _text(item) and item.get("position")]
+        if len(anchors) != 1:
+            return self._failure(selected, "action_anchor_not_unique", lobby_frame)
+        clicked = _center(anchors[0])
+        if self.tap(clicked) is False:
+            return self._failure(selected, "read_only_denied", lobby_frame, clicked=clicked)
+        if verify_frames < 2:
+            return self._failure(selected, "multiframe_verification_required", lobby_frame, clicked=clicked)
+        verified = 0
+        last = lobby_frame
+        # The action panel also animates after the OCR-anchor click.  Sample a
+        # bounded window and require consecutive matching frames; transition
+        # frames neither count as success nor cause another tap.
+        for _ in range(max(6, int(verify_frames) * 4)):
+            if self.cancellation():
+                return self._failure(selected, "cancelled", last, clicked=clicked, verified_frames=verified)
+            if self.deadline is not None and self.monotonic() >= self.deadline:
+                return self._failure(selected, "overall_deadline_exceeded", last, clicked=clicked, verified_frames=verified)
+            self.sleep(0.35)
+            last = self.frame_provider()
+            if not exchange_page_matches(_items(last), selected):
+                verified = 0
+                continue
+            verified += 1
+            if verified >= int(verify_frames):
+                return ExchangeNavigationResult(True, selected, clicked=clicked, verified_frames=verified)
+        return self._failure(
+            selected, "postcondition_unstable", last,
+            clicked=clicked, verified_frames=verified,
+        )
+
+
+def _save_diagnostic(frame: object, action: ExchangeAction, reason: str) -> str:
+    image = getattr(frame, "image", None)
+    if image is None:
+        return ""
+    root = RUNTIME_DIR / "exchange-navigation"
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / f"{action.value.lower()}-{reason}.png"
+    try:
+        cv.imwrite(str(target), image)
+    except Exception as error:  # diagnostic failure must not change safety result
+        logger.warning(f"保存交易所导航诊断截图失败: {error}")
+        return ""
+    return str(target)
+
+
+def open_exchange_action(
+    action: ExchangeAction | str,
+    *,
+    read_only: bool = False,
+    cancellation: Callable[[], bool] | None = None,
+    timeout: float = 30.0,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> ExchangeNavigationResult:
+    """Open a verified action page; never clicks any transaction control."""
+
+    selected = _action(action)
+    started = monotonic()
+    deadline = started + max(0.0, float(timeout))
+    initial_city_anchor_dispatch: dict[str, object] = {
+        "terminal_block": False,
+        "reason": "",
+        "coordinate": None,
+        "dispatch_result": None,
+    }
+
+    def deadline_failure(stage: str, reason: str = "overall_deadline_exceeded"):
+        return ExchangeNavigationResult(
+            False, selected, reason=reason, stage=stage,
+            elapsed_seconds=max(0.0, monotonic() - started),
+        )
+
+    def safe_anchor_tap(pos: tuple[int, int]):
+        action_key = (
+            "exchange_buy_navigation"
+            if selected is ExchangeAction.BUY
+            else "exchange_sell_navigation"
+        )
+        target = "buy_navigation" if selected is ExchangeAction.BUY else "sell_navigation"
+        label = "我要买" if selected is ExchangeAction.BUY else "我要卖"
+        dispatch_result = input_tap(
+            pos,
+            intent=ActionIntent(
+                action_key, target,
+                f"exchange:{selected.value.lower()}:anchor",
+            ),
+        )
+        _capture_exchange_evidence(
+            "EXCHANGE_ANCHOR_DISPATCH",
+            ExchangeNavigationResult(
+                dispatch_result is not False,
+                selected,
+                reason=_dispatch_evidence_reason(dispatch_result),
+                clicked=pos,
+                stage="action_anchor_dispatch",
+            ),
+        )
+        return dispatch_result
+
+    def safe_city_outlet_click(
+        text: str,
+        *_args,
+        **_kwargs,
+    ) -> bool:
+        """Dispatch the city outlet through its unique visual parent control."""
+
+        if text != "交易所":
+            initial_city_anchor_dispatch.update(
+                terminal_block=True,
+                reason="unexpected_outlet_target",
+            )
+            return False
+        observed = screenshot()
+        observed_items = _items(observed)
+        anchors = _city_anchor_candidates(observed_items)
+        if len(anchors) != 1:
+            # A missing anchor may legitimately require the existing bounded
+            # outlet-list scroll.  Ambiguity, however, must never be scrolled
+            # or guessed through.
+            if len(anchors) > 1:
+                initial_city_anchor_dispatch.update(
+                    terminal_block=True,
+                    reason="exchange_anchor_ambiguous",
+                )
+            return False
+        parent_control = _exchange_city_parent_control(observed, anchors[0])
+        if parent_control is None:
+            initial_city_anchor_dispatch.update(
+                terminal_block=True,
+                reason="visual_parent_control_unresolved",
+            )
+            return False
+        coordinate = parent_control[0]
+        dispatch_result = input_tap(
+            coordinate,
+            random_offset=False,
+            intent=ActionIntent(
+                "navigation_anchor",
+                "交易所",
+                "exchange:city-anchor:initial-parent-control",
+            ),
+        )
+        initial_city_anchor_dispatch.update(
+            terminal_block=(dispatch_result is False),
+            reason=("read_only_denied" if dispatch_result is False else ""),
+            coordinate=coordinate,
+            dispatch_result=dispatch_result,
+        )
+        _capture_city_anchor_dispatch(
+            attempt=1,
+            dispatch_result=_dispatch_evidence_reason(dispatch_result),
+            anchor_coordinate=coordinate,
+            page_texts=_semantic_page_texts(observed_items),
+        )
+        return dispatch_result is not False
+
+    def safe_outlet_scroll(*args, **kwargs):
+        if bool(initial_city_anchor_dispatch["terminal_block"]):
+            return False
+        return input_swipe(*args, **kwargs)
+
+    if monotonic() >= deadline:
+        return deadline_failure("initial_capture")
+    frame = screenshot()
+    if not exchange_menu_matches(
+        _items(frame), frame_img=getattr(frame, "image", None)
+    ):
+        from core.preset import go_outlets
+        from core.preset.control import go_home
+
+        try:
+            home_ok = go_home(deadline=deadline, cancellation=cancellation)
+        except TypeError as error:
+            if "unexpected keyword" not in str(error):
+                raise
+            home_ok = go_home()
+        home_result = ExchangeNavigationResult(
+            bool(home_ok),
+            selected,
+            reason=(
+                ""
+                if home_ok
+                else (
+                    "overall_deadline_exceeded"
+                    if monotonic() >= deadline
+                    else "home_navigation_failed"
+                )
+            ),
+            stage="home_navigation",
+        )
+        _capture_exchange_evidence("EXCHANGE_HOME_VERIFY", home_result)
+        if not home_ok:
+            return deadline_failure("home_navigation", home_result.reason)
+        if monotonic() >= deadline:
+            return deadline_failure("home_navigation")
+        try:
+            outlet = go_outlets(
+                "交易所", deadline=deadline, cancellation=cancellation,
+                monotonic=monotonic,
+                ocr_click=safe_city_outlet_click,
+                swipe=safe_outlet_scroll,
+            )
+        except TypeError as error:
+            if "unexpected keyword" not in str(error):
+                raise
+            outlet = go_outlets("交易所")
+        outlet_result = ExchangeNavigationResult(
+            bool(outlet),
+            selected,
+            reason=str(getattr(outlet, "reason", "") or ""),
+            stage=str(getattr(outlet, "stage", "outlet_navigation")),
+        )
+        _capture_exchange_evidence("EXCHANGE_ANCHOR_SEARCH", outlet_result)
+        if not outlet:
+            return deadline_failure(
+                "outlet_navigation",
+                str(
+                    initial_city_anchor_dispatch["reason"]
+                    or getattr(outlet, "reason", "exchange_navigation_failed")
+                ),
+            )
+        # ``go_outlets`` returns as soon as the guarded city-anchor call
+        # returns.  On the live client that click can occasionally be ignored.
+        # Only a semantically stable, freshly re-observed city page may receive
+        # another click; transition frames and unknown pages are observation-
+        # only.  Legacy/mocked outlet results keep the historical wait path.
+        frame = None
+        structured_outlet = hasattr(outlet, "city")
+        if structured_outlet:
+            candidate = screenshot()
+            candidate_items = _items(candidate)
+            city_marker = _resolve_city_marker(candidate_items, outlet)
+            if exchange_menu_matches(
+                candidate_items, frame_img=getattr(candidate, "image", None)
+            ):
+                frame = candidate
+            else:
+                city_signatures: list[frozenset[str]] = []
+                city_parent_controls: list[tuple[tuple[int, int], int]] = []
+                physical_dispatches = 1
+                last_dispatch_at = monotonic()
+
+                def record_observation(
+                    rejection_reason: str,
+                    *,
+                    retryable: bool,
+                    jaccard_to_previous: float | None = None,
+                    signature_stable: bool = False,
+                    parent_control: tuple[tuple[int, int], int] | None = None,
+                    parent_control_stable: bool = False,
+                    dispatches: int | None = None,
+                ) -> None:
+                    _capture_city_anchor_observation(
+                        observation_index=observation_index,
+                        items=candidate_items,
+                        city_marker=city_marker,
+                        rejection_reason=rejection_reason,
+                        retryable=retryable,
+                        jaccard_to_previous=jaccard_to_previous,
+                        stable_window_size=len(city_signatures),
+                        signature_stable=signature_stable,
+                        cooldown_elapsed=monotonic() - last_dispatch_at,
+                        physical_dispatches=(
+                            physical_dispatches
+                            if dispatches is None
+                            else dispatches
+                        ),
+                        parent_control=parent_control,
+                        parent_control_stable=parent_control_stable,
+                    )
+
+                for observation_index in range(_CITY_ANCHOR_OBSERVATION_LIMIT):
+                    if observation_index:
+                        if cancellation and cancellation():
+                            return ExchangeNavigationResult(
+                                False, selected, reason="cancelled"
+                            )
+                        if monotonic() >= deadline:
+                            return deadline_failure("exchange_menu_wait")
+                        sleep(min(0.5, max(0.0, deadline - monotonic())))
+                        candidate = screenshot()
+                        candidate_items = _items(candidate)
+                    if exchange_menu_matches(
+                        candidate_items,
+                        frame_img=getattr(candidate, "image", None),
+                    ):
+                        record_observation(
+                            "exchange_menu_visible", retryable=False
+                        )
+                        frame = candidate
+                        break
+                    if not city_marker:
+                        city_marker = _resolve_city_marker(candidate_items, outlet)
+                    retryable = _retryable_city_anchor_frame(
+                        candidate_items, city_marker=city_marker
+                    )
+                    if retryable is None:
+                        city_signatures.clear()
+                        city_parent_controls.clear()
+                        record_observation(
+                            _city_anchor_frame_rejection_reason(
+                                candidate_items, city_marker=city_marker
+                            ),
+                            retryable=False,
+                        )
+                        continue
+                    page_texts, anchor = retryable
+                    parent_control = _exchange_city_parent_control(candidate, anchor)
+                    if parent_control is None:
+                        city_signatures.clear()
+                        city_parent_controls.clear()
+                        record_observation(
+                            "visual_parent_control_unresolved",
+                            retryable=False,
+                        )
+                        continue
+                    previous_signature = (
+                        city_signatures[-1] if city_signatures else None
+                    )
+                    jaccard_to_previous = (
+                        None
+                        if previous_signature is None
+                        else _text_jaccard(previous_signature, page_texts)
+                    )
+                    city_signatures.append(page_texts)
+                    del city_signatures[:-_CITY_ANCHOR_STABLE_FRAME_COUNT]
+                    city_parent_controls.append(parent_control)
+                    del city_parent_controls[:-_CITY_ANCHOR_STABLE_FRAME_COUNT]
+                    signature_stable = _stable_city_signatures(city_signatures)
+                    parent_control_stable = _stable_exchange_city_parent_controls(
+                        city_parent_controls
+                    )
+                    cooldown_elapsed = monotonic() - last_dispatch_at
+                    if not signature_stable:
+                        record_observation(
+                            "semantic_signature_unstable",
+                            retryable=True,
+                            jaccard_to_previous=jaccard_to_previous,
+                            parent_control=parent_control,
+                        )
+                        continue
+                    if not parent_control_stable:
+                        record_observation(
+                            "visual_parent_control_unstable",
+                            retryable=True,
+                            jaccard_to_previous=jaccard_to_previous,
+                            signature_stable=True,
+                            parent_control=parent_control,
+                        )
+                        continue
+                    if physical_dispatches >= _CITY_ANCHOR_TOTAL_DISPATCH_LIMIT:
+                        record_observation(
+                            "dispatch_limit_reached",
+                            retryable=True,
+                            jaccard_to_previous=jaccard_to_previous,
+                            signature_stable=True,
+                            parent_control=parent_control,
+                            parent_control_stable=True,
+                        )
+                        continue
+                    if (
+                        cooldown_elapsed
+                        < _CITY_ANCHOR_REDISPATCH_COOLDOWN_SECONDS
+                    ):
+                        record_observation(
+                            "cooldown_pending",
+                            retryable=True,
+                            jaccard_to_previous=jaccard_to_previous,
+                            signature_stable=True,
+                            parent_control=parent_control,
+                            parent_control_stable=True,
+                        )
+                        continue
+                    coordinate = parent_control[0]
+                    attempt = physical_dispatches + 1
+                    dispatch_result = input_tap(
+                        coordinate,
+                        random_offset=False,
+                        intent=ActionIntent(
+                            "navigation_anchor",
+                            "交易所",
+                            f"exchange:city-anchor:redispatch:{attempt}",
+                        ),
+                    )
+                    record_observation(
+                        "redispatch_authorized",
+                        retryable=True,
+                        jaccard_to_previous=jaccard_to_previous,
+                        signature_stable=True,
+                        parent_control=parent_control,
+                        parent_control_stable=True,
+                        dispatches=(
+                            physical_dispatches
+                            if dispatch_result is False
+                            else physical_dispatches + 1
+                        ),
+                    )
+                    _capture_city_anchor_dispatch(
+                        attempt=attempt,
+                        dispatch_result=_dispatch_evidence_reason(dispatch_result),
+                        anchor_coordinate=coordinate,
+                        page_texts=page_texts,
+                    )
+                    if dispatch_result is False:
+                        return deadline_failure(
+                            "exchange_city_anchor_redispatch", "read_only_denied"
+                        )
+                    physical_dispatches += 1
+                    last_dispatch_at = monotonic()
+                    city_signatures.clear()
+                    city_parent_controls.clear()
+        else:
+            for _ in range(12):
+                if cancellation and cancellation():
+                    return ExchangeNavigationResult(False, selected, reason="cancelled")
+                if monotonic() >= deadline:
+                    return deadline_failure("exchange_menu_wait")
+                sleep(min(0.5, max(0.0, deadline - monotonic())))
+                candidate = screenshot()
+                if exchange_menu_matches(
+                    _items(candidate), frame_img=getattr(candidate, "image", None)
+                ):
+                    frame = candidate
+                    break
+        if frame is None:
+            result = ExchangeNavigator(
+                lambda: candidate,
+                safe_anchor_tap,
+                sleep,
+                diagnostic=_save_diagnostic,
+                cancellation=cancellation,
+                deadline=deadline,
+                monotonic=monotonic,
+            )._failure(selected, "exchange_menu_not_confirmed", candidate)
+            menu_result = ExchangeNavigationResult(
+                result.success,
+                selected,
+                reason=result.reason,
+                clicked=result.clicked,
+                verified_frames=result.verified_frames,
+                diagnostic_path=result.diagnostic_path,
+                stage="exchange_menu_wait",
+                elapsed_seconds=max(0.0, monotonic() - started),
+            )
+            _capture_exchange_evidence("EXCHANGE_MENU_OBSERVE", menu_result)
+            return result
+    else:
+        _capture_exchange_evidence(
+            "EXCHANGE_HOME_VERIFY",
+            ExchangeNavigationResult(
+                True,
+                selected,
+                reason="exchange_menu_already_visible",
+                stage="home_navigation",
+            ),
+        )
+    first_frame = frame
+    first_pending = True
+
+    def next_frame():
+        nonlocal first_pending
+        if first_pending:
+            first_pending = False
+            return first_frame
+        return screenshot()
+
+    result = ExchangeNavigator(
+        next_frame,
+        safe_anchor_tap,
+        sleep,
+        diagnostic=_save_diagnostic,
+        cancellation=cancellation,
+        deadline=deadline,
+        monotonic=monotonic,
+    ).open(selected)
+    _capture_exchange_evidence(
+        "EXCHANGE_MENU_OBSERVE",
+        ExchangeNavigationResult(
+            result.success,
+            selected,
+            reason=result.reason,
+            clicked=result.clicked,
+            verified_frames=result.verified_frames,
+            diagnostic_path=result.diagnostic_path,
+            stage=result.stage or "exchange_action_postcondition",
+            elapsed_seconds=max(0.0, monotonic() - started),
+        ),
+    )
+    logger.info(
+        "交易所导航 action={} read_only={} success={} source={} reason={}".format(
+            selected.value, bool(read_only), result.success, result.source, result.reason
+        )
+    )
+    return result

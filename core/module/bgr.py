@@ -48,6 +48,30 @@ class BGR:
     def __repr__(self):
         return f"BGR({self.b}, {self.g}, {self.r}, O: {self.offset})"
 
+    def matches(
+        self,
+        other: Union["BGR", Tuple[int, int, int], List[int]],
+        offset: int | None = None,
+    ) -> bool:
+        """Return whether ``other`` is within this color's channel tolerance."""
+        tolerance = self.offset if offset is None else offset
+        if tolerance < 0:
+            raise ValueError("offset must be non-negative")
+        return compare_ranges(
+            (self.b - tolerance, self.g - tolerance, self.r - tolerance),
+            other,
+            (self.b + tolerance, self.g + tolerance, self.r + tolerance),
+        )
+
+    def in_range(
+        self,
+        low: Union["BGR", Tuple[int, int, int], List[int]],
+        high: Union["BGR", Tuple[int, int, int], List[int]],
+        inclusive: bool = True,
+    ) -> bool:
+        """Return whether this color is inside a component-wise BGR range."""
+        return compare_ranges(low, self, high, inclusive)
+
     def __eq__(self, other: Union["BGR", Tuple[int, int, int], List[int]]):
         """
         判断指定BGR是否在范围
@@ -55,11 +79,7 @@ class BGR:
         :param other: 另一个 BGR
         :warning: 该方法会根据 offset 对前一个 BGR 进行范围偏移
         """
-        return compare_ranges(
-            (self.b - self.offset, self.g - self.offset, self.r - self.offset),
-            other,
-            (self.b + self.offset, self.g + self.offset, self.r + self.offset),
-        )
+        return self.matches(other)
 
     def __ne__(self, other: Union["BGR", Tuple[int, int, int], List[int]]):
         """
@@ -68,11 +88,7 @@ class BGR:
         :param other: 另一个 BGR
         :warning: 该方法会根据 offset 对前一个 BGR 进行范围偏移
         """
-        return not compare_ranges(
-            (self.b - self.offset, self.g - self.offset, self.r - self.offset),
-            other,
-            (self.b + self.offset, self.g + self.offset, self.r + self.offset),
-        )
+        return not self.matches(other)
     
     def __le__(self, other: "BGR"):
         return self.b <= other.b and self.g <= other.g and self.r <= other.r
@@ -93,11 +109,11 @@ class BGR:
     def __getitem__(self, key):
         if isinstance(key, int):
             if key == 0 or key == -3:
-                return self.r
+                return self.b
             elif key == 1 or key == -2:
                 return self.g
             elif key == 2 or key == -1:
-                return self.b
+                return self.r
             else:
                 raise IndexError("BGR index out of range")
         else:

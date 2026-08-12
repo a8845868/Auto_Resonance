@@ -17,6 +17,7 @@ from ..common.config import cfg
 
 class Worker(QThread):
     result = Signal(object)
+    error = Signal(str)
 
     def __init__(self, func, stop = lambda : None, **kwargs):
         super(Worker, self).__init__()
@@ -32,8 +33,10 @@ class Worker(QThread):
             pass
         except AssertionError as e:
             logger.error(f"{e}")
+            self.error.emit(str(e))
         except Exception:
             logger.exception("崩溃信息:")
+            self.error.emit("任务执行失败，请查看日志")
 
     def stop(self):
         self.stop_func()

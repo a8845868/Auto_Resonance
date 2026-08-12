@@ -1,0 +1,91 @@
+"""Reusable last-run/next-run editor for task pages."""
+
+from datetime import datetime
+
+from PySide6.QtCore import Signal
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
+
+from core.services.task_schedule_state import (
+    request_immediate_run,
+    set_next_run,
+    task_timing,
+)
+
+
+class TaskScheduleCard(QWidget):
+    scheduleChanged = Signal()
+
+    def __init__(self, task_key: str, parent=None):
+        super().__init__(parent)
+        self.taskKey = task_key
+        # ExpandLayout otherwise compresses a plain QWidget to roughly one
+        # text line, hiding the next-run editor and buttons.
+        self.setMinimumHeight(128)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.setObjectName("taskScheduleCard")
+        self.setStyleSheet(
+            "QWidget#taskScheduleCard { border: 1px solid rgba(128,128,128,.28); "
+            "border-radius: 8px; background: rgba(128,128,128,.06); }"
+        )
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 12, 16, 12)
+        self.lastRunLabel = QLabel(self)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("下一次执行", self))
+        self.nextRunEdit = QLineEdit(self)
+        self.nextRunEdit.setPlaceholderText("留空表示立即执行，例如 2026-07-13 05:00:00")
+        save = QPushButton("保存", self)
+        clear = QPushButton("清空并立即执行", self)
+        save.clicked.connect(self.save)
+        clear.clicked.connect(self.clearNextRun)
+        row.addWidget(self.nextRunEdit, 1)
+        row.addWidget(save)
+        row.addWidget(clear)
+        root.addWidget(self.lastRunLabel)
+        root.addLayout(row)
+        self.refresh()
+
+    def refresh(self):
+        timing = task_timing(self.taskKey)
+        result = timing.get("result") if isinstance(timing.get("result"), dict) else {}
+        reason = result.get("next_run_reason") or result.get("reason") or "未记录"
+        self.lastRunLabel.setText(
+            f"上次检查：{timing.get('last_attempt') or timing.get('last_run') or '从未执行'}\n"
+            f"上次取得进度：{timing.get('progress_at') or '尚无'} · "
+            f"上次完整完成：{timing.get('completed_at') or '尚无'}\n"
+            f"下一次检查原因：{reason}"
+        )
+        self.nextRunEdit.setText((timing.get("next_run") or "").replace("T", " "))
+
+    def save(self):
+        text = self.nextRunEdit.text().strip()
+        if text:
+            try:
+                parsed = datetime.fromisoformat(text)
+            except ValueError:
+                self.nextRunEdit.setStyleSheet("border: 1px solid #ff5f57;")
+                return
+            set_next_run(self.taskKey, parsed)
+        else:
+            request_immediate_run(self.taskKey)
+        self.nextRunEdit.setStyleSheet("")
+        self.refresh()
+        self.scheduleChanged.emit()
+
+    def clearNextRun(self):
+        self.nextRunEdit.clear()
+        request_immediate_run(self.taskKey)
+        self.refresh()
+        self.scheduleChanged.emit()
+
+    def showEvent(self, event):
+        self.refresh()
+        super().showEvent(event)

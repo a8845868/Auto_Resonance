@@ -13,18 +13,41 @@ from core.control.control import input_tap, screenshot
 from core.model.config import config
 from core.module.bgr import BGR
 from core.preset.control import go_home
+from core.services.train_eta import (
+    TrainArrivalEstimator,
+    parse_remaining_distance,
+    polling_interval,
+)
 from core.utils.utils import RESOURCES_PATH
 
 FIGHT_TIME = 300
 MAP_WAIT_TIME = 3000
+SPEED_BOOST_COLOR = (251, 253, 253)
+SPEED_BOOST_EXCLUDED_LOW = (235, 235, 250)
+SPEED_BOOST_EXCLUDED_HIGH = (240, 240, 255)
+DISTANCE_OCR_INTERVAL = 15.0
 
 # pick_mask = cv.imread("resources/mask/pick_mask.png", cv.IMREAD_GRAYSCALE)
 # _, pick_mask = cv.threshold(pick_mask, 128, 255, cv.THRESH_BINARY)
 
 
+def _should_use_speed_boost(color: BGR, enabled: bool) -> bool:
+    return (
+        enabled
+        and color.matches(SPEED_BOOST_COLOR, offset=0)
+        and not color.in_range(SPEED_BOOST_EXCLUDED_LOW, SPEED_BOOST_EXCLUDED_HIGH)
+    )
+
+
 class STATION:
 
-    def __init__(self, station: bool, is_destine: bool = False) -> None:
+    def __init__(
+        self,
+        station: bool,
+        is_destine: bool = False,
+        *,
+        departure_outcome: str = "NOT_STARTED",
+    ) -> None:
         """
         站点类
 
@@ -35,6 +58,7 @@ class STATION:
         """
         self.station = station
         self.is_destine = is_destine
+        self.last_wait_outcome = str(departure_outcome)
 
     def __bool__(self) -> bool:
         return self.station
@@ -45,13 +69,21 @@ class STATION:
             等待进入站点
         """
         if self.station == False:
+            if self.last_wait_outcome == "NOT_STARTED":
+                self.last_wait_outcome = "DEPARTURE_NOT_ESTABLISHED"
             logger.error("进入列车行驶状态失败")
             return False
         if self.is_destine:
+            self.last_wait_outcome = "DESTINATION_ALREADY_CONFIRMED"
             return True
         logger.info("进入行车监听")
+        self.last_wait_outcome = "MONITORING"
         start = time.perf_counter()
+        estimator = TrainArrivalEstimator()
+        eta_seconds = None
+        last_distance_ocr = float("-inf")
         while time.perf_counter() - start < MAP_WAIT_TIME:
+            now = time.perf_counter()
             image = screenshot()
             # 0-2攻击检测，3-4拦截检测
             attack_bgrs = image.get_bgrs(
@@ -64,6 +96,19 @@ class STATION:
             logger.debug(f"行车攻击检测: {attack_bgrs}")
             logger.debug(f"行车检测: {reach_bgrs}")
             logger.debug(f"是否进站检测: {run_bgr}")
+            if now - last_distance_ocr >= DISTANCE_OCR_INTERVAL:
+                last_distance_ocr = now
+                distance = parse_remaining_distance(image.ocr())
+                if distance is not None:
+                    eta_seconds = estimator.observe(distance, now)
+                    if eta_seconds is None:
+                        logger.info(f"剩余行程 {distance:.1f}km，正在采集速度样本")
+                    else:
+                        logger.info(
+                            f"剩余行程 {distance:.1f}km，平均速度 "
+                            f"{estimator.speed * 3600:.1f}km/h，预计 "
+                            f"{eta_seconds:.0f} 秒到站"
+                        )
             if (
                 BGR(8, 168, 234) <= attack_bgrs[0] <= BGR(10, 171, 245)
                 and BGR(8, 168, 234) <= attack_bgrs[1] <= BGR(10, 171, 245)
@@ -81,25 +126,29 @@ class STATION:
                 and BGR(250, 250, 250) <= reach_bgrs[1] <= BGR(255, 255, 255)
             ):
                 logger.info("站点到达")
+                self.last_wait_outcome = "ARRIVAL_FIXED_PIXEL_CONFIRMED"
                 input_tap((877, 359))
                 # go_home()
                 return True
             elif BGR(0, 174, 243) == run_bgr:
                 logger.info("站点到达")
+                self.last_wait_outcome = "ARRIVAL_HUD_CONFIRMED"
                 return True
-            elif (
-                reach_bgrs[2] == [251, 253, 253]
-                and reach_bgrs[2] < BGR(235, 235, 250) 
-                and reach_bgrs[2] > BGR(240, 240, 255)
-                and config.global_config.is_speed
+            elif _should_use_speed_boost(
+                reach_bgrs[2], config.global_config.is_speed
             ):
                 logger.info("点击加速弹丸")
                 input_tap((1061, 657))
                 time.sleep(0.5)
             if config.global_config.is_auto_pick:
                 input_tap((781, 484))  # 捡垃圾
-            time.sleep(0.3)
+            time.sleep(
+                polling_interval(
+                    eta_seconds, auto_pick=config.global_config.is_auto_pick
+                )
+            )
         logger.error("站点超时")
+        self.last_wait_outcome = "ARRIVAL_MONITOR_TIMEOUT"
         return False
 
     def wait_join(self):

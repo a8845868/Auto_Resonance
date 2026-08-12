@@ -1,0 +1,178 @@
+{
+  "success": true,
+  "task": "shop_probe",
+  "result": {
+    "success": true,
+    "shop": "headquarters_black_moon",
+    "pages": 7,
+    "scan_page_limit": 30,
+    "reached_bottom": true,
+    "page_limit_reached": false,
+    "requires_attention": false,
+    "results": [
+      {
+        "id": "laplace_weekly_iron",
+        "name": "拉普拉斯协议",
+        "status": "found",
+        "remaining": 3,
+        "limit": 3
+      },
+      {
+        "id": "self_observation_daily_iron",
+        "name": "自观测胶卷",
+        "status": "found",
+        "remaining": 5,
+        "limit": 5
+      },
+      {
+        "id": "nebula_4_daily_iron",
+        "name": "星云物质（4钛）",
+        "status": "found",
+        "remaining": 36,
+        "limit": 36
+      },
+      {
+        "id": "blank_tape_daily_iron",
+        "name": "空白录像带",
+        "status": "found",
+        "remaining": 10,
+        "limit": 10
+      },
+      {
+        "id": "cactus_energy_weekly_iron",
+        "name": "仙人掌能量棒棒糖",
+        "status": "found",
+        "remaining": 8,
+        "limit": 8
+      },
+      {
+        "id": "energy_candy_weekly_iron",
+        "name": "提神棒棒糖",
+        "status": "found",
+        "remaining": 8,
+        "limit": 8
+      },
+      {
+        "id": "bait_balloon_weekly_iron",
+        "name": "诱饵气球",
+        "status": "found",
+        "remaining": 30,
+        "limit": 30
+      },
+      {
+        "id": "purchase_book_weekly_iron",
+        "name": "进货采买书",
+        "status": "found",
+        "remaining": 5,
+        "limit": 5
+      },
+      {
+        "id": "renegotiation_weekly_iron",
+        "name": "再交涉请求书",
+        "status": "found",
+        "remaining": 5,
+        "limit": 5
+      },
+      {
+        "id": "advertising_weekly_iron",
+        "name": "广告投放券",
+        "status": "found",
+        "remaining": 3,
+        "limit": 3
+      },
+      {
+        "id": "solo_string_monthly_resume",
+        "name": "独奏之弦",
+        "status": "found",
+        "remaining": 2,
+        "limit": 2
+      },
+      {
+        "id": "echo_string_monthly_resume",
+        "name": "回响之弦",
+        "status": "found",
+        "remaining": 1,
+        "limit": 1
+      },
+      {
+        "id": "source_string_monthly_resume",
+        "name": "本源之弦",
+        "status": "found",
+        "remaining": 1,
+        "limit": 1
+      },
+      {
+        "id": "source_string_monthly_iron",
+        "name": "本源之弦",
+        "status": "found",
+        "remaining": 4,
+        "limit": 4
+      },
+      {
+        "id": "solitary_shard_monthly_resume",
+        "name": "独石碎片",
+        "status": "found",
+        "remaining": 42,
+        "limit": 42
+      },
+      {
+        "id": "nebula_8_monthly_resume",
+        "name": "星云物质（8钛）",
+        "status": "found",
+        "remaining": 500,
+        "limit": 500
+      },
+      {
+        "id": "black_moon_ticket_weekly_birch",
+        "name": "黑月采购券",
+        "status": "found",
+        "remaining": 5,
+        "limit": 5
+      },
+      {
+        "id": "purchase_book_daily_birch",
+        "name": "进货采买书",
+        "status": "found",
+        "remaining": 10,
+        "limit": 10
+      },
+      {
+        "id": "blank_tape_daily_birch",
+        "name": "空白录像带",
+        "status": "found",
+        "remaining": 10,
+        "limit": 10
+      },
+      {
+        "id": "self_observation_daily_birch",
+        "name": "自观测胶卷",
+        "status": "found",
+        "remaining": 100,
+        "limit": 100
+      },
+      {
+        "id": "laplace_monthly_iron",
+        "name": "拉普拉斯协议",
+        "status": "sold_out",
+        "remaining": 0
+      },
+      {
+        "id": "extra_funding_monthly_iron",
+        "name": "追加注资申请书",
+        "status": "sold_out",
+        "remaining": 0
+      },
+      {
+        "id": "laplace_monthly_resume",
+        "name": "拉普拉斯协议",
+        "status": "sold_out",
+        "remaining": 0
+      }
+    ],
+    "missing": [],
+    "transport": "nemu_ipc"
+  },
+  "error": "",
+  "id": "1e79d4fb8ae244db93105476a5943f2a",
+  "finished_at": "2026-07-14T02:10:43"
+}

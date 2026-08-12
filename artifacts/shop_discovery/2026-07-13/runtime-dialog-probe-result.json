@@ -1,0 +1,29 @@
+{
+  "success": true,
+  "task": "shop_dialog_probe",
+  "result": {
+    "success": true,
+    "shop": "headquarters_black_moon",
+    "pages": 1,
+    "scan_page_limit": 30,
+    "reached_bottom": false,
+    "page_limit_reached": false,
+    "requires_attention": false,
+    "results": [
+      {
+        "id": "cactus_energy_weekly_iron",
+        "name": "仙人掌能量棒棒糖",
+        "status": "validated",
+        "quantity": 8,
+        "cost": 540000,
+        "dry_run": true,
+        "final_action": "cancel"
+      }
+    ],
+    "missing": [],
+    "transport": "nemu_ipc"
+  },
+  "error": "",
+  "id": "f3b2f28b77534dc7a7d3c667c65e7a2c",
+  "finished_at": "2026-07-14T02:31:41"
+}

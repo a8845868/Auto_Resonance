@@ -54,6 +54,7 @@ class Config(BaseModel):
     """跑商配置"""
 
 
+app = Config()
 if APP_PATH.exists() and APP_PATH.is_file():
     data = read_json(APP_PATH)
     app = Config.model_validate(data)

@@ -5,6 +5,7 @@ class SignalBus(QObject):
     """Signal bus"""
 
     switchToCard = Signal(str)
+    bookBudgetChanged = Signal()
 
 
 signalBus = SignalBus()

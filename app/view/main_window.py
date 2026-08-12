@@ -7,8 +7,8 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 from typing import Union
 
 from PySide6.QtCore import QSize, Qt, QTimer
-from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtGui import QAction, QIcon
+from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
 from loguru import logger
 from qfluentwidgets import DotInfoBadge
 from qfluentwidgets import FluentIcon as FIF
@@ -16,14 +16,15 @@ from qfluentwidgets import (
     InfoBadgePosition,
     InfoBar,
     InfoBarPosition,
-    MSFluentWindow,
+    FluentWindow,
     NavigationItemPosition,
     SplashScreen,
     FluentIconBase,
     SystemThemeListener,
+    TransparentToolButton,
     isDarkTheme,
     setTheme,
-    MessageBox
+    MessageBox,
 )
 
 import app.common.resource  # 图标数据
@@ -33,28 +34,43 @@ from app.components.update_message_box import UpdateMessageBox
 from app.utils.constants import ICON_PATH, ROOT_PATH
 from app.utils.utils import is_chinese
 from app.view.two_city_run_business_interface import TwoRunBusinessInterface
+from app.view.book_planner_interface import BookPlannerInterface
+from app.view.inventory_interface import InventoryInterface
+from app.view.gacha_planner_interface import GachaPlannerInterface
+from app.view.passenger_planner_interface import PassengerPlannerInterface
+from app.view.shop_planner_interface import ShopPlannerInterface
 from core.utils.update.base_update_utils import UpdateStatus
 from core.utils.update.mirror_update_utils import MirrorUpdateUtils
+from core.services.personal_automation_entry import build_personal_startup_queued_task
 
 from .adb_data_interface import ADBDataInterface
-from .home_interface import HomeInterface
-from .logger_interface import LoggerInterface
+from .codex_debug_interface import CodexDebugInterface
+from .dashboard_interface import DashboardInterface
+from .task_settings_interface import (
+    FatiguePlannerInterface,
+    ResidentActivityInterface,
+    RewardCollectionInterface,
+)
 from .setting_interface import SettingInterface
 
 
-class MainWindow(MSFluentWindow):
+class MainWindow(FluentWindow):
 
     def __init__(self):
         super().__init__()
         self.wights = {}
+        self._closeRetryScheduled = False
 
         # 主题监听器
         self.themeListener = SystemThemeListener(self)
 
         self.initWindow()
+        self.initSystemTray()
         self.setInterface()
 
         self.initNavigation()
+        self.navigationInterface.setExpandWidth(190)
+        self.navigationInterface.expand(useAni=False)
 
         self.connectSignalToSlot()
 
@@ -74,16 +90,19 @@ class MainWindow(MSFluentWindow):
 
     def initNavigation(self):
         self.addSubInterface(self.homeInterface, FIF.HOME, "主页")
+        self.addSubInterface(self.debugInterface, FIF.DEVELOPER_TOOLS, "调试")
+        self.addSubInterface(self.residentActivityInterface, FIF.PLAY, "扫荡配置")
+        self.addSubInterface(self.rewardCollectionInterface, FIF.ACCEPT, "领取任务奖励")
+        self.addSubInterface(self.fatiguePlannerInterface, FIF.CAFE, "疲劳规划")
+        self.addSubInterface(self.bookPlannerInterface, FIF.CALENDAR, "进货书规划")
+        self.addSubInterface(self.inventoryInterface, FIF.ALBUM, "货币规划")
+        self.addSubInterface(self.gachaPlannerInterface, FIF.SHOPPING_CART, "抽卡规划")
+        self.addSubInterface(self.passengerPlannerInterface, FIF.PEOPLE, "客运规划")
+        self.addSubInterface(self.shopPlannerInterface, FIF.SHOPPING_CART, "商店自动购买")
         self.addSubInterface(self.two_run_business_interface, FIF.TRAIN, "端点跑商")
         self.addSubInterface(self.adb_data_interface, FIF.GAME, "ADB信息")
 
         # 底部按钮
-        self.addSubInterface(
-            self.loggerInterface,
-            FIF.ALIGNMENT,
-            "日志",
-            position=NavigationItemPosition.BOTTOM,
-        )
         self.updateButton = self.navigationInterface.addItem(
             routeKey="Update",
             icon=FIF.UPDATE,
@@ -100,13 +119,13 @@ class MainWindow(MSFluentWindow):
         )
 
     def initWindow(self):
-        self.resize(960, 780)
-        self.setMinimumWidth(760)
+        self.resize(1280, 820)
+        self.setMinimumSize(1050, 700)
         self.setWindowIcon(QIcon(str(ICON_PATH / "logo.ico")))
         self.setWindowTitle(f"黑月无人驾驶 - {VERSION}")
 
         self.setMicaEffectEnabled(isWin11())
-        self.setResizeEnabled(False)
+        self.setResizeEnabled(True)
 
         # create splash screen
         self.splashScreen = SplashScreen(self.windowIcon(), self)
@@ -119,12 +138,91 @@ class MainWindow(MSFluentWindow):
         self.show()
         QApplication.processEvents()
 
+    def initSystemTray(self):
+        """Add an explicit title-bar action that keeps automation in the tray."""
+        self.trayIcon = QSystemTrayIcon(self.windowIcon(), self)
+        self.trayIcon.setToolTip(self.windowTitle())
+        tray_menu = QMenu(self)
+        restore_action = QAction("显示主窗口", self)
+        quit_action = QAction("退出", self)
+        restore_action.triggered.connect(self.restoreFromTray)
+        quit_action.triggered.connect(self.close)
+        tray_menu.addAction(restore_action)
+        tray_menu.addSeparator()
+        tray_menu.addAction(quit_action)
+        self.trayIcon.setContextMenu(tray_menu)
+        self.trayIcon.activated.connect(self._onTrayActivated)
+
+        self.trayButton = TransparentToolButton(FIF.DOWN, self.titleBar)
+        self.trayButton.setFixedSize(46, 32)
+        self.trayButton.setToolTip("最小化到托盘")
+        self.trayButton.clicked.connect(self.minimizeToTray)
+        self.titleBar.buttonLayout.insertWidget(0, self.trayButton)
+
+    def minimizeToTray(self):
+        if not self._systemTrayAvailable():
+            self.showMinimized()
+            return
+        self.trayIcon.show()
+        self.hide()
+
+    def _systemTrayAvailable(self):
+        return QSystemTrayIcon.isSystemTrayAvailable()
+
+    def restoreFromTray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _onTrayActivated(self, reason):
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self.restoreFromTray()
+
     def setInterface(self):
         # create sub interface
-        self.homeInterface = HomeInterface(self)
-        self.loggerInterface = LoggerInterface(self)
+        self.homeInterface = DashboardInterface(self)
+        self.debugInterface = CodexDebugInterface(self)
+        self.residentActivityInterface = ResidentActivityInterface(self)
+        self.rewardCollectionInterface = RewardCollectionInterface(self)
+        self.fatiguePlannerInterface = FatiguePlannerInterface(self)
         self.settingInterface = SettingInterface(self)
+        self.bookPlannerInterface = BookPlannerInterface(self)
+        self.inventoryInterface = InventoryInterface(self)
+        self.gachaPlannerInterface = GachaPlannerInterface(self)
+        self.passengerPlannerInterface = PassengerPlannerInterface(self)
+        self.shopPlannerInterface = ShopPlannerInterface(self)
         self.two_run_business_interface = TwoRunBusinessInterface(self)
+        self.homeInterface.setBusinessTaskProvider(
+            self.two_run_business_interface.buildQueuedTask
+        )
+        self.homeInterface.addPriorityTaskProvider(
+            lambda: build_personal_startup_queued_task()
+            if bool(cfg.enablePersonalStartupEpisode.value)
+            else None
+        )
+        self.homeInterface.addPriorityTaskProvider(
+            self.fatiguePlannerInterface.buildQueuedTask
+        )
+        self.homeInterface.addTaskProvider(self.passengerPlannerInterface.buildQueuedTask)
+        self.homeInterface.addTaskProvider(self.shopPlannerInterface.buildQueuedTask)
+        for page in (
+            self.residentActivityInterface,
+            self.rewardCollectionInterface,
+            self.fatiguePlannerInterface,
+            self.two_run_business_interface,
+            self.passengerPlannerInterface,
+            self.shopPlannerInterface,
+        ):
+            page.scheduleCard.scheduleChanged.connect(
+                self.homeInterface.refreshScheduleOverview
+            )
+        self.homeInterface.refreshScheduleOverview()
+        self.homeInterface.activityStateChanged.connect(
+            self.residentActivityInterface.setRunState
+        )
         self.adb_data_interface = ADBDataInterface(self)
 
         self.update_message_box = UpdateMessageBox(self)
@@ -139,23 +237,54 @@ class MainWindow(MSFluentWindow):
         isTransparent=False,
     ):
         super().addSubInterface(
-            interface, icon, text, selectedIcon, position, isTransparent
+            interface,
+            icon,
+            text,
+            position=position,
+            isTransparent=isTransparent,
         )
         self.wights[interface.objectName()] = interface
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        self.splashScreen.resize(self.size())
+        # Newer PySide6/qframelesswindow versions may deliver an early resize
+        # event from MSFluentWindow.__init__ before initWindow creates the
+        # splash screen.
+        if hasattr(self, "splashScreen"):
+            self.splashScreen.resize(self.size())
 
     def switchToCard(self, routeKey):
         """切换到指定界面"""
         self.switchTo(self.wights[routeKey])
 
     def closeEvent(self, e):
-        # 停止监听器线程
-        self.themeListener.terminate()
-        self.themeListener.deleteLater()
+        queue_stopped = self.homeInterface.shutdown()
+        scan_stopped = self.adb_data_interface.shutdown()
+        self.debugInterface.shutdown()
+        if not queue_stopped or not scan_stopped:
+            e.ignore()
+            if not self._closeRetryScheduled:
+                self._closeRetryScheduled = True
+                QTimer.singleShot(250, self._retryClose)
+            return
+        self.trayIcon.hide()
+        self._stopThemeListener()
         super().closeEvent(e)
+
+    def _stopThemeListener(self):
+        """Synchronize native listener shutdown before its QObject is deleted."""
+        try:
+            self.themeListener.requestInterruption()
+            self.themeListener.terminate()
+            self.themeListener.wait(1000)
+            self.themeListener.deleteLater()
+        except RuntimeError:
+            # Qt may deliver a second close event after the listener has
+            # already been deleted.
+            pass
+    def _retryClose(self):
+        self._closeRetryScheduled = False
+        self.close()
 
     def _onThemeChangedFinished(self):
         super()._onThemeChangedFinished()

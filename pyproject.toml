@@ -6,7 +6,7 @@ authors = [
     {name = "Night-stars-1", email = "nujj1042633805@gmail.com"},
 ]
 dependencies = [
-    "Pillow==10.3.0",
+    "Pillow==12.1.1",
     "loguru==0.7.2",
     "numpy==1.26.4",
     "opencv-python==4.9.0.80",
@@ -24,16 +24,37 @@ requires-python = "<3.13,>=3.11"
 readme = "README.md"
 license = {text = "MIT"}
 
+[project.optional-dependencies]
+# PP-OCRv6 CPU-only.  ~10 s/frame on typical office hardware; acceptable
+# for offline analysis but impractical for interactive dry-run scans.
+ocr-v6-cpu = [
+    "paddleocr>=3.5,<4",
+    "paddlepaddle>=3.2,<4",
+]
+# PP-OCRv6 GPU.  paddlepaddle-gpu already supports CPU fallback via
+# ``device="cpu"``, so this single package works for both providers.
+ocr-v6-gpu = [
+    "paddleocr>=3.5,<4",
+    "paddlepaddle-gpu>=3.2,<4",
+]
+
 [build-system]
 requires = ["pdm-backend"]
 build-backend = "pdm.backend"
 
-
 [tool.pdm]
 distribution = true
+
+[tool.pdm.scripts]
+build-updater = "pdm run pyinstaller -F --distpath ./dist/updater -i app/resource/images/logo.ico -n 'HeiYue Updater' updater.py -y"
 
 [tool.pdm.dev-dependencies]
 dev = [
     "pytest>=8.1.1",
     "pyinstaller==6.13.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["_worktrees", ".git", ".venv"]
+addopts = ["--ignore=tests/tests"]

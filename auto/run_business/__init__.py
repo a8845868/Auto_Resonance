@@ -6,7 +6,7 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 """
 
 from .buy import buy_business
-from .main import go_business, run, stop, two_city_run
+from .main import adaptive_weekly_run, go_business, run, stop, two_city_run, two_city_weekly_run
 
 __all__ = [
     "buy_business",
@@ -14,4 +14,6 @@ __all__ = [
     "go_business",
     "stop",
     "two_city_run",
+    "two_city_weekly_run",
+    "adaptive_weekly_run",
 ]

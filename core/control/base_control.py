@@ -24,8 +24,14 @@ class IADB(ABC):
     def input_tap(self, x: int, y: int):
         pass
 
+    def input_keyevent(self, keycode: int):
+        """Dispatch one Android key event when the backend supports it."""
+
+        raise NotImplementedError("backend_keyevent_not_supported")
+
     @abstractmethod
     def screenshot(self) -> cv.typing.MatLike:
+        """Return a screenshot in OpenCV BGR channel order."""
         pass
     
     @abstractmethod

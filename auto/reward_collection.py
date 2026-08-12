@@ -1,0 +1,2281 @@
+"""Collect Daily Activity and Travel Manual rewards.
+
+The game UI is normalized to 1280x720 by the control layer.  Navigation uses
+OCR for page confirmation and red notification badges only for discovering the
+two icon-only home shortcuts.
+"""
+
+from __future__ import annotations
+
+import time
+import json
+import re
+import inspect
+import hashlib
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timedelta
+from enum import Enum
+from pathlib import Path
+from typing import Callable, Optional
+
+import cv2 as cv
+import numpy as np
+from loguru import logger
+
+from core.control.control import connect, input_swipe, input_tap, screenshot
+from core.services.read_only_policy import ActionIntent
+from core.services.runtime_errors import BlockedBySafetyError
+from core.services.screen_state import (
+    RESOURCE_DOWNLOAD_CONFIRM_TAP,
+    RESOURCE_DOWNLOAD_WAIT_ATTEMPTS,
+    clarity_replenish_cancel_position,
+    ResidentHomeState,
+    resident_home_state,
+    startup_screen_action,
+)
+from core.services.daily_rewards import (
+    DailyProgressSnapshot,
+    RewardStrategy,
+    decide_reward_run,
+)
+from core.services.server_calendar import SERVER_CLOCK
+
+
+STATE_PATH = Path("config") / "reward_state.json"
+READ_ONLY_SHORTCUTS = {
+    "每日活跃": (1048, 82),
+    "环游手册": (1132, 82),
+}
+
+
+class RewardTransientError(RuntimeError):
+    """Explicit retryable screenshot, OCR, or device-transport failure."""
+
+
+def _load_state() -> dict:
+    try:
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _daily_cycle(now: Optional[datetime] = None) -> str:
+    """Return the game-day key; daily tasks refresh at local time 05:00."""
+    current = now or datetime.now(SERVER_CLOCK.timezone)
+    if current.tzinfo is None or current.utcoffset() is None:
+        current = current.replace(
+            tzinfo=datetime.now().astimezone().tzinfo
+        ).astimezone(SERVER_CLOCK.timezone)
+    else:
+        current = current.astimezone(SERVER_CLOCK.timezone)
+    return SERVER_CLOCK.server_day_id(current)
+
+
+def _center(item: dict) -> tuple[int, int]:
+    points = item["position"]
+    return int((points[0][0] + points[2][0]) / 2), int((points[0][1] + points[2][1]) / 2)
+
+
+def _manual_daily_progress_observation(
+    items: list[dict],
+) -> tuple[int, int, int, int] | None:
+    """Read one uniquely anchored aggregate ratio and preserve its center."""
+
+    task_markers = (
+        "姣忔棩浠诲姟", "浠婃棩浠诲姟", "浠诲姟鍒楄〃",
+        "每日任务", "今日任务", "任务列表",
+    )
+    aggregate_markers = (
+        "鎬昏繘搴?", "瀹屾垚杩涘害", "总进度", "完成进度", "AGGREGATE",
+    )
+    task_anchors = [
+        _center(item)
+        for item in items
+        if item.get("position")
+        and any(marker in str(item.get("text", "")) for marker in task_markers)
+    ]
+    aggregate_anchors = [
+        _center(item)
+        for item in items
+        if item.get("position")
+        and any(marker in str(item.get("text", "")) for marker in aggregate_markers)
+    ]
+    if not task_anchors or not aggregate_anchors:
+        return None
+    candidates: set[tuple[int, int, int, int]] = set()
+    for item in items:
+        if not item.get("position"):
+            continue
+        match = re.search(r"(\d+)\s*/\s*(\d+)", str(item.get("text", "")))
+        if not match:
+            continue
+        x, y = _center(item)
+        if not (100 <= x <= 620 and 90 <= y <= 360):
+            continue
+        completed, total = map(int, match.groups())
+        if not (0 < total <= 50 and 0 <= completed <= total):
+            continue
+        for anchor_x, anchor_y in aggregate_anchors:
+            # The aggregate value is below its label in the same summary card.
+            # Ratios above/beside the label are per-task counters.
+            if abs(x - anchor_x) <= 100 and 35 <= y - anchor_y <= 100:
+                candidates.add((completed, total, x, y))
+    if len(candidates) != 1:
+        return None
+    return next(iter(candidates))
+
+
+def _manual_daily_progress(items: list[dict]) -> tuple[int, int] | None:
+    observation = _manual_daily_progress_observation(items)
+    return observation[:2] if observation is not None else None
+
+
+def _manual_level_frame_observation(frame) -> tuple | None:
+    """Return page anchor, numeric level and claim evidence from fixed ROIs."""
+
+    items = frame.ocr()
+    page_markers = ("鐜父鎵嬪唽", "绛夌骇濂栧姳", "环游手册", "等级奖励")
+    if not any(
+        any(marker in str(item.get("text", "")) for marker in page_markers)
+        for item in items
+    ):
+        return None
+    levels: set[tuple[int, int, int]] = set()
+    claim_positions: list[tuple[int, int]] = []
+    claim_markers = ("鍙鍙?", "涓€閿鍙?", "可领取", "一键领取")
+    for item in items:
+        if not item.get("position"):
+            continue
+        x, y = _center(item)
+        text = str(item.get("text", ""))
+        if 120 <= x <= 560 and 80 <= y <= 260:
+            match = re.search(
+                r"(?:LV\.?|等级|绛夌骇)\s*[:：]?\s*(\d{1,3})",
+                text,
+                re.IGNORECASE,
+            )
+            if match:
+                level = int(match.group(1))
+                if 1 <= level <= 100:
+                    levels.add((level, x, y))
+        if 780 <= x <= 1220 and 430 <= y <= 680 and any(
+            marker in text for marker in claim_markers
+        ):
+            claim_positions.append((x, y))
+    if len(levels) != 1:
+        return None
+    image = getattr(frame, "image", None)
+    red_dot_center = None
+    if isinstance(image, np.ndarray) and image.size:
+        hsv = cv.cvtColor(image, cv.COLOR_BGR2HSV)
+        roi = hsv[60:680, 760:1240]
+        red = cv.bitwise_or(
+            cv.inRange(roi, np.array((0, 120, 120)), np.array((10, 255, 255))),
+            cv.inRange(roi, np.array((170, 120, 120)), np.array((179, 255, 255))),
+        )
+        pixels = cv.findNonZero(red)
+        if pixels is not None and len(pixels) >= 12:
+            mean = pixels.reshape(-1, 2).mean(axis=0)
+            red_dot_center = (int(round(mean[0])) + 760, int(round(mean[1])) + 60)
+    level, level_x, level_y = next(iter(levels))
+    return (
+        level,
+        len(claim_positions),
+        int(red_dot_center is not None),
+        level_x,
+        level_y,
+        tuple(sorted(claim_positions)),
+        red_dot_center,
+    )
+
+
+def _centers_stable(first, second, tolerance: int = 8) -> bool:
+    if first is None or second is None:
+        return first is second
+    if isinstance(first, tuple) and first and isinstance(first[0], tuple):
+        return len(first) == len(second) and all(
+            _centers_stable(left, right, tolerance) for left, right in zip(first, second)
+        )
+    return abs(first[0] - second[0]) <= tolerance and abs(first[1] - second[1]) <= tolerance
+
+
+def _manual_level_observations_stable(first: tuple, other: tuple) -> bool:
+    return bool(
+        first[:3] == other[:3]
+        and _centers_stable(first[3:5], other[3:5])
+        and _centers_stable(first[5], other[5])
+        and _centers_stable(first[6], other[6])
+    )
+
+
+def _observe_manual_level_rewards(driver, stable_frames: int = 2) -> int | None:
+    observations = []
+    count = max(2, int(stable_frames))
+    for index in range(count):
+        observation = _manual_level_frame_observation(driver.frame())
+        if observation is None:
+            return None
+        observations.append(observation)
+        if index + 1 < count:
+            driver.sleep(0.25)
+    if any(
+        not _manual_level_observations_stable(observations[0], item)
+        for item in observations[1:]
+    ):
+        return None
+    _, claimable, red_dot, *_ = observations[0]
+    return max(claimable, red_dot)
+
+
+def _matches(actual: str, expected: str) -> bool:
+    return expected.replace(" ", "") in actual.replace(" ", "")
+
+
+def _daily_stage_boxes(image) -> list[tuple[int, int]]:
+    """Return currently claimable yellow stage boxes from a fresh frame."""
+    hsv = cv.cvtColor(image, cv.COLOR_BGR2HSV)
+    boxes = []
+    for x in (439, 562, 684, 806, 929, 1051):
+        patch = hsv[135:195, x - 30:x + 30]
+        yellow = cv.inRange(patch, np.array((15, 100, 120)), np.array((40, 255, 255)))
+        yellow_count = cv.countNonZero(yellow)
+        if yellow_count >= 25:
+            boxes.append((x, yellow_count))
+    return boxes
+
+
+def _daily_activity_value(items: list[dict]) -> int | None:
+    """Read the current daily activity total from its fixed normalized region."""
+    activity = None
+    for item in items:
+        x, y = _center(item)
+        if 150 <= x <= 300 and 160 <= y <= 240:
+            text = str(item.get("text", ""))
+            progress = re.search(r"(\d+)\s*/\s*(\d+)", text)
+            if progress:
+                value = int(progress.group(1))
+            else:
+                numbers = re.findall(r"\d+", text)
+                value = int(numbers[0]) if len(numbers) == 1 else None
+            if value is not None:
+                activity = max(activity or 0, value)
+    return activity
+
+
+def _daily_activity_progress(items: list[dict]) -> tuple[int, int] | None:
+    """Read current and maximum from the normalized daily-activity region."""
+
+    if not _is_daily_activity_page(items):
+        return None
+    for item in items:
+        position = item.get("position")
+        if not position:
+            continue
+        x, y = _center(item)
+        if not (130 <= x <= 340 and 145 <= y <= 260):
+            continue
+        match = re.search(r"(\d+)\s*/\s*(\d+)", str(item.get("text", "")))
+        if not match:
+            continue
+        current, maximum = map(int, match.groups())
+        if 0 < maximum <= 5000 and 0 <= current <= maximum:
+            return current, maximum
+    return None
+
+
+def _is_daily_activity_page(items: list[dict]) -> bool:
+    texts = [str(item.get("text", "")) for item in items]
+    return any(_matches(text, "每日活跃") for text in texts) or (
+        any(_matches(text, "完成进度") for text in texts)
+        and any(_matches(text, "活跃度") for text in texts)
+    )
+
+
+class CardProgressState(str, Enum):
+    UNKNOWN = "UNKNOWN"
+    STABLE_INCOMPLETE = "STABLE_INCOMPLETE"
+    STABLE_COMPLETE = "STABLE_COMPLETE"
+    CONFLICT = "CONFLICT"
+
+
+@dataclass(frozen=True)
+class DailyTaskCard:
+    task_key: str
+    title: str
+    current: int
+    target: int
+    completed: bool
+    claimable: bool | None
+    claimed: bool | None
+    contribution: int | None
+    page_fingerprint: str
+    claim_state_evidence: CardClaimState | None = None
+    progress_conflict: bool = False
+    progress_evidence_frames: int = 1
+    settlement_candidate: bool = False
+    settlement_evidence_frames: int = 0
+    progress_state: CardProgressState = CardProgressState.UNKNOWN
+    progress_evidence_capture_ids: tuple[str, ...] = ()
+    claim_evidence_capture_ids: tuple[str, ...] = ()
+    page_revision: str = ""
+
+    @property
+    def claim_state(self) -> "CardClaimState":
+        return self.claim_state_evidence or _claim_state(self.claimable, self.claimed)
+
+
+@dataclass(frozen=True)
+class DailyActivityPageObservation:
+    current: int | None
+    maximum: int | None
+    current_source: str
+    threshold_values: tuple[int, ...]
+    task_cards: tuple[DailyTaskCard, ...]
+    task_rewards_claimable: int
+    stage_rewards_claimable: int
+    page_complete: bool
+    confidence: str
+    observed_at: datetime
+    missing_evidence: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class DailyVisualSnapshot:
+    activity_current: int | None
+    activity_maximum: int | None
+    task_cards: tuple[DailyTaskCard, ...]
+    claim_states: tuple[str, ...]
+    confidence: str
+    evidence_frames: tuple[str, ...]
+    status: str
+    reason: str
+
+    @property
+    def completed(self) -> bool | None:
+        if self.status != "PASS" or self.activity_current is None or self.activity_maximum is None:
+            return None
+        return self.activity_current >= self.activity_maximum
+
+
+@dataclass(frozen=True)
+class ManualTaskCard:
+    task_key: str
+    title: str
+    current: int
+    target: int
+    completed: bool
+    claimable: bool | None
+    claimed: bool | None
+    contribution: int | None
+    page_fingerprint: str
+    claim_state_evidence: CardClaimState | None = None
+    progress_conflict: bool = False
+    progress_evidence_frames: int = 1
+    settlement_candidate: bool = False
+    settlement_evidence_frames: int = 0
+    progress_state: CardProgressState = CardProgressState.UNKNOWN
+    progress_evidence_capture_ids: tuple[str, ...] = ()
+    claim_evidence_capture_ids: tuple[str, ...] = ()
+    page_revision: str = ""
+
+    @property
+    def claim_state(self) -> "CardClaimState":
+        return self.claim_state_evidence or _claim_state(self.claimable, self.claimed)
+
+
+class CardClaimState(str, Enum):
+    UNKNOWN = "UNKNOWN"
+    CLAIMABLE = "CLAIMABLE"
+    SETTLEMENT_CANDIDATE = "SETTLEMENT_CANDIDATE"
+    CLAIMED_SETTLED = "CLAIMED_SETTLED"
+    NO_REWARD_APPLICABLE_CONFIRMED = "NO_REWARD_APPLICABLE_CONFIRMED"
+    NOT_YET_CLAIMABLE = "NOT_YET_CLAIMABLE"
+    DISABLED_UNKNOWN = "DISABLED_UNKNOWN"
+    CONFLICT = "CONFLICT"
+    # Compatibility aliases for historical reports/tests. New production
+    # decisions use the explicit names above.
+    CLAIMED = "CLAIMED_SETTLED"
+    NONE_CONFIRMED = "NO_REWARD_APPLICABLE_CONFIRMED"
+
+
+def _claim_state(claimable: bool | None, claimed: bool | None) -> CardClaimState:
+    if claimable is True and claimed is False:
+        return CardClaimState.CLAIMABLE
+    if claimable is False and claimed is True:
+        return CardClaimState.SETTLEMENT_CANDIDATE
+    if claimable is False and claimed is False:
+        return CardClaimState.NOT_YET_CLAIMABLE
+    if claimable is None and claimed is None:
+        return CardClaimState.UNKNOWN
+    return CardClaimState.CONFLICT
+
+
+class MovementState(str, Enum):
+    MOVED = "MOVED"
+    STATIONARY_CONFIRMED = "STATIONARY_CONFIRMED"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class MovementObservation:
+    state: MovementState
+    displacement_px: int | None
+    matched_content_items: int
+    dispersion: float | None
+    direction_consistent: bool
+    fixed_anchor_displacement: int | None
+
+
+@dataclass(frozen=True)
+class ManualTaskInventoryObservation:
+    cards: tuple[ManualTaskCard, ...]
+    completed: int | None
+    total: int | None
+    scan_complete: bool
+
+
+@dataclass(frozen=True)
+class ManualLevelObservation:
+    current_level: int | None
+    claimable_level_rewards: int
+    visible_locked_levels: int
+    visible_claimed_levels: int
+    track_scan_complete: bool
+    confidence: str
+    claimability_complete: bool = False
+
+
+@dataclass(frozen=True)
+class PageScanEvidence:
+    movement_confirmed: bool
+    end_marker: bool
+    captured_at: datetime
+    displacement_px: int | None = None
+    page_anchor_confirmed: bool = True
+    swipe_attempted: bool = False
+    content_displacement_px: int | None = None
+    matched_content_items: int = 0
+    fixed_anchor_displacement_px: int | None = None
+    end_candidate_sequence: int = 0
+    end_confirmed_after_last_move: bool = False
+    movement_state: MovementState = MovementState.UNKNOWN
+    capture_id: str = ""
+
+
+def _evidence_movement_state(evidence: PageScanEvidence) -> MovementState:
+    if evidence.movement_state is not MovementState.UNKNOWN:
+        return evidence.movement_state
+    displacement = evidence.content_displacement_px
+    if displacement is None and evidence.movement_confirmed:
+        displacement = evidence.displacement_px
+    if evidence.movement_confirmed and displacement is not None and abs(displacement) >= 30:
+        return MovementState.MOVED
+    if (
+        evidence.swipe_attempted
+        and displacement is not None
+        and abs(displacement) < 10
+        and evidence.matched_content_items >= 2
+    ):
+        return MovementState.STATIONARY_CONFIRMED
+    return MovementState.UNKNOWN
+
+
+@dataclass(frozen=True)
+class ManualTrackSegment:
+    level: int
+    slot: str
+    claimable: bool | None
+    claimed: bool | None
+    locked: bool | None
+    reward_lane: str = "default"
+    reward_type: str = "level_reward"
+    screen_x: int | None = None
+
+
+class ManualRewardTrackScanner:
+    def __init__(
+        self,
+        *,
+        min_frame_separation: timedelta = timedelta(milliseconds=200),
+    ):
+        self.min_frame_separation = min_frame_separation
+        self._segments: dict[tuple[int, str, str], ManualTrackSegment] = {}
+        self._conflicts: set[tuple[tuple[int, str, str], str]] = set()
+        self._movement_seen = False
+        self._end_seen = False
+        self._end_candidate_sequence = 0
+        self._last_captured_at: datetime | None = None
+        self._time_separated = True
+        self._anchor_valid = True
+
+    @property
+    def segments(self) -> tuple[ManualTrackSegment, ...]:
+        return tuple(self._segments.values())
+
+    @property
+    def complete(self) -> bool:
+        return (
+            self._movement_seen
+            and self._end_seen
+            and self._time_separated
+            and self._anchor_valid
+        )
+
+    @property
+    def claimability_complete(self) -> bool:
+        return bool(self.complete and self.segments) and all(
+            item.claimable is not None
+            and item.claimed is not None
+            and item.locked is not None
+            for item in self.segments
+        )
+
+    @property
+    def claimable_level_rewards(self) -> int:
+        return sum(1 for segment in self.segments if segment.claimable)
+
+    def add_segments(
+        self,
+        segments: list[ManualTrackSegment],
+        evidence: PageScanEvidence,
+    ) -> None:
+        if self._last_captured_at is not None:
+            if evidence.captured_at - self._last_captured_at < self.min_frame_separation:
+                self._time_separated = False
+        self._last_captured_at = evidence.captured_at
+        self._anchor_valid = self._anchor_valid and evidence.page_anchor_confirmed
+        movement_state = _evidence_movement_state(evidence)
+        if movement_state is MovementState.MOVED:
+            self._movement_seen = True
+            self._end_seen = False
+            self._end_candidate_sequence = 0
+        elif movement_state is MovementState.STATIONARY_CONFIRMED and self._movement_seen:
+            self._end_candidate_sequence += 1
+        if evidence.end_marker and self._movement_seen and (
+            evidence.end_confirmed_after_last_move
+        ):
+            self._end_seen = True
+        elif self._end_candidate_sequence >= 2 and self._movement_seen:
+            self._end_seen = True
+        for segment in segments:
+            key = (int(segment.level), str(segment.reward_lane), str(segment.reward_type))
+            old = self._segments.get(key)
+            if old is None:
+                self._segments[key] = segment
+                continue
+            merged = {}
+            for field in ("claimable", "claimed", "locked"):
+                old_value, new_value = getattr(old, field), getattr(segment, field)
+                conflict_key = (key, field)
+                if conflict_key in self._conflicts:
+                    value = None
+                elif new_value is None:
+                    value = old_value
+                elif old_value is None:
+                    value = new_value
+                elif old_value == new_value:
+                    value = old_value
+                else:
+                    self._conflicts.add(conflict_key)
+                    value = None
+                merged[field] = value
+            self._segments[key] = replace(
+                old, **merged, screen_x=segment.screen_x,
+                slot=old.slot,
+            )
+
+    def observation(self) -> ManualLevelObservation:
+        return ManualLevelObservation(
+            current_level=None,
+            claimable_level_rewards=self.claimable_level_rewards,
+            visible_locked_levels=sum(1 for item in self.segments if item.locked),
+            visible_claimed_levels=sum(1 for item in self.segments if item.claimed),
+            track_scan_complete=self.complete,
+            confidence="HIGH" if self.complete and self.claimability_complete else "UNKNOWN",
+            claimability_complete=self.claimability_complete,
+        )
+
+
+def _normalized_key(title: str) -> str:
+    return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", title).casefold()
+
+
+def _items_fingerprint(items: list[dict]) -> str:
+    import hashlib
+
+    text = "|".join(
+        sorted(
+            f"{_normalized_key(str(item.get('text', '')))}@{_center(item)}"
+            for item in items
+            if item.get("position")
+        )
+    )
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _card_items(items: list[dict], *, manual: bool) -> list[DailyTaskCard | ManualTaskCard]:
+    ratio_rows = []
+    for item in items:
+        if not item.get("position"):
+            continue
+        match = re.fullmatch(r"\s*(\d+)\s*/\s*(\d+)\s*", str(item.get("text", "")))
+        if not match:
+            continue
+        x, y = _center(item)
+        if manual and not (250 <= y <= 380):
+            continue
+        if not manual and not (285 <= y <= 365):
+            continue
+        current, target = map(int, match.groups())
+        if target <= 0 or current < 0 or current > target:
+            continue
+        ratio_rows.append((x, y, current, target))
+    result = []
+    fingerprint = _items_fingerprint(items)
+    for x, y, current, target in ratio_rows:
+        if manual:
+            title_candidates = [
+                item for item in items if item.get("position")
+                and abs(_center(item)[0] - x) <= 115 and 245 <= _center(item)[1] <= 305
+                and "/" not in str(item.get("text", ""))
+            ]
+            contribution_candidates = [
+                item for item in items if item.get("position")
+                and abs(_center(item)[0] - x) <= 110 and 470 <= _center(item)[1] <= 525
+            ]
+            status_candidates = [
+                item for item in items if item.get("position")
+                and abs(_center(item)[0] - x) <= 100 and 520 <= _center(item)[1] <= 570
+            ]
+        else:
+            title_candidates = [
+                item for item in items if item.get("position")
+                and abs(_center(item)[0] - x) <= 120 and 360 <= _center(item)[1] <= 430
+            ]
+            contribution_candidates = [
+                item for item in items if item.get("position")
+                and abs(_center(item)[0] - x) <= 100 and 525 <= _center(item)[1] <= 575
+            ]
+            status_candidates = [
+                item for item in items if item.get("position")
+                and abs(_center(item)[0] - x) <= 105 and 590 <= _center(item)[1] <= 650
+            ]
+        if not title_candidates:
+            continue
+        title = str(min(title_candidates, key=lambda item: abs(_center(item)[0] - x)).get("text", "")).strip()
+        if not _normalized_key(title):
+            continue
+        contribution = None
+        for item in contribution_candidates:
+            numbers = re.findall(r"\d+", str(item.get("text", "")))
+            if numbers:
+                contribution = int(numbers[-1])
+                break
+        status_text = " ".join(str(item.get("text", "")) for item in status_candidates)
+        claim_state_evidence = None
+        settlement_candidate = False
+        if "已领取" in status_text:
+            claimable, claimed = None, None
+            claim_state_evidence = CardClaimState.SETTLEMENT_CANDIDATE
+            settlement_candidate = True
+        elif "按钮禁用" in status_text:
+            claimable = claimed = None
+            claim_state_evidence = CardClaimState.DISABLED_UNKNOWN
+        elif "不可领取" in status_text:
+            claimable = claimed = False
+            claim_state_evidence = CardClaimState.NOT_YET_CLAIMABLE
+        elif "奖励已结清" in status_text:
+            claimable = claimed = None
+            claim_state_evidence = CardClaimState.UNKNOWN
+            settlement_candidate = True
+        elif "无可领取" in status_text:
+            # A card-local substring cannot prove the page-global absence of
+            # rewards. Keep it unknown until an authoritative page predicate.
+            claimable = claimed = None
+            claim_state_evidence = CardClaimState.UNKNOWN
+        elif "可领取" in status_text or (
+            manual and "领取" in status_text and "已领取" not in status_text
+        ):
+            claimable, claimed = True, False
+        else:
+            # Absence of OCR status text is missing evidence, not proof that
+            # the card has no reward.
+            claimable = claimed = None
+        card_type = ManualTaskCard if manual else DailyTaskCard
+        result.append(
+            card_type(
+                task_key=_normalized_key(title), title=title, current=current, target=target,
+                completed=current >= target, claimable=claimable, claimed=claimed,
+                contribution=contribution, page_fingerprint=fingerprint,
+                claim_state_evidence=claim_state_evidence,
+                settlement_candidate=settlement_candidate,
+                settlement_evidence_frames=1 if settlement_candidate else 0,
+                progress_state=CardProgressState.UNKNOWN,
+                page_revision=fingerprint,
+            )
+        )
+    return result
+
+
+class _CardScannerBase:
+    manual = False
+
+    def __init__(self, *, max_pages: int = 12):
+        self.max_pages = max(1, int(max_pages))
+        self._cards: dict[str, DailyTaskCard | ManualTaskCard] = {}
+        self._pages = 0
+        self._no_new = 0
+        self.cancelled = False
+        self._evidence_mode = False
+        self._movement_seen = False
+        self._end_seen = False
+        self._end_candidate_sequence = 0
+        self._last_evidence_at: datetime | None = None
+        self._distinct_evidence_times = True
+        self._anchor_valid = True
+        self._claim_conflicts: set[str] = set()
+        self._authoritative_no_task_evidence = False
+
+    @property
+    def cards(self):
+        return tuple(self._cards.values())
+
+    @property
+    def complete(self) -> bool:
+        if self._evidence_mode:
+            return (
+                not self.cancelled
+                and self._movement_seen
+                and self._end_seen
+                and self._distinct_evidence_times
+                and self._anchor_valid
+                and self._pages <= self.max_pages
+            )
+        return not self.cancelled and self._no_new >= 2 and self._pages <= self.max_pages
+
+    @property
+    def progress_states_complete(self) -> bool:
+        if not self.cards:
+            return bool(self.complete and self._authoritative_no_task_evidence)
+        return bool(
+            self.complete
+            and all(
+                card.progress_state
+                in {
+                    CardProgressState.STABLE_INCOMPLETE,
+                    CardProgressState.STABLE_COMPLETE,
+                }
+                for card in self.cards
+            )
+        )
+
+    @property
+    def claim_states_complete(self) -> bool:
+        if not self.cards:
+            return bool(self.complete and self._authoritative_no_task_evidence)
+        if not self.progress_states_complete:
+            return False
+        completed = [
+            card
+            for card in self.cards
+            if card.progress_state is CardProgressState.STABLE_COMPLETE
+        ]
+        if not completed:
+            return bool(self.complete)
+        return all(
+            card.claim_state in (
+                CardClaimState.CLAIMED_SETTLED,
+                CardClaimState.NO_REWARD_APPLICABLE_CONFIRMED,
+            )
+            for card in completed
+        )
+
+    def mark_authoritative_no_tasks(self, confirmed: bool = True) -> None:
+        """Record an anchored, authoritative empty-inventory observation."""
+
+        self._authoritative_no_task_evidence = bool(confirmed)
+
+    @staticmethod
+    def _same_title(left: str, right: str) -> bool:
+        left_key, right_key = _normalized_key(left), _normalized_key(right)
+        return bool(
+            left_key == right_key
+            or min(len(left_key), len(right_key)) >= 4
+            and (left_key in right_key or right_key in left_key)
+        )
+
+    def _canonical_key(self, card: DailyTaskCard | ManualTaskCard) -> str:
+        for key, existing in self._cards.items():
+            if self._same_title(existing.title, card.title):
+                return key
+        return card.task_key
+
+    def _merge_card(self, key, old, new):
+        contribution = old.contribution if new.contribution is None else new.contribution
+        if old.contribution is not None and new.contribution is not None and old.contribution != new.contribution:
+            contribution = old.contribution
+        settlement_frames = old.settlement_evidence_frames
+        if old.settlement_candidate and new.settlement_candidate:
+            settlement_frames = old.settlement_evidence_frames + 1
+            new_state = (
+                CardClaimState.CLAIMED_SETTLED
+                if settlement_frames >= 2
+                else CardClaimState.UNKNOWN
+            )
+            new = replace(
+                new,
+                claimable=False if settlement_frames >= 2 else None,
+                claimed=True if settlement_frames >= 2 else None,
+                claim_state_evidence=new_state,
+                settlement_evidence_frames=settlement_frames,
+            )
+        elif new.settlement_candidate:
+            settlement_frames = max(1, new.settlement_evidence_frames)
+            new = replace(
+                new,
+                claimable=None,
+                claimed=None,
+                claim_state_evidence=CardClaimState.SETTLEMENT_CANDIDATE,
+                settlement_evidence_frames=settlement_frames,
+            )
+        elif old.settlement_candidate:
+            new = replace(
+                new,
+                claimable=None,
+                claimed=None,
+                claim_state_evidence=CardClaimState.SETTLEMENT_CANDIDATE,
+                settlement_candidate=True,
+                settlement_evidence_frames=old.settlement_evidence_frames,
+            )
+        old_state, new_state = old.claim_state, new.claim_state
+        if key in self._claim_conflicts:
+            claimable = claimed = None
+            claim_state_evidence = CardClaimState.CONFLICT
+        elif (
+            old_state is CardClaimState.SETTLEMENT_CANDIDATE
+            and new_state is CardClaimState.CLAIMED_SETTLED
+            and new.settlement_evidence_frames >= 2
+        ):
+            claimable, claimed = False, True
+            claim_state_evidence = CardClaimState.CLAIMED_SETTLED
+        elif new_state is CardClaimState.UNKNOWN:
+            claimable, claimed = old.claimable, old.claimed
+            claim_state_evidence = old.claim_state_evidence
+        elif old_state is CardClaimState.UNKNOWN:
+            claimable, claimed = new.claimable, new.claimed
+            claim_state_evidence = new.claim_state_evidence
+        elif old_state is new_state:
+            claimable, claimed = old.claimable, old.claimed
+            claim_state_evidence = old.claim_state_evidence
+        else:
+            self._claim_conflicts.add(key)
+            claimable = claimed = None
+            claim_state_evidence = CardClaimState.CONFLICT
+        progress_ids = tuple(dict.fromkeys(
+            (*old.progress_evidence_capture_ids, *new.progress_evidence_capture_ids)
+        ))
+        claim_ids = tuple(dict.fromkeys(
+            (*old.claim_evidence_capture_ids, *new.claim_evidence_capture_ids)
+        ))
+        if (
+            old.progress_state is CardProgressState.CONFLICT
+            or old.current != new.current
+            or old.target != new.target
+        ):
+            progress_state = CardProgressState.CONFLICT
+            progress_conflict = True
+            current, target, completed = new.current, new.target, False
+        elif len(progress_ids) >= 2:
+            progress_state = (
+                CardProgressState.STABLE_COMPLETE
+                if new.current >= new.target
+                else CardProgressState.STABLE_INCOMPLETE
+            )
+            progress_conflict = False
+            current, target = new.current, new.target
+            completed = progress_state is CardProgressState.STABLE_COMPLETE
+        else:
+            progress_state = CardProgressState.UNKNOWN
+            progress_conflict = False
+            current, target, completed = new.current, new.target, False
+        progress_frames = len(progress_ids)
+        return replace(
+            old,
+            current=current,
+            target=target,
+            completed=completed,
+            progress_conflict=progress_conflict,
+            progress_evidence_frames=progress_frames,
+            progress_state=progress_state,
+            progress_evidence_capture_ids=progress_ids,
+            claim_evidence_capture_ids=claim_ids,
+            claimable=claimable,
+            claimed=claimed,
+            claim_state_evidence=claim_state_evidence,
+            settlement_candidate=new.settlement_candidate,
+            settlement_evidence_frames=new.settlement_evidence_frames,
+            contribution=contribution,
+            page_fingerprint=new.page_fingerprint,
+            page_revision=new.page_revision or new.page_fingerprint,
+            title=old.title if len(_normalized_key(old.title)) >= len(_normalized_key(new.title)) else new.title,
+        )
+
+    def add_cards(
+        self,
+        cards: list[DailyTaskCard | ManualTaskCard],
+        *,
+        evidence: PageScanEvidence | None = None,
+    ) -> int:
+        if self.cancelled or self._pages >= self.max_pages:
+            return 0
+        self._pages += 1
+        capture_id = (
+            str(evidence.capture_id).strip()
+            if evidence is not None and str(evidence.capture_id).strip()
+            else hashlib.sha256(
+                (
+                    evidence.captured_at.isoformat(timespec="microseconds")
+                    if evidence is not None
+                    else f"scanner-page:{self._pages}"
+                ).encode("utf-8")
+            ).hexdigest()[:16]
+        )
+        if evidence is not None:
+            self._evidence_mode = True
+            if self._last_evidence_at is not None and evidence.captured_at <= self._last_evidence_at:
+                self._distinct_evidence_times = False
+            self._last_evidence_at = evidence.captured_at
+            self._anchor_valid = self._anchor_valid and evidence.page_anchor_confirmed
+            if not evidence.page_anchor_confirmed:
+                self.cancelled = True
+            movement_state = _evidence_movement_state(evidence)
+            if movement_state is MovementState.MOVED:
+                self._movement_seen = True
+                self._end_seen = False
+                self._end_candidate_sequence = 0
+            elif movement_state is MovementState.STATIONARY_CONFIRMED and self._movement_seen:
+                self._end_candidate_sequence += 1
+            if evidence.end_marker and self._movement_seen and (
+                evidence.end_confirmed_after_last_move
+            ):
+                self._end_seen = True
+            elif self._end_candidate_sequence >= 2 and self._movement_seen:
+                self._end_seen = True
+        before = len(self._cards)
+        for card in cards:
+            claim_ids = (
+                (capture_id,)
+                if card.claim_state
+                not in {CardClaimState.UNKNOWN, CardClaimState.DISABLED_UNKNOWN}
+                else ()
+            )
+            card = replace(
+                card,
+                progress_state=CardProgressState.UNKNOWN,
+                progress_evidence_frames=1,
+                progress_evidence_capture_ids=(capture_id,),
+                claim_evidence_capture_ids=claim_ids,
+                page_revision=card.page_revision or card.page_fingerprint,
+            )
+            key = self._canonical_key(card)
+            old = self._cards.get(key)
+            self._cards[key] = (
+                replace(card, completed=False)
+                if old is None else self._merge_card(key, old, card)
+            )
+        added = len(self._cards) - before
+        self._no_new = 0 if added else self._no_new + 1
+        return added
+
+    def add_page(
+        self,
+        items: list[dict],
+        *,
+        evidence: PageScanEvidence | None = None,
+    ) -> int:
+        return self.add_cards(_card_items(items, manual=self.manual), evidence=evidence)
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+def _horizontal_displacement(
+    previous: list[dict],
+    current: list[dict],
+    *,
+    content_roi: tuple[int, int, int, int] | None = None,
+) -> MovementObservation:
+    """Classify content movement without converting missing evidence to zero."""
+
+    def unique_x(items: list[dict], *, inside_roi: bool) -> dict[str, float]:
+        grouped: dict[str, list[float]] = {}
+        for item in items:
+            if not item.get("position"):
+                continue
+            x, y = _center(item)
+            if content_roi is not None:
+                x1, y1, x2, y2 = content_roi
+                inside = (
+                    min(x1, x2) <= x <= max(x1, x2)
+                    and min(y1, y2) <= y <= max(y1, y2)
+                )
+                if inside != inside_roi:
+                    continue
+            elif not inside_roi:
+                continue
+            key = _normalized_key(str(item.get("text", "")))
+            if len(key) < 2:
+                continue
+            # Quantized vertical lane separates repeated labels on different
+            # rows without binding identity to the moving screen x coordinate.
+            key = f"{key}:lane{int(round(y / 80.0))}"
+            grouped.setdefault(key, []).append(float(x))
+        return {key: values[0] for key, values in grouped.items() if len(values) == 1}
+
+    before = unique_x(previous, inside_roi=True)
+    after = unique_x(current, inside_roi=True)
+    deltas = [after[key] - before[key] for key in before.keys() & after.keys()]
+    fixed_displacement = None
+    if content_roi is not None:
+        fixed_before = unique_x(previous, inside_roi=False)
+        fixed_after = unique_x(current, inside_roi=False)
+        fixed_deltas = [
+            fixed_after[key] - fixed_before[key]
+            for key in fixed_before.keys() & fixed_after.keys()
+        ]
+        if fixed_deltas:
+            fixed_displacement = int(round(float(np.median(fixed_deltas))))
+
+    if len(deltas) < 2:
+        return MovementObservation(
+            MovementState.UNKNOWN, None, len(deltas), None, False, fixed_displacement
+        )
+    median = int(round(float(np.median(deltas))))
+    dispersion = float(np.std(deltas))
+    consistent = [value for value in deltas if abs(value - median) <= 20]
+    direction_consistent = len(consistent) >= 2 and (
+        abs(median) < 10
+        or all(value <= 0 for value in consistent)
+        or all(value >= 0 for value in consistent)
+    )
+    if direction_consistent and abs(median) >= 30:
+        state = MovementState.MOVED
+    elif direction_consistent and abs(median) < 10 and dispersion <= 10:
+        state = MovementState.STATIONARY_CONFIRMED
+    else:
+        state = MovementState.UNKNOWN
+    return MovementObservation(
+        state, median if state is not MovementState.UNKNOWN else None,
+        len(deltas), dispersion, direction_consistent, fixed_displacement,
+    )
+
+
+def _page_scan_evidence(
+    scanner: object,
+    movement: MovementObservation,
+    captured_at: datetime,
+    *,
+    page_anchor_confirmed: bool = True,
+    swipe_attempted: bool = True,
+) -> PageScanEvidence:
+    """Translate a movement observation into fail-closed scanner evidence."""
+
+    previous_sequence = int(getattr(scanner, "_end_candidate_sequence", 0))
+    movement_seen = bool(getattr(scanner, "_movement_seen", False))
+    if movement.state is MovementState.MOVED:
+        sequence = 0
+    elif movement.state is MovementState.STATIONARY_CONFIRMED and movement_seen:
+        sequence = previous_sequence + 1
+    else:
+        sequence = previous_sequence
+    end_confirmed = bool(movement_seen and sequence >= 2)
+    return PageScanEvidence(
+        movement_confirmed=movement.state is MovementState.MOVED,
+        end_marker=end_confirmed,
+        captured_at=captured_at,
+        displacement_px=(
+            abs(movement.displacement_px)
+            if movement.displacement_px is not None
+            else None
+        ),
+        page_anchor_confirmed=page_anchor_confirmed,
+        swipe_attempted=swipe_attempted,
+        content_displacement_px=movement.displacement_px,
+        matched_content_items=movement.matched_content_items,
+        fixed_anchor_displacement_px=movement.fixed_anchor_displacement,
+        end_candidate_sequence=sequence,
+        end_confirmed_after_last_move=end_confirmed,
+        movement_state=movement.state,
+    )
+
+
+class DailyCardScanner(_CardScannerBase):
+    manual = False
+
+
+class ManualCardScanner(_CardScannerBase):
+    manual = True
+
+    def observation(self) -> ManualTaskInventoryObservation:
+        summary = self.summary()
+        return ManualTaskInventoryObservation(
+            tuple(self.cards),
+            summary[0] if summary else None,
+            summary[1] if summary else None,
+            self.complete,
+        )
+
+    def summary(self) -> tuple[int, int] | None:
+        if not self.progress_states_complete:
+            return None
+        return sum(1 for card in self.cards if card.completed or card.claimed), len(self.cards)
+
+
+def _image_daily_zero(image: np.ndarray | None) -> int | None:
+    """Conservatively recognize only a uniquely closed, symmetric zero glyph.
+
+    A hole alone is not evidence of zero: 6/8/9 and decorative rings all have
+    holes. Ambiguous images deliberately remain UNKNOWN (``None``).
+    """
+
+    if image is None or image.shape[0] < 225 or image.shape[1] < 260:
+        return None
+    roi = image[175:225, 190:260]
+    hsv = cv.cvtColor(roi, cv.COLOR_BGR2HSV)
+    mask = cv.inRange(hsv, (85, 60, 80), (140, 255, 255))
+    mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, np.ones((2, 2), np.uint8))
+    contours, hierarchy = cv.findContours(mask, cv.RETR_CCOMP, cv.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None:
+        return None
+    candidates = []
+    for index, contour in enumerate(contours):
+        if hierarchy[0][index][3] >= 0:
+            continue
+        x, y, width, height = cv.boundingRect(contour)
+        if not (6 <= width <= 30 and 14 <= height <= 40):
+            continue
+        if not (0.42 <= width / height <= 0.90):
+            continue
+        children = [
+            child_index for child_index in range(len(contours))
+            if hierarchy[0][child_index][3] == index
+        ]
+        if len(children) != 1:
+            continue
+        hole = contours[children[0]]
+        moments = cv.moments(hole)
+        if moments["m00"] <= 0:
+            continue
+        hole_center_y = moments["m01"] / moments["m00"]
+        normalized_y = (hole_center_y - y) / height
+        outer_area = max(cv.contourArea(contour), 1.0)
+        hole_ratio = cv.contourArea(hole) / outer_area
+        if not (0.40 <= normalized_y <= 0.60 and 0.18 <= hole_ratio <= 0.48):
+            continue
+        candidates.append((x, y, width, height))
+    return 0 if len(candidates) == 1 else None
+
+
+def _stable_visual_daily_current(
+    frames: list[list[dict]],
+    *,
+    maximum: int | None,
+    images: list[np.ndarray] | None = None,
+) -> int | None:
+    values = []
+    for index, items in enumerate(frames):
+        if not _is_daily_activity_page(items):
+            values.append(None)
+            continue
+        candidates = []
+        for item in items:
+            if not item.get("position"):
+                continue
+            x, y = _center(item)
+            if not (130 <= x <= 340 and 145 <= y <= 260):
+                continue
+            match = re.search(r"(\d+)\s*/\s*(\d+)", str(item.get("text", "")))
+            if match:
+                candidates.append(int(match.group(1)))
+                continue
+            text = str(item.get("text", "")).strip()
+            if re.fullmatch(r"\d{1,4}", text):
+                candidates.append(int(text))
+        if not candidates and images and index < len(images):
+            image_value = _image_daily_zero(images[index])
+            if image_value is not None:
+                candidates.append(image_value)
+        candidates = [
+            value for value in candidates
+            if maximum is not None and 0 <= value <= maximum
+        ]
+        values.append(candidates[0] if len(candidates) == 1 else None)
+    return values[0] if values and values[0] is not None and all(value == values[0] for value in values) else None
+
+
+def observe_daily_activity_layout(
+    frames: list[list[dict]],
+    *,
+    scanner: DailyCardScanner | None = None,
+    page_complete: bool | None = None,
+    stage_rewards_claimable: int = 0,
+    images: list[np.ndarray] | None = None,
+) -> DailyActivityPageObservation:
+    threshold_sets = []
+    for items in frames:
+        values = {
+            int(str(item.get("text", "")).strip())
+            for item in items
+            if item.get("position")
+            and 90 <= _center(item)[1] <= 190
+            and re.fullmatch(r"\d{2,4}", str(item.get("text", "")).strip())
+        }
+        threshold_sets.append(tuple(sorted(value for value in values if value > 0)))
+    thresholds = threshold_sets[0] if threshold_sets and all(item == threshold_sets[0] for item in threshold_sets) else ()
+    maximum = max(thresholds) if len(thresholds) >= 2 else None
+    visual = _stable_visual_daily_current(frames, maximum=maximum, images=images)
+    cards = tuple(scanner.cards) if scanner else tuple(_card_items(frames[-1] if frames else [], manual=False))
+    complete = scanner.complete if scanner is not None else bool(page_complete)
+    card_current = None
+    if complete and cards and all(card.contribution is not None for card in cards):
+        card_current = sum(
+            int(card.contribution or 0)
+            for card in cards
+            if card.completed or card.claimed
+        )
+    if visual is not None and card_current is not None and visual != card_current:
+        current, source = None, "conflict"
+    elif visual is not None:
+        current, source = visual, "visual_roi"
+    elif card_current is not None:
+        current, source = card_current, "complete_card_inventory"
+    else:
+        current, source = None, "unknown"
+    missing = []
+    if maximum is None:
+        missing.append("stable_stage_thresholds")
+    if current is None:
+        missing.append("stable_current_or_complete_card_inventory")
+    if not complete:
+        missing.append("end_of_card_list")
+    return DailyActivityPageObservation(
+        current=current,
+        maximum=maximum,
+        current_source=source,
+        threshold_values=thresholds,
+        task_cards=cards,
+        task_rewards_claimable=sum(1 for card in cards if card.claimable),
+        stage_rewards_claimable=max(0, int(stage_rewards_claimable)),
+        page_complete=complete,
+        # The total and thresholds are independent fixed-page facts. Card-list
+        # completeness is reported separately and only gates card inventory.
+        confidence="HIGH" if maximum is not None and current is not None else "UNKNOWN",
+        observed_at=SERVER_CLOCK.server_now(),
+        missing_evidence=tuple(missing),
+    )
+
+
+def build_daily_visual_snapshot(
+    frames: list[list[dict]],
+    *,
+    scanner: DailyCardScanner | None = None,
+    page_complete: bool | None = None,
+    stage_rewards_claimable: int = 0,
+    images: list[np.ndarray] | None = None,
+    captured_at: datetime | None = None,
+) -> DailyVisualSnapshot:
+    """Build a read-only snapshot whose unknown values remain unknown."""
+
+    del captured_at  # Evidence time remains on the underlying observation.
+    observation = observe_daily_activity_layout(
+        frames,
+        scanner=scanner,
+        page_complete=page_complete,
+        stage_rewards_claimable=stage_rewards_claimable,
+        images=images,
+    )
+    evidence_frames = tuple(
+        hashlib.sha256(
+            json.dumps(items, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        for items in frames
+    )
+    known = observation.current is not None and observation.maximum is not None
+    return DailyVisualSnapshot(
+        activity_current=observation.current,
+        activity_maximum=observation.maximum,
+        task_cards=observation.task_cards,
+        claim_states=tuple(card.claim_state.value for card in observation.task_cards),
+        confidence=observation.confidence if known else "UNKNOWN",
+        evidence_frames=evidence_frames,
+        status="PASS" if known else "UNKNOWN",
+        reason="daily_activity_confirmed" if known else "daily_activity_not_confirmed",
+    )
+
+
+def observe_manual_level_layout(
+    frames: list[list[dict]],
+    *,
+    track_scan_complete: bool,
+) -> ManualLevelObservation:
+    snapshots = []
+    page_anchored = True
+    for items in frames:
+        texts = [str(item.get("text", "")).replace(" ", "") for item in items]
+        page_anchored = page_anchored and any(
+            _matches(text, marker)
+            for text in texts
+            for marker in ("环游手册", "等级奖励")
+        )
+        levels = {
+            int(match.group(1))
+            for text in texts
+            for match in [re.search(r"(?:当前等级|玩家等级)[:：]?\s*(\d{1,3})", text, re.I)]
+            if match
+        }
+        snapshots.append((
+            next(iter(levels)) if len(levels) == 1 else None,
+            sum(text == "可领取" for text in texts),
+            sum(any(marker in text for marker in ("未解锁", "锁定")) for text in texts),
+            sum("已领取" in text for text in texts),
+        ))
+    stable = bool(snapshots and all(item == snapshots[0] for item in snapshots))
+    current, claimable, locked, claimed = snapshots[0] if stable else (None, 0, 0, 0)
+    return ManualLevelObservation(
+        current, claimable, locked, claimed, bool(track_scan_complete),
+        "HIGH" if stable and track_scan_complete and page_anchored else "UNKNOWN",
+        bool(stable and track_scan_complete and page_anchored),
+    )
+
+
+def _manual_track_segments(items: list[dict]) -> list[ManualTrackSegment]:
+    segments: list[ManualTrackSegment] = []
+    for item in items:
+        if not item.get("position"):
+            continue
+        x, y = _center(item)
+        text = str(item.get("text", "")).strip()
+        if not (105 <= y <= 190 and re.fullmatch(r"\d{1,3}", text)):
+            continue
+        level = int(text)
+        nearby = " ".join(
+            str(candidate.get("text", ""))
+            for candidate in items
+            if candidate.get("position")
+            and abs(_center(candidate)[0] - x) <= 80
+            and 180 <= _center(candidate)[1] <= 620
+        )
+        is_claimable = any(_matches(nearby, marker) for marker in ("可领取", "领取")) and not _matches(nearby, "已领取")
+        is_claimed = _matches(nearby, "已领取")
+        is_locked = any(_matches(nearby, marker) for marker in ("未解锁", "锁定"))
+        explicit = is_claimable or is_claimed or is_locked
+        segments.append(
+            ManualTrackSegment(
+                level=level,
+                slot=f"x{round(x / 25) * 25}",
+                claimable=is_claimable if explicit else None,
+                claimed=is_claimed if explicit else None,
+                locked=is_locked if explicit else None,
+                reward_lane="main", reward_type="level_reward", screen_x=x,
+            )
+        )
+    return segments
+
+
+def _is_manual_task_inventory_page(items: list[dict]) -> bool:
+    return bool(
+        _manual_daily_progress_observation(items) is not None
+        or _card_items(items, manual=True)
+    )
+
+
+def _is_manual_track_page(items: list[dict]) -> bool:
+    texts = [str(item.get("text", "")) for item in items]
+    return bool(
+        _manual_track_segments(items)
+        and any(
+            _matches(text, marker)
+            for text in texts
+            for marker in ("环游手册", "等级奖励")
+        )
+    )
+
+
+@dataclass
+class RewardDriver:
+    sleep: Callable[[float], None] = time.sleep
+
+    def frame(self):
+        return screenshot()
+
+    def texts(self) -> list[dict]:
+        return self.frame().ocr()
+
+    def tap(
+        self,
+        pos: tuple[int, int],
+        *,
+        action_key: str = "unclassified_tap",
+        page_id: str = "reward_navigation",
+        anchor_key: str = "coordinate",
+    ) -> bool:
+        if action_key == "open_tab":
+            is_task_tab = "任务列表" in str(anchor_key).replace(" ", "")
+            mapped_action = "manual_tasks_tab" if is_task_tab else "manual_track_tab"
+        else:
+            mapped_action = (
+            "reward_back" if action_key == "back"
+            else action_key
+            )
+        requested_target = (
+            "top_left_back" if mapped_action == "reward_back"
+            else "manual_tasks_tab" if mapped_action == "manual_tasks_tab"
+            else "manual_track_tab" if mapped_action == "manual_track_tab"
+            else anchor_key
+        )
+        result = input_tap(
+            pos,
+            intent=ActionIntent(
+                mapped_action,
+                requested_target,
+                f"reward:{page_id}:{anchor_key}",
+            ),
+        )
+        if result is False:
+            raise PermissionError(f"read-only action denied: {action_key}")
+        return bool(result)
+
+    def swipe_left(self, page_type: str = "daily") -> None:
+        start = (1100, 450)
+        manual = str(page_type).startswith("manual")
+        result = input_swipe(
+            start, (500, 450), swipe_time=650,
+            intent=ActionIntent(
+                "manual_horizontal_scroll" if manual else "daily_horizontal_scroll",
+                "manual_content" if manual else "daily_content",
+                f"reward:{page_type}:horizontal-scroll",
+            ),
+        )
+        if result is False:
+            raise PermissionError("read-only action denied: scroll")
+        self.sleep(0.8)
+
+    def click_text(
+        self, text: str, attempts: int = 3, *, action_key: str = "open_tab"
+    ) -> bool:
+        for _ in range(attempts):
+            for item in self.texts():
+                if _matches(item["text"], text):
+                    self.tap(_center(item), action_key=action_key, page_id="reward_ocr_page", anchor_key=text)
+                    self.sleep(1)
+                    return True
+            self.sleep(0.4)
+        return False
+
+    def has_text(self, text: str) -> bool:
+        return any(_matches(item["text"], text) for item in self.texts())
+
+    def go_home(self, attempt_limit: int = 45) -> bool:
+        startup_recovery = False
+        resource_download_seen = False
+        attempt = 0
+        attempt_limit = max(1, int(attempt_limit))
+        while attempt < attempt_limit:
+            attempt += 1
+            texts = self.texts()
+            home_state = resident_home_state(texts)
+            if home_state is ResidentHomeState.HOME_READY:
+                return True
+            if home_state in {
+                ResidentHomeState.ANNOUNCEMENT_OVERLAY,
+                ResidentHomeState.CHECKIN_OVERLAY,
+            } or (
+                home_state is ResidentHomeState.UNKNOWN_OVERLAY and not startup_recovery
+            ):
+                logger.warning(f"reward return-home blocked by observed overlay: {home_state.value}")
+                return False
+            clarity_cancel = clarity_replenish_cancel_position(texts)
+            if clarity_cancel is not None:
+                logger.info("检测到澄明度补充提示，取消后继续返回主界面")
+                self.tap(clarity_cancel, action_key="dialog_cancel", page_id="clarity_dialog", anchor_key="cancel")
+                self.sleep(1)
+                continue
+            action = startup_screen_action(texts)
+            if action == "cancel_resource_repair":
+                logger.warning("检测到资源完整性修复提示，取消修复")
+                self.tap((320, 500), action_key="dialog_cancel", page_id="resource_repair", anchor_key="cancel")
+                startup_recovery = True
+                self.sleep(1)
+                continue
+            if action == "confirm_resource_download":
+                logger.info("检测到登录前资源包更新提示，确认下载并等待完成")
+                self.tap(RESOURCE_DOWNLOAD_CONFIRM_TAP, action_key="unclassified_tap", page_id="resource_download", anchor_key="confirm")
+                startup_recovery = True
+                if not resource_download_seen:
+                    attempt_limit = max(
+                        attempt_limit,
+                        attempt + RESOURCE_DOWNLOAD_WAIT_ATTEMPTS,
+                    )
+                    resource_download_seen = True
+                self.sleep(2)
+                continue
+            if action == "enter_game":
+                logger.info("检测到游戏登录页，点击安全区域进入游戏")
+                self.tap((640, 560), action_key="enter_game", page_id="login", anchor_key="enter_game")
+                startup_recovery = True
+                self.sleep(4)
+                continue
+            if action == "dismiss_startup_overlay":
+                logger.info("关闭登录后的启动弹窗")
+                self.tap((100, 650), action_key="dialog_cancel", page_id="startup_overlay", anchor_key="cancel")
+                startup_recovery = True
+                self.sleep(1)
+                continue
+            if action == "wait_for_game" or startup_recovery:
+                self.sleep(2)
+                continue
+            self.tap(
+                (82, 36), action_key="page_back",
+                page_id="unknown_page", anchor_key="top_left_back",
+            )
+            self.sleep(0.8)
+        return False
+
+    def click_exact_text(self, text: str, attempts: int = 3) -> bool:
+        """Click an exact OCR label, avoiding prefix matches such as
+        ``环游手册等级`` when the requested bottom tab is ``环游手册``.
+        """
+        expected = text.replace(" ", "")
+        for _ in range(attempts):
+            for item in self.texts():
+                if item["text"].replace(" ", "") == expected:
+                    self.tap(_center(item), action_key="open_tab", page_id="reward_ocr_page", anchor_key=text)
+                    self.sleep(1)
+                    return True
+            self.sleep(0.4)
+        return False
+
+    def red_badge_shortcuts(self) -> list[tuple[int, int]]:
+        """Return icon centers inferred from small red exclamation badges."""
+        image = self.frame().image
+        hsv = cv.cvtColor(image, cv.COLOR_BGR2HSV)
+        mask1 = cv.inRange(hsv, np.array((0, 150, 120)), np.array((10, 255, 255)))
+        mask2 = cv.inRange(hsv, np.array((170, 150, 120)), np.array((179, 255, 255)))
+        mask = cv.morphologyEx(mask1 | mask2, cv.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        count, _, stats, centers = cv.connectedComponentsWithStats(mask)
+        result = []
+        for index in range(1, count):
+            x, y, width, height, area = stats[index]
+            if 6 <= width <= 35 and 6 <= height <= 35 and 35 <= area <= 700:
+                badge_x, badge_y = centers[index]
+                result.append((int(badge_x - 25), int(badge_y + 20)))
+        return result
+
+
+class RewardCollector:
+    def __init__(self, driver: Optional[RewardDriver] = None):
+        self.driver = driver or RewardDriver()
+        self.state = _load_state()
+
+    def _tap(self, pos: tuple[int, int], **semantic) -> object:
+        """Preserve the small injected-driver protocol used by deterministic tests."""
+        parameters = inspect.signature(self.driver.tap).parameters
+        return self.driver.tap(pos, **semantic) if "action_key" in parameters else self.driver.tap(pos)
+
+    def _click_text(self, text: str, attempts: int, *, action_key: str) -> bool:
+        parameters = inspect.signature(self.driver.click_text).parameters
+        if "action_key" in parameters:
+            return bool(self.driver.click_text(text, attempts=attempts, action_key=action_key))
+        return bool(self.driver.click_text(text, attempts=attempts))
+
+    def _swipe_left(self, page_type: str) -> None:
+        parameters = inspect.signature(self.driver.swipe_left).parameters
+        if "page_type" in parameters:
+            self.driver.swipe_left(page_type=page_type)
+        else:
+            self.driver.swipe_left()
+
+    def _page_is_open(self, page_marker: str) -> bool:
+        if self.driver.has_text(page_marker):
+            return True
+        if page_marker == "每日活跃":
+            texts = [item["text"] for item in self.driver.texts()]
+            return (
+                any(_matches(text, "完成进度") for text in texts)
+                and any(_matches(text, "活跃度") for text in texts)
+            )
+        return False
+
+    def _matching_text_count(self, text: str) -> int:
+        return sum(
+            1 for item in self.driver.texts()
+            if _matches(item["text"], text)
+        )
+
+    def _open_from_home(self, page_marker: str) -> bool:
+        if not self.driver.go_home():
+            raise BlockedBySafetyError("无法返回主界面，取消领取奖励")
+        candidates = self.driver.red_badge_shortcuts()
+        learned = self.state.get("shortcut_positions", {}).get(page_marker)
+        if learned:
+            nearby = [
+                pos for pos in candidates
+                if abs(pos[0] - learned[0]) <= 35 and abs(pos[1] - learned[1]) <= 35
+            ]
+            if nearby:
+                # The learned coordinate is only a search hint.  Keep every
+                # current badge as a fallback because home shortcuts may move
+                # after an update or a resolution/layout change.
+                candidates = nearby + [pos for pos in candidates if pos not in nearby]
+            else:
+                # A missing badge normally means "nothing pending", not that
+                # the shortcut moved.  Open the learned shortcut once and
+                # inspect the page; if it is genuinely stale, the remaining
+                # current badges are still tried afterwards.
+                logger.info(f"{page_marker}入口当前无角标，使用缓存坐标复核页面")
+                learned_pos = tuple(learned)
+                candidates = [learned_pos] + [
+                    pos for pos in candidates if pos != learned_pos
+                ]
+
+        if not candidates:
+            stable = READ_ONLY_SHORTCUTS.get(page_marker)
+            if stable:
+                logger.info(f"{page_marker}当前无提醒角标，使用稳定入口坐标只读复核")
+                candidates = [stable]
+            else:
+                logger.info(f"主界面没有发现可用于进入{page_marker}的提醒角标")
+                return False
+
+        for pos in candidates:
+            keys = tuple(READ_ONLY_SHORTCUTS)
+            daily = bool(keys and page_marker == keys[0])
+            self._tap(
+                pos,
+                action_key="daily_page_open" if daily else "manual_page_open",
+                page_id="home",
+                anchor_key="daily_shortcut" if daily else "manual_shortcut",
+            )
+            self.driver.sleep(1.5)
+            if self._page_is_open(page_marker):
+                positions = self.state.setdefault("shortcut_positions", {})
+                positions[page_marker] = list(pos)
+                _save_state(self.state)
+                return True
+            self._tap((82, 36), action_key="back", page_id="reward_candidate", anchor_key="top_left_back")
+            self.driver.sleep(0.8)
+        logger.info(f"没有找到带提醒角标的{page_marker}入口")
+        return False
+
+    def _claim_one_click(self, area: str) -> bool:
+        """Claim a one-click batch and require the actionable button to go away."""
+        if not self._click_text("一键领取", attempts=2, action_key="reward_claim"):
+            return False
+        self._tap((640, 660), action_key="reward_claim", page_id=area, anchor_key="dismiss_reward")
+        self.driver.sleep(0.8)
+        if self.driver.has_text("一键领取"):
+            logger.warning(f"{area}的一键领取按钮点击后仍存在，本次不计为已领取")
+            return False
+        logger.info(f"{area}的一键领取按钮已消失，确认领取成功")
+        return True
+
+    def _daily_completion_confirmed(self, frames: int = 2) -> bool:
+        """Require two clean frames before treating the daily reward page as complete."""
+        for frame_index in range(frames):
+            observation = self.driver.frame()
+            items = observation.ocr()
+            if not _is_daily_activity_page(items):
+                return False
+            progress = _daily_activity_progress(items)
+            if progress is None or progress[0] < progress[1]:
+                return False
+            if any(_matches(str(item.get("text", "")), "可领取") for item in items):
+                return False
+            if _daily_stage_boxes(observation.image):
+                return False
+            if frame_index + 1 < frames:
+                self.driver.sleep(0.25)
+        return True
+
+    def _claim_daily_stage_batch(
+        self,
+        yellow_boxes: list[tuple[int, int]],
+        attempts: int = 2,
+        confirmation_frames: int = 3,
+    ) -> bool:
+        """Claim the game-side stage batch without chasing stale yellow boxes."""
+        if not yellow_boxes:
+            return False
+
+        # The game claims every unlocked stage reward when any yellow gift is
+        # tapped. Prefer the rightmost (highest unlocked) gift and keep the
+        # retry on that same target instead of producing clicks across boxes.
+        target_x = yellow_boxes[-1][0]
+        for attempt_index in range(attempts):
+            self._tap((target_x, 164), action_key="reward_claim", page_id="daily_activity", anchor_key="stage_reward")
+
+            # Let the reward presentation appear before dismissing it. The old
+            # 0.8-second blind tap was often early, after which stale page pixels
+            # were mistaken for a failed claim and several other boxes got hit.
+            self.driver.sleep(1.2)
+            self._tap((640, 660), action_key="reward_claim", page_id="daily_activity", anchor_key="dismiss_reward")
+
+            saw_daily_page = False
+            for frame_index in range(confirmation_frames):
+                self.driver.sleep(0.7)
+                observation = self.driver.frame()
+                items = observation.ocr()
+                if not _is_daily_activity_page(items):
+                    # A reward presentation may temporarily cover the page.
+                    # Dismiss it, but never interpret another page as success.
+                    self._tap((640, 660), action_key="reward_claim", page_id="daily_activity", anchor_key="dismiss_reward")
+                    continue
+                saw_daily_page = True
+                if not _daily_stage_boxes(observation.image):
+                    logger.info("每日活跃阶段奖励已批量领取，并在每日活跃页确认黄色箱消失")
+                    return True
+                if frame_index + 1 < confirmation_frames:
+                    self.driver.sleep(0.4)
+
+            if attempt_index + 1 < attempts:
+                reason = "黄色箱仍存在" if saw_daily_page else "领奖后尚未回到每日活跃页"
+                logger.info(
+                    f"每日活跃阶段箱 x={target_x} {reason}，等待稳定后重试同一箱"
+                )
+
+        logger.warning(
+            f"每日活跃阶段箱 x={target_x} 两次受控点击后仍未在每日活跃页确认领取，"
+            "停止额外点击并留待下次复核"
+        )
+        return False
+
+    def collect_daily_activity(self) -> int:
+        cycle = _daily_cycle()
+        cached_complete = self.state.get("daily_activity_completed_cycle") == cycle
+        if not self._open_from_home("每日活跃"):
+            return 0
+        if cached_complete:
+            logger.info("本周期存在每日活跃完成缓存，执行两帧轻量复核")
+            if self._daily_completion_confirmed():
+                logger.info("连续两帧确认无可领取任务和阶段箱，跳过重复领取")
+                return 0
+            self.state.pop("daily_activity_completed_cycle", None)
+            _save_state(self.state)
+            logger.warning("每日活跃完成缓存与当前页面不一致，已撤销并重新检查奖励")
+
+        # One task click often claims all completed tasks, but require the
+        # actionable-label count to decrease before treating it as success.
+        claimed = 0
+        for _ in range(8):
+            before = self._matching_text_count("可领取")
+            if before == 0:
+                break
+            if not self._click_text("可领取", attempts=1, action_key="reward_claim"):
+                break
+            self._tap((640, 660), action_key="reward_claim", page_id="daily_activity", anchor_key="dismiss_reward")
+            self.driver.sleep(0.8)
+            after = self._matching_text_count("可领取")
+            if after >= before:
+                logger.warning("每日活跃的可领取状态点击后没有减少，本次不计成功")
+                break
+            claimed += 1
+
+        # One yellow gift claims all currently unlocked stage rewards. Wait for
+        # the UI to stabilize and confirm the result on this page instead of
+        # iterating over candidates from stale screenshots.
+        yellow_boxes = _daily_stage_boxes(self.driver.frame().image)
+        if self._claim_daily_stage_batch(yellow_boxes):
+            claimed += 1
+
+        # Reaching 600 only unlocks every stage. Cache completion only after two
+        # fresh frames also prove that no task or stage reward remains claimable.
+        if self._daily_completion_confirmed():
+            self.state["daily_activity_completed_cycle"] = cycle
+            _save_state(self.state)
+            logger.info("活跃度已达 600 且连续两帧无可领取奖励，记录本周期奖励已完成")
+        logger.info(f"每日活跃奖励处理完成，共触发 {claimed} 次领取")
+        return claimed
+
+    def observe_daily_activity(self, stable_frames: int = 2) -> dict[str, int] | None:
+        """Read a stable, known daily activity value and reward-tier state."""
+
+        if not self._open_from_home("每日活跃"):
+            return None
+        observations = []
+        layout_frames: list[list[dict]] = []
+        layout_images: list[np.ndarray] = []
+        for frame_index in range(max(2, stable_frames)):
+            frame = self.driver.frame()
+            items = frame.ocr()
+            layout_frames.append(items)
+            layout_images.append(frame.image)
+            progress = _daily_activity_progress(items)
+            if progress is None:
+                scanner = DailyCardScanner()
+                stage_claimable = len(_daily_stage_boxes(frame.image))
+                scanner.add_page(
+                    items,
+                    evidence=PageScanEvidence(
+                        False, False, datetime.now().astimezone(),
+                        page_anchor_confirmed=_is_daily_activity_page(items),
+                    ),
+                )
+                previous_items = items
+                for page_index in range(12):
+                    if scanner.complete:
+                        break
+                    if hasattr(self.driver, "swipe_left"):
+                        self._swipe_left("daily")
+                    next_frame = self.driver.frame()
+                    next_items = next_frame.ocr()
+                    displacement = _horizontal_displacement(
+                        previous_items, next_items,
+                        content_roi=(150, 200, 1180, 650),
+                    )
+                    anchored = _is_daily_activity_page(next_items)
+                    scanner.add_page(
+                        next_items,
+                        evidence=_page_scan_evidence(
+                            scanner,
+                            displacement,
+                            datetime.now().astimezone(),
+                            page_anchor_confirmed=anchored,
+                        ),
+                    )
+                    previous_items = next_items
+                    if scanner.cancelled:
+                        break
+                    layout_frames.append(next_items)
+                    layout_images.append(next_frame.image)
+                    stage_claimable = max(stage_claimable, len(_daily_stage_boxes(next_frame.image)))
+                structured = observe_daily_activity_layout(
+                    layout_frames,
+                    scanner=scanner,
+                    stage_rewards_claimable=stage_claimable,
+                    images=layout_images,
+                )
+                return {
+                    "current": structured.current,
+                    "maximum": structured.maximum,
+                    "claimable_tiers": structured.stage_rewards_claimable + structured.task_rewards_claimable,
+                    "unclaimed_tiers": structured.stage_rewards_claimable + structured.task_rewards_claimable,
+                    "claimed_tiers": 0,
+                    "current_source": structured.current_source,
+                    "confidence": structured.confidence,
+                    "missing_evidence": list(structured.missing_evidence),
+                    "task_cards": [asdict(card) for card in structured.task_cards],
+                    "page_complete": structured.page_complete,
+                    "task_inventory_complete": bool(
+                        structured.page_complete and scanner.progress_states_complete
+                    ),
+                    "stage_track_complete": structured.page_complete,
+                    "claim_state_confidence": (
+                        "HIGH"
+                        if structured.page_complete
+                        and scanner.progress_states_complete
+                        and scanner.claim_states_complete
+                        else "UNKNOWN"
+                    ),
+                    "scan_revision": _items_fingerprint(layout_frames[-1]),
+                    "page_fingerprint": _items_fingerprint(layout_frames[-1]),
+                }
+            current, maximum = progress
+            stage_claimable = len(_daily_stage_boxes(frame.image))
+            button_claimable = int(
+                any(_matches(str(item.get("text", "")), "可领取") for item in items)
+            )
+            claimable = max(stage_claimable, button_claimable)
+            thresholds = [maximum * index // 6 for index in range(1, 7)]
+            locked = sum(1 for threshold in thresholds if current < threshold)
+            observations.append((current, maximum, claimable, claimable + locked))
+            if frame_index + 1 < max(2, stable_frames):
+                self.driver.sleep(0.25)
+        if any(item != observations[0] for item in observations[1:]):
+            logger.warning("每日活跃 OCR 多帧不稳定，本次保持 UNKNOWN")
+            return None
+        current, maximum, claimable, unclaimed = observations[0]
+        return {
+            "current": current,
+            "maximum": maximum,
+            "claimable_tiers": claimable,
+            "unclaimed_tiers": unclaimed,
+            "claimed_tiers": max(0, 6 - unclaimed),
+            # Aggregate OCR does not prove the horizontally scrolling task
+            # inventory reached its end.
+            "page_complete": False,
+            "task_inventory_complete": False,
+            "stage_track_complete": True,
+            "claim_state_confidence": "UNKNOWN",
+            "scan_revision": _items_fingerprint(layout_frames[-1]),
+            "page_fingerprint": _items_fingerprint(layout_frames[-1]),
+        }
+
+    def collect_travel_manual(self) -> int:
+        if not self._open_from_home("环游手册"):
+            return 0
+        claimed = 0
+        if self.driver.click_text("任务列表", attempts=2):
+            if self._claim_one_click("环游手册任务列表"):
+                claimed += 1
+            progress = _manual_daily_progress(self.driver.texts())
+            if progress is not None:
+                completed, total = progress
+                self.state["travel_manual_progress"] = {
+                    "cycle": _daily_cycle(),
+                    "completed": completed,
+                    "total": total,
+                }
+                _save_state(self.state)
+        if not self.driver.click_exact_text("环游手册", attempts=2):
+            logger.warning("未能准确点击底部‘环游手册’标签，暂不检查等级奖励")
+            return claimed
+
+        # The manual page has its own one-click claim at the bottom right.
+        # It becomes marked with a red exclamation after task EXP raises levels.
+        if self._claim_one_click("环游手册等级奖励"):
+            claimed += 1
+        logger.info(f"环游手册奖励处理完成，共触发 {claimed} 次领取")
+        return claimed
+
+    def observe_travel_manual(self, stable_frames: int = 2) -> dict[str, int] | None:
+        """Observe task completion and reward availability as separate facts."""
+
+        if not self._open_from_home("环游手册"):
+            return None
+        if not self.driver.click_text("任务列表", attempts=2):
+            return None
+        frames = []
+        scanner = ManualCardScanner()
+        for frame_index in range(max(2, stable_frames)):
+            items = self.driver.texts()
+            scanner.add_page(
+                items,
+                evidence=PageScanEvidence(
+                    False, False, datetime.now().astimezone(),
+                    page_anchor_confirmed=_is_manual_task_inventory_page(items),
+                ),
+            )
+            observation = _manual_daily_progress_observation(items)
+            if observation is None:
+                previous_items = items
+                for _ in range(12 - len(frames)):
+                    if scanner.complete:
+                        break
+                    if hasattr(self.driver, "swipe_left"):
+                        self._swipe_left("manual_tasks")
+                    next_items = self.driver.texts()
+                    displacement = _horizontal_displacement(
+                        previous_items, next_items,
+                        content_roi=(150, 200, 1180, 650),
+                    )
+                    anchored = _is_manual_task_inventory_page(next_items)
+                    scanner.add_page(
+                        next_items,
+                        evidence=_page_scan_evidence(
+                            scanner,
+                            displacement,
+                            datetime.now().astimezone(),
+                            page_anchor_confirmed=anchored,
+                        ),
+                    )
+                    previous_items = next_items
+                    if scanner.cancelled:
+                        break
+                summary = scanner.summary()
+                if summary is None:
+                    return None
+                completed, total = summary
+                task_rewards = sum(1 for card in scanner.cards if card.claimable)
+                if not self.driver.click_exact_text("环游手册", attempts=2):
+                    return None
+                track = ManualRewardTrackScanner()
+                first_items = self.driver.texts()
+                track.add_segments(
+                    _manual_track_segments(first_items),
+                    PageScanEvidence(
+                        False, False, datetime.now().astimezone(),
+                        page_anchor_confirmed=_is_manual_track_page(first_items),
+                    ),
+                )
+                previous_items = first_items
+                for _ in range(12):
+                    self._swipe_left("manual_track")
+                    next_items = self.driver.texts()
+                    displacement = _horizontal_displacement(
+                        previous_items, next_items,
+                        content_roi=(150, 100, 1180, 650),
+                    )
+                    anchored = _is_manual_track_page(next_items)
+                    track.add_segments(
+                        _manual_track_segments(next_items),
+                        _page_scan_evidence(
+                            track,
+                            displacement,
+                            datetime.now().astimezone(),
+                            page_anchor_confirmed=anchored,
+                        ),
+                    )
+                    previous_items = next_items
+                    if not anchored:
+                        break
+                    if track.complete:
+                        break
+                level = track.observation()
+                return {
+                    "completed": completed,
+                    "total": total,
+                    "claimable_rewards": task_rewards + level.claimable_level_rewards,
+                    "unclaimed_rewards": task_rewards + level.claimable_level_rewards,
+                    "task_cards": [asdict(card) for card in scanner.cards],
+                    "track_scan_complete": level.track_scan_complete,
+                    "task_inventory_complete": scanner.progress_states_complete,
+                    "level_track_complete": level.track_scan_complete,
+                    "claim_state_confidence": (
+                        "HIGH"
+                        if level.claimability_complete
+                        and scanner.progress_states_complete
+                        and scanner.claim_states_complete
+                        else "UNKNOWN"
+                    ),
+                    "scan_revision": _items_fingerprint(first_items),
+                    "page_fingerprint": _items_fingerprint(first_items),
+                    "confidence": (
+                        "HIGH"
+                        if level.confidence == "HIGH" and scanner.complete
+                        else "UNKNOWN"
+                    ),
+                }
+            claimable = sum(
+                1
+                for item in items
+                if any(
+                    marker in str(item.get("text", ""))
+                    for marker in ("可领取", "一键领取")
+                )
+            )
+            frames.append((*observation, claimable))
+            if frame_index + 1 < max(2, stable_frames):
+                self.driver.sleep(0.25)
+        if any(
+            item[:2] != frames[0][:2]
+            or abs(item[2] - frames[0][2]) > 8
+            or abs(item[3] - frames[0][3]) > 8
+            or item[4] != frames[0][4]
+            for item in frames[1:]
+        ):
+            logger.warning("手册每日任务 OCR 多帧不稳定，本次保持 UNKNOWN")
+            return None
+        completed, total, _ratio_x, _ratio_y, task_rewards = frames[0]
+        if not self.driver.click_exact_text("环游手册", attempts=2):
+            return None
+        track = ManualRewardTrackScanner()
+        try:
+            first_items = self.driver.texts()
+        except StopIteration:
+            return None
+        track.add_segments(
+            _manual_track_segments(first_items),
+            PageScanEvidence(
+                False, False, datetime.now().astimezone(),
+                page_anchor_confirmed=_is_manual_track_page(first_items),
+            ),
+        )
+        previous_items = first_items
+        for _ in range(12):
+            self._swipe_left("manual_track")
+            next_items = self.driver.texts()
+            displacement = _horizontal_displacement(
+                previous_items, next_items,
+                content_roi=(150, 100, 1180, 650),
+            )
+            anchored = _is_manual_track_page(next_items)
+            track.add_segments(
+                _manual_track_segments(next_items),
+                _page_scan_evidence(
+                    track,
+                    displacement,
+                    datetime.now().astimezone(),
+                    page_anchor_confirmed=anchored,
+                ),
+            )
+            previous_items = next_items
+            if not anchored:
+                break
+            if track.complete:
+                break
+        level = track.observation()
+        level_rewards = (
+            level.claimable_level_rewards if level.track_scan_complete else None
+        )
+        if level_rewards is None:
+            logger.warning("手册等级奖励页多帧证据不稳定，本次保持 UNKNOWN")
+            return None
+        return {
+            "completed": completed,
+            "total": total,
+            "claimable_rewards": task_rewards + level_rewards,
+            "unclaimed_rewards": task_rewards + level_rewards,
+            "track_scan_complete": level.track_scan_complete,
+            "task_inventory_complete": False,
+            "level_track_complete": level.track_scan_complete,
+            "claim_state_confidence": (
+                "HIGH" if level.claimability_complete else "UNKNOWN"
+            ),
+            "scan_revision": _items_fingerprint(first_items),
+            "page_fingerprint": _items_fingerprint(first_items),
+            "confidence": level.confidence,
+        }
+
+    def run(self, daily_activity: bool = True, travel_manual: bool = True) -> dict[str, int]:
+        if not connect():
+            raise BlockedBySafetyError("ADB连接失败")
+        result = {"每日活跃": 0, "环游手册": 0}
+        if daily_activity:
+            result["每日活跃"] = self.collect_daily_activity()
+        if travel_manual:
+            result["环游手册"] = self.collect_travel_manual()
+        return result
+
+
+def collect_rewards(daily_activity: bool = True, travel_manual: bool = True) -> dict[str, int]:
+    return RewardCollector().run(daily_activity, travel_manual)
+
+
+def collect_scheduled_rewards(
+    daily_activity: bool = True,
+    travel_manual: bool = True,
+    *,
+    strategy: str = RewardStrategy.MAXIMIZE_PROGRESS.value,
+    running_dependencies: bool = False,
+) -> dict:
+    """Collect currently unlocked rewards and return a conservative schedule result."""
+    now = SERVER_CLOCK.server_now()
+    collector = RewardCollector()
+    try:
+        rewards = collector.run(daily_activity, travel_manual)
+    except Exception as error:
+        programmer_errors = (NameError, AttributeError, TypeError, AssertionError)
+        retryable_runtime = isinstance(error, RuntimeError) and any(
+            marker in str(error).lower()
+            for marker in ("adb", "ocr", "screenshot", "timeout", "连接", "截图", "识别")
+        )
+        if isinstance(error, programmer_errors) or not (
+            isinstance(error, (RewardTransientError, OSError, TimeoutError, ConnectionError))
+            or retryable_runtime
+        ):
+            raise
+        attempt = int(collector.state.get("transient_attempt", 0)) + 1
+        collector.state["transient_attempt"] = min(attempt, 99)
+        _save_state(collector.state)
+        try:
+            selected_strategy = RewardStrategy(strategy)
+        except ValueError:
+            selected_strategy = RewardStrategy.MAXIMIZE_PROGRESS
+        logger.exception(
+            f"奖励生产观察发生暂时异常，使用有界退避: {type(error).__name__}: {error}"
+        )
+        decision = decide_reward_run(
+            None,
+            now=now,
+            strategy=selected_strategy,
+            transient_error=True,
+            attempt=attempt,
+            blocked_reasons=(f"{type(error).__name__}: {error}",),
+        )
+        return {
+            **decision.to_dict(),
+            "task_rewards": {},
+            "rewards_claimed": 0,
+            "progress_made": False,
+            "completion_predicate": False,
+        }
+    collector.state["transient_attempt"] = 0
+    _save_state(collector.state)
+    cycle = SERVER_CLOCK.server_day_id(now)
+    daily_observation = (
+        {"current": 0, "maximum": 0, "claimable_tiers": 0, "unclaimed_tiers": 0}
+        if not daily_activity
+        else collector.observe_daily_activity()
+    )
+    manual_observation = (
+        {"completed": 0, "total": 0, "claimable_rewards": 0, "unclaimed_rewards": 0}
+        if not travel_manual
+        else collector.observe_travel_manual()
+    )
+    snapshot = DailyProgressSnapshot(
+        server_day_id=cycle,
+        daily_activity_current=(daily_observation or {}).get("current"),
+        daily_activity_max=(daily_observation or {}).get("maximum"),
+        daily_activity_source=(daily_observation or {}).get("current_source", "OCR") if daily_observation is not None else "UNKNOWN",
+        daily_activity_confidence=(daily_observation or {}).get("confidence", "HIGH") if daily_observation is not None else "UNKNOWN",
+        daily_activity_claimable_tiers=(daily_observation or {}).get("claimable_tiers"),
+        daily_activity_unclaimed_tiers=(daily_observation or {}).get("unclaimed_tiers"),
+        handbook_daily_tasks_total=(manual_observation or {}).get("total"),
+        handbook_daily_tasks_completed=(manual_observation or {}).get("completed"),
+        handbook_rewards_claimable=(manual_observation or {}).get("claimable_rewards"),
+        handbook_rewards_unclaimed=(manual_observation or {}).get("unclaimed_rewards"),
+        observed_at=now,
+        handbook_confidence=(manual_observation or {}).get("confidence", "HIGH") if manual_observation is not None else "UNKNOWN",
+        daily_reward_confidence=(daily_observation or {}).get("confidence", "HIGH") if daily_observation is not None else "UNKNOWN",
+        handbook_reward_confidence=(
+            (manual_observation or {}).get("confidence", "HIGH")
+            if manual_observation is not None else "UNKNOWN"
+        ),
+        daily_task_inventory_complete=(
+            bool((daily_observation or {}).get("task_inventory_complete", (daily_observation or {}).get("page_complete", False)))
+            if daily_observation is not None else False
+        ),
+        daily_stage_track_complete=(
+            bool((daily_observation or {}).get("stage_track_complete", (daily_observation or {}).get("page_complete", False)))
+            if daily_observation is not None else False
+        ),
+        daily_claim_state_confidence=(
+            (daily_observation or {}).get("claim_state_confidence", "UNKNOWN")
+            if daily_observation is not None else "UNKNOWN"
+        ),
+        handbook_task_inventory_complete=(
+            bool((manual_observation or {}).get("task_inventory_complete", False))
+            if manual_observation is not None else False
+        ),
+        handbook_level_track_complete=(
+            bool((manual_observation or {}).get("level_track_complete", (manual_observation or {}).get("track_scan_complete", False)))
+            if manual_observation is not None else False
+        ),
+        handbook_claim_state_confidence=(
+            (manual_observation or {}).get("claim_state_confidence", "UNKNOWN")
+            if manual_observation is not None else "UNKNOWN"
+        ),
+        scan_revision="|".join(filter(None, (
+            str((daily_observation or {}).get("scan_revision", "")),
+            str((manual_observation or {}).get("scan_revision", "")),
+        ))),
+        page_fingerprint="|".join(filter(None, (
+            str((daily_observation or {}).get("page_fingerprint", "")),
+            str((manual_observation or {}).get("page_fingerprint", "")),
+        ))),
+    )
+    try:
+        selected_strategy = RewardStrategy(strategy)
+    except ValueError:
+        selected_strategy = RewardStrategy.MAXIMIZE_PROGRESS
+    decision = decide_reward_run(
+        snapshot,
+        now=now,
+        strategy=selected_strategy,
+        running_dependencies=running_dependencies,
+        daily_activity_enabled=daily_activity,
+        travel_manual_enabled=travel_manual,
+    )
+    payload = decision.to_dict()
+    payload.update(
+        task_rewards=rewards,
+        rewards_claimed=sum(rewards.values()),
+        progress_made=any(rewards.values()),
+        completion_predicate=decision.all_tracked_objectives_complete,
+    )
+    return payload
