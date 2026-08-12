@@ -578,6 +578,14 @@ def _departure_boundary_classification(travel) -> str:
     ) + f"|departure_outcome={_departure_outcome(travel)}"
 
 
+def _arrival_boundary_classification(travel) -> str:
+    return (
+        "ARRIVAL_VERIFIED_BY_NAVIGATION_WAIT"
+        if travel and bool(getattr(travel, "arrived", True))
+        else "ARRIVAL_NOT_VERIFIED_BY_NAVIGATION_WAIT"
+    ) + f"|monitor_outcome={_departure_outcome(travel)}"
+
+
 def _begin_departure(
     ledger_context: dict | None,
     *,
@@ -1006,9 +1014,11 @@ def run(
                 destination=city.sell_city_name,
                 leg_id=leg_id,
             )
+        sell_entry_classification = "ARRIVAL_CONTEXT_CONFIRMED_BY_LEDGER"
         if resume_action in {"START", "PURCHASE", "DEPART", "WAIT_ARRIVAL"}:
             before_travel = None
             after_travel = None
+            sell_entry_classification = "ARRIVAL_CONTEXT_ALREADY_AT_DESTINATION"
             if should_issue_departure(
                 resume_action, city_name, city.sell_city_name
             ):
@@ -1045,6 +1055,7 @@ def run(
                 ):
                     logger.error(f"无法到达卖货城市 {city.sell_city_name}，停止本次跑商")
                     return False
+                sell_entry_classification = _arrival_boundary_classification(travel)
                 after_travel = read_strength()
             elif city_name != city.sell_city_name:
                 logger.info(
@@ -1076,7 +1087,7 @@ def run(
             "ENTER_SELL_PAGE_BEFORE",
             ledger_context=ledger_context,
             leg_id=leg_id,
-            current_page_classification="ARRIVAL_CONTEXT",
+            current_page_classification=sell_entry_classification,
         )
         if not (is_sell_page() or go_business("sell")):
             _capture_run_business_evidence(

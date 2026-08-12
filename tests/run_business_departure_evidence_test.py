@@ -118,3 +118,29 @@ def test_departure_classification_preserves_success_state():
         "TRAIN_IN_TRANSIT_VERIFIED_BY_DEPARTURE"
         "|departure_outcome=DEPARTURE_TRANSIT_CONFIRMED"
     )
+
+
+def test_arrival_classification_preserves_monitor_outcome_for_sell_boundary():
+    travel = _Travel(
+        True,
+        arrived=True,
+        outcome="ARRIVAL_FIXED_PIXEL_CONFIRMED",
+    )
+
+    assert business._arrival_boundary_classification(travel) == (
+        "ARRIVAL_VERIFIED_BY_NAVIGATION_WAIT"
+        "|monitor_outcome=ARRIVAL_FIXED_PIXEL_CONFIRMED"
+    )
+
+
+def test_arrival_classification_does_not_invent_success():
+    travel = _Travel(
+        True,
+        arrived=False,
+        outcome="ARRIVAL_MONITOR_TIMEOUT",
+    )
+
+    assert business._arrival_boundary_classification(travel) == (
+        "ARRIVAL_NOT_VERIFIED_BY_NAVIGATION_WAIT"
+        "|monitor_outcome=ARRIVAL_MONITOR_TIMEOUT"
+    )
