@@ -144,3 +144,34 @@ def test_arrival_classification_does_not_invent_success():
         "ARRIVAL_NOT_VERIFIED_BY_NAVIGATION_WAIT"
         "|monitor_outcome=ARRIVAL_MONITOR_TIMEOUT"
     )
+
+
+def test_exchange_result_classification_preserves_navigation_failure():
+    result = business.exchange_navigation.ExchangeNavigationResult(
+        False,
+        business.exchange_navigation.ExchangeAction.SELL,
+        reason="exchange_menu_not_confirmed",
+        clicked=(901, 276),
+        stage="exchange_menu_wait",
+    )
+
+    assert business._exchange_result_classification(
+        result,
+        success_label="SELL_PAGE_VERIFIED",
+        failure_label="SELL_PAGE_NOT_VERIFIED",
+    ) == (
+        "SELL_PAGE_NOT_VERIFIED"
+        "|stage=exchange_menu_wait"
+        "|reason=exchange_menu_not_confirmed"
+        "|clicked=(901, 276)"
+    )
+
+
+def test_go_business_result_wrapper_respects_compatibility_mock(monkeypatch):
+    monkeypatch.setattr(business, "go_business", lambda kind: kind == "sell")
+
+    result = business._go_business_with_result("sell")
+
+    assert result.success is True
+    assert result.source == "compatibility_boundary"
+    assert result.reason == "structured_result_unavailable"

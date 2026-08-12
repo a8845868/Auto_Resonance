@@ -174,7 +174,12 @@ def test_adaptive_preflight_failure_writes_navigation_evidence(
         "ADAPTIVE_PREFLIGHT_BUY_PAGE_AFTER",
         "FINAL_CYCLE_RESULT",
     ]
-    assert metadata[-2]["current_page_classification"] == "BUY_PAGE_NOT_VERIFIED"
+    assert metadata[-2]["current_page_classification"] == (
+        "BUY_PAGE_NOT_VERIFIED"
+        "|stage=unknown"
+        "|reason=structured_result_unavailable"
+        "|clicked=None"
+    )
     assert {row["cycle_id"] for row in metadata} == {metadata[0]["cycle_id"]}
     assert all(
         row["leg_id"] == "岚心城|武林源"

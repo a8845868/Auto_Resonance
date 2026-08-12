@@ -7,6 +7,7 @@ LastEditors: Night-stars-1 nujj1042633805@gmail.com
 
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import wraps
@@ -59,6 +60,9 @@ city_sell_data = {
     city: dict(sorted(goods.items(), key=lambda item: item[1]["price"], reverse=True))
     for city, goods in _city_sell_data.items()
 }
+_LAST_EXCHANGE_NAVIGATION_RESULT: ContextVar[
+    exchange_navigation.ExchangeNavigationResult | None
+] = ContextVar("last_exchange_navigation_result", default=None)
 
 
 def _with_run_business_evidence(function):
@@ -397,20 +401,77 @@ def _is_exchange_lobby(image=None) -> bool:
     return sum(any(marker in text for text in texts) for marker in markers) >= 2
 
 
-def go_business(type: Literal["buy", "sell"] = "buy"):
-    if is_train_in_transit(screenshot().ocr()):
-        logger.error("安全门禁：列车仍在行驶，拒绝执行前往交易所")
-        return False
-    if type == "sell" and is_sell_page():
-        logger.info("已在交易所卖货页，直接复用当前页面")
-        return True
-    logger.info("前往交易所")
+def _go_business_result(
+    type: Literal["buy", "sell"] = "buy",
+) -> exchange_navigation.ExchangeNavigationResult:
     action = (
         exchange_navigation.ExchangeAction.BUY
         if type == "buy"
         else exchange_navigation.ExchangeAction.SELL
     )
-    return exchange_navigation.open_exchange_action(action, read_only=False).success
+    if is_train_in_transit(screenshot().ocr()):
+        logger.error("安全门禁：列车仍在行驶，拒绝执行前往交易所")
+        return exchange_navigation.ExchangeNavigationResult(
+            False,
+            action,
+            source="run_business_guard",
+            reason="train_in_transit",
+            stage="precondition",
+        )
+    if type == "sell" and is_sell_page():
+        logger.info("已在交易所卖货页，直接复用当前页面")
+        return exchange_navigation.ExchangeNavigationResult(
+            True,
+            action,
+            source="existing_page",
+            reason="already_on_sell_page",
+            stage="precondition",
+        )
+    logger.info("前往交易所")
+    return exchange_navigation.open_exchange_action(action, read_only=False)
+
+
+def _exchange_result_classification(
+    result: exchange_navigation.ExchangeNavigationResult,
+    *,
+    success_label: str,
+    failure_label: str,
+) -> str:
+    return (
+        success_label if result.success else failure_label
+    ) + (
+        f"|stage={result.stage or 'unknown'}"
+        f"|reason={result.reason or 'ok'}"
+        f"|clicked={result.clicked}"
+    )
+
+
+def go_business(type: Literal["buy", "sell"] = "buy"):
+    result = _go_business_result(type)
+    _LAST_EXCHANGE_NAVIGATION_RESULT.set(result)
+    return result.success
+
+
+def _go_business_with_result(
+    type: Literal["buy", "sell"],
+) -> exchange_navigation.ExchangeNavigationResult:
+    _LAST_EXCHANGE_NAVIGATION_RESULT.set(None)
+    succeeded = bool(go_business(type))
+    result = _LAST_EXCHANGE_NAVIGATION_RESULT.get()
+    if result is not None:
+        return result
+    action = (
+        exchange_navigation.ExchangeAction.BUY
+        if type == "buy"
+        else exchange_navigation.ExchangeAction.SELL
+    )
+    return exchange_navigation.ExchangeNavigationResult(
+        succeeded,
+        action,
+        source="compatibility_boundary",
+        reason="structured_result_unavailable",
+        stage="unknown",
+    )
 
 
 def _record_ledger_event(
@@ -940,19 +1001,28 @@ def run(
                 leg_id=leg_id,
                 current_page_classification="STATION_CONTEXT_FROM_ROUTE",
             )
-            if not go_business("buy"):
+            buy_page_result = _go_business_with_result("buy")
+            if not buy_page_result.success:
                 _capture_run_business_evidence(
                     "ENTER_BUY_PAGE_AFTER",
                     ledger_context=ledger_context,
                     leg_id=leg_id,
-                    current_page_classification="BUY_PAGE_NOT_VERIFIED",
+                    current_page_classification=_exchange_result_classification(
+                        buy_page_result,
+                        success_label="BUY_PAGE_VERIFIED_BY_NAVIGATION",
+                        failure_label="BUY_PAGE_NOT_VERIFIED",
+                    ),
                 )
                 return False
             _capture_run_business_evidence(
                 "ENTER_BUY_PAGE_AFTER",
                 ledger_context=ledger_context,
                 leg_id=leg_id,
-                current_page_classification="BUY_PAGE_VERIFIED_BY_NAVIGATION",
+                current_page_classification=_exchange_result_classification(
+                    buy_page_result,
+                    success_label="BUY_PAGE_VERIFIED_BY_NAVIGATION",
+                    failure_label="BUY_PAGE_NOT_VERIFIED",
+                ),
             )
             buy_haggle = prepare_negotiation("buy", min(city.haggle_num, 2))
             if buy_haggle == 0 and not can_afford_fatigue(travel_cost):
@@ -1089,19 +1159,37 @@ def run(
             leg_id=leg_id,
             current_page_classification=sell_entry_classification,
         )
-        if not (is_sell_page() or go_business("sell")):
+        if is_sell_page():
+            sell_page_result = exchange_navigation.ExchangeNavigationResult(
+                True,
+                exchange_navigation.ExchangeAction.SELL,
+                source="existing_page",
+                reason="already_on_sell_page",
+                stage="precondition",
+            )
+        else:
+            sell_page_result = _go_business_with_result("sell")
+        if not sell_page_result.success:
             _capture_run_business_evidence(
                 "ENTER_SELL_PAGE_AFTER",
                 ledger_context=ledger_context,
                 leg_id=leg_id,
-                current_page_classification="SELL_PAGE_NOT_VERIFIED",
+                current_page_classification=_exchange_result_classification(
+                    sell_page_result,
+                    success_label="SELL_PAGE_VERIFIED",
+                    failure_label="SELL_PAGE_NOT_VERIFIED",
+                ),
             )
             return False
         _capture_run_business_evidence(
             "ENTER_SELL_PAGE_AFTER",
             ledger_context=ledger_context,
             leg_id=leg_id,
-            current_page_classification="SELL_PAGE_VERIFIED",
+            current_page_classification=_exchange_result_classification(
+                sell_page_result,
+                success_label="SELL_PAGE_VERIFIED",
+                failure_label="SELL_PAGE_NOT_VERIFIED",
+            ),
         )
         # Selling profit is always maximized: pursue the game's two-success cap
         # regardless of the per-city buy-side haggle setting.
@@ -1559,15 +1647,16 @@ def adaptive_weekly_run():
             leg_id=preflight_leg_id,
             current_page_classification="BUY_PAGE_NAVIGATION_PENDING",
         )
-        buy_page_ready = go_business("buy")
+        buy_page_result = _go_business_with_result("buy")
+        buy_page_ready = buy_page_result.success
         _capture_run_business_evidence(
             "ADAPTIVE_PREFLIGHT_BUY_PAGE_AFTER",
             ledger_context=None,
             leg_id=preflight_leg_id,
-            current_page_classification=(
-                "BUY_PAGE_VERIFIED_BY_NAVIGATION"
-                if buy_page_ready
-                else "BUY_PAGE_NOT_VERIFIED"
+            current_page_classification=_exchange_result_classification(
+                buy_page_result,
+                success_label="BUY_PAGE_VERIFIED_BY_NAVIGATION",
+                failure_label="BUY_PAGE_NOT_VERIFIED",
             ),
         )
         if not buy_page_ready:
