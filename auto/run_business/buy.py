@@ -27,6 +27,8 @@ from auto.module.strength import exit_negotiation_safely
 BUY_BARGAIN_TIMEOUT = 45
 BUY_RESULT_TIMEOUT = 3.0
 BUY_RESULT_POLL_INTERVAL = 0.2
+BUY_CONFIRM_TIMEOUT = 10.0
+BUY_CONFIRM_STABLE_FRAMES = 2
 CARGO_CAPACITY_ROI = (1080, 350, 1270, 430)
 
 
@@ -61,8 +63,8 @@ def _buy_tap(pos: tuple[int, int]) -> object:
     )
 
 
-def _cargo_capacity_full(items) -> bool:
-    """Confirm the buy-page cargo counter reports current >= capacity."""
+def _cargo_capacity_value(items) -> tuple[int, int] | None:
+    """Read the buy-page cargo counter without inferring from unrelated text."""
     x1, y1, x2, y2 = CARGO_CAPACITY_ROI
     for item in items:
         position = item.get("position")
@@ -74,7 +76,61 @@ def _cargo_capacity_full(items) -> bool:
             continue
         match = re.search(r"(\d+)\s*/\s*(\d+)\+?", item.get("text", ""))
         if match and int(match.group(2)) > 0:
-            return int(match.group(1)) >= int(match.group(2))
+            return int(match.group(1)), int(match.group(2))
+    return None
+
+
+def _cargo_capacity_full(items) -> bool:
+    """Confirm the buy-page cargo counter reports current >= capacity."""
+    value = _cargo_capacity_value(items)
+    return value is not None and value[0] >= value[1]
+
+
+def _purchase_completion_observed(
+    before: tuple[int, int],
+    *,
+    timeout: float = BUY_CONFIRM_TIMEOUT,
+    stable_frames: int = BUY_CONFIRM_STABLE_FRAMES,
+) -> bool:
+    """Require a stable cargo increase after the confirmation dispatch.
+
+    A reward overlay may temporarily cover the cargo counter. It is dismissed
+    once only after both affirmative result markers are visible in one frame.
+    """
+    deadline = time.perf_counter() + max(0.0, float(timeout))
+    stable = 0
+    expected_capacity = before[1]
+    overlay_dismissed = False
+    while time.perf_counter() < deadline:
+        items = screenshot().ocr()
+        texts = {
+            re.sub(r"\s+", "", str(item.get("text", "")))
+            for item in items
+            if item.get("text")
+        }
+        if (
+            not overlay_dismissed
+            and {"获得物品", "触碰空白区域退出"}.issubset(texts)
+        ):
+            if _buy_tap((896, 676)) is False:
+                return False
+            overlay_dismissed = True
+            stable = 0
+            time.sleep(BUY_RESULT_POLL_INTERVAL)
+            continue
+
+        observed = _cargo_capacity_value(items)
+        if (
+            observed is not None
+            and observed[1] == expected_capacity
+            and before[0] < observed[0] <= observed[1]
+        ):
+            stable += 1
+            if stable >= max(1, int(stable_frames)):
+                return True
+        else:
+            stable = 0
+        time.sleep(BUY_RESULT_POLL_INTERVAL)
     return False
 
 
@@ -237,15 +293,22 @@ def buy_business(
         )
         if on_purchase_confirmed is not None:
             on_purchase_confirmed()
-        time.sleep(0.5)
-        _buy_tap((896, 676))
         _capture_buy_evidence(
             "BUY_FLOW_COMPLETE",
             ledger_context=ledger_context,
             leg_id=leg_id,
             current_page_classification=f"BUY_COMPLETED|confirmed_books={book}",
         )
-        return {"success": True, "confirmed_books": book} if detailed else True
+        return (
+            {
+                "success": True,
+                "confirmed_books": book,
+                "purchase_confirmed": True,
+                "cargo_already_full": False,
+            }
+            if detailed
+            else True
+        )
     elif cargo_full:
         _capture_buy_evidence(
             "BUY_FLOW_COMPLETE",
@@ -253,7 +316,16 @@ def buy_business(
             leg_id=leg_id,
             current_page_classification=f"CARGO_ALREADY_FULL|confirmed_books={book}",
         )
-        return {"success": True, "confirmed_books": book} if detailed else True
+        return (
+            {
+                "success": True,
+                "confirmed_books": book,
+                "purchase_confirmed": False,
+                "cargo_already_full": True,
+            }
+            if detailed
+            else True
+        )
     else:
         _capture_buy_evidence(
             "BUY_FLOW_FAILED",
@@ -457,15 +529,17 @@ def click_bargain_button(num=0):
 def click_buy_button():
     """
     说明:
-        点击购买按钮
+        点击一次购买按钮，并以购买前后载货计数增加作为成交证明。
     """
-    start = time.time()
-    while time.time() - start < 10:
-        _buy_tap((1056, 647))
-        time.sleep(1)
-        image = screenshot()
-        bgr = image.get_bgr((1177, 459), offset=5)
-        logger.debug(f"购买物品界面颜色检查: {bgr}")
-        if bgr != [2, 133, 253] and bgr != [251, 253, 253]:
-            return True
+    before = _cargo_capacity_value(screenshot().ocr())
+    if before is None or before[0] >= before[1]:
+        logger.warning("购买前未取得可信的载货计数，拒绝派发购买确认")
+        return False
+    dispatch_result = _buy_tap((1056, 647))
+    if dispatch_result is False:
+        logger.warning("购买确认点击被安全策略拒绝")
+        return False
+    if _purchase_completion_observed(before):
+        return True
+    logger.warning("购买确认已派发，但未观察到稳定的载货计数增加")
     return False

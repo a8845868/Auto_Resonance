@@ -1051,15 +1051,6 @@ def run(
                     purchase_book_delta=1,
                 )
 
-            def purchase_committed():
-                _record_ledger_event(
-                    ledger_context,
-                    "PURCHASE_CONFIRMED",
-                    origin=city.buy_city_name,
-                    destination=city.sell_city_name,
-                    leg_id=leg_id,
-                )
-
             goods_data = list(city.goods_data.keys())
             buy_result = buy_business(
                 goods_data[:1],
@@ -1069,21 +1060,26 @@ def run(
                 detailed=ledger_context is not None,
                 confirmed_books=confirmed_before,
                 on_book_confirmed=book_committed,
-                on_purchase_confirmed=purchase_committed,
                 ledger_context=ledger_context,
                 leg_id=leg_id,
             )
             if not buy_result:
                 return False
-            # Full-cargo verification is also a confirmed purchase outcome and
-            # does not invoke the click callback; the stable event deduplicates.
-            _record_ledger_event(
-                ledger_context,
-                "PURCHASE_CONFIRMED",
-                origin=city.buy_city_name,
-                destination=city.sell_city_name,
-                leg_id=leg_id,
-            )
+            if ledger_context is not None:
+                if not isinstance(buy_result, dict):
+                    logger.error("购买结果缺少结构化完成证据，账本保持 PURCHASE 阶段")
+                    return False
+                if buy_result.get("purchase_confirmed") is True:
+                    _record_ledger_event(
+                        ledger_context,
+                        "PURCHASE_CONFIRMED",
+                        origin=city.buy_city_name,
+                        destination=city.sell_city_name,
+                        leg_id=leg_id,
+                    )
+                elif buy_result.get("cargo_already_full") is not True:
+                    logger.error("购买结果未提供肯定成交或已满载证据，账本保持 PURCHASE 阶段")
+                    return False
         sell_entry_classification = "ARRIVAL_CONTEXT_CONFIRMED_BY_LEDGER"
         if resume_action in {"START", "PURCHASE", "DEPART", "WAIT_ARRIVAL"}:
             before_travel = None

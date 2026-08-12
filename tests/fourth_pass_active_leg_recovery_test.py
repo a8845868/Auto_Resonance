@@ -173,7 +173,14 @@ def test_price_revalidated_before_each_purchase(tmp_path):
     ), patch.object(business, "_clear_residual_cargo", return_value=True), patch.object(
         business, "click_station", return_value=travel
     ), patch.object(business, "prepare_negotiation", return_value=2), patch.object(
-        business, "buy_business", return_value=True
+        business,
+        "buy_business",
+        return_value={
+            "success": True,
+            "confirmed_books": 0,
+            "purchase_confirmed": True,
+            "cargo_already_full": False,
+        },
     ) as buy, patch.object(
         business, "_prepare_max_sell_haggle", return_value=2
     ), patch.object(business, "sell_business", return_value=True), patch.object(

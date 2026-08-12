@@ -1,4 +1,4 @@
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import auto.run_business.buy as buy
 from core.module.bgr import BGR
@@ -37,6 +37,88 @@ class FakeOcrImage:
 
     def ocr(self):
         return self.items
+
+
+def test_buy_confirmation_requires_stable_cargo_increase_and_dispatches_once():
+    before = [ocr_item("100/1121", 1157, 386, 1247, 405)]
+    after = [ocr_item("160/1121", 1157, 386, 1247, 405)]
+    with patch.object(
+        buy,
+        "screenshot",
+        side_effect=[FakeOcrImage(before), FakeOcrImage(after), FakeOcrImage(after)],
+    ), patch.object(buy, "_buy_tap", return_value=object()) as tap, patch.object(
+        buy.time, "sleep"
+    ):
+        assert buy.click_buy_button() is True
+
+    tap.assert_called_once_with((1056, 647))
+
+
+def test_buy_confirmation_blank_or_unrelated_frames_never_confirm_or_redispatch():
+    before = [ocr_item("100/1121", 1157, 386, 1247, 405)]
+    unrelated = [ocr_item("访问城市", 1080, 386, 1247, 405)]
+    clock = iter([0.0, 0.1, 0.2, 11.0])
+    with patch.object(
+        buy,
+        "screenshot",
+        side_effect=[FakeOcrImage(before), FakeOcrImage([]), FakeOcrImage(unrelated)],
+    ), patch.object(buy, "_buy_tap", return_value=object()) as tap, patch.object(
+        buy.time, "perf_counter", side_effect=lambda: next(clock)
+    ), patch.object(buy.time, "sleep"):
+        assert buy.click_buy_button() is False
+
+    tap.assert_called_once_with((1056, 647))
+
+
+def test_buy_confirmation_dismisses_only_affirmative_overlay_then_checks_cargo():
+    before = [ocr_item("100/1121", 1157, 386, 1247, 405)]
+    overlay = [
+        {"text": "获得物品"},
+        {"text": "触碰空白区域退出"},
+    ]
+    after = [ocr_item("160/1121", 1157, 386, 1247, 405)]
+    with patch.object(
+        buy,
+        "screenshot",
+        side_effect=[
+            FakeOcrImage(before),
+            FakeOcrImage(overlay),
+            FakeOcrImage(after),
+            FakeOcrImage(after),
+        ],
+    ), patch.object(buy, "_buy_tap", return_value=object()) as tap, patch.object(
+        buy.time, "sleep"
+    ):
+        assert buy.click_buy_button() is True
+
+    assert tap.call_args_list == [
+        call((1056, 647)),
+        call((896, 676)),
+    ]
+
+
+def test_single_reward_marker_never_authorizes_overlay_dismissal():
+    before = [ocr_item("100/1121", 1157, 386, 1247, 405)]
+    clock = iter([0.0, 0.1, 11.0])
+    with patch.object(
+        buy,
+        "screenshot",
+        side_effect=[FakeOcrImage(before), FakeOcrImage([{"text": "获得物品"}])],
+    ), patch.object(buy, "_buy_tap", return_value=object()) as tap, patch.object(
+        buy.time, "perf_counter", side_effect=lambda: next(clock)
+    ), patch.object(buy.time, "sleep"):
+        assert buy.click_buy_button() is False
+
+    tap.assert_called_once_with((1056, 647))
+
+
+def test_buy_confirmation_without_pre_dispatch_cargo_proof_sends_zero_input():
+    with patch.object(buy, "screenshot", return_value=FakeOcrImage([])), patch.object(
+        buy, "_buy_tap"
+    ) as tap:
+        assert buy.click_buy_button() is False
+
+    tap.assert_not_called()
 
 
 def test_buy_bargain_completes_without_legacy_fixed_pixel_wait():
